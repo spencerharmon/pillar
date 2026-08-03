@@ -175,6 +175,95 @@ impl WotAuthority {
         best.get(node).copied()
     }
 
+    /// The maximum remaining delegation budget reachable at `node` starting
+    /// from an arbitrary `root` (rather than the fixed [`owner`](Self::owner)),
+    /// budgeted at `root_budget` hops — the generalization
+    /// [`WotAuthority::owns`] uses to resolve *node ownership*: a node's
+    /// subkey chains, over zero or more further tsig edges, back to a
+    /// user's own primary key (which need not be the authority's global
+    /// `owner`). Same budget-composition/bounded-fixpoint rule as
+    /// [`reachable_depth`](Self::reachable_depth), just rooted anywhere.
+    #[must_use]
+    pub fn reachable_depth_from(&self, root: &NodeId, root_budget: u8, node: &NodeId) -> Option<u8> {
+        if node == root {
+            return if self.revoked_keys.contains(root) {
+                None
+            } else {
+                Some(root_budget)
+            };
+        }
+        if self.revoked_keys.contains(node) || self.revoked_keys.contains(root) {
+            return None;
+        }
+
+        let mut best: HashMap<NodeId, u8> = HashMap::new();
+        best.insert(root.clone(), root_budget);
+        for _ in 0..=root_budget {
+            let mut changed = false;
+            for (signer, subject, level) in self.valid_edges() {
+                let Some(&rb) = best.get(signer) else {
+                    continue;
+                };
+                if rb == 0 {
+                    continue;
+                }
+                let granted = (rb - 1).min(*level);
+                let entry = best.entry(subject.clone()).or_insert(0);
+                if granted > *entry {
+                    *entry = granted;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        best.get(node).copied()
+    }
+
+    /// Node ownership: whether `node`'s subkey chains, via zero or more
+    /// tsig edges, back to `user_primary` — the model of "a node subkey
+    /// chains to a user primary key" from the ROI. Uses [`max_depth`] as
+    /// the bound on the chain search rooted at `user_primary` (a user's own
+    /// primary key is treated as carrying the authority's full delegation
+    /// budget, mirroring how the global `owner` is treated).
+    ///
+    /// [`max_depth`]: WotAuthority::max_depth
+    #[must_use]
+    pub fn owns(&self, user_primary: &NodeId, node: &NodeId) -> bool {
+        self.reachable_depth_from(user_primary, self.max_depth, node)
+            .is_some()
+    }
+
+    /// This authority's configured bound on tsig delegation depth
+    /// (`MaxDepth` in the spec).
+    #[must_use]
+    pub fn max_depth(&self) -> u8 {
+        self.max_depth
+    }
+
+    /// Group membership: the set of subjects with a currently-valid direct
+    /// tsig edge signed by `parent` — the model of "group = node subkeys
+    /// signed by a common parent subkey". A group is identified by its
+    /// signing parent key, not by an asserted membership list: any node
+    /// whose subkey the parent has (validly) signed is, by construction, a
+    /// member.
+    #[must_use]
+    pub fn group_members(&self, parent: &NodeId) -> HashSet<NodeId> {
+        self.valid_edges()
+            .filter(|(signer, _, _)| signer == parent)
+            .map(|(_, subject, _)| subject.clone())
+            .collect()
+    }
+
+    /// Whether `subject` is a member of the group signed by `parent` (see
+    /// [`group_members`](Self::group_members)).
+    #[must_use]
+    pub fn is_group_member(&self, parent: &NodeId, subject: &NodeId) -> bool {
+        self.valid_edges()
+            .any(|(signer, s, _)| signer == parent && s == subject)
+    }
+
     /// Whether `subject` is currently authoritative: reachable from the
     /// owner over valid edges within bound, AND its direct grant has not
     /// been separately revoked (`revokedGrants`, an out-of-band deny that
@@ -498,5 +587,62 @@ mod tests {
         a.revoke_key(n("x"));
         a.revoke_key(n("x"));
         assert_eq!(a.rev_count(), 1);
+    }
+
+    // --- ownership / grouping ------------------------------------------
+
+    #[test]
+    fn node_owned_when_its_subkey_chains_to_user_primary() {
+        // "user" is not the authority's global owner, but is its own trust
+        // root for its own devices: a node subkey chained (directly or
+        // transitively) back to the user's primary key is owned by it.
+        let mut a = owner_authority(3);
+        a.issue_edge(n("alice-primary"), n("alice-laptop"), 2);
+        a.issue_edge(n("alice-laptop"), n("alice-phone-subkey"), 2);
+
+        assert!(a.owns(&n("alice-primary"), &n("alice-laptop")));
+        assert!(a.owns(&n("alice-primary"), &n("alice-phone-subkey")));
+        // Unrelated node is not owned.
+        assert!(!a.owns(&n("alice-primary"), &n("bob-laptop")));
+        // A user's own primary key always "owns" itself.
+        assert!(a.owns(&n("alice-primary"), &n("alice-primary")));
+    }
+
+    #[test]
+    fn ownership_does_not_cross_revoked_edges() {
+        let mut a = owner_authority(3);
+        a.issue_edge(n("alice-primary"), n("alice-laptop"), 2);
+        assert!(a.owns(&n("alice-primary"), &n("alice-laptop")));
+
+        a.revoke_edge(n("alice-primary"), n("alice-laptop"));
+        assert!(!a.owns(&n("alice-primary"), &n("alice-laptop")));
+    }
+
+    #[test]
+    fn group_is_node_subkeys_signed_by_a_common_parent_subkey() {
+        let mut a = owner_authority(3);
+        a.issue_edge(n("team-parent"), n("node-a"), 2);
+        a.issue_edge(n("team-parent"), n("node-b"), 2);
+        a.issue_edge(n("other-parent"), n("node-c"), 2);
+
+        let members = a.group_members(&n("team-parent"));
+        assert!(members.contains(&n("node-a")));
+        assert!(members.contains(&n("node-b")));
+        assert!(!members.contains(&n("node-c")));
+
+        assert!(a.is_group_member(&n("team-parent"), &n("node-a")));
+        assert!(!a.is_group_member(&n("team-parent"), &n("node-c")));
+    }
+
+    #[test]
+    fn revoked_group_edge_removes_that_member_only() {
+        let mut a = owner_authority(3);
+        a.issue_edge(n("team-parent"), n("node-a"), 2);
+        a.issue_edge(n("team-parent"), n("node-b"), 2);
+        a.revoke_edge(n("team-parent"), n("node-a"));
+
+        let members = a.group_members(&n("team-parent"));
+        assert!(!members.contains(&n("node-a")));
+        assert!(members.contains(&n("node-b")));
     }
 }
