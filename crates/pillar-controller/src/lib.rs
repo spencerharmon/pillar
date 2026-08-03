@@ -52,6 +52,12 @@
 
 #![forbid(unsafe_code)]
 
+mod plugin;
+pub use plugin::{
+    ControllerError, ControllerRegistry, ImageSource, ReconcileContext, ReconcileOutcome,
+    ResourceController, ResourceType, WORKLOAD_RESOURCE_TYPE,
+};
+
 use pillar_coordination::LeaseRegister;
 use pillar_core::{Epoch, NodeId, SideEffect};
 use pillar_identity::capability::{Capability, CapabilityRegistry, ScopeError};
