@@ -24,8 +24,8 @@
 //!   reached (e.g. because they are behind a NAT).
 
 use libp2p::{
-    dcutr, gossipsub, identify, identity::Keypair, kad, noise, relay, swarm::behaviour::toggle::Toggle,
-    tcp, upnp, yamux, PeerId, Swarm,
+    dcutr, gossipsub, identify, identity::Keypair, kad, noise, relay,
+    swarm::behaviour::toggle::Toggle, tcp, upnp, yamux, PeerId, Swarm,
 };
 
 pub mod blob;
@@ -290,8 +290,7 @@ pub mod overlay {
             let text = std::str::from_utf8(bytes).map_err(|_| DecodeError::NotUtf8)?;
             let mut lines = text.lines();
             let peer_id_line = lines.next().ok_or(DecodeError::Empty)?;
-            let peer_id =
-                PeerId::from_str(peer_id_line).map_err(|_| DecodeError::InvalidPeerId)?;
+            let peer_id = PeerId::from_str(peer_id_line).map_err(|_| DecodeError::InvalidPeerId)?;
             let addresses = lines
                 .map(|line| Multiaddr::from_str(line).map_err(|_| DecodeError::InvalidAddress))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -317,7 +316,9 @@ pub mod overlay {
             let msg = match self {
                 DecodeError::NotUtf8 => "mesh peer record payload was not valid UTF-8",
                 DecodeError::Empty => "mesh peer record payload was empty",
-                DecodeError::InvalidPeerId => "mesh peer record's first line was not a valid PeerId",
+                DecodeError::InvalidPeerId => {
+                    "mesh peer record's first line was not a valid PeerId"
+                }
                 DecodeError::InvalidAddress => "mesh peer record contained an invalid Multiaddr",
             };
             f.write_str(msg)
