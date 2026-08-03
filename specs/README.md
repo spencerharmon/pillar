@@ -19,6 +19,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
 | `EventDAG.tla` | `UniquePerAuthorSeq`, `NoGaps`, `PrevLinkIntegrity`, `ParentsCrossAuthorAndExist`, `CausalMonotone`, `TypeOK` | event order & integrity substrate (PGP-signed events in a hash-linked Merkle DAG: per-author linear chain + cross-author causal partial order + content-addressed dedup) | ROI P1 event order & integrity |
 | `IPAM.tla` | `NoDoubleAllocation`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-ipam` (IPv4/IPv6 allocation from a delegated pool) | ROI P3 distributed-authority |
+| `WoTAuthority.tla` | `NoActionAfterRevocation`, `FailClosedUnderStaleView`, `TypeOK`, `CaughtUpBounded` | Web-of-Trust authority & RBAC (`wot-authority-impl`, `rbac-decider`): owner-anchored bounded-depth tsig reachability, 3 revocation kinds, revoke-before-act | ROI P1 WoT authority |
 
 ## Running the checker
 
@@ -70,3 +71,16 @@ pinned release into `./.tools/` (the path CI uses).
   safety-only (`-deadlock`): address release/re-allocation and the
   pool-delegation handshake itself are out of scope, left to the Rust
   refinement (`ipam-impl`).
+- `WoTAuthority` models tsig authority as owner-anchored bounded-depth
+  reachability over non-revoked edges, with edge issuance (AP, unconditional)
+  separated from the three revocation kinds (key/edge/grant). Revocations are
+  CP/fail-closed at the point they matter -- not when appended to the log
+  (an unconditional write), but at `Act` time: `Act`'s guard is the
+  revoke-before-act rule, requiring the actor's local view (`caughtUpTo`) to
+  be a fully caught-up, fenced read of the current revocation log before it
+  may treat a subject as authoritative. `Partition`/`StaleView` let a node's
+  view lag arbitrarily (and `Heal` restore it), and `FailClosedUnderStaleView`
+  proves the unsafe optimistic path -- acting on a subject that only looks
+  authoritative under a stale view -- is structurally unreachable. Safety-only
+  (`-deadlock`): full convergence to a caught-up, unrevoked-everywhere
+  quiescent state is expected, not a fault.
