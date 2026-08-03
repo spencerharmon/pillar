@@ -2202,6 +2202,7 @@ version = "0.0.0"
 dependencies = [
  "pillar-core",
  "pillar-streamdb",
+ "serde",
 ]
 
 [[package]]
@@ -2232,6 +2233,7 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "libp2p",
+ "pillar-eventlog",
  "pillar-streamdb",
  "serde",
  "tokio",

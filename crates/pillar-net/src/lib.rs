@@ -34,6 +34,12 @@ pub use blob::{
     BlobStore, BLOB_PROTOCOL_NAME,
 };
 
+pub mod antientropy;
+pub use antientropy::{
+    answer_sync, apply_sync, build_anti_entropy_swarm, AntiEntropyBehaviour,
+    AntiEntropyBehaviourEvent, SyncRequest, SyncResponse, ANTI_ENTROPY_PROTOCOL_NAME,
+};
+
 /// Gossipsub topic carrying Pillar's append-only event log.
 pub const EVENT_LOG_TOPIC: &str = "/pillar/event-log/1.0.0";
 

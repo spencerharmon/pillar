@@ -43,17 +43,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pillar_streamdb::{content_address, OpLog};
+use serde::{Deserialize, Serialize};
+
+pub mod antientropy;
+pub use antientropy::LogDigest;
 
 /// The fingerprint of an event author's OpenPGP identity. An event is authored
 /// by exactly one author (the `auth` field of `EventDAG.tla`).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Author(pub String);
 
 /// A content address: the identity of an [`Event`], a pure function of its
 /// content. Mirrors `Id(a, n)` in the spec, whose `UniquePerAuthorSeq`
 /// theorem makes the content address a faithful surrogate for a
 /// collision-resistant hash of the full event content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventId(pub u64);
 
 /// The signed content of an event: author, per-author sequence number, the
@@ -63,7 +67,7 @@ pub struct EventId(pub u64);
 /// The [`EventId`] is a pure function of exactly these fields
 /// ([`EventContent::id`]), so identical content deduplicates and a fork (two
 /// distinct events sharing an id) is impossible.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventContent {
     author: Author,
     seq: u64,
@@ -160,7 +164,7 @@ impl EventContent {
 /// checks it still matches: if any field of the content was rewritten after
 /// signing, the digest changes and the signature no longer verifies —
 /// tamper-evidence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     author: Author,
     signed_digest: u64,
@@ -194,7 +198,7 @@ impl Signature {
 }
 
 /// A fully-formed, signed event: its content plus its author's PGP signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     content: EventContent,
     signature: Signature,
@@ -262,6 +266,10 @@ pub struct EventLog {
     events: BTreeMap<EventId, Event>,
     height: BTreeMap<Author, u64>,
     tip: BTreeMap<Author, EventId>,
+    /// Per-author, per-seq index: `(author, seq) -> EventId`. Lets anti-entropy
+    /// address an author's chain by position (`Id(a, n)` in the spec) so a peer
+    /// can serve exactly the contiguous range another peer is missing.
+    by_seq: BTreeMap<(Author, u64), EventId>,
 }
 
 impl EventLog {
@@ -412,7 +420,8 @@ impl EventLog {
         // record the event and advance the author's chain.
         self.store.append(event.content.canonical_bytes());
         self.height.insert(author.clone(), seq + 1);
-        self.tip.insert(author, id);
+        self.tip.insert(author.clone(), id);
+        self.by_seq.insert((author, seq), id);
         self.events.insert(id, event);
         Ok(id)
     }
