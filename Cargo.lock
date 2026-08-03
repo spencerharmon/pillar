@@ -2207,6 +2207,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-manifest"
+version = "0.0.0"
+dependencies = [
+ "pillar-streamdb",
+]
+
+[[package]]
 name = "pillar-net"
 version = "0.0.0"
 dependencies = [

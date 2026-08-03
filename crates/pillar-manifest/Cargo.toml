@@ -1,0 +1,14 @@
+[package]
+name = "pillar-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Signed intent manifests: a CRD-compatible body inside a pillar-native envelope (signer-key, causal-parents, content-hash, capability-scope) riding the merkle-DAG log."
+
+[dependencies]
+pillar-streamdb = { path = "../pillar-streamdb" }
+
+[lints]
+workspace = true
