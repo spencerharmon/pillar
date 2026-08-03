@@ -24,8 +24,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use pillar_core::{Epoch, NodeId};
 use pillar_coordination::{GrantError, LeaseRegister};
+use pillar_core::{Epoch, NodeId};
 
 /// A contiguous, delegated block of addresses this authority may hand out.
 ///
