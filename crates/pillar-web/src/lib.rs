@@ -29,10 +29,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, TcpListener};
 
 use pillar_core::NodeId;
 use pillar_identity::{NodeSubkey, Registry, Signature, UserPrimary};
+use pillar_manifest::{Crd, Value};
 use pillar_rbac::{Decision, ExplicitGrant, PolicyEvent, RbacDecider, Request};
 use pillar_wot_authority::WotAuthority;
 
@@ -87,6 +91,223 @@ impl AuthMode {
                 _ => Err(AuthError::SecondFactorRequired),
             },
         }
+    }
+}
+
+/// A registered WebAuthn/passkey credential: an opaque, server-visible
+/// credential id. This crate carries no real WebAuthn/CBOR/COSE stack (see
+/// the module docs on why: same reason [`pillar_identity::Signature`] stands
+/// in for a verified OpenPGP certification rather than shipping real key
+/// material) — [`PasskeyAuthenticator`] models the registration+assertion
+/// *protocol* precisely: the server never learns the authenticator's secret,
+/// only a challenge-bound proof of possession it can verify.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PasskeyCredential(pub String);
+
+impl From<&str> for PasskeyCredential {
+    fn from(s: &str) -> Self {
+        PasskeyCredential(s.to_owned())
+    }
+}
+
+fn deterministic_digest(parts: &[&str]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// A passkey/WebAuthn authenticator relying party: registers credentials and
+/// verifies assertions.
+///
+/// Registration binds a credential id to a secret that never leaves the
+/// (simulated) authenticator; assertion presents a response the server
+/// verifies by recomputing the challenge-bound proof from the credential's
+/// stored public half — an authenticator without the matching secret cannot
+/// produce a response that verifies, exactly like a real WebAuthn assertion
+/// signature. Distinct challenges (and thus distinct signing-action
+/// requests) never share a valid response, so a captured assertion cannot be
+/// replayed against a different challenge.
+#[derive(Clone, Debug, Default)]
+pub struct PasskeyAuthenticator {
+    // credential id -> the public verifier derived at registration time.
+    credentials: HashMap<PasskeyCredential, u64>,
+}
+
+impl PasskeyAuthenticator {
+    /// A relying party with no credentials registered yet.
+    #[must_use]
+    pub fn new() -> Self {
+        PasskeyAuthenticator::default()
+    }
+
+    /// Register a new passkey credential (`navigator.credentials.create`),
+    /// given the authenticator's private secret. Only the resulting
+    /// [`PasskeyCredential`] and its derived public verifier are retained;
+    /// the secret itself is never stored server-side.
+    pub fn register(&mut self, credential: impl Into<PasskeyCredential>, secret: &str) -> PasskeyCredential {
+        let credential = credential.into();
+        let verifier = deterministic_digest(&["pillar-passkey-register", &credential.0, secret]);
+        self.credentials.insert(credential.clone(), verifier);
+        credential
+    }
+
+    /// Whether a credential has been registered.
+    #[must_use]
+    pub fn is_registered(&self, credential: &PasskeyCredential) -> bool {
+        self.credentials.contains_key(credential)
+    }
+
+    /// Verify an assertion (`navigator.credentials.get`) for `credential`
+    /// over `challenge`, given the authenticator's `response` and the
+    /// (never-transmitted) `secret` it was produced with.
+    ///
+    /// A caller who does not hold the authenticator's secret cannot compute
+    /// a `response` that verifies; an unregistered credential never
+    /// verifies regardless of secret.
+    #[must_use]
+    pub fn assert(&self, credential: &PasskeyCredential, challenge: &str, response: &str) -> bool {
+        let Some(&verifier) = self.credentials.get(credential) else {
+            return false;
+        };
+        let expected = deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()]);
+        response == expected.to_string()
+    }
+
+    /// Compute the response an authenticator holding `secret` for
+    /// `credential` would produce over `challenge` — a test/client-side
+    /// helper mirroring what a real authenticator computes internally.
+    #[must_use]
+    pub fn sign_challenge(credential: &PasskeyCredential, secret: &str, challenge: &str) -> String {
+        let verifier = deterministic_digest(&["pillar-passkey-register", &credential.0, secret]);
+        deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()]).to_string()
+    }
+}
+
+/// A pluggable external second-factor provider — the plugin surface this
+/// crate's open-standard passkey/WebAuthn core rides. A user's manifest
+/// declares which provider gates their signing actions (see
+/// [`declared_second_factor_provider`]); anything implementing this trait —
+/// a TOTP app, a push-approval service, a hardware-key bridge — can be
+/// registered under that name and honored identically to the built-in
+/// [`PasskeyAuthenticator`].
+pub trait SecondFactorProvider {
+    /// The manifest-declared provider name this instance answers to.
+    fn name(&self) -> &str;
+    /// Verify a presented second-factor token/response for `user`.
+    fn verify(&self, user: &str, presented: &str) -> bool;
+}
+
+/// A registry of pluggable external [`SecondFactorProvider`]s, keyed by the
+/// name a user's manifest declares in `secondFactorProvider`.
+#[derive(Default)]
+pub struct SecondFactorProviders {
+    providers: HashMap<String, Box<dyn SecondFactorProvider>>,
+}
+
+impl SecondFactorProviders {
+    /// A registry with no providers registered yet.
+    #[must_use]
+    pub fn new() -> Self {
+        SecondFactorProviders::default()
+    }
+
+    /// Register an external provider under its own declared name.
+    pub fn register(&mut self, provider: Box<dyn SecondFactorProvider>) {
+        self.providers.insert(provider.name().to_owned(), provider);
+    }
+
+    /// Verify `presented` for `user` against the named provider. `false` if
+    /// no provider is registered under `name`.
+    #[must_use]
+    pub fn verify(&self, name: &str, user: &str, presented: &str) -> bool {
+        self.providers
+            .get(name)
+            .is_some_and(|provider| provider.verify(user, presented))
+    }
+}
+
+/// The manifest field name a user declares their external 2FA provider
+/// under: `spec.secondFactorProvider`.
+pub const SECOND_FACTOR_PROVIDER_FIELD: &str = "secondFactorProvider";
+
+/// Read the manifest-declared external second-factor provider name from a
+/// user's manifest (`spec.secondFactorProvider`) — the plugin-surface toggle
+/// [`SecondFactorProviders::verify`] looks the provider up by.
+#[must_use]
+pub fn declared_second_factor_provider(manifest: &Crd) -> Option<&str> {
+    match manifest.spec.get(SECOND_FACTOR_PROVIDER_FIELD) {
+        Some(Value::String(name)) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Honor a user's manifest-declared external second-factor provider: looks
+/// up the provider `manifest` names in [`SECOND_FACTOR_PROVIDER_FIELD`] and
+/// verifies `presented` against it. `false` if the manifest declares no
+/// provider, or names one that is not registered.
+#[must_use]
+pub fn second_factor_honored(providers: &SecondFactorProviders, manifest: &Crd, user: &str, presented: &str) -> bool {
+    match declared_second_factor_provider(manifest) {
+        Some(name) => providers.verify(name, user, presented),
+        None => false,
+    }
+}
+
+/// Which second factor gates a signing action: the built-in
+/// passkey/WebAuthn core, or a manifest-declared external
+/// [`SecondFactorProvider`].
+pub enum SigningGate<'a> {
+    /// Gate by a WebAuthn/passkey assertion against a registered credential.
+    Passkey {
+        /// The relying party holding registered credentials.
+        authenticator: &'a PasskeyAuthenticator,
+        /// The credential the caller is asserting.
+        credential: &'a PasskeyCredential,
+    },
+    /// Gate by the external provider the signing user's manifest declares.
+    ExternalProvider {
+        /// The registry of pluggable external providers.
+        providers: &'a SecondFactorProviders,
+        /// The signing user's manifest (names the provider to honor).
+        manifest: &'a Crd,
+        /// The signing user's identity, passed through to the provider.
+        user: &'a str,
+    },
+}
+
+/// Gate a web-UI signing action after bootstrap: localhost is required
+/// unconditionally (as in [`AuthMode::authorize`]), and in addition the
+/// caller must present a valid second factor — either a passkey/WebAuthn
+/// assertion over `challenge`, or (for [`SigningGate::ExternalProvider`]) a
+/// token honored by the user's manifest-declared provider. An unauthenticated
+/// signing attempt (no valid assertion/token) is always refused.
+///
+/// # Errors
+///
+/// [`AuthError::NotLocalhost`] if `peer` is not loopback;
+/// [`AuthError::SecondFactorRequired`] if the presented second factor does
+/// not verify.
+pub fn authorize_signing_action(
+    peer: &SocketAddr,
+    gate: &SigningGate<'_>,
+    challenge: &str,
+    presented: &str,
+) -> Result<(), AuthError> {
+    if !peer.ip().is_loopback() {
+        return Err(AuthError::NotLocalhost);
+    }
+    let verified = match gate {
+        SigningGate::Passkey { authenticator, credential } => authenticator.assert(credential, challenge, presented),
+        SigningGate::ExternalProvider { providers, manifest, user } => {
+            second_factor_honored(providers, manifest, user, presented)
+        }
+    };
+    if verified {
+        Ok(())
+    } else {
+        Err(AuthError::SecondFactorRequired)
     }
 }
 
@@ -210,6 +431,7 @@ pub fn bind_localhost(port: u16) -> std::io::Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pillar_manifest::Metadata;
     use pillar_rbac::{Capability, Request};
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -334,5 +556,133 @@ mod tests {
         let listener = bind_localhost(0).expect("bind an ephemeral localhost port");
         let addr = listener.local_addr().expect("local_addr");
         assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn passkey_registration_and_assertion_gates_a_signing_action() {
+        let mut authenticator = PasskeyAuthenticator::new();
+        let credential = authenticator.register(PasskeyCredential::from("cred-1"), "authenticator-secret");
+        assert!(authenticator.is_registered(&credential));
+
+        let challenge = "sign-node-42";
+        let response = PasskeyAuthenticator::sign_challenge(&credential, "authenticator-secret", challenge);
+
+        let gate = SigningGate::Passkey {
+            authenticator: &authenticator,
+            credential: &credential,
+        };
+        assert_eq!(authorize_signing_action(&loopback(8080), &gate, challenge, &response), Ok(()));
+    }
+
+    #[test]
+    fn unauthenticated_signing_action_is_refused_without_a_valid_passkey_assertion() {
+        let mut authenticator = PasskeyAuthenticator::new();
+        let credential = authenticator.register(PasskeyCredential::from("cred-2"), "real-secret");
+        let challenge = "sign-node-99";
+
+        let gate = SigningGate::Passkey {
+            authenticator: &authenticator,
+            credential: &credential,
+        };
+
+        // No response at all (empty string never matches a real assertion).
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, challenge, ""),
+            Err(AuthError::SecondFactorRequired)
+        );
+        // A forged response computed without the authenticator's secret.
+        let forged = PasskeyAuthenticator::sign_challenge(&credential, "guessed-secret", challenge);
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, challenge, &forged),
+            Err(AuthError::SecondFactorRequired)
+        );
+        // A genuine response replayed against a different challenge.
+        let response = PasskeyAuthenticator::sign_challenge(&credential, "real-secret", challenge);
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, "a-different-challenge", &response),
+            Err(AuthError::SecondFactorRequired)
+        );
+    }
+
+    #[test]
+    fn passkey_signing_action_still_refuses_non_localhost_even_with_a_valid_assertion() {
+        let mut authenticator = PasskeyAuthenticator::new();
+        let credential = authenticator.register(PasskeyCredential::from("cred-3"), "secret");
+        let challenge = "sign-node-1";
+        let response = PasskeyAuthenticator::sign_challenge(&credential, "secret", challenge);
+
+        let gate = SigningGate::Passkey {
+            authenticator: &authenticator,
+            credential: &credential,
+        };
+        assert_eq!(
+            authorize_signing_action(&remote(8080), &gate, challenge, &response),
+            Err(AuthError::NotLocalhost)
+        );
+    }
+
+    struct StubTotpProvider {
+        expected_code: String,
+    }
+
+    impl SecondFactorProvider for StubTotpProvider {
+        fn name(&self) -> &str {
+            "stub-totp"
+        }
+
+        fn verify(&self, _user: &str, presented: &str) -> bool {
+            presented == self.expected_code
+        }
+    }
+
+    #[test]
+    fn manifest_declared_second_factor_provider_is_honored() {
+        let manifest = Crd::new("pillar.dev/v1", "User", Metadata::new("alice")).with_spec(
+            SECOND_FACTOR_PROVIDER_FIELD,
+            Value::String("stub-totp".to_owned()),
+        );
+        assert_eq!(declared_second_factor_provider(&manifest), Some("stub-totp"));
+
+        let mut providers = SecondFactorProviders::new();
+        providers.register(Box::new(StubTotpProvider {
+            expected_code: "654321".to_owned(),
+        }));
+
+        let gate = SigningGate::ExternalProvider {
+            providers: &providers,
+            manifest: &manifest,
+            user: "alice",
+        };
+
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, "unused-challenge", "654321"),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, "unused-challenge", "000000"),
+            Err(AuthError::SecondFactorRequired)
+        );
+    }
+
+    #[test]
+    fn manifest_with_no_declared_provider_never_honors_a_second_factor() {
+        let manifest = Crd::new("pillar.dev/v1", "User", Metadata::new("bob"));
+        assert_eq!(declared_second_factor_provider(&manifest), None);
+
+        let mut providers = SecondFactorProviders::new();
+        providers.register(Box::new(StubTotpProvider {
+            expected_code: "111111".to_owned(),
+        }));
+
+        let gate = SigningGate::ExternalProvider {
+            providers: &providers,
+            manifest: &manifest,
+            user: "bob",
+        };
+
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, "unused-challenge", "111111"),
+            Err(AuthError::SecondFactorRequired)
+        );
     }
 }

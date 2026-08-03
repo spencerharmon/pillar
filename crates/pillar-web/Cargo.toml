@@ -10,6 +10,7 @@ description = "The web-interface layer: same binary, `--web` (localhost-only) fl
 [dependencies]
 pillar-core = { path = "../pillar-core" }
 pillar-identity = { path = "../pillar-identity" }
+pillar-manifest = { path = "../pillar-manifest" }
 pillar-rbac = { path = "../pillar-rbac" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 
