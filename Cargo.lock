@@ -19,3 +19,10 @@ version = "0.0.0"
 dependencies = [
  "pillar-core",
 ]
+
+[[package]]
+name = "pillar-streamdb"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+]

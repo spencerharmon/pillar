@@ -4,6 +4,7 @@ members = [
     "crates/pillar-core",
     "crates/pillar-coordination",
     "crates/pillar-identity",
+    "crates/pillar-streamdb",
 ]
 
 [workspace.package]
