@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pillar-core",
     "crates/pillar-controller",
+    "crates/pillar-eventlog",
     "crates/pillar-coordination",
     "crates/pillar-identity",
     "crates/pillar-net",
