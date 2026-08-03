@@ -2199,6 +2199,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-ipam"
+version = "0.0.0"
+dependencies = [
+ "pillar-coordination",
+ "pillar-core",
+]
+
+[[package]]
 name = "pillar-net"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,15 @@
+[package]
+name = "pillar-ipam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Quorum-fenced address allocation from a delegated pool: the Rust refinement of specs/IPAM.tla."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-coordination = { path = "../pillar-coordination" }
+
+[lints]
+workspace = true
