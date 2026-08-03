@@ -17,6 +17,7 @@ trusted. Each document below links to the specification that proves its claims.
 | [architecture.md](architecture.md) | System layers, the state model, how components fit together |
 | [consistency-model.md](consistency-model.md) | The CP/AP per-view split and the coordination core (`specs/CoordinationCore.tla`) |
 | [identity.md](identity.md) | The OpenPGP key hierarchy and node-admission handshake (`specs/Registration.tla`) |
+| [plugin-surface.md](plugin-surface.md) | The complete out-of-tree plugin surface and each plugin's interface contract |
 
 ## Design principles
 

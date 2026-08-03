@@ -2220,7 +2220,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-rbac"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+ "pillar-wot-authority",
+]
+
+[[package]]
 name = "pillar-streamdb"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+]
+
+[[package]]
+name = "pillar-wot-authority"
 version = "0.0.0"
 dependencies = [
  "pillar-core",

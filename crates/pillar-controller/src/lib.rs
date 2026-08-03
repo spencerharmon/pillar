@@ -49,8 +49,26 @@
 //! 2. The caller pulls the bytes for [`AdmittedFetch::digest`] over the libp2p
 //!    blob substrate, then [`AdmittedFetch::run`] verifies those bytes hash to
 //!    the authorized digest and produces the [`RunningWorkload`].
+//!
+//! # The plugin interface: [`ResourceSpec`] / [`ResourceReconciler`]
+//!
+//! Everything above the substrate pull (identity/capability authorization,
+//! target-node matching, view-policy admission, coordination-lease
+//! exclusivity) is generic over *what* is being reconciled — it never
+//! inspects the workload's image digest or any other resource-specific
+//! field. [`ResourceReconciler<S>`] extracts exactly that generic pipeline
+//! for any resource type `S: ResourceSpec`, so an out-of-tree crate can
+//! define its own resource type and controller and get the identical safety
+//! guarantees `Controller`/`WorkloadSpec` get, through the SAME public
+//! interface — no in-tree privilege. [`Controller`] itself is now a thin
+//! `ResourceReconciler<WorkloadSpec>` wrapper: the vertical-proof controller
+//! is the interface's first (in-tree) client, not a special case of it. See
+//! `pillar-controller`'s integration tests for an out-of-tree resource type
+//! reconciled entirely through this public interface.
 
 #![forbid(unsafe_code)]
+
+use std::marker::PhantomData;
 
 use pillar_coordination::LeaseRegister;
 use pillar_core::{Epoch, NodeId, SideEffect};
@@ -58,6 +76,202 @@ use pillar_identity::capability::{Capability, CapabilityRegistry, ScopeError};
 use pillar_identity::{NodeSubkey, Registry};
 use pillar_net::BlobDigest;
 use pillar_streamdb::View;
+
+/// A declared resource a [`ResourceReconciler`] can reconcile: the plugin
+/// interface's extension point.
+///
+/// Any crate — in-tree or out-of-tree — implements this for its own resource
+/// type to get the full shared safety pipeline (identity/capability
+/// authorization, target-node matching, view-policy admission, coordination-
+/// lease exclusivity) via [`ResourceReconciler::authorize`]. The trait asks
+/// for only what that generic pipeline needs; resource-specific behavior
+/// (how the resource is actually materialized once admitted) stays with the
+/// implementer, entirely outside this crate.
+pub trait ResourceSpec: Clone {
+    /// The node this resource is declared to run on.
+    fn target_node(&self) -> &NodeId;
+
+    /// The resource's side-effect class, gating view-policy admission and
+    /// whether a coordination lease is required.
+    fn effect(&self) -> SideEffect;
+}
+
+impl ResourceSpec for WorkloadSpec {
+    fn target_node(&self) -> &NodeId {
+        &self.target_node
+    }
+
+    fn effect(&self) -> SideEffect {
+        self.effect
+    }
+}
+
+/// The registries and read handle a [`ResourceReconciler`] needs to run the
+/// shared, resource-agnostic safety pipeline.
+///
+/// Bundled so a caller (in-tree or out-of-tree) builds it once per
+/// reconciliation pass and hands it to [`ResourceReconciler::authorize`]
+/// alongside the declared resource.
+pub struct ReconcileContext<'a> {
+    /// The identity registry admitted subkeys are checked against.
+    pub identity: &'a Registry,
+    /// The capability registry granting/refusing the reconciler's action.
+    pub caps: &'a CapabilityRegistry,
+    /// The coordination lease register, consulted only for an exclusive
+    /// resource.
+    pub lease: &'a LeaseRegister,
+    /// The coordination epoch this reconciliation pass acts under.
+    pub epoch: Epoch,
+    /// The streaming-DB view the resource was read through, whose policy
+    /// must admit the resource's side effect.
+    pub view: &'a View<'a>,
+}
+
+impl<'a> ReconcileContext<'a> {
+    /// Bundle the registries and view a reconciliation pass acts under.
+    #[must_use]
+    pub fn new(
+        identity: &'a Registry,
+        caps: &'a CapabilityRegistry,
+        lease: &'a LeaseRegister,
+        epoch: Epoch,
+        view: &'a View<'a>,
+    ) -> Self {
+        ReconcileContext {
+            identity,
+            caps,
+            lease,
+            epoch,
+            view,
+        }
+    }
+}
+
+/// The public, resource-agnostic reconciler: THE ONE interface in-tree and
+/// out-of-tree controllers share.
+///
+/// Generic over any `S: ResourceSpec`, [`authorize`](Self::authorize) runs
+/// exactly the non-network safety gates that never depend on what the
+/// resource actually is — the controller subkey's identity/capability
+/// authorization, the resource's target-node match, the view's admission of
+/// the resource's side effect, and (for an exclusive resource) the
+/// coordination lease. A resource-specific controller — in-tree
+/// ([`Controller`]) or out-of-tree — is built on top of this by choosing an
+/// `S` and, on success, materializing whatever the admitted resource
+/// requires from [`Admitted::spec`]; that materialization step is exactly
+/// where in-tree/out-of-tree code differs, and it is never reached by a
+/// resource that this shared pipeline refuses.
+#[derive(Clone, Debug)]
+pub struct ResourceReconciler<S> {
+    subkey: NodeSubkey,
+    action: Capability,
+    _spec: PhantomData<fn() -> S>,
+}
+
+impl<S: ResourceSpec> ResourceReconciler<S> {
+    /// A reconciler that acts under `subkey`, enforcing capability `action`
+    /// for the resource type `S`.
+    #[must_use]
+    pub fn new(subkey: NodeSubkey, action: &str) -> Self {
+        ResourceReconciler {
+            subkey,
+            action: Capability::from(action),
+            _spec: PhantomData,
+        }
+    }
+
+    /// The node identity this reconciler acts as.
+    #[must_use]
+    pub fn node(&self) -> NodeId {
+        self.subkey.node_id()
+    }
+
+    /// Run every non-network safety gate against `spec`, admitting it for
+    /// resource-specific materialization on success.
+    ///
+    /// In order: the subkey must be admitted by `ctx.identity` and granted
+    /// this reconciler's action by `ctx.caps`; the resource must target this
+    /// reconciler's node; `ctx.view`'s policy must admit the resource's side
+    /// effect; and, for an exclusive resource, the reconciler must hold
+    /// `ctx.lease` for `ctx.epoch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ReconcileError`] for the first gate that refuses.
+    pub fn authorize(
+        &self,
+        ctx: &ReconcileContext<'_>,
+        spec: &S,
+    ) -> Result<Admitted<S>, ReconcileError> {
+        // Controller layer: the subkey must be admitted AND explicitly
+        // granted the reconciler's action. Bare admission is not enough.
+        let node = ctx
+            .caps
+            .authorize(ctx.identity, &self.subkey, &self.action)
+            .map_err(ReconcileError::Unauthorized)?;
+
+        // A reconciler only reconciles resources declared for its own peer.
+        if *spec.target_node() != node {
+            return Err(ReconcileError::NotTargetNode {
+                declared: spec.target_node().clone(),
+                controller: node,
+            });
+        }
+
+        // View layer: the stream's policy must admit this resource's side
+        // effect (a Relaxed/AP stream refuses an exclusive resource).
+        if !ctx.view.admits(spec.effect()) {
+            return Err(ReconcileError::ViewRefusedEffect {
+                effect: spec.effect(),
+            });
+        }
+
+        // Coordination layer: an exclusive resource is a fenced singleton —
+        // the reconciler may act on it only while it holds the lease for the
+        // epoch.
+        if spec.effect() == SideEffect::Exclusive && ctx.lease.holder(ctx.epoch) != Some(&node) {
+            return Err(ReconcileError::NotLeaseHolder { epoch: ctx.epoch });
+        }
+
+        Ok(Admitted {
+            node,
+            spec: spec.clone(),
+            epoch: ctx.epoch,
+        })
+    }
+}
+
+/// A resource admitted by [`ResourceReconciler::authorize`]: every
+/// resource-agnostic safety gate passed. Resource-specific materialization
+/// (fetching bytes by digest, provisioning a record, …) reads [`spec`](Self::spec)
+/// and proceeds from here — entirely outside this crate for an out-of-tree
+/// resource type.
+#[derive(Clone, Debug)]
+pub struct Admitted<S> {
+    node: NodeId,
+    spec: S,
+    epoch: Epoch,
+}
+
+impl<S: ResourceSpec> Admitted<S> {
+    /// The node the resource will be materialized on.
+    #[must_use]
+    pub fn node(&self) -> &NodeId {
+        &self.node
+    }
+
+    /// The admitted resource declaration.
+    #[must_use]
+    pub fn spec(&self) -> &S {
+        &self.spec
+    }
+
+    /// The coordination epoch the resource was authorized under.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+}
 
 /// The capability a subkey must hold to run a workload through a controller.
 ///
@@ -272,10 +486,17 @@ impl std::fmt::Display for ReconcileError {
 impl std::error::Error for ReconcileError {}
 
 /// A controller acting under an admitted, capability-granted node subkey.
+///
+/// This is the in-tree, first client of the shared [`ResourceReconciler`]
+/// interface: everything below `authorize_fetch` — identity/capability
+/// authorization, target-node matching, view-policy admission, coordination
+/// exclusivity — is delegated to `ResourceReconciler<WorkloadSpec>` and is
+/// NOT reimplemented here. Only the workload-specific final step (fetching
+/// the image by digest and verifying it in [`AdmittedFetch::run`]) is
+/// specific to this type.
 #[derive(Clone, Debug)]
 pub struct Controller {
-    subkey: NodeSubkey,
-    action: Capability,
+    reconciler: ResourceReconciler<WorkloadSpec>,
 }
 
 impl Controller {
@@ -284,15 +505,14 @@ impl Controller {
     #[must_use]
     pub fn new(subkey: NodeSubkey) -> Self {
         Controller {
-            subkey,
-            action: Capability::from(RUN_WORKLOAD_CAPABILITY),
+            reconciler: ResourceReconciler::new(subkey, RUN_WORKLOAD_CAPABILITY),
         }
     }
 
     /// The node identity this controller acts as.
     #[must_use]
     pub fn node(&self) -> NodeId {
-        self.subkey.node_id()
+        self.reconciler.node()
     }
 
     /// Run every non-network safety gate against `spec`, read through `view`,
@@ -306,6 +526,10 @@ impl Controller {
     /// only the authorization to fetch the image digest — the bytes are pulled
     /// over the substrate and verified separately by [`AdmittedFetch::run`].
     ///
+    /// This is a thin, workload-typed facade over
+    /// [`ResourceReconciler::authorize`] — the shared plugin interface every
+    /// controller (in-tree or out-of-tree) goes through.
+    ///
     /// # Errors
     ///
     /// Returns the [`ReconcileError`] for the first gate that refuses.
@@ -318,39 +542,8 @@ impl Controller {
         view: &View<'_>,
         spec: &WorkloadSpec,
     ) -> Result<AdmittedFetch, ReconcileError> {
-        // Controller layer: the subkey must be admitted AND explicitly granted
-        // the run-workload capability. Bare admission is not enough.
-        let node = caps
-            .authorize(identity, &self.subkey, &self.action)
-            .map_err(ReconcileError::Unauthorized)?;
-
-        // A controller only reconciles workloads declared for its own peer.
-        if spec.target_node != node {
-            return Err(ReconcileError::NotTargetNode {
-                declared: spec.target_node.clone(),
-                controller: node,
-            });
-        }
-
-        // View layer: the stream's policy must admit this workload's side
-        // effect (a Relaxed/AP stream refuses an exclusive workload).
-        if !view.admits(spec.effect) {
-            return Err(ReconcileError::ViewRefusedEffect {
-                effect: spec.effect,
-            });
-        }
-
-        // Coordination layer: an exclusive workload is a fenced singleton — the
-        // controller may run it only while it holds the lease for `epoch`.
-        if spec.effect == SideEffect::Exclusive && lease.holder(epoch) != Some(&node) {
-            return Err(ReconcileError::NotLeaseHolder { epoch });
-        }
-
-        Ok(AdmittedFetch {
-            node,
-            spec: spec.clone(),
-            epoch,
-        })
+        let ctx = ReconcileContext::new(identity, caps, lease, epoch, view);
+        self.reconciler.authorize(&ctx, spec).map(AdmittedFetch)
     }
 }
 
@@ -359,25 +552,22 @@ impl Controller {
 ///
 /// It grants nothing beyond fetching [`digest`](Self::digest); the bytes must
 /// still verify against it in [`run`](Self::run) before the workload runs.
+/// A thin workload-typed wrapper over the shared [`Admitted<WorkloadSpec>`].
 #[derive(Clone, Debug)]
-pub struct AdmittedFetch {
-    node: NodeId,
-    spec: WorkloadSpec,
-    epoch: Epoch,
-}
+pub struct AdmittedFetch(Admitted<WorkloadSpec>);
 
 impl AdmittedFetch {
     /// The content address of the image the controller is authorized to pull
     /// over the substrate.
     #[must_use]
     pub fn digest(&self) -> BlobDigest {
-        self.spec.image
+        self.0.spec().image
     }
 
     /// The node the workload will run on.
     #[must_use]
     pub fn node(&self) -> &NodeId {
-        &self.node
+        self.0.node()
     }
 
     /// Verify `image_bytes` (pulled over the substrate) against the authorized
@@ -394,18 +584,19 @@ impl AdmittedFetch {
     /// to the authorized digest.
     pub fn run(self, image_bytes: Vec<u8>) -> Result<RunningWorkload, ReconcileError> {
         let actual = BlobDigest::of(&image_bytes);
-        if actual != self.spec.image {
-            return Err(ReconcileError::ImageDigestMismatch {
-                expected: self.spec.image,
-                actual,
-            });
+        let expected = self.0.spec().image;
+        if actual != expected {
+            return Err(ReconcileError::ImageDigestMismatch { expected, actual });
         }
+        let node = self.0.node().clone();
+        let epoch = self.0.epoch();
+        let spec = self.0.spec().clone();
         Ok(RunningWorkload {
-            name: self.spec.name,
-            node: self.node,
-            image: self.spec.image,
+            name: spec.name,
+            node,
+            image: spec.image,
             image_bytes,
-            epoch: self.epoch,
+            epoch,
         })
     }
 }

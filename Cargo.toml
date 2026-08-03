@@ -9,6 +9,8 @@ members = [
     "crates/pillar-identity",
     "crates/pillar-net",
     "crates/pillar-streamdb",
+    "crates/pillar-wot-authority",
+    "crates/pillar-rbac",
 ]
 
 [workspace.package]
