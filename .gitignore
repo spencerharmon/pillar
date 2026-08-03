@@ -1,1 +1,14 @@
-*~
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock linguist-generated
+
+# TLA+ / TLC
+specs/.tools/
+specs/states/
+specs/*_TTrace_*.tla
+specs/*.old
+
+# Editors / OS
+.DS_Store
+*.swp

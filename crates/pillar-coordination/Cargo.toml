@@ -1,0 +1,14 @@
+[package]
+name = "pillar-coordination"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Quorum-fenced lease: the Rust refinement of specs/CoordinationCore.tla."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+
+[lints]
+workspace = true
