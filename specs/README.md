@@ -20,6 +20,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `EventDAG.tla` | `UniquePerAuthorSeq`, `NoGaps`, `PrevLinkIntegrity`, `ParentsCrossAuthorAndExist`, `CausalMonotone`, `TypeOK` | event order & integrity substrate (PGP-signed events in a hash-linked Merkle DAG: per-author linear chain + cross-author causal partial order + content-addressed dedup) | ROI P1 event order & integrity |
 | `IPAM.tla` | `NoDoubleAllocation`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-ipam` (IPv4/IPv6 allocation from a delegated pool) | ROI P3 distributed-authority |
 | `WoTAuthority.tla` | `NoActionAfterRevocation`, `FailClosedUnderStaleView`, `TypeOK`, `CaughtUpBounded` | Web-of-Trust authority & RBAC (`wot-authority-impl`, `rbac-decider`): owner-anchored bounded-depth tsig reachability, 3 revocation kinds, revoke-before-act | ROI P1 WoT authority |
+| `AntiEntropy.tla` | `CausallyClosed`, `LogSubsetOfWritten`, `NoLostWrite`, `SelfComplete`, `TypeOK`, + liveness `Completeness` (`<>[]`) | anti-entropy sync (fills gossipsub's best-effort gaps): hypercore / SSB-EBT style range-based set reconciliation over a lossy channel | ROI P1 event order & integrity |
 
 ## Running the checker
 
@@ -84,3 +85,24 @@ pinned release into `./.tools/` (the path CI uses).
   authoritative under a stale view -- is structurally unreachable. Safety-only
   (`-deadlock`): full convergence to a caught-up, unrevoked-everywhere
   quiescent state is expected, not a fault.
+- `AntiEntropy` proves the replication discipline that fills gossipsub's
+  best-effort delivery gaps: a hypercore / SSB-EBT style range-based set
+  reconciliation, where every author is also a full replica that syncs
+  missing ranges from peers strictly in causal (per-author `seq`) order --
+  never a gap. Unlike `StreamingDB`'s flat CRDT op-log union, a peer here may
+  never accept `(a, seq)` without already holding `(a, seq-1)`
+  (`CausallyClosed`), matching the hash-linked chain `EventDAG` defines. The
+  lossy channel is modeled the same way as `StreamingDB`'s `Partition`/`Heal`
+  (adversarial, arbitrarily repeated splits); its liveness property
+  `Completeness` (`<>[]AllConverged`) proves that despite arbitrarily many
+  dropped/delayed deliveries, once authoring quiesces and anti-entropy +
+  healing are **strongly** fair per replica pair, every peer converges to,
+  and stays at, the identical reachable event set -- weak fairness is
+  insufficient for the same reason as in `StreamingDB` (an adversarial
+  partition leaves a given deliverable step enabled only intermittently). TLC
+  is run with `-deadlock` (full agreement, or a fully-saturated set of
+  author chains, is expected quiescence, not a fault). Cross-author `parents`
+  hash-links (the DAG shape `EventDAG` proves) are out of scope here -- this
+  spec is scoped to the per-author linear-chain range-sync contract that
+  hypercore/SSB-EBT replicate; a follow-up spec composing the two would prove
+  full-DAG anti-entropy.
