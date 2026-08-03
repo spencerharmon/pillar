@@ -20,32 +20,27 @@ if [[ -z "$JAR" ]]; then
   fi
 fi
 
-# spec name : extra TLC flags
-declare -A SPECS=(
+# spec name : extra TLC flags. Order is fixed so output is deterministic.
+SPECS=(CoordinationCore Registration StreamingDB)
+declare -A FLAGS=(
   [CoordinationCore]="-deadlock"
   [Registration]="-deadlock"
+  [StreamingDB]="-deadlock"
 )
 
 rc=0
-for spec in "${!SPECS[@]}"; do
+for spec in "${SPECS[@]}"; do
   echo "== TLC: $spec =="
   log="/tmp/tlc-$spec.log"
-  # Redirect TLC's own output straight to the log file (rather than piping it
-  # live through `grep -q`) so a NUL-byte-free, fully-flushed log always
-  # exists before we inspect it. Piping `tee | grep -q` here is a documented
-  # footgun under `set -o pipefail`: `grep -q` exits (and closes its stdin)
-  # the instant it finds a match, which can raise SIGPIPE in the upstream
-  # `tee`/`java` stages; with pipefail that SIGPIPE can outrank grep's own
-  # zero exit status, so the pipeline as a whole intermittently reports
-  # non-zero *even though TLC succeeded* (verified: the same captured log
-  # greps clean every time when inspected as a plain file afterward).
-  if java -cp "$JAR" tlc2.TLC ${SPECS[$spec]} -config "$spec.cfg" "$spec.tla" \
-       > "$log" 2>&1; then
-    tlc_rc=0
-  else
-    tlc_rc=$?
-  fi
-  if [[ "$tlc_rc" -eq 0 ]] && grep -qE 'No error has been found' "$log"; then
+  # Run TLC to a log file first, THEN inspect it. Piping java directly into
+  # `grep -q` makes grep close the pipe on first match, java takes SIGPIPE, and
+  # under `set -o pipefail` the whole pipeline reports failure even though the
+  # model check passed. Decoupling the run from the match avoids that.
+  set +e
+  java -cp "$JAR" tlc2.TLC ${FLAGS[$spec]} -config "$spec.cfg" "$spec.tla" \
+    >"$log" 2>&1
+  set -e
+  if grep -qE 'No error has been found' "$log"; then
     echo "   OK"
   else
     echo "   FAILED — invariant violation or model error in $spec"

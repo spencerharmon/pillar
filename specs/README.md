@@ -16,6 +16,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 |------|-------------------|-----------------|------------|
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
 | `Registration.tla` | `AdmissionRequiresAuthorizedChain`, `NoAmbientAuthority`, `TypeOK` | `crates/pillar-identity` (PGP key hierarchy: USER_PRIMARY -> NODE_SUBKEY + REGISTRATION; node-join handshake) | ROI P1 identity/PGP |
+| `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
 
 ## Running the checker
 
@@ -40,3 +41,12 @@ pinned release into `./.tools/` (the path CI uses).
   admission of an already-registered-then-revoked primary's earlier grants is
   out of scope here (no `Revoke` action) -- that is left to a follow-up spec
   alongside the Rust refinement (`identity-impl`).
+- `StreamingDB` composes the AP op-log with the CP `CoordinationCore` lease
+  protocol under a single `Next` and re-checks `AtMostOneHolderPerEpoch`, proving
+  the CP mutual-exclusion invariant is preserved under the composition (the two
+  planes touch disjoint state). Its `Convergence` liveness property
+  (`<>[]AllConverged`) proves that after arbitrary `Partition`/`Heal` the op-log
+  reconverges, under **strong** per-pair fairness of anti-entropy and of healing
+  — weak fairness is insufficient because an adversarial partition leaves a
+  deliverable gossip step enabled only intermittently. TLC is run with
+  `-deadlock` (quiescence at the semilattice top is an expected idle state).
