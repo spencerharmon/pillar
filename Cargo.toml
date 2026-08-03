@@ -4,6 +4,7 @@ members = [
     "crates/pillar-core",
     "crates/pillar-coordination",
     "crates/pillar-identity",
+    "crates/pillar-net",
     "crates/pillar-streamdb",
 ]
 
