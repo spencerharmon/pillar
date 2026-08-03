@@ -19,6 +19,9 @@
 //! repackages the set.
 
 use std::collections::BTreeMap;
+use std::fmt;
+
+use pillar_core::{SideEffect, ViewPolicy};
 
 /// A content address: the identity of an [`Op`], derived purely from its
 /// payload bytes.
@@ -217,6 +220,177 @@ impl Snapshot {
     }
 }
 
+/// A stream (equivalently, a single partition) admitting ops under a
+/// [`ViewPolicy`].
+///
+/// The policy attaches to the stream itself, not to any individual view: it
+/// is the safe-by-default admission gate declared once for the resource
+/// (`docs/consistency-model.md`), and every [`View`] taken over the stream
+/// inherits it (`Stream::view`). Unspecified -> [`ViewPolicy::Strict`] (CP):
+/// [`Stream::new`] defaults to the safe side of the CAP choice so a caller
+/// who forgets to classify a resource gets the conservative behavior, never
+/// a silently-relaxed one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stream {
+    log: OpLog,
+    policy: Option<ViewPolicy>,
+}
+
+/// A stream/view's declared policy defaulted because none was specified.
+/// Mirrors "unspecified -> CP" in `docs/consistency-model.md`.
+const DEFAULT_POLICY: ViewPolicy = ViewPolicy::Strict;
+
+impl Stream {
+    /// A fresh, empty stream with no explicit policy: safe-by-default,
+    /// admitting only what [`ViewPolicy::Strict`] admits (i.e. everything),
+    /// per the CP-unless-declared-otherwise rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Stream { log: OpLog::new(), policy: None }
+    }
+
+    /// A fresh, empty stream/partition with an explicit declared policy.
+    #[must_use]
+    pub fn with_policy(policy: ViewPolicy) -> Self {
+        Stream { log: OpLog::new(), policy: Some(policy) }
+    }
+
+    /// This stream's effective policy: the declared one, or
+    /// [`ViewPolicy::Strict`] if none was ever declared (safe-by-default).
+    #[must_use]
+    pub fn policy(&self) -> ViewPolicy {
+        self.policy.unwrap_or(DEFAULT_POLICY)
+    }
+
+    /// Declare (or change) this stream's policy.
+    pub fn set_policy(&mut self, policy: ViewPolicy) {
+        self.policy = Some(policy);
+    }
+
+    /// Append `payload` as a fresh op, refusing the write if this stream's
+    /// policy does not admit `effect`.
+    ///
+    /// This is the real-stream admission wiring for
+    /// `pillar_core::ViewPolicy::admits`: a non-idempotent
+    /// ([`SideEffect::Exclusive`]) effect is refused outright on a stream
+    /// whose (possibly defaulted) policy is [`ViewPolicy::Relaxed`] (AP),
+    /// never merely warned about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyViolation`] if `effect` is not admitted by this
+    /// stream's policy; the log is left unchanged.
+    pub fn try_append(
+        &mut self,
+        payload: impl Into<Vec<u8>>,
+        effect: SideEffect,
+    ) -> Result<OpId, PolicyViolation> {
+        let policy = self.policy();
+        if !policy.admits(effect) {
+            return Err(PolicyViolation { policy, effect });
+        }
+        Ok(self.log.append(payload))
+    }
+
+    /// Merge another stream's log into this one (the underlying CvRDT
+    /// `Gossip` join). Policy is a local admission concern, not part of the
+    /// replicated state, so merging never changes `self`'s declared policy.
+    pub fn merge(&mut self, other: &Stream) {
+        self.log.merge(&other.log);
+    }
+
+    /// A read-only [`View`] over this stream, inheriting its current
+    /// effective policy.
+    #[must_use]
+    pub fn view(&self) -> View<'_> {
+        View { log: &self.log, policy: self.policy() }
+    }
+
+    /// The underlying op-log, for read access that does not need the policy
+    /// (e.g. gossip/snapshot plumbing).
+    #[must_use]
+    pub fn log(&self) -> &OpLog {
+        &self.log
+    }
+}
+
+/// A read-only view over a [`Stream`], carrying the policy it inherited from
+/// that stream at the time it was taken.
+///
+/// Views never declare their own policy: the whole point of attaching the
+/// policy to the stream/partition is that every consumer of that stream sees
+/// the same admission rule, so a view cannot silently opt itself into a more
+/// permissive class than its stream allows.
+#[derive(Clone, Copy, Debug)]
+pub struct View<'a> {
+    log: &'a OpLog,
+    policy: ViewPolicy,
+}
+
+impl View<'_> {
+    /// The policy this view inherited from its stream.
+    #[must_use]
+    pub fn policy(&self) -> ViewPolicy {
+        self.policy
+    }
+
+    /// Whether an action with the given side effect may run against this
+    /// view, per the inherited policy.
+    #[must_use]
+    pub fn admits(&self, effect: SideEffect) -> bool {
+        self.policy.admits(effect)
+    }
+
+    /// The view's materialized order, delegating to the underlying log.
+    #[must_use]
+    pub fn order(&self) -> Vec<&Op> {
+        self.log.order()
+    }
+
+    /// The view's Merkle root, delegating to the underlying log.
+    #[must_use]
+    pub fn root(&self) -> u64 {
+        self.log.root()
+    }
+}
+
+/// A [`SideEffect`] refused by a stream/view's [`ViewPolicy`].
+///
+/// Constructed only by [`Stream::try_append`] when the effective policy does
+/// not [`ViewPolicy::admits`] the requested effect (safe-by-default: this is
+/// always an `Exclusive` effect meeting a `Relaxed` policy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyViolation {
+    policy: ViewPolicy,
+    effect: SideEffect,
+}
+
+impl PolicyViolation {
+    /// The policy that refused the effect.
+    #[must_use]
+    pub fn policy(&self) -> ViewPolicy {
+        self.policy
+    }
+
+    /// The refused effect.
+    #[must_use]
+    pub fn effect(&self) -> SideEffect {
+        self.effect
+    }
+}
+
+impl fmt::Display for PolicyViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} side effect refused under {:?} view policy",
+            self.effect, self.policy
+        )
+    }
+}
+
+impl std::error::Error for PolicyViolation {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +563,99 @@ mod tests {
         let restored = OpLog::bootstrap(&snapshot, &[]);
         assert!(restored.is_empty());
         assert_eq!(restored.root(), empty.root());
+    }
+
+    /// Safe-by-default: a stream with no declared policy behaves as
+    /// [`ViewPolicy::Strict`] (CP) — it admits an exclusive, non-idempotent
+    /// effect rather than silently defaulting to the relaxed/AP class.
+    #[test]
+    fn unspecified_stream_policy_defaults_to_strict_cp() {
+        let mut stream = Stream::new();
+        assert_eq!(stream.policy(), ViewPolicy::Strict);
+        assert!(stream.try_append(b"claim-dns-name".to_vec(), SideEffect::Exclusive).is_ok());
+    }
+
+    /// The core admission wiring: a non-idempotent (exclusive) effect is
+    /// refused outright against a real stream whose policy is
+    /// [`ViewPolicy::Relaxed`] (AP) — the write never lands in the log.
+    #[test]
+    fn relaxed_stream_refuses_exclusive_effect_and_leaves_log_unchanged() {
+        let mut stream = Stream::with_policy(ViewPolicy::Relaxed);
+        let result = stream.try_append(b"fire-cronjob".to_vec(), SideEffect::Exclusive);
+        assert!(result.is_err());
+        let violation = result.unwrap_err();
+        assert_eq!(violation.policy(), ViewPolicy::Relaxed);
+        assert_eq!(violation.effect(), SideEffect::Exclusive);
+        assert!(stream.log().is_empty());
+    }
+
+    /// A convergent (idempotent) effect is admitted under a relaxed stream
+    /// and actually appends.
+    #[test]
+    fn relaxed_stream_admits_convergent_effect() {
+        let mut stream = Stream::with_policy(ViewPolicy::Relaxed);
+        let result = stream.try_append(b"replica-heartbeat".to_vec(), SideEffect::Convergent);
+        assert!(result.is_ok());
+        assert_eq!(stream.log().len(), 1);
+    }
+
+    /// A strict stream admits both effect classes.
+    #[test]
+    fn strict_stream_admits_both_effect_classes() {
+        let mut strict = Stream::with_policy(ViewPolicy::Strict);
+        assert!(strict.try_append(b"a".to_vec(), SideEffect::Exclusive).is_ok());
+        assert!(strict.try_append(b"b".to_vec(), SideEffect::Convergent).is_ok());
+    }
+
+    /// Views attach no policy of their own: a view taken over a stream
+    /// inherits exactly that stream's effective policy (declared or
+    /// defaulted), so a consumer can never observe a more permissive class
+    /// than the stream/partition declared.
+    #[test]
+    fn view_inherits_policy_from_its_stream() {
+        let mut default_stream = Stream::new();
+        default_stream.try_append(b"x".to_vec(), SideEffect::Convergent).unwrap();
+        let default_view = default_stream.view();
+        assert_eq!(default_view.policy(), ViewPolicy::Strict);
+        assert!(default_view.admits(SideEffect::Exclusive));
+
+        let mut relaxed_stream = Stream::with_policy(ViewPolicy::Relaxed);
+        relaxed_stream.try_append(b"y".to_vec(), SideEffect::Convergent).unwrap();
+        let relaxed_view = relaxed_stream.view();
+        assert_eq!(relaxed_view.policy(), ViewPolicy::Relaxed);
+        assert!(!relaxed_view.admits(SideEffect::Exclusive));
+        assert!(relaxed_view.admits(SideEffect::Convergent));
+
+        // The view's data still reflects the stream's real materialized
+        // state, not just its policy.
+        assert_eq!(relaxed_view.order().len(), 1);
+        assert_eq!(relaxed_view.root(), relaxed_stream.log().root());
+    }
+
+    /// Changing a stream's declared policy after the fact is reflected by a
+    /// freshly-taken view (views are a lens, not a policy snapshot copy that
+    /// can drift from the stream).
+    #[test]
+    fn view_reflects_current_stream_policy_after_change() {
+        let mut stream = Stream::new();
+        assert_eq!(stream.view().policy(), ViewPolicy::Strict);
+        stream.set_policy(ViewPolicy::Relaxed);
+        assert_eq!(stream.view().policy(), ViewPolicy::Relaxed);
+    }
+
+    /// Merging streams (the CRDT gossip join) never changes the receiving
+    /// stream's declared policy — policy is a local admission concern, not
+    /// replicated state.
+    #[test]
+    fn merge_does_not_change_policy() {
+        let mut relaxed = Stream::with_policy(ViewPolicy::Relaxed);
+        relaxed.try_append(b"r".to_vec(), SideEffect::Convergent).unwrap();
+
+        let mut strict = Stream::with_policy(ViewPolicy::Strict);
+        strict.try_append(b"s".to_vec(), SideEffect::Exclusive).unwrap();
+
+        relaxed.merge(&strict);
+        assert_eq!(relaxed.policy(), ViewPolicy::Relaxed);
+        assert_eq!(relaxed.log().len(), 2);
     }
 }
