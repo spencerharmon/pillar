@@ -17,6 +17,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
 | `Registration.tla` | `AdmissionRequiresAuthorizedChain`, `NoAmbientAuthority`, `TypeOK` | `crates/pillar-identity` (PGP key hierarchy: USER_PRIMARY -> NODE_SUBKEY + REGISTRATION; node-join handshake) | ROI P1 identity/PGP |
 | `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
+| `EventDAG.tla` | `UniquePerAuthorSeq`, `NoGaps`, `PrevLinkIntegrity`, `ParentsCrossAuthorAndExist`, `CausalMonotone`, `TypeOK` | event order & integrity substrate (PGP-signed events in a hash-linked Merkle DAG: per-author linear chain + cross-author causal partial order + content-addressed dedup) | ROI P1 event order & integrity |
 | `IPAM.tla` | `NoDoubleAllocation`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-ipam` (IPv4/IPv6 allocation from a delegated pool) | ROI P3 distributed-authority |
 
 ## Running the checker
@@ -51,6 +52,16 @@ pinned release into `./.tools/` (the path CI uses).
   — weak fairness is insufficient because an adversarial partition leaves a
   deliverable gossip step enabled only intermittently. TLC is run with
   `-deadlock` (quiescence at the semilattice top is an expected idle state).
+- `EventDAG` is **safety-only** (`-deadlock`): a state where every author's
+  chain has saturated is expected quiescence, not a fault (the `ReBroadcast`
+  self-loop also keeps the model deadlock-free). It ADOPTS the git / CT / SSB /
+  hypercore hash-linked-DAG convention rather than inventing one, and models an
+  event's content-address by its `(author, seq)` id -- a faithful surrogate for
+  a collision-resistant content hash GIVEN the `UniquePerAuthorSeq` (no-fork)
+  theorem it proves. The CP total order is deliberately NOT modeled here
+  (`CoordinationCore` supplies it); PGP signing is modeled at the ground-truth
+  authorship level (each event carries its author) rather than as cryptographic
+  verification, matching how `Registration` models `signedBy`.
 - `IPAM` allocates addresses from a delegated pool by DIRECTLY INSTANTIATING
   `CoordinationCore` with "epoch" specialised to "address": granting/acquiring
   epoch `e` is granting/acquiring address `e` from the pool, so
