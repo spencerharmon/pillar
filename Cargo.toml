@@ -5,6 +5,7 @@ members = [
     "crates/pillar-controller",
     "crates/pillar-eventlog",
     "crates/pillar-coordination",
+    "crates/pillar-ipam",
     "crates/pillar-identity",
     "crates/pillar-net",
     "crates/pillar-streamdb",
