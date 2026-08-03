@@ -28,6 +28,12 @@ use libp2p::{
     tcp, upnp, yamux, PeerId, Swarm,
 };
 
+pub mod blob;
+pub use blob::{
+    build_blob_swarm, BlobBehaviour, BlobBehaviourEvent, BlobDigest, BlobRequest, BlobResponse,
+    BlobStore, BLOB_PROTOCOL_NAME,
+};
+
 /// Gossipsub topic carrying Pillar's append-only event log.
 pub const EVENT_LOG_TOPIC: &str = "/pillar/event-log/1.0.0";
 
