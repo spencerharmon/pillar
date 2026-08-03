@@ -17,6 +17,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
 | `Registration.tla` | `AdmissionRequiresAuthorizedChain`, `NoAmbientAuthority`, `TypeOK` | `crates/pillar-identity` (PGP key hierarchy: USER_PRIMARY -> NODE_SUBKEY + REGISTRATION; node-join handshake) | ROI P1 identity/PGP |
 | `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
+| `IPAM.tla` | `NoDoubleAllocation`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-ipam` (IPv4/IPv6 allocation from a delegated pool) | ROI P3 distributed-authority |
 
 ## Running the checker
 
@@ -50,3 +51,11 @@ pinned release into `./.tools/` (the path CI uses).
   — weak fairness is insufficient because an adversarial partition leaves a
   deliverable gossip step enabled only intermittently. TLC is run with
   `-deadlock` (quiescence at the semilattice top is an expected idle state).
+- `IPAM` allocates addresses from a delegated pool by DIRECTLY INSTANTIATING
+  `CoordinationCore` with "epoch" specialised to "address": granting/acquiring
+  epoch `e` is granting/acquiring address `e` from the pool, so
+  `AtMostOneHolderPerEpoch` re-exported as `NoDoubleAllocation` is exactly the
+  duplicate-IP exclusion this spec exists to prove. It is spec-only and
+  safety-only (`-deadlock`): address release/re-allocation and the
+  pool-delegation handshake itself are out of scope, left to the Rust
+  refinement (`ipam-impl`).
