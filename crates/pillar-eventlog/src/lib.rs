@@ -1,0 +1,667 @@
+//! PGP-signed, hash-linked event DAG — the Rust refinement of
+//! `specs/EventDAG.tla`.
+//!
+//! Pillar's "event order & integrity" layer (ROI P1, method #1) ADOPTS the
+//! git / Certificate-Transparency / Secure-Scuttlebutt / hypercore convention
+//! rather than inventing a new one: every event is
+//!
+//! * **PGP-signed** by exactly one author, so a tampered event is detectable
+//!   (its signature no longer covers its content);
+//! * **content-addressed** — its identity ([`EventId`]) is a pure function of
+//!   its content, computed with the SAME canonical content-addressing the
+//!   [`pillar_streamdb`] op-log uses ([`pillar_streamdb::content_address`]),
+//!   so re-broadcasting an event **deduplicates** (ingesting it twice is a
+//!   no-op);
+//! * **hash-linked** — it carries a `prev` link to that author's immediately
+//!   preceding event (the per-author linear chain) and a set of `parents`
+//!   links to the observed tips of OTHER authors (the cross-author causal /
+//!   happens-before edges).
+//!
+//! The signature and the collision-resistant hash are modelled with the same
+//! dependency-free stand-ins the rest of the crate graph uses (see
+//! `pillar_identity`): [`Signature`] asserts a *verified* PGP signature over
+//! an event's content digest, and content addresses are the streamdb content
+//! hash. This crate refines the AP integrity structure of the append log; the
+//! CP total order is supplied elsewhere (the coordination core).
+//!
+//! The type mirrors, and its tests encode, the TLC-proven invariants of
+//! `EventDAG.tla`:
+//!
+//! * `UniquePerAuthorSeq` / dedup — [`EventLog::ingest`] is idempotent and no
+//!   two distinct events share a content id (see
+//!   [`tests::dedup_by_content_id`]);
+//! * `NoGaps` — an event at `seq n > 0` is refused unless its `n-1`
+//!   predecessor is already present ([`tests::gap_is_detected`]);
+//! * `PrevLinkIntegrity` — a rewritten link breaks the signature and is
+//!   rejected ([`tests::tampered_link_is_rejected`]);
+//! * `ParentsCrossAuthorAndExist` — every parent references an existing event
+//!   of a different author;
+//! * `CausalMonotone` — happens-before (via `prev` and `parents`) is a strict
+//!   partial order, so the DAG is acyclic
+//!   ([`tests::causal_order_is_a_strict_partial_order`]).
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use pillar_streamdb::{content_address, OpLog};
+
+/// The fingerprint of an event author's OpenPGP identity. An event is authored
+/// by exactly one author (the `auth` field of `EventDAG.tla`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Author(pub String);
+
+/// A content address: the identity of an [`Event`], a pure function of its
+/// content. Mirrors `Id(a, n)` in the spec, whose `UniquePerAuthorSeq`
+/// theorem makes the content address a faithful surrogate for a
+/// collision-resistant hash of the full event content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventId(pub u64);
+
+/// The signed content of an event: author, per-author sequence number, the
+/// `prev` hash-link (the same-author chain edge; `None` for a genesis event),
+/// the set of cross-author `parents` hash-links, and the opaque payload.
+///
+/// The [`EventId`] is a pure function of exactly these fields
+/// ([`EventContent::id`]), so identical content deduplicates and a fork (two
+/// distinct events sharing an id) is impossible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventContent {
+    author: Author,
+    seq: u64,
+    prev: Option<EventId>,
+    parents: BTreeSet<EventId>,
+    payload: Vec<u8>,
+}
+
+impl EventContent {
+    /// The author of this event.
+    #[must_use]
+    pub fn author(&self) -> &Author {
+        &self.author
+    }
+
+    /// The per-author sequence number (chain position) of this event.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The `prev` hash-link to the author's immediately preceding event, or
+    /// `None` for a genesis (`seq == 0`) event.
+    #[must_use]
+    pub fn prev(&self) -> Option<EventId> {
+        self.prev
+    }
+
+    /// The set of cross-author `parents` hash-links (observed tips of other
+    /// authors — the happens-before edges).
+    #[must_use]
+    pub fn parents(&self) -> &BTreeSet<EventId> {
+        &self.parents
+    }
+
+    /// The opaque event payload.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Every backward hash-link of this event: `prev` (if any) plus every
+    /// cross-author parent. These are exactly the happens-before edges.
+    fn links(&self) -> BTreeSet<EventId> {
+        let mut links = self.parents.clone();
+        if let Some(p) = self.prev {
+            links.insert(p);
+        }
+        links
+    }
+
+    /// The canonical, deterministic byte serialization of this content. Fed to
+    /// the content-address hash; stable across runs and platforms so two nodes
+    /// holding the same content necessarily agree on its [`EventId`].
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(self.author.0.len() as u64).to_le_bytes());
+        b.extend_from_slice(self.author.0.as_bytes());
+        b.extend_from_slice(&self.seq.to_le_bytes());
+        match self.prev {
+            Some(p) => {
+                b.push(1);
+                b.extend_from_slice(&p.0.to_le_bytes());
+            }
+            None => b.push(0),
+        }
+        b.extend_from_slice(&(self.parents.len() as u64).to_le_bytes());
+        // BTreeSet iterates in sorted order — canonical regardless of insert order.
+        for p in &self.parents {
+            b.extend_from_slice(&p.0.to_le_bytes());
+        }
+        b.extend_from_slice(&self.payload);
+        b
+    }
+
+    /// The content digest — the raw 64-bit content address of this content.
+    fn digest(&self) -> u64 {
+        content_address(&self.canonical_bytes())
+    }
+
+    /// The content-addressed identity of this event.
+    #[must_use]
+    pub fn id(&self) -> EventId {
+        EventId(self.digest())
+    }
+}
+
+/// A *verified* OpenPGP signature over an [`EventContent`] by its author — the
+/// dependency-free stand-in for a real PGP signature packet (the same
+/// modelling `pillar_identity::Signature` uses).
+///
+/// Constructing one via [`Signature::sign`] asserts the author signed the
+/// content's digest. [`Signature::verifies`] recomputes the content digest and
+/// checks it still matches: if any field of the content was rewritten after
+/// signing, the digest changes and the signature no longer verifies —
+/// tamper-evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    author: Author,
+    signed_digest: u64,
+}
+
+impl Signature {
+    /// Sign `content` as `author`, binding the signature to the content's
+    /// current digest.
+    #[must_use]
+    pub fn sign(author: &Author, content: &EventContent) -> Self {
+        Signature {
+            author: author.clone(),
+            signed_digest: content.digest(),
+        }
+    }
+
+    /// Whether this signature verifies against `content`: it must have been
+    /// issued by the content's own author AND still cover the content's
+    /// (recomputed) digest. A rewritten link or payload changes the digest and
+    /// fails this check.
+    #[must_use]
+    pub fn verifies(&self, content: &EventContent) -> bool {
+        self.author == content.author && self.signed_digest == content.digest()
+    }
+
+    /// The author who issued this signature.
+    #[must_use]
+    pub fn author(&self) -> &Author {
+        &self.author
+    }
+}
+
+/// A fully-formed, signed event: its content plus its author's PGP signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    content: EventContent,
+    signature: Signature,
+}
+
+impl Event {
+    /// The signed content of this event.
+    #[must_use]
+    pub fn content(&self) -> &EventContent {
+        &self.content
+    }
+
+    /// The author's signature over this event.
+    #[must_use]
+    pub fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    /// The content-addressed identity of this event.
+    #[must_use]
+    pub fn id(&self) -> EventId {
+        self.content.id()
+    }
+
+    /// Whether this event's signature verifies against its content (see
+    /// [`Signature::verifies`]).
+    #[must_use]
+    pub fn is_authentic(&self) -> bool {
+        self.signature.verifies(&self.content)
+    }
+}
+
+/// Why an event was refused by [`EventLog::ingest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventError {
+    /// The event's signature does not verify its content — a tampered link,
+    /// payload, or a signature by someone other than the author.
+    TamperedSignature,
+    /// The event's stated [`EventId`] does not match its content's content
+    /// address (a forged/mismatched id).
+    IdMismatch,
+    /// A genesis event (`seq == 0`) must carry no `prev` link, or a non-genesis
+    /// event must carry one — this event violates that.
+    MalformedChainLink,
+    /// The event's `prev` link does not point at exactly its `(author, seq-1)`
+    /// predecessor, or that predecessor is not present — a gap or a broken
+    /// same-author chain (`NoGaps` / `PrevLinkIntegrity`).
+    GapOrBrokenPrev,
+    /// A `parents` link references an event authored by the SAME author, or an
+    /// event that is not present — a dangling / non-cross-author causal edge
+    /// (`ParentsCrossAuthorAndExist`).
+    DanglingParent,
+}
+
+/// The append-only, content-addressed event DAG: the grow-only set of
+/// published events (`log` in the spec), plus the per-author chain heights and
+/// tips used to build and validate hash-links.
+///
+/// Events are stored behind the shared content-addressed store
+/// ([`pillar_streamdb::OpLog`]) so an event's bytes are deduplicated by the
+/// same canonical content-addressing used everywhere else in Pillar.
+#[derive(Debug, Default)]
+pub struct EventLog {
+    store: OpLog,
+    events: BTreeMap<EventId, Event>,
+    height: BTreeMap<Author, u64>,
+    tip: BTreeMap<Author, EventId>,
+}
+
+impl EventLog {
+    /// An empty log.
+    #[must_use]
+    pub fn new() -> Self {
+        EventLog::default()
+    }
+
+    /// The number of distinct events held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether the log holds no events.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Whether the log already holds `id`.
+    #[must_use]
+    pub fn contains(&self, id: EventId) -> bool {
+        self.events.contains_key(&id)
+    }
+
+    /// Borrow a held event by id.
+    #[must_use]
+    pub fn get(&self, id: EventId) -> Option<&Event> {
+        self.events.get(&id)
+    }
+
+    /// The current tip (latest event id) of `author`, if it has published.
+    #[must_use]
+    pub fn tip(&self, author: &Author) -> Option<EventId> {
+        self.tip.get(author).copied()
+    }
+
+    /// Author `author` appends `payload` as its next event, building the
+    /// hash-links from local state: `prev` chains to the author's own current
+    /// tip (`None` for the genesis event) and `parents` observes the current
+    /// tip of every OTHER author that has published — the cross-author causal
+    /// edges (`AddEvent` in the spec). The event is signed, content-addressed,
+    /// and inserted; its id is returned.
+    ///
+    /// This is the local-authoring path, so its links are correct by
+    /// construction and it never fails.
+    pub fn append(&mut self, author: &Author, payload: impl Into<Vec<u8>>) -> EventId {
+        let seq = self.height.get(author).copied().unwrap_or(0);
+        let prev = self.tip.get(author).copied();
+        let parents: BTreeSet<EventId> = self
+            .tip
+            .iter()
+            .filter(|(a, _)| *a != author)
+            .map(|(_, id)| *id)
+            .collect();
+        let content = EventContent {
+            author: author.clone(),
+            seq,
+            prev,
+            parents,
+            payload: payload.into(),
+        };
+        let signature = Signature::sign(author, &content);
+        let event = Event { content, signature };
+        // ingest cannot fail for a locally-authored, correctly-linked event.
+        self.ingest(event)
+            .expect("locally authored event is always valid")
+    }
+
+    /// Ingest a (possibly remotely gossiped) fully-formed event, enforcing
+    /// every `EventDAG.tla` integrity invariant before admitting it:
+    ///
+    /// * **dedup** (`UniquePerAuthorSeq`) — an event already held is a no-op;
+    ///   its id is returned unchanged (idempotent re-broadcast);
+    /// * **tamper-evidence** (`PrevLinkIntegrity`) — the signature must verify
+    ///   the content, and the stated id must match the content address;
+    /// * **gap detection** (`NoGaps` + `PrevLinkIntegrity`) — a non-genesis
+    ///   event's `prev` must be exactly its `(author, seq-1)` predecessor and
+    ///   that predecessor must be present;
+    /// * **cross-author causal edges** (`ParentsCrossAuthorAndExist`) — every
+    ///   `parents` link must reference a present event of a DIFFERENT author.
+    ///
+    /// Returns the event's [`EventId`] on success, or the specific
+    /// [`EventError`] that refused it.
+    pub fn ingest(&mut self, event: Event) -> Result<EventId, EventError> {
+        let id = event.content.id();
+
+        // Dedup: an already-held event is idempotent (re-broadcast is a no-op).
+        if self.events.contains_key(&id) {
+            return Ok(id);
+        }
+
+        // Tamper-evidence: the signature must cover the content, and the id
+        // must be the genuine content address.
+        if !event.is_authentic() {
+            return Err(EventError::TamperedSignature);
+        }
+        if event.signature.author != event.content.author {
+            return Err(EventError::TamperedSignature);
+        }
+
+        let author = event.content.author.clone();
+        let seq = event.content.seq;
+
+        // Same-author chain link + gap detection.
+        match event.content.prev {
+            None => {
+                if seq != 0 {
+                    return Err(EventError::MalformedChainLink);
+                }
+                // Genesis: there must not already be a chain for this author at
+                // seq 0 (a fork would violate UniquePerAuthorSeq); a distinct
+                // genesis id colliding is impossible by content-addressing.
+                if self.height.get(&author).copied().unwrap_or(0) != 0 {
+                    return Err(EventError::GapOrBrokenPrev);
+                }
+            }
+            Some(prev_id) => {
+                if seq == 0 {
+                    return Err(EventError::MalformedChainLink);
+                }
+                // The prev link must be exactly the (author, seq-1)
+                // predecessor, which must be present — this is both gap
+                // detection and prev-link integrity.
+                let expected = self.tip.get(&author).copied();
+                if expected != Some(prev_id) {
+                    return Err(EventError::GapOrBrokenPrev);
+                }
+                match self.events.get(&prev_id) {
+                    Some(p) if p.content.author == author && p.content.seq == seq - 1 => {}
+                    _ => return Err(EventError::GapOrBrokenPrev),
+                }
+            }
+        }
+
+        // Cross-author causal edges: every parent exists and is a different
+        // author.
+        for parent_id in &event.content.parents {
+            match self.events.get(parent_id) {
+                Some(p) if p.content.author != author => {}
+                _ => return Err(EventError::DanglingParent),
+            }
+        }
+
+        // Admit: store the content-addressed bytes in the shared store, then
+        // record the event and advance the author's chain.
+        self.store.append(event.content.canonical_bytes());
+        self.height.insert(author.clone(), seq + 1);
+        self.tip.insert(author, id);
+        self.events.insert(id, event);
+        Ok(id)
+    }
+
+    /// The set of STRICT ancestors of `id` reachable by following `prev` and
+    /// `parents` hash-links backward (the transitive happens-before predecessor
+    /// set). `id` itself is not included.
+    #[must_use]
+    pub fn ancestors(&self, id: EventId) -> BTreeSet<EventId> {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<EventId> = Vec::new();
+        if let Some(ev) = self.events.get(&id) {
+            stack.extend(ev.content.links());
+        }
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            if let Some(ev) = self.events.get(&cur) {
+                stack.extend(ev.content.links());
+            }
+        }
+        seen
+    }
+
+    /// Whether `a` happens-before `b`: `a` is a strict ancestor of `b` in the
+    /// DAG. This relation is the transitive closure of the `prev`/`parents`
+    /// hash-links, and (per `CausalMonotone`) is a strict partial order —
+    /// irreflexive, asymmetric, and transitive — so the DAG is acyclic.
+    #[must_use]
+    pub fn happens_before(&self, a: EventId, b: EventId) -> bool {
+        self.ancestors(b).contains(&a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn author(name: &str) -> Author {
+        Author(name.to_string())
+    }
+
+    /// `UniquePerAuthorSeq` + content-address dedup: re-ingesting an event is a
+    /// no-op (the log does not grow), and identical content yields an identical
+    /// id (no fork).
+    #[test]
+    fn dedup_by_content_id() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+
+        let g = log.append(&alice, b"genesis".to_vec());
+        let e1 = log.get(g).unwrap().clone();
+        assert_eq!(log.len(), 1);
+
+        // Re-broadcasting the very same event is idempotent.
+        let again = log.ingest(e1.clone()).unwrap();
+        assert_eq!(again, g);
+        assert_eq!(
+            log.len(),
+            1,
+            "re-ingesting a held event must not grow the log"
+        );
+
+        // Identical content computes the identical content address (no fork).
+        let dup_content = EventContent {
+            author: alice.clone(),
+            seq: 0,
+            prev: None,
+            parents: BTreeSet::new(),
+            payload: b"genesis".to_vec(),
+        };
+        assert_eq!(
+            dup_content.id(),
+            g,
+            "identical content must share the content id"
+        );
+
+        // Different payload => different content address.
+        let other = EventContent {
+            payload: b"different".to_vec(),
+            ..dup_content
+        };
+        assert_ne!(other.id(), g);
+    }
+
+    /// `NoGaps`: an event at `seq n > 0` is refused unless its `n-1`
+    /// predecessor is already present.
+    #[test]
+    fn gap_is_detected() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+        let g = log.append(&alice, b"seq0".to_vec());
+
+        // Forge a well-signed event at seq 2 whose prev points at the genuine
+        // genesis — but seq 1 is missing. It must be refused as a gap.
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 2,
+            prev: Some(g),
+            parents: BTreeSet::new(),
+            payload: b"seq2".to_vec(),
+        };
+        let signature = Signature::sign(&alice, &content);
+        let gapped = Event { content, signature };
+
+        assert_eq!(log.ingest(gapped), Err(EventError::GapOrBrokenPrev));
+        assert_eq!(log.len(), 1, "a gapped event must not be admitted");
+
+        // Filling seq 1 first, then seq 2 chained to it, is accepted.
+        let s1 = log.append(&alice, b"seq1".to_vec());
+        let c2 = EventContent {
+            author: alice.clone(),
+            seq: 2,
+            prev: Some(s1),
+            parents: BTreeSet::new(),
+            payload: b"seq2".to_vec(),
+        };
+        let sig2 = Signature::sign(&alice, &c2);
+        assert!(log
+            .ingest(Event {
+                content: c2,
+                signature: sig2
+            })
+            .is_ok());
+    }
+
+    /// `PrevLinkIntegrity`: a rewritten (tampered) hash-link breaks the
+    /// signature and is rejected.
+    #[test]
+    fn tampered_link_is_rejected() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+        let g = log.append(&alice, b"seq0".to_vec());
+        let s1 = log.append(&alice, b"seq1".to_vec());
+
+        // Take the genuine seq-1 event, then rewrite its prev link to point at
+        // itself (history tampering) while keeping the original signature.
+        let mut tampered = log.get(s1).unwrap().clone();
+        tampered.content.prev = Some(s1);
+
+        assert!(
+            !tampered.is_authentic(),
+            "rewriting a signed link must break the signature"
+        );
+
+        // A fresh log that has seq0 must still reject the tampered seq1.
+        let mut log2 = EventLog::new();
+        log2.ingest(log.get(g).unwrap().clone()).unwrap();
+        assert_eq!(log2.ingest(tampered), Err(EventError::TamperedSignature));
+    }
+
+    /// `ParentsCrossAuthorAndExist`: a parent link to a same-author event, or
+    /// to an absent event, is refused.
+    #[test]
+    fn parent_must_be_a_present_other_author() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+        let g = log.append(&alice, b"seq0".to_vec());
+
+        // seq1 by alice with a parent pointing at alice's own genesis — a
+        // same-author "cross-author" edge is illegal.
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 1,
+            prev: Some(g),
+            parents: BTreeSet::from([g]),
+            payload: b"seq1".to_vec(),
+        };
+        let signature = Signature::sign(&alice, &content);
+        assert_eq!(
+            log.ingest(Event { content, signature }),
+            Err(EventError::DanglingParent)
+        );
+
+        // A parent id that is not present at all is also refused.
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 1,
+            prev: Some(g),
+            parents: BTreeSet::from([EventId(0xdead_beef)]),
+            payload: b"seq1".to_vec(),
+        };
+        let signature = Signature::sign(&alice, &content);
+        assert_eq!(
+            log.ingest(Event { content, signature }),
+            Err(EventError::DanglingParent)
+        );
+    }
+
+    /// `CausalMonotone`: happens-before (via `prev` and `parents`) is a STRICT
+    /// partial order — irreflexive, asymmetric, transitive — over a real
+    /// cross-author DAG, so the DAG is acyclic and its `parents` are genuine
+    /// cross-author causal edges.
+    #[test]
+    fn causal_order_is_a_strict_partial_order() {
+        let alice = author("alice");
+        let bob = author("bob");
+        let mut log = EventLog::new();
+
+        // alice: a0 -> a1 ; bob observes a0 then publishes b0 (parent a0);
+        // alice then publishes a1 observing bob's b0.
+        let a0 = log.append(&alice, b"a0".to_vec());
+        let b0 = log.append(&bob, b"b0".to_vec()); // parents = {a0}
+        let a1 = log.append(&alice, b"a1".to_vec()); // prev a0, parents {b0}
+
+        // Sanity: the cross-author edges were actually built.
+        assert!(log.get(b0).unwrap().content.parents().contains(&a0));
+        assert!(log.get(a1).unwrap().content.parents().contains(&b0));
+
+        let all = [a0, b0, a1];
+
+        // Irreflexive: nothing happens-before itself.
+        for &x in &all {
+            assert!(
+                !log.happens_before(x, x),
+                "happens-before must be irreflexive"
+            );
+        }
+
+        // Known edges of the causal order.
+        assert!(log.happens_before(a0, b0));
+        assert!(log.happens_before(b0, a1));
+        assert!(log.happens_before(a0, a1)); // transitive: a0 -> b0 -> a1
+
+        // Asymmetric: no pair is ordered both ways.
+        for &x in &all {
+            for &y in &all {
+                if log.happens_before(x, y) {
+                    assert!(
+                        !log.happens_before(y, x),
+                        "happens-before must be asymmetric (acyclic)"
+                    );
+                }
+            }
+        }
+
+        // Transitive over the whole set.
+        for &x in &all {
+            for &y in &all {
+                for &z in &all {
+                    if log.happens_before(x, y) && log.happens_before(y, z) {
+                        assert!(
+                            log.happens_before(x, z),
+                            "happens-before must be transitive"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
