@@ -1,0 +1,17 @@
+[package]
+name = "pillar-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The web-interface layer: same binary, `--web` (localhost-only) flag, not a separate daemon. Bootstrap (keygen, node admission, user-key signing/QR-assisted signing) and post-bootstrap actions (predicted-effect preview via the shared RBAC decider, edits that land as signed events), gated by localhost-only auth during bootstrap and a second factor afterward."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-identity = { path = "../pillar-identity" }
+pillar-rbac = { path = "../pillar-rbac" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
+
+[lints]
+workspace = true

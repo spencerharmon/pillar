@@ -17,6 +17,8 @@ pillar-manifest = { path = "../pillar-manifest" }
 pillar-eventlog = { path = "../pillar-eventlog" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-rbac = { path = "../pillar-rbac" }
+pillar-identity = { path = "../pillar-identity" }
+pillar-web = { path = "../pillar-web" }
 
 [lints]
 workspace = true

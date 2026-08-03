@@ -2164,8 +2164,10 @@ version = "0.0.0"
 dependencies = [
  "pillar-core",
  "pillar-eventlog",
+ "pillar-identity",
  "pillar-manifest",
  "pillar-rbac",
+ "pillar-web",
  "pillar-wot-authority",
 ]
 
@@ -2250,6 +2252,16 @@ name = "pillar-streamdb"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+]
+
+[[package]]
+name = "pillar-web"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+ "pillar-identity",
+ "pillar-rbac",
+ "pillar-wot-authority",
 ]
 
 [[package]]

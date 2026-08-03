@@ -13,6 +13,7 @@ members = [
     "crates/pillar-wot-authority",
     "crates/pillar-rbac",
     "crates/pillar-cli",
+    "crates/pillar-web",
 ]
 
 [workspace.package]
