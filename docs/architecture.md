@@ -71,6 +71,8 @@ more **node subkeys**; a node joins the cluster through a registration
 handshake signed up the key hierarchy. Controllers act under capability-scoped
 subkeys — an out-of-tree provider holding a proprietary credential is granted
 only the capabilities it needs and never inherits ambient cluster authority.
+The full admission model, its TLA+ proof, and the Rust refinement are in
+[identity.md](identity.md).
 
 ## Distributed-authority primitives collapse onto one core
 
