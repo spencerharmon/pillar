@@ -15,6 +15,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | Spec | Proven properties | Backs component | Design doc |
 |------|-------------------|-----------------|------------|
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
+| `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
 
 ## Running the checker
 
@@ -32,3 +33,12 @@ pinned release into `./.tools/` (the path CI uses).
   `-deadlock` because terminal quiescence (every voter has granted its final
   epoch) is an expected idle state, not a fault. Deadlock-freedom and liveness
   (`Declared ~> Held`) are tracked as a follow-up spec, not yet asserted here.
+- `StreamingDB` composes the AP op-log with the CP `CoordinationCore` lease
+  protocol under a single `Next` and re-checks `AtMostOneHolderPerEpoch`, proving
+  the CP mutual-exclusion invariant is preserved under the composition (the two
+  planes touch disjoint state). Its `Convergence` liveness property
+  (`<>[]AllConverged`) proves that after arbitrary `Partition`/`Heal` the op-log
+  reconverges, under **strong** per-pair fairness of anti-entropy and of healing
+  — weak fairness is insufficient because an adversarial partition leaves a
+  deliverable gossip step enabled only intermittently. TLC is run with
+  `-deadlock` (quiescence at the semilattice top is an expected idle state).

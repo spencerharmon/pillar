@@ -20,20 +20,30 @@ if [[ -z "$JAR" ]]; then
   fi
 fi
 
-# spec name : extra TLC flags
-declare -A SPECS=(
+# spec name : extra TLC flags. Order is fixed so output is deterministic.
+SPECS=(CoordinationCore StreamingDB)
+declare -A FLAGS=(
   [CoordinationCore]="-deadlock"
+  [StreamingDB]="-deadlock"
 )
 
 rc=0
-for spec in "${!SPECS[@]}"; do
+for spec in "${SPECS[@]}"; do
   echo "== TLC: $spec =="
-  if java -cp "$JAR" tlc2.TLC ${SPECS[$spec]} -config "$spec.cfg" "$spec.tla" \
-       2>&1 | tee "/tmp/tlc-$spec.log" | grep -qE 'No error has been found'; then
+  log="/tmp/tlc-$spec.log"
+  # Run TLC to a log file first, THEN inspect it. Piping java directly into
+  # `grep -q` makes grep close the pipe on first match, java takes SIGPIPE, and
+  # under `set -o pipefail` the whole pipeline reports failure even though the
+  # model check passed. Decoupling the run from the match avoids that.
+  set +e
+  java -cp "$JAR" tlc2.TLC ${FLAGS[$spec]} -config "$spec.cfg" "$spec.tla" \
+    >"$log" 2>&1
+  set -e
+  if grep -qE 'No error has been found' "$log"; then
     echo "   OK"
   else
     echo "   FAILED — invariant violation or model error in $spec"
-    tail -30 "/tmp/tlc-$spec.log" || true
+    tail -30 "$log" || true
     rc=1
   fi
   rm -f "${spec}_TTrace_"*.tla
