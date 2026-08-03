@@ -17,6 +17,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
 | `Registration.tla` | `AdmissionRequiresAuthorizedChain`, `NoAmbientAuthority`, `TypeOK` | `crates/pillar-identity` (PGP key hierarchy: USER_PRIMARY -> NODE_SUBKEY + REGISTRATION; node-join handshake) | ROI P1 identity/PGP |
 | `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
+| `WoTAuthority.tla` | `NoActionAfterRevocation`, `FailClosedUnderStaleView`, `TypeOK`, `CaughtUpBounded` | Web-of-Trust authority & RBAC (`wot-authority-impl`, `rbac-decider`): owner-anchored bounded-depth tsig reachability, 3 revocation kinds, revoke-before-act | ROI P1 WoT authority |
 
 ## Running the checker
 
@@ -50,3 +51,16 @@ pinned release into `./.tools/` (the path CI uses).
   — weak fairness is insufficient because an adversarial partition leaves a
   deliverable gossip step enabled only intermittently. TLC is run with
   `-deadlock` (quiescence at the semilattice top is an expected idle state).
+- `WoTAuthority` models tsig authority as owner-anchored bounded-depth
+  reachability over non-revoked edges, with edge issuance (AP, unconditional)
+  separated from the three revocation kinds (key/edge/grant). Revocations are
+  CP/fail-closed at the point they matter -- not when appended to the log
+  (an unconditional write), but at `Act` time: `Act`'s guard is the
+  revoke-before-act rule, requiring the actor's local view (`caughtUpTo`) to
+  be a fully caught-up, fenced read of the current revocation log before it
+  may treat a subject as authoritative. `Partition`/`StaleView` let a node's
+  view lag arbitrarily (and `Heal` restore it), and `FailClosedUnderStaleView`
+  proves the unsafe optimistic path -- acting on a subject that only looks
+  authoritative under a stale view -- is structurally unreachable. Safety-only
+  (`-deadlock`): full convergence to a caught-up, unrevoked-everywhere
+  quiescent state is expected, not a fault.
