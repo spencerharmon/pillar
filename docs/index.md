@@ -16,6 +16,7 @@ trusted. Each document below links to the specification that proves its claims.
 |----------|----------------|
 | [architecture.md](architecture.md) | System layers, the state model, how components fit together |
 | [consistency-model.md](consistency-model.md) | The CP/AP per-view split and the coordination core (`specs/CoordinationCore.tla`) |
+| [identity.md](identity.md) | The OpenPGP key hierarchy and node-admission handshake (`specs/Registration.tla`) |
 
 ## Design principles
 
