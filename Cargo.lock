@@ -2159,6 +2159,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pillar-controller"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "libp2p",
+ "pillar-coordination",
+ "pillar-core",
+ "pillar-identity",
+ "pillar-net",
+ "pillar-streamdb",
+ "tokio",
+]
+
+[[package]]
 name = "pillar-coordination"
 version = "0.0.0"
 dependencies = [
