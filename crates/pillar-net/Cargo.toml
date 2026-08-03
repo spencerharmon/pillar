@@ -21,6 +21,7 @@ libp2p = { version = "0.56", features = [
     "quic",
     "tokio",
     "macros",
+    "upnp",
 ] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -29,6 +30,12 @@ tracing = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Dev-only: proves the overlay mesh metadata round-trips through the
+# streaming DB. NOT a runtime dependency of the substrate crate itself —
+# the substrate (build_event_swarm et al.) never depends on pillar-streamdb,
+# which is exactly the "overlay never a bootstrap dep of the substrate"
+# invariant this task requires.
+pillar-streamdb = { path = "../pillar-streamdb" }
 
 [lints]
 workspace = true

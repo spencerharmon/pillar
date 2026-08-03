@@ -24,7 +24,8 @@
 //!   reached (e.g. because they are behind a NAT).
 
 use libp2p::{
-    dcutr, gossipsub, identify, identity::Keypair, kad, noise, relay, tcp, yamux, PeerId, Swarm,
+    dcutr, gossipsub, identify, identity::Keypair, kad, noise, relay, swarm::behaviour::toggle::Toggle,
+    tcp, upnp, yamux, PeerId, Swarm,
 };
 
 /// Gossipsub topic carrying Pillar's append-only event log.
@@ -203,6 +204,185 @@ pub fn build_relay_client_swarm(
 /// Convenience: the [`PeerId`] a [`Keypair`] resolves to.
 pub fn peer_id_of(keypair: &Keypair) -> PeerId {
     keypair.public().to_peer_id()
+}
+
+/// Optional decentralized overlay mesh: reliability resources (liveness), not
+/// safety.
+///
+/// **INVARIANT**: the overlay is strictly additive on top of [`EventBehaviour`]
+/// / [`RelayClientBehaviour`] / [`RelayServerBehaviour`] and must NEVER become
+/// a bootstrap dependency of the substrate. Concretely: [`build_event_swarm`]
+/// and friends never reference this module, and [`build_overlay_event_swarm`]
+/// with `overlay_enabled: false` degrades to exactly the plain substrate
+/// behaviour (see `substrate_bootstraps_with_overlay_disabled` in the tests
+/// below). The overlay's own peer-mesh metadata (addresses/capabilities a
+/// node advertises to the mesh) is NOT pushed over its own bespoke gossip
+/// channel; it rides the existing streaming DB (`pillar_streamdb`) as
+/// ordinary content-addressed ops, per the ROI's "metadata rides the
+/// streaming DB" requirement — see [`MeshPeerRecord::encode`] /
+/// [`MeshPeerRecord::decode`], which are the pure (de)serialization the
+/// `pillar-streamdb` round-trip test in this crate's dev-dependencies drives
+/// an [`pillar_streamdb`]-backed `Op` payload through.
+pub mod overlay {
+    use libp2p::{multiaddr::Multiaddr, PeerId};
+    use std::str::FromStr;
+
+    /// A mesh peer's advertised reachability: its [`PeerId`] plus every
+    /// [`Multiaddr`] it wants the overlay to know about (its role in the
+    /// decentralized headscale/Nebula-analog overlay).
+    ///
+    /// This is pure metadata with no network behaviour of its own — it is
+    /// produced/consumed by whatever already-connected substrate transport
+    /// (gossipsub, direct RPC, …) a node uses to publish to its stream; the
+    /// overlay never needs its own bootstrap channel to exchange it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct MeshPeerRecord {
+        peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
+    }
+
+    impl MeshPeerRecord {
+        /// Build a record for `peer_id` advertising `addresses`.
+        #[must_use]
+        pub fn new(peer_id: PeerId, addresses: Vec<Multiaddr>) -> Self {
+            MeshPeerRecord { peer_id, addresses }
+        }
+
+        /// This record's [`PeerId`].
+        #[must_use]
+        pub fn peer_id(&self) -> PeerId {
+            self.peer_id
+        }
+
+        /// The addresses this record advertises.
+        #[must_use]
+        pub fn addresses(&self) -> &[Multiaddr] {
+            &self.addresses
+        }
+
+        /// Encode this record to bytes suitable as a `pillar_streamdb::Op`
+        /// payload: a simple length-prefixed, dependency-free wire format
+        /// (newline-delimited UTF-8 strings — the peer id then each
+        /// multiaddr), so the metadata can ride any content-addressed op
+        /// log without requiring `pillar-streamdb` (or any serde crate) as a
+        /// runtime dependency of this crate.
+        #[must_use]
+        pub fn encode(&self) -> Vec<u8> {
+            let mut lines = vec![self.peer_id.to_base58()];
+            lines.extend(self.addresses.iter().map(std::string::ToString::to_string));
+            lines.join("\n").into_bytes()
+        }
+
+        /// Decode a record previously produced by [`Self::encode`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DecodeError`] if `bytes` is not valid UTF-8, is empty, or
+        /// its first line is not a valid [`PeerId`], or any subsequent line is
+        /// not a valid [`Multiaddr`].
+        pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+            let text = std::str::from_utf8(bytes).map_err(|_| DecodeError::NotUtf8)?;
+            let mut lines = text.lines();
+            let peer_id_line = lines.next().ok_or(DecodeError::Empty)?;
+            let peer_id =
+                PeerId::from_str(peer_id_line).map_err(|_| DecodeError::InvalidPeerId)?;
+            let addresses = lines
+                .map(|line| Multiaddr::from_str(line).map_err(|_| DecodeError::InvalidAddress))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MeshPeerRecord { peer_id, addresses })
+        }
+    }
+
+    /// A [`MeshPeerRecord::decode`] failure.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DecodeError {
+        /// The payload was not valid UTF-8.
+        NotUtf8,
+        /// The payload was empty (no peer id line).
+        Empty,
+        /// The first line was not a valid [`PeerId`].
+        InvalidPeerId,
+        /// A subsequent line was not a valid [`Multiaddr`].
+        InvalidAddress,
+    }
+
+    impl std::fmt::Display for DecodeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let msg = match self {
+                DecodeError::NotUtf8 => "mesh peer record payload was not valid UTF-8",
+                DecodeError::Empty => "mesh peer record payload was empty",
+                DecodeError::InvalidPeerId => "mesh peer record's first line was not a valid PeerId",
+                DecodeError::InvalidAddress => "mesh peer record contained an invalid Multiaddr",
+            };
+            f.write_str(msg)
+        }
+    }
+
+    impl std::error::Error for DecodeError {}
+}
+
+/// The behaviour run by a normal Pillar node with the OPTIONAL overlay mesh
+/// enabled: exactly [`EventBehaviour`] (gossipsub event log, Kademlia
+/// discovery, identify) plus a [`Toggle`]d UPnP/NAT-PMP behaviour that tries
+/// to open a port mapping on the local gateway to reduce partition
+/// frequency/duration.
+///
+/// The `upnp` field is a [`Toggle`], not a bare [`upnp::tokio::Behaviour`],
+/// specifically so the overlay can be compiled in but runtime-disabled
+/// without changing the behaviour type — this is what lets
+/// [`build_overlay_event_swarm`] guarantee the substrate boots identically
+/// whether or not the overlay is present.
+#[derive(libp2p::swarm::NetworkBehaviour)]
+pub struct OverlayEventBehaviour {
+    /// Append-only event log broadcast.
+    pub gossipsub: gossipsub::Behaviour,
+    /// Peer discovery / bootstrap DHT.
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    /// Address/protocol exchange.
+    pub identify: identify::Behaviour,
+    /// Optional UPnP/NAT-PMP port mapping — the overlay's reliability
+    /// resource. Disabled (`Toggle::from(None)`) leaves this behaviour
+    /// entirely inert, at which point [`OverlayEventBehaviour`] behaves
+    /// exactly like [`EventBehaviour`].
+    pub upnp: Toggle<upnp::tokio::Behaviour>,
+}
+
+/// Builds a [`Swarm`] running [`OverlayEventBehaviour`]: the same substrate
+/// as [`build_event_swarm`] (gossipsub + kademlia + identify) with the
+/// optional overlay mesh's UPnP/NAT-PMP port mapping toggled by
+/// `overlay_enabled`.
+///
+/// **INVARIANT**: with `overlay_enabled: false` this is behaviourally
+/// identical to [`build_event_swarm`] — the substrate never requires the
+/// overlay to bootstrap. See `substrate_bootstraps_with_overlay_disabled`.
+pub fn build_overlay_event_swarm(
+    keypair: Keypair,
+    overlay_enabled: bool,
+) -> Result<Swarm<OverlayEventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_quic()
+        .with_behaviour(|key| {
+            let peer_id = key.public().to_peer_id();
+            let upnp = if overlay_enabled {
+                Toggle::from(Some(upnp::tokio::Behaviour::default()))
+            } else {
+                Toggle::from(None)
+            };
+            OverlayEventBehaviour {
+                gossipsub: gossipsub_behaviour(key),
+                kademlia: new_kademlia(peer_id),
+                identify: identify::Behaviour::new(identify_config(key)),
+                upnp,
+            }
+        })?
+        .build();
+    Ok(swarm)
 }
 
 #[cfg(test)]
@@ -449,5 +629,98 @@ mod tests {
             _ => None,
         })
         .await;
+    }
+
+    /// INVARIANT under test: the overlay mesh must never be a bootstrap
+    /// dependency of the substrate. A node built with
+    /// `build_overlay_event_swarm(.., overlay_enabled: false)` must still
+    /// bootstrap and run the same substrate protocols (gossipsub, kademlia)
+    /// as plain [`build_event_swarm`] — with the overlay's UPnP behaviour
+    /// entirely absent, not merely idle.
+    #[tokio::test]
+    async fn substrate_bootstraps_with_overlay_disabled() {
+        let mut a = build_overlay_event_swarm(Keypair::generate_ed25519(), false).unwrap();
+        let mut b = build_overlay_event_swarm(Keypair::generate_ed25519(), false).unwrap();
+        let b_peer_id = *b.local_peer_id();
+
+        // The overlay behaviour is disabled: no gateway search task is
+        // spawned, so there is nothing overlay-related to wait on. Bootstrap
+        // proceeds purely on the substrate (kademlia + identify), exactly as
+        // it does for `build_event_swarm`.
+        let b_addr = listen_and_get_addr(&mut b).await;
+        a.behaviour_mut()
+            .kademlia
+            .add_address(&b_peer_id, b_addr.clone());
+        a.dial(b_addr.with(Protocol::P2p(b_peer_id))).unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                b.select_next_some().await;
+            }
+        });
+
+        drive_until(&mut a, Duration::from_secs(10), |event| match event {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == b_peer_id => Some(()),
+            _ => None,
+        })
+        .await;
+
+        let query_id = a.behaviour_mut().kademlia.get_closest_peers(b_peer_id);
+        let found = drive_until(&mut a, Duration::from_secs(15), |event| match event {
+            SwarmEvent::Behaviour(OverlayEventBehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    id,
+                    result: kad::QueryResult::GetClosestPeers(Ok(result)),
+                    step,
+                    ..
+                },
+            )) if *id == query_id && step.last => {
+                Some(result.peers.iter().any(|p| p.peer_id == b_peer_id))
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            found,
+            "substrate (kademlia) must bootstrap fully with the overlay disabled"
+        );
+    }
+
+    /// Mesh metadata round-trips through the streaming DB: a
+    /// [`overlay::MeshPeerRecord`] survives `encode` -> [`pillar_streamdb::Op`]
+    /// append -> gossip/merge into another node's log -> read back -> `decode`,
+    /// unchanged. This is the "metadata rides the streaming DB" requirement:
+    /// the overlay never gets its own bespoke metadata-gossip channel.
+    #[test]
+    fn mesh_metadata_round_trips_via_streaming_db() {
+        use overlay::MeshPeerRecord;
+        use pillar_streamdb::OpLog;
+
+        let peer_id = PeerId::random();
+        let addr_a: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let addr_b: Multiaddr = "/ip4/198.51.100.7/udp/4002/quic-v1".parse().unwrap();
+        let record = MeshPeerRecord::new(peer_id, vec![addr_a, addr_b]);
+
+        // The node holding the record appends it to its stream (its slice of
+        // the shared content-addressed op log).
+        let mut publisher_log = OpLog::new();
+        let op_id = publisher_log.append(record.encode());
+
+        // Gossiped to another node exactly like any other op — pure CRDT
+        // merge, no overlay-specific transport involved.
+        let mut receiver_log = OpLog::new();
+        receiver_log.merge(&publisher_log);
+        assert!(receiver_log.contains(op_id));
+
+        // The receiver reads the op back out of its materialized order and
+        // decodes it to the identical mesh peer record.
+        let stored_op = receiver_log
+            .order()
+            .into_iter()
+            .find(|op| op.id() == op_id)
+            .expect("appended op is present in the materialized order");
+        let decoded = MeshPeerRecord::decode(stored_op.payload())
+            .expect("a record encoded by MeshPeerRecord::encode always decodes");
+        assert_eq!(decoded, record);
     }
 }

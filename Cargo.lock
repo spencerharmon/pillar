@@ -2153,6 +2153,7 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "libp2p",
+ "pillar-streamdb",
  "tokio",
  "tracing",
  "tracing-subscriber",
