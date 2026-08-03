@@ -31,6 +31,18 @@ use pillar_core::{SideEffect, ViewPolicy};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OpId(pub u64);
 
+/// Deterministic content address of an arbitrary byte payload.
+///
+/// This is the SAME pure bytes->identity function the op-log uses for
+/// [`OpId`], exposed so other Pillar layers (e.g. content-addressed blob /
+/// OCI-layer distribution over the network transport) derive a blob's digest
+/// with the identical, canonical content-addressing rather than reinventing
+/// one. Two nodes holding the same bytes necessarily agree on the address.
+#[must_use]
+pub fn content_address(bytes: &[u8]) -> u64 {
+    content_hash(bytes)
+}
+
 /// Deterministic content hash (FNV-1a, 64-bit). Dependency-free and stable
 /// across runs/platforms, which is all the CRDT needs: a pure function from
 /// bytes to an identity, not cryptographic collision resistance.
@@ -184,9 +196,9 @@ impl OpLog {
 fn fold_root(ops: &[&Op]) -> u64 {
     const FOLD_PRIME: u64 = 31;
     const FOLD_MODULUS: u64 = 1_000_003;
-    ops.iter()
-        .rev()
-        .fold(0u64, |acc, op| (op.id.0.wrapping_add(FOLD_PRIME.wrapping_mul(acc))) % FOLD_MODULUS)
+    ops.iter().rev().fold(0u64, |acc, op| {
+        (op.id.0.wrapping_add(FOLD_PRIME.wrapping_mul(acc))) % FOLD_MODULUS
+    })
 }
 
 /// A content-addressed compaction of an [`OpLog`] at a point in time.
@@ -246,13 +258,19 @@ impl Stream {
     /// per the CP-unless-declared-otherwise rule.
     #[must_use]
     pub fn new() -> Self {
-        Stream { log: OpLog::new(), policy: None }
+        Stream {
+            log: OpLog::new(),
+            policy: None,
+        }
     }
 
     /// A fresh, empty stream/partition with an explicit declared policy.
     #[must_use]
     pub fn with_policy(policy: ViewPolicy) -> Self {
-        Stream { log: OpLog::new(), policy: Some(policy) }
+        Stream {
+            log: OpLog::new(),
+            policy: Some(policy),
+        }
     }
 
     /// This stream's effective policy: the declared one, or
@@ -303,7 +321,10 @@ impl Stream {
     /// effective policy.
     #[must_use]
     pub fn view(&self) -> View<'_> {
-        View { log: &self.log, policy: self.policy() }
+        View {
+            log: &self.log,
+            policy: self.policy(),
+        }
     }
 
     /// The underlying op-log, for read access that does not need the policy
@@ -454,7 +475,10 @@ mod tests {
         assert!(a_before_ids.iter().all(|id| merged_ab.contains(*id)));
 
         // Commutative: merging a into b or b into a converges to the same set.
-        assert_eq!(merged_ab.ids().collect::<Vec<_>>(), merged_ba.ids().collect::<Vec<_>>());
+        assert_eq!(
+            merged_ab.ids().collect::<Vec<_>>(),
+            merged_ba.ids().collect::<Vec<_>>()
+        );
 
         // Idempotent: merging again changes nothing.
         let mut merged_twice = merged_ab.clone();
@@ -502,7 +526,10 @@ mod tests {
         node_a.merge(&node_b);
         node_b.merge(&a_snapshot);
 
-        assert_eq!(node_a.ids().collect::<Vec<_>>(), node_b.ids().collect::<Vec<_>>());
+        assert_eq!(
+            node_a.ids().collect::<Vec<_>>(),
+            node_b.ids().collect::<Vec<_>>()
+        );
         assert_eq!(node_a.root(), node_b.root());
     }
 
@@ -535,7 +562,11 @@ mod tests {
         );
         assert_eq!(fresh_peer.root(), source.root());
         assert_eq!(
-            fresh_peer.order().iter().map(|op| op.id()).collect::<Vec<_>>(),
+            fresh_peer
+                .order()
+                .iter()
+                .map(|op| op.id())
+                .collect::<Vec<_>>(),
             source.order().iter().map(|op| op.id()).collect::<Vec<_>>()
         );
     }
@@ -572,7 +603,9 @@ mod tests {
     fn unspecified_stream_policy_defaults_to_strict_cp() {
         let mut stream = Stream::new();
         assert_eq!(stream.policy(), ViewPolicy::Strict);
-        assert!(stream.try_append(b"claim-dns-name".to_vec(), SideEffect::Exclusive).is_ok());
+        assert!(stream
+            .try_append(b"claim-dns-name".to_vec(), SideEffect::Exclusive)
+            .is_ok());
     }
 
     /// The core admission wiring: a non-idempotent (exclusive) effect is
@@ -603,8 +636,12 @@ mod tests {
     #[test]
     fn strict_stream_admits_both_effect_classes() {
         let mut strict = Stream::with_policy(ViewPolicy::Strict);
-        assert!(strict.try_append(b"a".to_vec(), SideEffect::Exclusive).is_ok());
-        assert!(strict.try_append(b"b".to_vec(), SideEffect::Convergent).is_ok());
+        assert!(strict
+            .try_append(b"a".to_vec(), SideEffect::Exclusive)
+            .is_ok());
+        assert!(strict
+            .try_append(b"b".to_vec(), SideEffect::Convergent)
+            .is_ok());
     }
 
     /// Views attach no policy of their own: a view taken over a stream
@@ -614,13 +651,17 @@ mod tests {
     #[test]
     fn view_inherits_policy_from_its_stream() {
         let mut default_stream = Stream::new();
-        default_stream.try_append(b"x".to_vec(), SideEffect::Convergent).unwrap();
+        default_stream
+            .try_append(b"x".to_vec(), SideEffect::Convergent)
+            .unwrap();
         let default_view = default_stream.view();
         assert_eq!(default_view.policy(), ViewPolicy::Strict);
         assert!(default_view.admits(SideEffect::Exclusive));
 
         let mut relaxed_stream = Stream::with_policy(ViewPolicy::Relaxed);
-        relaxed_stream.try_append(b"y".to_vec(), SideEffect::Convergent).unwrap();
+        relaxed_stream
+            .try_append(b"y".to_vec(), SideEffect::Convergent)
+            .unwrap();
         let relaxed_view = relaxed_stream.view();
         assert_eq!(relaxed_view.policy(), ViewPolicy::Relaxed);
         assert!(!relaxed_view.admits(SideEffect::Exclusive));
@@ -649,10 +690,14 @@ mod tests {
     #[test]
     fn merge_does_not_change_policy() {
         let mut relaxed = Stream::with_policy(ViewPolicy::Relaxed);
-        relaxed.try_append(b"r".to_vec(), SideEffect::Convergent).unwrap();
+        relaxed
+            .try_append(b"r".to_vec(), SideEffect::Convergent)
+            .unwrap();
 
         let mut strict = Stream::with_policy(ViewPolicy::Strict);
-        strict.try_append(b"s".to_vec(), SideEffect::Exclusive).unwrap();
+        strict
+            .try_append(b"s".to_vec(), SideEffect::Exclusive)
+            .unwrap();
 
         relaxed.merge(&strict);
         assert_eq!(relaxed.policy(), ViewPolicy::Relaxed);
