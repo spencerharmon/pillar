@@ -15,6 +15,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | Spec | Proven properties | Backs component | Design doc |
 |------|-------------------|-----------------|------------|
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
+| `Registration.tla` | `AdmissionRequiresAuthorizedChain`, `NoAmbientAuthority`, `TypeOK` | `crates/pillar-identity` (PGP key hierarchy: USER_PRIMARY -> NODE_SUBKEY + REGISTRATION; node-join handshake) | ROI P1 identity/PGP |
 
 ## Running the checker
 
@@ -32,3 +33,10 @@ pinned release into `./.tools/` (the path CI uses).
   `-deadlock` because terminal quiescence (every voter has granted its final
   epoch) is an expected idle state, not a fault. Deadlock-freedom and liveness
   (`Declared ~> Held`) are tracked as a follow-up spec, not yet asserted here.
+- `Registration` is likewise **safety-only** (`-deadlock`): a state where every
+  candidate subkey has been admitted (or every remaining action is disabled)
+  is expected quiescence, not a fault. It models the ground-truth signature
+  relation directly (`signedBy`) rather than cryptographic verification, and
+  admission of an already-registered-then-revoked primary's earlier grants is
+  out of scope here (no `Revoke` action) -- that is left to a follow-up spec
+  alongside the Rust refinement (`identity-impl`).
