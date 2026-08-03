@@ -1,0 +1,22 @@
+[package]
+name = "pillar-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The `pillar` kubectl-style CLI: apply/get/describe over signed manifests. apply signs a CRD into a pillar-native envelope and emits a WoT-authorized signed event; get/describe render a materialized view of events (status is a view, never written back); kustomize (text) and helm-as-renderer reuse produce CRD bodies that apply."
+
+[[bin]]
+name = "pillar"
+path = "src/main.rs"
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-manifest = { path = "../pillar-manifest" }
+pillar-eventlog = { path = "../pillar-eventlog" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
+pillar-rbac = { path = "../pillar-rbac" }
+
+[lints]
+workspace = true

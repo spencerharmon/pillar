@@ -12,6 +12,7 @@ members = [
     "crates/pillar-streamdb",
     "crates/pillar-wot-authority",
     "crates/pillar-rbac",
+    "crates/pillar-cli",
 ]
 
 [workspace.package]
