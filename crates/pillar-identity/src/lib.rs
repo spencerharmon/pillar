@@ -33,6 +33,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capability;
+
 use std::collections::{HashMap, HashSet};
 
 use pillar_core::NodeId;
