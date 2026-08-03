@@ -1,0 +1,14 @@
+[package]
+name = "pillar-wot-authority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Web-of-trust authority: tsig parsing, owner-anchored bounded-depth reachability, and revoke-before-act, refining specs/WoTAuthority.tla."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+
+[lints]
+workspace = true
