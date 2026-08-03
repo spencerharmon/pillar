@@ -276,7 +276,10 @@ mod tests {
         let (_identity, controller_node, _foreign_node) = admitted_registry();
         let secret = EncryptedSecret::seal("db-password", [controller_node.node_id()]);
 
-        assert_eq!(secret.decrypt(&controller_node.node_id()), Ok("db-password"));
+        assert_eq!(
+            secret.decrypt(&controller_node.node_id()),
+            Ok("db-password")
+        );
     }
 
     #[test]
