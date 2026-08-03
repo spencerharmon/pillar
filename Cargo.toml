@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pillar-core",
     "crates/pillar-coordination",
+    "crates/pillar-net",
 ]
 
 [workspace.package]
