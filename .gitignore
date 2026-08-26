@@ -12,3 +12,6 @@ specs/*.old
 # Editors / OS
 .DS_Store
 *.swp
+
+# nix build output
+/result

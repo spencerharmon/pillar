@@ -1,27 +1,25 @@
 # build-image — Gitea Actions workflow that builds the `pillar` container image
-# (Dockerfile at repo root, packaging the `pillar node run` entrypoint — see
-# crates/pillar-cli/src/run.rs) and publishes it to the in-cluster Gitea OCI
-# registry, mirroring the gostream / jellyfin-phantom image-build workflows
-# documented in flux's `docs/runbooks/build-image-in-gitea.md` and
-# INFRASTRUCTURE.md "Gitea Actions consolidation" section (flux task
-# gitea-actions-image-build-workflows), and the `images/` owner rename those
-# tasks landed.
+# from the repo-root `flake.nix` (nix `dockerTools.streamLayeredImage`, packaging
+# the `pillar node run` entrypoint — see crates/pillar-cli/src/run.rs) and
+# publishes it to the in-cluster Gitea OCI registry.
 #
-# Unlike gostream/jellyfin-phantom (upstream forks whose build lives in the
-# separate `spencerharmon/actions` repo), pillar is a first-party Gitea repo,
-# so its build workflow lives in-repo per flux INFRASTRUCTURE.md's guidance
-# ("Pipelines that belong in a producer's OWN main repo are that submodule's
-# own `.gitea/workflows/*` work").
+# SUPERSEDES the former Dockerfile-based build. There is NO Dockerfile: the job
+# runs inside a **nixery build image** (`nixery.dev/shell/nix/skopeo`, which
+# provides a shell plus `nix` and `skopeo`) and runs `nix build .#pillar-oci-image`
+# to generate the OCI image, then pushes it with `skopeo`.
 #
-# PREREQUISITES (see flux docs/gitea-actions-runner-setup.md):
-#   - A registered act_runner advertising the `ubuntu-latest` label
-#     (flux infrastructure/gitea-actions/), with the docker socket whitelisted
-#     (flux infrastructure/gitea-actions/configmap.yaml) so `docker build` /
-#     `docker push` work inside the job container.
-#   - Actions secrets REGISTRY_USER / REGISTRY_PASSWORD on THIS repo, holding
-#     the `write:package` Gitea credential (same identity flux's
-#     provision-gitea-actions-registry-secret.sh materializes for the
-#     `actions` repo; provision the equivalent for `spencerharmon/pillar`).
+# The flake output is INFRA-AGNOSTIC (no registry/host/credential baked in), so
+# the SAME `nix build` runs in GitHub Actions (pillar is public) and here in
+# Gitea Actions. The registry target + push credentials come from CI config /
+# Actions secrets, never hardcoded in the image. The push to the private Gitea
+# OCI registry happens on THIS (Gitea Actions) side, where the creds live.
+#
+# PREREQUISITES:
+#   - A registered act_runner advertising the `ubuntu-latest` label, able to run
+#     the `nixery.dev/shell/nix/skopeo` job container (nixery pulls the image on
+#     first use — see the top-level INFRASTRUCTURE.md "nixery" section).
+#   - Actions secrets REGISTRY_USER / REGISTRY_PASSWORD on THIS repo, holding the
+#     `write:package` Gitea credential for `git.spencerharmon.com/images/pillar`.
 name: build-image
 
 on:
@@ -29,15 +27,16 @@ on:
   push:
     branches: [main]
     paths:
-      - Dockerfile
+      - flake.nix
+      - flake.lock
       - .gitea/workflows/build-image.yaml
       - crates/**
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
   schedule:
-    # Weekly, so the base image (debian:bookworm-slim / rust:1.80-bookworm)
-    # picks up upstream security updates even absent a source change.
+    # Weekly, so the pinned nixpkgs base picks up rebuilds even absent a source
+    # change.
     - cron: "0 5 * * 1"
 
 env:
@@ -47,9 +46,17 @@ env:
 jobs:
   build-publish:
     runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/skopeo
     steps:
       - name: Checkout pillar
         uses: actions/checkout@v4
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          echo "experimental-features = nix-command flakes" > ~/.config/nix/nix.conf
 
       - name: Compute image tag
         id: tag
@@ -57,7 +64,15 @@ jobs:
           set -euo pipefail
           echo "tag=$(echo "${GITHUB_SHA}" | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Gitea OCI registry
+      - name: Build OCI image from flake
+        run: |
+          set -euo pipefail
+          # streamLayeredImage produces `result`, an executable that streams the
+          # image tar to stdout. Materialize it to a tarball skopeo can copy.
+          nix build .#pillar-oci-image
+          ./result > pillar-image.tar
+
+      - name: Log in and push to Gitea OCI registry
         env:
           REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
           REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
@@ -65,18 +80,26 @@ jobs:
           set -euo pipefail
           test -n "$REGISTRY_USER" || { echo "Actions secret REGISTRY_USER is not set"; exit 1; }
           test -n "$REGISTRY_PASSWORD" || { echo "Actions secret REGISTRY_PASSWORD is not set"; exit 1; }
-          echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+          tag="${{ steps.tag.outputs.tag }}"
+          dest_sha="docker://${REGISTRY}/${IMAGE}:${tag}"
+          dest_latest="docker://${REGISTRY}/${IMAGE}:latest"
+          # Push both the sha tag and `latest` from the single built tarball.
+          skopeo copy \
+            --dest-creds "${REGISTRY_USER}:${REGISTRY_PASSWORD}" \
+            docker-archive:pillar-image.tar "$dest_sha"
+          skopeo copy \
+            --dest-creds "${REGISTRY_USER}:${REGISTRY_PASSWORD}" \
+            docker-archive:pillar-image.tar "$dest_latest"
 
-      - name: Build image
+      - name: Resolve registry-served digest
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
-          docker build -f Dockerfile -t "${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }}" .
-
-      - name: Push image (by tag, then resolve registry-served digest)
-        id: push
-        run: |
-          set -euo pipefail
-          docker push "${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }}"
-          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }}" | sed 's/^.*@//')"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "Published ${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }} @ ${digest}"
+          tag="${{ steps.tag.outputs.tag }}"
+          digest="$(skopeo inspect \
+            --creds "${REGISTRY_USER}:${REGISTRY_PASSWORD}" \
+            --format '{{.Digest}}' \
+            "docker://${REGISTRY}/${IMAGE}:${tag}")"
+          echo "Published ${REGISTRY}/${IMAGE}:${tag} (and :latest) @ ${digest}"
