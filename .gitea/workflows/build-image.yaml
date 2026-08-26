@@ -16,8 +16,12 @@
 #
 # PREREQUISITES:
 #   - A registered act_runner advertising the `ubuntu-latest` label, able to run
-#     the `nixery.dev/shell/nix/skopeo` job container (nixery pulls the image on
-#     first use — see the top-level INFRASTRUCTURE.md "nixery" section).
+#     the `nixery.dev/shell/nix/skopeo/git` job container (nixery pulls the image on
+#     first use — see the top-level INFRASTRUCTURE.md "nixery" section). `git` is
+#     added to the nixery image path because `actions/checkout@v4` requires a
+#     node.js runtime that the plain nix/skopeo shell image does not provide (it
+#     failed with `exec: "node": executable file not found`); checkout is done
+#     with a plain `git clone` instead (see the "Checkout pillar" step).
 #   - Actions secrets REGISTRY_USER / REGISTRY_PASSWORD on THIS repo, holding the
 #     `write:package` Gitea credential for `git.spencerharmon.com/images/pillar`.
 name: build-image
@@ -47,16 +51,38 @@ jobs:
   build-publish:
     runs-on: ubuntu-latest
     container:
-      image: nixery.dev/shell/nix/skopeo
+      image: nixery.dev/shell/nix/skopeo/git
     steps:
       - name: Checkout pillar
-        uses: actions/checkout@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # actions/checkout@v4 requires a node.js runtime the plain nix/skopeo
+          # shell image doesn't provide, so check out with a bare git clone
+          # instead (git is pulled in via the nixery image path above).
+          # GITHUB_SERVER_URL already carries its own scheme (in-cluster Actions
+          # runs see the internal http:// gitea-http service URL, not the
+          # public https:// ingress host) — use it as-is, never re-prefix it.
+          git -c http.extraHeader="Authorization: Bearer ${GITHUB_TOKEN}" \
+            clone --no-checkout "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
 
       - name: Enable nix flakes
         run: |
           set -euo pipefail
           mkdir -p ~/.config/nix
-          echo "experimental-features = nix-command flakes" > ~/.config/nix/nix.conf
+          {
+            echo "experimental-features = nix-command flakes"
+            # The job container runs as root with no nixbld user/group
+            # provisioned (single-container CI, not a real nix multi-user
+            # install), so the default multi-user sandboxed build fails with
+            # "the group 'nixbld' specified in 'build-users-group' does not
+            # exist". Disable the build-users-group so nix builds directly
+            # as the current (root) user instead of trying to sandbox to
+            # nixbld1..N.
+            echo "build-users-group ="
+          } > ~/.config/nix/nix.conf
 
       - name: Compute image tag
         id: tag
@@ -80,6 +106,13 @@ jobs:
           set -euo pipefail
           test -n "$REGISTRY_USER" || { echo "Actions secret REGISTRY_USER is not set"; exit 1; }
           test -n "$REGISTRY_PASSWORD" || { echo "Actions secret REGISTRY_PASSWORD is not set"; exit 1; }
+          # skopeo requires a container trust policy file; this build image has
+          # none provisioned by default ("no policy.json file found"). Accept
+          # anything — the registry destination + creds are what actually gate
+          # the push, this policy only controls skopeo's own local signature
+          # verification (irrelevant for a same-host build->push).
+          mkdir -p /etc/containers
+          echo '{"default":[{"type":"insecureAcceptAnything"}]}' > /etc/containers/policy.json
           tag="${{ steps.tag.outputs.tag }}"
           dest_sha="docker://${REGISTRY}/${IMAGE}:${tag}"
           dest_latest="docker://${REGISTRY}/${IMAGE}:latest"
