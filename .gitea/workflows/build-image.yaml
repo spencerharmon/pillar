@@ -1,0 +1,82 @@
+# build-image — Gitea Actions workflow that builds the `pillar` container image
+# (Dockerfile at repo root, packaging the `pillar node run` entrypoint — see
+# crates/pillar-cli/src/run.rs) and publishes it to the in-cluster Gitea OCI
+# registry, mirroring the gostream / jellyfin-phantom image-build workflows
+# documented in flux's `docs/runbooks/build-image-in-gitea.md` and
+# INFRASTRUCTURE.md "Gitea Actions consolidation" section (flux task
+# gitea-actions-image-build-workflows), and the `images/` owner rename those
+# tasks landed.
+#
+# Unlike gostream/jellyfin-phantom (upstream forks whose build lives in the
+# separate `spencerharmon/actions` repo), pillar is a first-party Gitea repo,
+# so its build workflow lives in-repo per flux INFRASTRUCTURE.md's guidance
+# ("Pipelines that belong in a producer's OWN main repo are that submodule's
+# own `.gitea/workflows/*` work").
+#
+# PREREQUISITES (see flux docs/gitea-actions-runner-setup.md):
+#   - A registered act_runner advertising the `ubuntu-latest` label
+#     (flux infrastructure/gitea-actions/), with the docker socket whitelisted
+#     (flux infrastructure/gitea-actions/configmap.yaml) so `docker build` /
+#     `docker push` work inside the job container.
+#   - Actions secrets REGISTRY_USER / REGISTRY_PASSWORD on THIS repo, holding
+#     the `write:package` Gitea credential (same identity flux's
+#     provision-gitea-actions-registry-secret.sh materializes for the
+#     `actions` repo; provision the equivalent for `spencerharmon/pillar`).
+name: build-image
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .gitea/workflows/build-image.yaml
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+  schedule:
+    # Weekly, so the base image (debian:bookworm-slim / rust:1.80-bookworm)
+    # picks up upstream security updates even absent a source change.
+    - cron: "0 5 * * 1"
+
+env:
+  REGISTRY: git.spencerharmon.com
+  IMAGE: images/pillar
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pillar
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          echo "tag=$(echo "${GITHUB_SHA}" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Gitea OCI registry
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$REGISTRY_USER" || { echo "Actions secret REGISTRY_USER is not set"; exit 1; }
+          test -n "$REGISTRY_PASSWORD" || { echo "Actions secret REGISTRY_PASSWORD is not set"; exit 1; }
+          echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker build -f Dockerfile -t "${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }}" .
+
+      - name: Push image (by tag, then resolve registry-served digest)
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }}" | sed 's/^.*@//')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Published ${REGISTRY}/${IMAGE}:${{ steps.tag.outputs.tag }} @ ${digest}"
