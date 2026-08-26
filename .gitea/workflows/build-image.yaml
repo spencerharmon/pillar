@@ -72,7 +72,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.config/nix
-          echo "experimental-features = nix-command flakes" > ~/.config/nix/nix.conf
+          {
+            echo "experimental-features = nix-command flakes"
+            # The job container runs as root with no nixbld user/group
+            # provisioned (single-container CI, not a real nix multi-user
+            # install), so the default multi-user sandboxed build fails with
+            # "the group 'nixbld' specified in 'build-users-group' does not
+            # exist". Disable the build-users-group so nix builds directly
+            # as the current (root) user instead of trying to sandbox to
+            # nixbld1..N.
+            echo "build-users-group ="
+          } > ~/.config/nix/nix.conf
 
       - name: Compute image tag
         id: tag
