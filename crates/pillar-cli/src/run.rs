@@ -25,6 +25,21 @@
 //! | `--identity-key` | `PILLAR_IDENTITY_KEY` | `<data-dir>/identity.key` |
 //! | `--data-dir` | `PILLAR_DATA_DIR` | `./pillar-data` |
 //! | `--listen` (repeatable) | `PILLAR_LISTEN` (comma/space list) | `/ip4/0.0.0.0/tcp/0` |
+//! | `--dial` (repeatable) | `PILLAR_DIAL` (comma/space list) | none |
+//!
+//! `--dial` names peer multiaddrs to connect out to at boot — the rootless,
+//! multi-process integration rig's only mesh-formation mechanism, since this
+//! process runs no separate bootstrap/rendezvous service. Every dial target
+//! is attempted; a single bad dial does not abort boot (peers may come and
+//! go), but is logged loudly.
+//!
+//! `PILLAR_TEST_PUBLISH`, if set, is an integration-rig-only hook: once the
+//! swarm has been listening for [`TEST_PUBLISH_DELAY`], the node publishes
+//! its value once to the event-log gossipsub topic, and every message this
+//! node (or any peer) receives on that topic is logged at `info` with its
+//! exact payload — so an external script can grep peer stdout for the value
+//! to assert real cross-process gossipsub convergence. It has no effect on
+//! a production boot that never sets the variable.
 //!
 //! The config parsing, identity load/persist, and data-dir preparation are
 //! pure and filesystem-scoped, so they are exercised directly by the unit
@@ -47,6 +62,16 @@ pub const DEFAULT_DATA_DIR: &str = "pillar-data";
 const ENV_IDENTITY_KEY: &str = "PILLAR_IDENTITY_KEY";
 const ENV_DATA_DIR: &str = "PILLAR_DATA_DIR";
 const ENV_LISTEN: &str = "PILLAR_LISTEN";
+const ENV_DIAL: &str = "PILLAR_DIAL";
+
+/// Integration-rig-only: the value to publish once to the event-log
+/// gossipsub topic after boot settles. Unset in every production boot.
+const ENV_TEST_PUBLISH: &str = "PILLAR_TEST_PUBLISH";
+
+/// How long after listen-address bind-up the [`ENV_TEST_PUBLISH`] hook waits
+/// before publishing, giving `--dial` connections + gossipsub mesh
+/// (re)grafting a real chance to settle first.
+const TEST_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// A fully-resolved configuration for a `pillar node run` boot, produced by
 /// [`NodeConfig::from_args_env`] from CLI flags layered over environment
@@ -59,6 +84,9 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// libp2p multiaddrs the peer listens on. Never empty.
     pub listen: Vec<Multiaddr>,
+    /// libp2p multiaddrs (of already-running peers) to dial at boot — the
+    /// rig's mesh-formation mechanism. May be empty (a first/seed node).
+    pub dial: Vec<Multiaddr>,
 }
 
 /// A failure resolving a [`NodeConfig`] from flags/env.
@@ -110,6 +138,7 @@ impl NodeConfig {
         let mut identity_key: Option<PathBuf> = None;
         let mut data_dir: Option<PathBuf> = None;
         let mut listen: Vec<Multiaddr> = Vec::new();
+        let mut dial: Vec<Multiaddr> = Vec::new();
 
         let mut i = 0;
         while i < args.len() {
@@ -129,8 +158,15 @@ impl NodeConfig {
                     i += 2;
                 }
                 "--listen" => {
-                    let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--listen"))?;
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--listen"))?;
                     listen.push(parse_listen(v)?);
+                    i += 2;
+                }
+                "--dial" => {
+                    let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--dial"))?;
+                    dial.push(parse_listen(v)?);
                     i += 2;
                 }
                 other => return Err(ConfigError::Unknown(other.to_owned())),
@@ -164,10 +200,21 @@ impl NodeConfig {
             listen.push(parse_listen(DEFAULT_LISTEN)?);
         }
 
+        // Dial: explicit flags win; else a single env list; no default (a
+        // seed/first node dials nothing).
+        if dial.is_empty() {
+            if let Some(v) = env(ENV_DIAL) {
+                for entry in v.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+                    dial.push(parse_listen(entry)?);
+                }
+            }
+        }
+
         Ok(NodeConfig {
             identity_key,
             data_dir,
             listen,
+            dial,
         })
     }
 
@@ -178,10 +225,12 @@ impl NodeConfig {
 }
 
 fn parse_listen(value: &str) -> Result<Multiaddr, ConfigError> {
-    value.parse::<Multiaddr>().map_err(|e| ConfigError::BadListen {
-        value: value.to_owned(),
-        reason: e.to_string(),
-    })
+    value
+        .parse::<Multiaddr>()
+        .map_err(|e| ConfigError::BadListen {
+            value: value.to_owned(),
+            reason: e.to_string(),
+        })
 }
 
 /// A failure booting the peer.
@@ -309,8 +358,27 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             .listen_on(addr.clone())
             .map_err(|e| BootError::Transport(format!("listen_on {addr}: {e}")))?;
     }
+    for addr in &config.dial {
+        match swarm.dial(addr.clone()) {
+            Ok(()) => tracing::info!(%addr, "pillar peer dialing configured peer"),
+            Err(e) => {
+                tracing::warn!(%addr, error = %e, "pillar peer failed to dial configured peer")
+            }
+        }
+    }
 
     tracing::info!("pillar peer running; press Ctrl-C to stop");
+
+    // Integration-rig-only: once the listening addr(s) are confirmed and a
+    // grace period elapses (letting `--dial` connections/gossipsub mesh
+    // settle), publish PILLAR_TEST_PUBLISH's value once to the event-log
+    // topic. Absent the env var this future never resolves and costs
+    // nothing beyond the idle `tokio::select!` arm.
+    let test_publish = std::env::var(ENV_TEST_PUBLISH).ok();
+    let mut publish_at = test_publish
+        .is_some()
+        .then(|| Box::pin(tokio::time::sleep(TEST_PUBLISH_DELAY)));
+    let mut published = false;
 
     // Controller loop: fold inbound event-log messages into the stream and
     // block until a shutdown signal.
@@ -321,11 +389,38 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 tracing::info!("shutdown signal received; stopping peer");
                 return Ok(());
             }
+            () = async {
+                if let Some(sleep) = publish_at.as_mut() {
+                    sleep.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if !published && publish_at.is_some() => {
+                if let Some(payload) = &test_publish {
+                    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload.clone().into_bytes()) {
+                        Ok(_) => tracing::info!(%payload, "pillar peer published test payload"),
+                        Err(e) => tracing::warn!(%payload, error = %e, "pillar peer failed to publish test payload"),
+                    }
+                }
+                published = true;
+                publish_at = None;
+            }
             event = swarm.select_next_some() => {
+                match &event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        tracing::info!(%address, "pillar peer listening");
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        tracing::info!(%peer_id, "pillar peer connection established");
+                    }
+                    _ => {}
+                }
                 if let SwarmEvent::Behaviour(pillar_net::EventBehaviourEvent::Gossipsub(
                     libp2p::gossipsub::Event::Message { message, .. },
                 )) = event
                 {
+                    let payload_text = String::from_utf8_lossy(&message.data).into_owned();
+                    tracing::info!(payload = %payload_text, "pillar peer received gossip event");
                     // Every gossiped event-log message is an append-only op the
                     // controller folds into the local stream view.
                     let _ = stream.try_append(
@@ -372,8 +467,14 @@ mod tests {
         let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
         // Identity key defaults beside the data dir.
-        assert_eq!(cfg.identity_key, PathBuf::from(DEFAULT_DATA_DIR).join("identity.key"));
-        assert_eq!(cfg.listen, vec![DEFAULT_LISTEN.parse::<Multiaddr>().unwrap()]);
+        assert_eq!(
+            cfg.identity_key,
+            PathBuf::from(DEFAULT_DATA_DIR).join("identity.key")
+        );
+        assert_eq!(
+            cfg.listen,
+            vec![DEFAULT_LISTEN.parse::<Multiaddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -395,7 +496,9 @@ mod tests {
             cfg.listen,
             vec![
                 "/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap(),
-                "/ip4/0.0.0.0/udp/4001/quic-v1".parse::<Multiaddr>().unwrap(),
+                "/ip4/0.0.0.0/udp/4001/quic-v1"
+                    .parse::<Multiaddr>()
+                    .unwrap(),
             ]
         );
     }
@@ -438,7 +541,10 @@ mod tests {
             _ => None,
         };
         let cfg = NodeConfig::from_args_env(&[], env).unwrap();
-        assert_eq!(cfg.identity_key, PathBuf::from("/env/data").join("identity.key"));
+        assert_eq!(
+            cfg.identity_key,
+            PathBuf::from("/env/data").join("identity.key")
+        );
     }
 
     #[test]
@@ -449,7 +555,10 @@ mod tests {
         };
         let args = vec![s("--listen"), s("/ip4/127.0.0.1/tcp/1")];
         let cfg = NodeConfig::from_args_env(&args, env).unwrap();
-        assert_eq!(cfg.listen, vec!["/ip4/127.0.0.1/tcp/1".parse::<Multiaddr>().unwrap()]);
+        assert_eq!(
+            cfg.listen,
+            vec!["/ip4/127.0.0.1/tcp/1".parse::<Multiaddr>().unwrap()]
+        );
     }
 
     #[test]

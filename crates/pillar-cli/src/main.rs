@@ -23,8 +23,9 @@ fn usage() -> &'static str {
      USAGE:\n\
      \x20 pillar apply    <manifest.txt>            validate, authorize, sign, emit a signed event\n\
      \x20 pillar get      <api> <kind> <name>       render a resource from the materialized view\n\
-     \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...]  boot a full peer and block\n\
+     \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...]  boot a full peer and block\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
+     \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
      \x20 pillar render kustomize <base.txt>        (see library API for overlay construction)\n\
      \x20 pillar --web [--port N]                  serve the localhost-only bootstrap/web UI\n\
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
         Some("--web") => web(&args[1..]),
         Some("node") => node(&args[1..]),
         Some("render") => render(&args[1..]),
+        Some("onboard") => onboard(),
         Some("apply") | Some("get") | Some("describe") => {
             // These verbs act over a live, persistent platform, which this
             // demonstration shell does not host. The library `Platform` API is
@@ -53,13 +55,30 @@ fn main() -> ExitCode {
                 "`pillar {}` operates over a live platform via the pillar_cli library API.",
                 args[0]
             );
-            eprintln!("Use `pillar render …` to produce manifest text, and the library to apply it.");
+            eprintln!(
+                "Use `pillar render …` to produce manifest text, and the library to apply it."
+            );
             ExitCode::from(2)
         }
         Some(other) => {
             eprintln!("unknown verb `{other}`\n");
             print!("{}", usage());
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `pillar onboard`: drive the keygen -> node-key signing -> cross-user
+/// trust -> depth/policy-config sequence in one process, asserting every
+/// safety invariant `pillar_cli::onboard` checks. Prints one `ok: <step>`
+/// line per passing step; exits non-zero with a `FAIL: <step>: <why>` line
+/// naming the first violated invariant.
+fn onboard() -> ExitCode {
+    match pillar_cli::onboard::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -84,6 +103,20 @@ fn node(args: &[String]) -> ExitCode {
 }
 
 fn node_run(args: &[String]) -> ExitCode {
+    // Emit `tracing` output (peer id, listen addrs, connections, gossip
+    // messages) to stderr so both an operator and the integration rig script
+    // can observe real boot/convergence events; defaults to `info` unless
+    // `RUST_LOG` overrides it. Safe to call even if a subscriber is already
+    // installed elsewhere (ignored on error).
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
     let config = match pillar_cli::run::NodeConfig::from_process_args(args) {
         Ok(c) => c,
         Err(e) => {
@@ -160,7 +193,9 @@ fn web(args: &[String]) -> ExitCode {
 
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        let Ok(peer) = stream.peer_addr() else { continue };
+        let Ok(peer) = stream.peer_addr() else {
+            continue;
+        };
         if let Err(e) = auth.authorize(&peer, None) {
             let _ = writeln!(stream, "refused: {e:?}");
             continue;
@@ -196,7 +231,10 @@ fn web(args: &[String]) -> ExitCode {
                 break;
             }
             _ => {
-                let _ = writeln!(stream, "unknown command; use `keygen`, `admit <primary> <subkey>`, or `quit`");
+                let _ = writeln!(
+                    stream,
+                    "unknown command; use `keygen`, `admit <primary> <subkey>`, or `quit`"
+                );
             }
         }
     }

@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod onboard;
 pub mod run;
 
 use std::collections::BTreeMap;
@@ -37,8 +38,8 @@ use std::fmt;
 use pillar_core::NodeId;
 use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_manifest::{
-    Capability as ManifestCapability, ContentHash, Crd, Envelope, FieldType, Metadata,
-    SchemaError, SchemaRegistry, Value,
+    Capability as ManifestCapability, ContentHash, Crd, Envelope, FieldType, Metadata, SchemaError,
+    SchemaRegistry, Value,
 };
 use pillar_rbac::{
     Capability as RbacCapability, Decision, ExplicitGrant, PolicyEvent, RbacDecider, Request,
@@ -205,7 +206,9 @@ impl Platform {
         // Emit exactly one signed event; its payload names the sealed
         // manifest by content-hash — the view resolves it from the store.
         let author = Author(actor.0.clone());
-        let event = self.log.append(&author, content_hash.0.to_le_bytes().to_vec());
+        let event = self
+            .log
+            .append(&author, content_hash.0.to_le_bytes().to_vec());
 
         self.store.insert(content_hash, envelope);
         self.applied.push(content_hash);
@@ -259,7 +262,10 @@ impl Platform {
 
         let mut out = String::new();
         out.push_str(&format!("Name:        {}\n", body.metadata.name));
-        out.push_str(&format!("Kind:        {}/{}\n", body.api_version, body.kind));
+        out.push_str(&format!(
+            "Kind:        {}/{}\n",
+            body.api_version, body.kind
+        ));
         if !body.metadata.labels.is_empty() {
             out.push_str("Labels:\n");
             for (k, v) in &body.metadata.labels {

@@ -26,6 +26,7 @@ libp2p = { version = "0.56", features = ["ed25519"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 futures = "0.3"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
