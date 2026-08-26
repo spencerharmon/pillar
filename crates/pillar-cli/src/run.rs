@@ -1,0 +1,502 @@
+//! `pillar node run`: the full-peer boot entrypoint.
+//!
+//! This is the process the containerized deployment (flux ROI Priority 3)
+//! runs to bring a real Pillar peer online. It is a thin, deterministic
+//! sequence with no hidden state:
+//!
+//! 1. **Identity** — load the node's long-lived ed25519 keypair from
+//!    `--identity-key <path>` (protobuf-encoded, the libp2p canonical form),
+//!    generating and persisting a fresh key at that path on first boot so a
+//!    peer keeps a stable [`libp2p::PeerId`] across restarts.
+//! 2. **Streaming DB** — open the node's append-only op store rooted at
+//!    `--data-dir <path>` (created if absent), the durable home of the event
+//!    log the controller reconciles against.
+//! 3. **Transport** — bring up the libp2p [`pillar_net`] event swarm on the
+//!    configured listen multiaddrs and subscribe it to the Pillar event-log
+//!    gossipsub topic.
+//! 4. **Controller loop** — drive the swarm event loop, folding inbound events
+//!    into the stream, and block until a shutdown signal (SIGINT/SIGTERM).
+//!
+//! Every knob is configurable by flag OR environment variable so the same
+//! binary works from a shell and from a container spec:
+//!
+//! | flag | env | default |
+//! |------|-----|---------|
+//! | `--identity-key` | `PILLAR_IDENTITY_KEY` | `<data-dir>/identity.key` |
+//! | `--data-dir` | `PILLAR_DATA_DIR` | `./pillar-data` |
+//! | `--listen` (repeatable) | `PILLAR_LISTEN` (comma/space list) | `/ip4/0.0.0.0/tcp/0` |
+//!
+//! The config parsing, identity load/persist, and data-dir preparation are
+//! pure and filesystem-scoped, so they are exercised directly by the unit
+//! tests below; [`run`] itself only wires those results into the async swarm
+//! loop and blocks.
+
+use std::path::{Path, PathBuf};
+
+use libp2p::identity::Keypair;
+use libp2p::Multiaddr;
+
+/// The default listen address when none is configured: an ephemeral TCP port
+/// on all interfaces (the container/orchestrator maps it).
+pub const DEFAULT_LISTEN: &str = "/ip4/0.0.0.0/tcp/0";
+
+/// The default data directory, relative to the process CWD.
+pub const DEFAULT_DATA_DIR: &str = "pillar-data";
+
+/// Environment variable names, kept in one place so flags and env stay in sync.
+const ENV_IDENTITY_KEY: &str = "PILLAR_IDENTITY_KEY";
+const ENV_DATA_DIR: &str = "PILLAR_DATA_DIR";
+const ENV_LISTEN: &str = "PILLAR_LISTEN";
+
+/// A fully-resolved configuration for a `pillar node run` boot, produced by
+/// [`NodeConfig::from_args_env`] from CLI flags layered over environment
+/// variables layered over defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeConfig {
+    /// Path to the node's ed25519 identity keypair (protobuf-encoded).
+    pub identity_key: PathBuf,
+    /// Directory the streaming DB / event log is rooted at.
+    pub data_dir: PathBuf,
+    /// libp2p multiaddrs the peer listens on. Never empty.
+    pub listen: Vec<Multiaddr>,
+}
+
+/// A failure resolving a [`NodeConfig`] from flags/env.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// A flag that requires a value was given none.
+    MissingValue(&'static str),
+    /// A `--listen` / `PILLAR_LISTEN` entry did not parse as a multiaddr.
+    BadListen {
+        /// The offending value.
+        value: String,
+        /// The parser's reason.
+        reason: String,
+    },
+    /// An argument was not recognized.
+    Unknown(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::MissingValue(flag) => write!(f, "{flag} requires a value"),
+            ConfigError::BadListen { value, reason } => {
+                write!(f, "invalid listen multiaddr `{value}`: {reason}")
+            }
+            ConfigError::Unknown(arg) => write!(f, "unknown `node run` argument `{arg}`"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl NodeConfig {
+    /// Resolves a config from `args` (the argv slice AFTER `node run`) layered
+    /// over an environment lookup `env` layered over the built-in defaults.
+    ///
+    /// Precedence, highest first: an explicit flag, then the matching env var,
+    /// then the default. `--listen` may be repeated; when unset, a single
+    /// `PILLAR_LISTEN` may carry a comma-or-whitespace-separated list. The
+    /// identity-key default is derived from the resolved data dir so a lone
+    /// `--data-dir` keeps the key beside the data.
+    ///
+    /// `env` is injected (rather than reading `std::env` directly) so the pure
+    /// resolution is unit-testable without mutating process globals.
+    pub fn from_args_env<F>(args: &[String], env: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut identity_key: Option<PathBuf> = None;
+        let mut data_dir: Option<PathBuf> = None;
+        let mut listen: Vec<Multiaddr> = Vec::new();
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--identity-key" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--identity-key"))?;
+                    identity_key = Some(PathBuf::from(v));
+                    i += 2;
+                }
+                "--data-dir" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--data-dir"))?;
+                    data_dir = Some(PathBuf::from(v));
+                    i += 2;
+                }
+                "--listen" => {
+                    let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--listen"))?;
+                    listen.push(parse_listen(v)?);
+                    i += 2;
+                }
+                other => return Err(ConfigError::Unknown(other.to_owned())),
+            }
+        }
+
+        // Env fallbacks for the scalar knobs.
+        if data_dir.is_none() {
+            if let Some(v) = env(ENV_DATA_DIR) {
+                data_dir = Some(PathBuf::from(v));
+            }
+        }
+        let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+
+        if identity_key.is_none() {
+            if let Some(v) = env(ENV_IDENTITY_KEY) {
+                identity_key = Some(PathBuf::from(v));
+            }
+        }
+        let identity_key = identity_key.unwrap_or_else(|| data_dir.join("identity.key"));
+
+        // Listen: explicit flags win; else a single env list; else the default.
+        if listen.is_empty() {
+            if let Some(v) = env(ENV_LISTEN) {
+                for entry in v.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+                    listen.push(parse_listen(entry)?);
+                }
+            }
+        }
+        if listen.is_empty() {
+            listen.push(parse_listen(DEFAULT_LISTEN)?);
+        }
+
+        Ok(NodeConfig {
+            identity_key,
+            data_dir,
+            listen,
+        })
+    }
+
+    /// Resolves a config from a real argv slice and the process environment.
+    pub fn from_process_args(args: &[String]) -> Result<Self, ConfigError> {
+        Self::from_args_env(args, |k| std::env::var(k).ok())
+    }
+}
+
+fn parse_listen(value: &str) -> Result<Multiaddr, ConfigError> {
+    value.parse::<Multiaddr>().map_err(|e| ConfigError::BadListen {
+        value: value.to_owned(),
+        reason: e.to_string(),
+    })
+}
+
+/// A failure booting the peer.
+#[derive(Debug)]
+pub enum BootError {
+    /// The data directory could not be created/prepared.
+    DataDir {
+        /// The directory being prepared.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        source: std::io::Error,
+    },
+    /// The identity key could not be read, decoded, generated, or persisted.
+    Identity {
+        /// The key file path.
+        path: PathBuf,
+        /// A human-readable reason.
+        reason: String,
+    },
+    /// The libp2p swarm could not be built or bound.
+    Transport(String),
+}
+
+impl std::fmt::Display for BootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BootError::DataDir { path, source } => {
+                write!(f, "preparing data dir {}: {source}", path.display())
+            }
+            BootError::Identity { path, reason } => {
+                write!(f, "identity key {}: {reason}", path.display())
+            }
+            BootError::Transport(e) => write!(f, "transport bring-up: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BootError {}
+
+/// Ensures `data_dir` exists (creating it and any parents), returning it back
+/// for chaining.
+pub fn prepare_data_dir(data_dir: &Path) -> Result<(), BootError> {
+    std::fs::create_dir_all(data_dir).map_err(|source| BootError::DataDir {
+        path: data_dir.to_path_buf(),
+        source,
+    })
+}
+
+/// Loads the node's ed25519 keypair from `path`, generating and persisting a
+/// fresh one if the file does not yet exist.
+///
+/// The on-disk form is the libp2p canonical protobuf encoding
+/// ([`Keypair::to_protobuf_encoding`] / [`Keypair::from_protobuf_encoding`]),
+/// so a persisted key round-trips to the identical [`libp2p::PeerId`] across
+/// restarts. The parent directory must already exist (see
+/// [`prepare_data_dir`]).
+pub fn load_or_create_identity(path: &Path) -> Result<Keypair, BootError> {
+    if path.exists() {
+        let bytes = std::fs::read(path).map_err(|e| BootError::Identity {
+            path: path.to_path_buf(),
+            reason: format!("read: {e}"),
+        })?;
+        Keypair::from_protobuf_encoding(&bytes).map_err(|e| BootError::Identity {
+            path: path.to_path_buf(),
+            reason: format!("decode: {e}"),
+        })
+    } else {
+        let keypair = Keypair::generate_ed25519();
+        let bytes = keypair
+            .to_protobuf_encoding()
+            .map_err(|e| BootError::Identity {
+                path: path.to_path_buf(),
+                reason: format!("encode: {e}"),
+            })?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| BootError::Identity {
+                    path: path.to_path_buf(),
+                    reason: format!("create parent dir: {e}"),
+                })?;
+            }
+        }
+        std::fs::write(path, &bytes).map_err(|e| BootError::Identity {
+            path: path.to_path_buf(),
+            reason: format!("write: {e}"),
+        })?;
+        Ok(keypair)
+    }
+}
+
+/// Boots a full peer from `config` and blocks until a shutdown signal.
+///
+/// The steps are exactly those the module doc lists: prepare the data dir,
+/// load/create the identity, open the streaming DB, bring up the libp2p event
+/// swarm on the configured listen addrs, subscribe to the event-log topic, and
+/// run the swarm/controller event loop until SIGINT/SIGTERM. Returns `Ok(())`
+/// on a clean shutdown.
+///
+/// This is the imperative shell over the pure, unit-tested helpers above; it
+/// performs real network and filesystem side effects and so is driven by the
+/// integration/deploy path rather than unit tests.
+pub async fn run(config: NodeConfig) -> Result<(), BootError> {
+    use futures::StreamExt;
+    use libp2p::swarm::SwarmEvent;
+
+    prepare_data_dir(&config.data_dir)?;
+    let keypair = load_or_create_identity(&config.identity_key)?;
+    let peer_id = pillar_net::peer_id_of(&keypair);
+    tracing::info!(%peer_id, data_dir = %config.data_dir.display(), "pillar peer identity loaded");
+
+    // Streaming DB: the durable op store the controller reconciles against.
+    let mut stream = pillar_streamdb::Stream::new();
+
+    // Transport: bring up the libp2p event swarm and subscribe to the log topic.
+    let mut swarm =
+        pillar_net::build_event_swarm(keypair).map_err(|e| BootError::Transport(e.to_string()))?;
+    let topic = pillar_net::event_log_topic();
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topic)
+        .map_err(|e| BootError::Transport(format!("subscribe: {e}")))?;
+    for addr in &config.listen {
+        swarm
+            .listen_on(addr.clone())
+            .map_err(|e| BootError::Transport(format!("listen_on {addr}: {e}")))?;
+    }
+
+    tracing::info!("pillar peer running; press Ctrl-C to stop");
+
+    // Controller loop: fold inbound event-log messages into the stream and
+    // block until a shutdown signal.
+    let mut shutdown = Box::pin(shutdown_signal());
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received; stopping peer");
+                return Ok(());
+            }
+            event = swarm.select_next_some() => {
+                if let SwarmEvent::Behaviour(pillar_net::EventBehaviourEvent::Gossipsub(
+                    libp2p::gossipsub::Event::Message { message, .. },
+                )) = event
+                {
+                    // Every gossiped event-log message is an append-only op the
+                    // controller folds into the local stream view.
+                    let _ = stream.try_append(
+                        message.data,
+                        pillar_core::SideEffect::Convergent,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A future that resolves on the first SIGINT or (on Unix) SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn s(v: &str) -> String {
+        v.to_owned()
+    }
+
+    #[test]
+    fn defaults_when_no_flags_and_no_env() {
+        let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        // Identity key defaults beside the data dir.
+        assert_eq!(cfg.identity_key, PathBuf::from(DEFAULT_DATA_DIR).join("identity.key"));
+        assert_eq!(cfg.listen, vec![DEFAULT_LISTEN.parse::<Multiaddr>().unwrap()]);
+    }
+
+    #[test]
+    fn flags_override_everything() {
+        let args = vec![
+            s("--identity-key"),
+            s("/keys/node.key"),
+            s("--data-dir"),
+            s("/var/lib/pillar"),
+            s("--listen"),
+            s("/ip4/127.0.0.1/tcp/4001"),
+            s("--listen"),
+            s("/ip4/0.0.0.0/udp/4001/quic-v1"),
+        ];
+        let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
+        assert_eq!(cfg.identity_key, PathBuf::from("/keys/node.key"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/pillar"));
+        assert_eq!(
+            cfg.listen,
+            vec![
+                "/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap(),
+                "/ip4/0.0.0.0/udp/4001/quic-v1".parse::<Multiaddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_fills_when_flags_absent() {
+        let env = |k: &str| match k {
+            ENV_IDENTITY_KEY => Some(s("/env/id.key")),
+            ENV_DATA_DIR => Some(s("/env/data")),
+            ENV_LISTEN => Some(s("/ip4/10.0.0.1/tcp/5001, /ip4/10.0.0.1/tcp/5002")),
+            _ => None,
+        };
+        let cfg = NodeConfig::from_args_env(&[], env).unwrap();
+        assert_eq!(cfg.identity_key, PathBuf::from("/env/id.key"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/env/data"));
+        assert_eq!(
+            cfg.listen,
+            vec![
+                "/ip4/10.0.0.1/tcp/5001".parse::<Multiaddr>().unwrap(),
+                "/ip4/10.0.0.1/tcp/5002".parse::<Multiaddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn flags_take_precedence_over_env() {
+        let env = |k: &str| match k {
+            ENV_DATA_DIR => Some(s("/env/data")),
+            _ => None,
+        };
+        let args = vec![s("--data-dir"), s("/flag/data")];
+        let cfg = NodeConfig::from_args_env(&args, env).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from("/flag/data"));
+    }
+
+    #[test]
+    fn identity_key_default_follows_env_data_dir() {
+        let env = |k: &str| match k {
+            ENV_DATA_DIR => Some(s("/env/data")),
+            _ => None,
+        };
+        let cfg = NodeConfig::from_args_env(&[], env).unwrap();
+        assert_eq!(cfg.identity_key, PathBuf::from("/env/data").join("identity.key"));
+    }
+
+    #[test]
+    fn explicit_listen_flag_wins_over_env_list() {
+        let env = |k: &str| match k {
+            ENV_LISTEN => Some(s("/ip4/10.0.0.1/tcp/5001")),
+            _ => None,
+        };
+        let args = vec![s("--listen"), s("/ip4/127.0.0.1/tcp/1")];
+        let cfg = NodeConfig::from_args_env(&args, env).unwrap();
+        assert_eq!(cfg.listen, vec!["/ip4/127.0.0.1/tcp/1".parse::<Multiaddr>().unwrap()]);
+    }
+
+    #[test]
+    fn missing_flag_value_errors() {
+        let err = NodeConfig::from_args_env(&[s("--data-dir")], no_env).unwrap_err();
+        assert_eq!(err, ConfigError::MissingValue("--data-dir"));
+    }
+
+    #[test]
+    fn bad_listen_multiaddr_errors() {
+        let args = vec![s("--listen"), s("not-a-multiaddr")];
+        let err = NodeConfig::from_args_env(&args, no_env).unwrap_err();
+        match err {
+            ConfigError::BadListen { value, .. } => assert_eq!(value, "not-a-multiaddr"),
+            other => panic!("expected BadListen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_arg_errors() {
+        let err = NodeConfig::from_args_env(&[s("--frobnicate")], no_env).unwrap_err();
+        assert_eq!(err, ConfigError::Unknown(s("--frobnicate")));
+    }
+
+    #[test]
+    fn identity_is_generated_persisted_and_stable_across_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("nested").join("identity.key");
+
+        // First load generates and persists.
+        assert!(!key_path.exists());
+        let first = load_or_create_identity(&key_path).unwrap();
+        assert!(key_path.exists(), "key file persisted on first boot");
+        let first_peer = pillar_net::peer_id_of(&first);
+
+        // Second load reads the same key back to the same PeerId.
+        let second = load_or_create_identity(&key_path).unwrap();
+        let second_peer = pillar_net::peer_id_of(&second);
+        assert_eq!(first_peer, second_peer, "peer id stable across restarts");
+    }
+
+    #[test]
+    fn prepare_data_dir_creates_nested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        assert!(!nested.exists());
+        prepare_data_dir(&nested).unwrap();
+        assert!(nested.is_dir());
+    }
+}

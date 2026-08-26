@@ -29,6 +29,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod run;
+
 use std::collections::BTreeMap;
 use std::fmt;
 

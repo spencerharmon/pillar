@@ -23,6 +23,7 @@ fn usage() -> &'static str {
      USAGE:\n\
      \x20 pillar apply    <manifest.txt>            validate, authorize, sign, emit a signed event\n\
      \x20 pillar get      <api> <kind> <name>       render a resource from the materialized view\n\
+     \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...]  boot a full peer and block\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
      \x20 pillar render kustomize <base.txt>        (see library API for overlay construction)\n\
@@ -41,6 +42,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("--web") => web(&args[1..]),
+        Some("node") => node(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("apply") | Some("get") | Some("describe") => {
             // These verbs act over a live, persistent platform, which this
@@ -58,6 +60,49 @@ fn main() -> ExitCode {
             eprintln!("unknown verb `{other}`\n");
             print!("{}", usage());
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `pillar node run [flags]`: boot a full peer and block until shutdown.
+///
+/// Delegates entirely to the unit-tested [`pillar_cli::run`] module: it
+/// resolves a [`pillar_cli::run::NodeConfig`] from flags layered over env,
+/// then drives the async boot sequence (identity load, streamdb open, libp2p
+/// transport bring-up, controller loop) on a Tokio runtime until SIGINT/
+/// SIGTERM. `node run` is the only `node` subcommand today.
+fn node(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("run") => node_run(&args[1..]),
+        _ => {
+            eprintln!(
+                "usage: pillar node run [--identity-key <path>] [--data-dir <path>] [--listen <multiaddr> ...]"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn node_run(args: &[String]) -> ExitCode {
+    let config = match pillar_cli::run::NodeConfig::from_process_args(args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pillar node run: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("failed to start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(pillar_cli::run::run(config)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("pillar node run: {e}");
+            ExitCode::FAILURE
         }
     }
 }
