@@ -139,19 +139,29 @@ jobs:
           getent passwd "$(id -u)" || true
           # With build-users-group disabled (no sandboxed nixbld user), nix
           # runs unsandboxed builds directly with HOME forced to a single
-          # shared /homeless-shelter path — and REFUSES to build if that
-          # path already exists ("please remove it to assure purity of
-          # builds without sandboxing"). A single upfront `rm -rf` is not
-          # enough: with the default parallel `--max-jobs`, two derivations
-          # building concurrently both target that same shared path, so the
-          # second one collides with the first's still-present directory.
-          # Force strictly serial builds (`--max-jobs 1`) so only one
-          # derivation ever occupies /homeless-shelter at a time.
-          rm -rf /homeless-shelter
+          # shared /homeless-shelter path — and REFUSES to build a
+          # derivation if that path already exists ("please remove it to
+          # assure purity of builds without sandboxing"). It does not
+          # reliably clean that dir up after every single derivation build
+          # completes (observed: it survives the fixed-output
+          # cargo-vendor-dir fetch and then blocks the very next
+          # derivation, pillar-0.0.0 itself, from starting) — a single
+          # upfront `rm -rf` is not enough. `nix build` resumes from
+          # already-built store paths, so retry in a loop, clearing the
+          # stale dir before every attempt, until it succeeds or we give up.
+          attempt=1
+          max_attempts=10
+          until rm -rf /homeless-shelter && nix build --max-jobs 1 .#pillar-oci-image; do
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "FAIL: nix build did not succeed after ${max_attempts} attempts" >&2
+              exit 1
+            fi
+            echo "nix build attempt ${attempt} failed (likely the /homeless-shelter purity check); retrying (${attempt}/${max_attempts})..." >&2
+            attempt=$((attempt + 1))
+          done
           # streamLayeredImage produces `result`, an executable that streams
           # the image tar to stdout. Materialize it to a tarball skopeo can
           # copy.
-          nix build --max-jobs 1 .#pillar-oci-image
           ./result > pillar-image.tar
 
       - name: Log in to ghcr.io
