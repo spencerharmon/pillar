@@ -29,6 +29,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod key_login;
+
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
