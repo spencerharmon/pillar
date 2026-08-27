@@ -127,8 +127,6 @@ jobs:
       - name: Build OCI image from flake
         run: |
           set -euo pipefail
-          echo "DEBUG: HOME=${HOME:-<unset>} whoami=$(whoami 2>&1 || true) id=$(id)"
-          ls -la "$HOME" || true
           # The nixery base image has no /etc/passwd entry for uid 0 at all
           # (whoami/getpwuid both fail), and nix's home-dir resolution
           # apparently still consults NSS/getpwuid in a path that ignores
@@ -136,7 +134,6 @@ jobs:
           if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
             echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
           fi
-          getent passwd "$(id -u)" || true
           # With build-users-group disabled (no sandboxed nixbld user), nix
           # runs unsandboxed builds directly with HOME forced to a single
           # shared /homeless-shelter path — and REFUSES to build a
