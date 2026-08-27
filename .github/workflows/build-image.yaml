@@ -138,15 +138,20 @@ jobs:
           fi
           getent passwd "$(id -u)" || true
           # With build-users-group disabled (no sandboxed nixbld user), nix
-          # runs unsandboxed builds directly with HOME forced to
-          # /homeless-shelter — and REFUSES to build if that path already
-          # exists ("please remove it to assure purity of builds without
-          # sandboxing"), which it does on this base image. Clear it first.
+          # runs unsandboxed builds directly with HOME forced to a single
+          # shared /homeless-shelter path — and REFUSES to build if that
+          # path already exists ("please remove it to assure purity of
+          # builds without sandboxing"). A single upfront `rm -rf` is not
+          # enough: with the default parallel `--max-jobs`, two derivations
+          # building concurrently both target that same shared path, so the
+          # second one collides with the first's still-present directory.
+          # Force strictly serial builds (`--max-jobs 1`) so only one
+          # derivation ever occupies /homeless-shelter at a time.
           rm -rf /homeless-shelter
           # streamLayeredImage produces `result`, an executable that streams
           # the image tar to stdout. Materialize it to a tarball skopeo can
           # copy.
-          nix build .#pillar-oci-image
+          nix build --max-jobs 1 .#pillar-oci-image
           ./result > pillar-image.tar
 
       - name: Log in to ghcr.io
