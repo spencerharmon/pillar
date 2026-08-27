@@ -103,6 +103,7 @@ jobs:
       - name: Enable nix flakes
         run: |
           set -euo pipefail
+          mkdir -p "$HOME"
           mkdir -p ~/.config/nix
           {
             echo "experimental-features = nix-command flakes"
