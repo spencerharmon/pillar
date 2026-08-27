@@ -18,8 +18,10 @@
 # workflow (`nixery.dev/shell/nix/skopeo`, extended with `/git` so
 # `actions/checkout@v4`'s node.js-based runtime requirement is sidestepped via
 # a plain `git clone` — the plain nix/skopeo shell image has no node.js and
-# checkout fails with `exec: "node": executable file not found"`), runs
-# `nix build .#pillar-oci-image`, and pushes the streamed tar with `skopeo
+# checkout fails with `exec: "node": executable file not found"`, and with
+# `/gnused` since the base nixery shell image has no `sed` either, needed by
+# the tag-computation step below), runs `nix build .#pillar-oci-image`, and
+# pushes the streamed tar with `skopeo
 # copy docker-archive:... docker://ghcr.io/spencerharmon/pillar:<tag>`.
 #
 # Tag scheme (ROI addendum, operator, 2026-08-26): push BOTH `:<version>` (the
@@ -59,7 +61,7 @@ jobs:
   build-publish:
     runs-on: ubuntu-latest
     container:
-      image: nixery.dev/shell/nix/skopeo/git
+      image: nixery.dev/shell/nix/skopeo/git/gnused
     steps:
       - name: Checkout pillar
         env:
