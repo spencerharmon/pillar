@@ -127,11 +127,13 @@ jobs:
       - name: Build OCI image from flake
         run: |
           set -euo pipefail
-          echo "DEBUG: HOME=${HOME:-<unset>} whoami=$(whoami) id=$(id)"
+          echo "DEBUG: HOME=${HOME:-<unset>} whoami=$(whoami 2>&1 || true) id=$(id)"
+          ls -la "$HOME" || true
+          env | sort
           # streamLayeredImage produces `result`, an executable that streams
           # the image tar to stdout. Materialize it to a tarball skopeo can
           # copy.
-          nix build .#pillar-oci-image
+          nix -vvvv build .#pillar-oci-image
           ./result > pillar-image.tar
 
       - name: Log in to ghcr.io
