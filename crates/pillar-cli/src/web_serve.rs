@@ -11,20 +11,39 @@
 //! exposed surface. Passkey/WebAuthn remains available only as an optional
 //! signer feeding the very same decider, never a parallel gate.
 //!
-//! The line protocol, one command per line, over a single TCP connection:
+//! ## Transport: HTTP/1.1
 //!
-//! - `NONCE` — issue a fresh challenge nonce bound to this server's origin;
-//!   replies `NONCE <id> <expiry>`.
-//! - `LOGIN <id> <expiry> <subkey> <sig>` — admit a WoT-key login: the client
-//!   locally unlocked its auth subkey and signed the nonce
-//!   ([`pillar_web::key_login::AuthSubkey::sign_nonce`]); replies `OK` and
-//!   the connection is authenticated for its remaining lifetime, or `DENIED
+//! The surface speaks **HTTP/1.1** so a browser, `curl`, or a k8s Ingress
+//! (traefik proxying plain HTTP to the pillar-web Service) can reach it — the
+//! flux `pillar-web-ingress-tls` check gates on `curl -sf https://…/`. Each
+//! request line + headers is parsed, dispatched to one of the endpoints
+//! below, and answered with a real HTTP/1.1 status line, `Content-Type`,
+//! `Content-Length`, and body. Because a single browser/`curl` session opens
+//! several short-lived connections, the WoT-key login SESSION is keyed by the
+//! nonce/subkey handshake (an `X-Pillar-Session` bearer the client echoes on
+//! the signing request), not by connection lifetime.
+//!
+//! Endpoints (the SAME auth-gate decisions as before — only the transport
+//! changed; `handle_line` still holds the pure protocol logic and its tests):
+//!
+//! - `GET /` — the UNAUTHENTICATED WoT-key login landing page (HTML, 200). It
+//!   is the client-side challenge/signature gate: the browser unlocks a
+//!   WoT-trusted auth subkey locally and signs the server nonce. Serving this
+//!   page exposes NO authenticated action.
+//! - `GET /nonce` — issue a fresh challenge nonce bound to this origin; body
+//!   `NONCE <id> <expiry>`.
+//! - `POST /login` — body `<id> <expiry> <subkey> <sig>`: admit a WoT-key
+//!   login; 200 `OK` (with an `X-Pillar-Session` token) or 401 `DENIED
 //!   <reason>`.
-//! - `PING` — a stand-in signing action, gated through
-//!   [`pillar_web::authorize_nonloopback_signing_action`]; replies `PONG` if
-//!   authorized (loopback peer, or a non-loopback peer with an admitted
-//!   session), else `REFUSED <reason>`.
-//! - `QUIT` — closes the connection.
+//! - `POST /ping` — a stand-in signing action gated through
+//!   [`pillar_web::authorize_nonloopback_signing_action`]; a non-loopback
+//!   peer must present an admitted session (`X-Pillar-Session`). 200 `PONG`
+//!   or 403 `REFUSED <reason>`.
+//!
+//! `handle_line` maps each HTTP endpoint onto the ORIGINAL line-protocol verb
+//! (`NONCE`/`LOGIN`/`PING`/`QUIT`), so the auth-gate decision logic — in
+//! particular that a non-loopback peer with no admitted session is ALWAYS
+//! refused — is unchanged and still exercised directly by the unit tests.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -47,6 +66,14 @@ pub struct WebAuthContext {
     issued: HashMap<u64, Nonce>,
     authority: WotAuthority,
     actor: FencedActor,
+    /// Admitted WoT-key login sessions, keyed by the bearer token handed to
+    /// the client (`X-Pillar-Session`) on a successful `POST /login`. HTTP is
+    /// connection-per-request, so an admitted session must outlive the
+    /// connection it was minted on; the client echoes its token on the later
+    /// signing request.
+    sessions: HashMap<String, LoginSession>,
+    /// Monotonic counter minting distinct session-token strings.
+    next_session: u64,
 }
 
 impl WebAuthContext {
@@ -63,6 +90,8 @@ impl WebAuthContext {
             issued: HashMap::new(),
             authority,
             actor,
+            sessions: HashMap::new(),
+            next_session: 0,
         }
     }
 
@@ -121,6 +150,22 @@ impl WebAuthContext {
         self.verifier
             .admit(&nonce, sig, subkey, &origin, clock, &self.authority, &self.actor)
     }
+
+    /// Store an admitted `session` under a freshly minted bearer token,
+    /// returning that token for the client to echo (`X-Pillar-Session`) on a
+    /// later signing request. HTTP connections are per-request, so the
+    /// session must be looked up by token, not connection.
+    fn store_session(&mut self, session: LoginSession) -> String {
+        let token = format!("s{}", self.next_session);
+        self.next_session += 1;
+        self.sessions.insert(token.clone(), session);
+        token
+    }
+
+    /// The admitted session for a bearer `token`, if any.
+    fn session_for(&self, token: &str) -> Option<&LoginSession> {
+        self.sessions.get(token)
+    }
 }
 
 /// Bind the web UI listener on `addr:port` — `addr` MAY be non-loopback (see
@@ -134,8 +179,8 @@ pub fn bind(addr: IpAddr, port: u16) -> std::io::Result<TcpListener> {
     bind_web(addr, port)
 }
 
-/// Serve the line protocol on `listener` until it errors or the process is
-/// torn down. Blocking — run on a dedicated thread.
+/// Serve HTTP/1.1 on `listener` until it errors or the process is torn down.
+/// Blocking — run on a dedicated thread.
 pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -143,41 +188,178 @@ pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
     }
 }
 
+/// The unauthenticated WoT-key login landing page. Client-side only: it
+/// unlocks a WoT-trusted auth subkey locally and signs the server nonce —
+/// serving it exposes no authenticated action.
+const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>pillar — WoT-key login</title></head>\n<body>\n<h1>pillar</h1>\n<p>WoT-key login. Unlock your auth subkey locally and sign the server nonce; your password and key never leave this browser.</p>\n<ol><li>GET <code>/nonce</code> for a challenge.</li><li>Sign it with your auth subkey.</li><li>POST the signature to <code>/login</code>.</li></ol>\n</body>\n</html>\n";
+
+/// A parsed HTTP request: method, path, and body.
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: String,
+}
+
+/// Read and parse one HTTP/1.1 request from `reader`. Returns `None` on a
+/// closed connection or an unparseable request line.
+fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
+    let mut request_line = String::new();
+    match reader.read_line(&mut request_line) {
+        Ok(0) | Err(_) => return None,
+        Ok(_) => {}
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_owned();
+    let path = parts.next()?.to_owned();
+
+    // Read headers until the blank line, capturing Content-Length.
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        match reader.read_line(&mut header) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = header.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+
+    let mut body = String::new();
+    if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        if reader.read_exact(&mut buf).is_ok() {
+            body = String::from_utf8_lossy(&buf).into_owned();
+        }
+    }
+
+    Some(HttpRequest { method, path, body })
+}
+
+/// An HTTP response to write back: status code, reason, content-type, an
+/// optional `X-Pillar-Session` token, and body.
+struct HttpResponse {
+    status: u16,
+    reason: &'static str,
+    content_type: &'static str,
+    session_token: Option<String>,
+    body: String,
+}
+
+impl HttpResponse {
+    fn write_to(&self, stream: &mut TcpStream) -> std::io::Result<()> {
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            self.status,
+            self.reason,
+            self.content_type,
+            self.body.len(),
+        );
+        if let Some(token) = &self.session_token {
+            head.push_str(&format!("X-Pillar-Session: {token}\r\n"));
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(self.body.as_bytes())?;
+        stream.flush()
+    }
+}
+
 fn handle_connection(mut stream: TcpStream, ctx: &mut WebAuthContext) {
     let Ok(peer) = stream.peer_addr() else { return };
-    let mut session: Option<LoginSession> = None;
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     });
+    let Some(request) = read_http_request(&mut reader) else {
+        return;
+    };
+    let response = dispatch_http(ctx, &peer, &request);
+    let _ = response.write_to(&mut stream);
+}
 
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
+/// Map an HTTP request onto the ORIGINAL line-protocol decision in
+/// [`handle_line`], preserving every auth-gate rule (only the transport
+/// changed). The signing action's session is resolved from the
+/// `X-Pillar-Session` bearer the client echoes.
+fn dispatch_http(ctx: &mut WebAuthContext, peer: &SocketAddr, request: &HttpRequest) -> HttpResponse {
+    // Strip any query string; match on the path prefix.
+    let path = request.path.split('?').next().unwrap_or(&request.path);
+    match (request.method.as_str(), path) {
+        ("GET", "/") => HttpResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8",
+            session_token: None,
+            body: LANDING_PAGE.to_owned(),
+        },
+        ("GET", "/nonce") => {
+            let mut session: Option<LoginSession> = None;
+            let reply = handle_line(ctx, &mut session, peer, "NONCE");
+            text_response(200, "OK", reply.text)
         }
-        let reply = handle_line(ctx, &mut session, &peer, &line);
-        let done = reply.done;
-        let _ = writeln!(stream, "{}", reply.text);
-        if done {
-            return;
+        ("POST", "/login") => {
+            let mut session: Option<LoginSession> = None;
+            let line = format!("LOGIN {}", request.body.trim());
+            let reply = handle_line(ctx, &mut session, peer, &line);
+            if reply.text == "OK" {
+                if let Some(s) = session {
+                    let token = ctx.store_session(s);
+                    return HttpResponse {
+                        status: 200,
+                        reason: "OK",
+                        content_type: "text/plain; charset=utf-8",
+                        session_token: Some(token),
+                        body: "OK\n".to_owned(),
+                    };
+                }
+            }
+            text_response(401, "Unauthorized", reply.text)
         }
+        ("POST", "/ping") => {
+            // Resolve the admitted session from the bearer token, then run the
+            // UNCHANGED gate: a non-loopback peer with no admitted session is
+            // still always refused.
+            let token = request.body.trim();
+            let mut session: Option<LoginSession> = ctx.session_for(token).cloned();
+            let reply = handle_line(ctx, &mut session, peer, "PING");
+            if reply.text == "PONG" {
+                text_response(200, "OK", reply.text)
+            } else {
+                text_response(403, "Forbidden", reply.text)
+            }
+        }
+        _ => text_response(404, "Not Found", "not found".to_owned()),
     }
 }
 
-/// One line-protocol reply: the text to write back, and whether the
-/// connection should close after it (`QUIT`).
+fn text_response(status: u16, reason: &'static str, mut body: String) -> HttpResponse {
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    HttpResponse {
+        status,
+        reason,
+        content_type: "text/plain; charset=utf-8",
+        session_token: None,
+        body,
+    }
+}
+
+/// One protocol reply: the text to write back. HTTP dispatch maps this onto
+/// a status code + body (see [`dispatch_http`]).
 struct Reply {
     text: String,
-    done: bool,
 }
 
 fn reply(text: impl Into<String>) -> Reply {
-    Reply {
-        text: text.into(),
-        done: false,
-    }
+    Reply { text: text.into() }
 }
 
 /// The pure per-line protocol handler, independent of any real socket, so
@@ -216,11 +398,7 @@ fn handle_line(ctx: &mut WebAuthContext, session: &mut Option<LoginSession>, pee
             Ok(()) => reply("PONG"),
             Err(e) => reply(format!("REFUSED {e:?}")),
         },
-        Some("QUIT") => Reply {
-            text: "BYE".to_owned(),
-            done: true,
-        },
-        _ => reply("unknown command; use NONCE, LOGIN, PING, or QUIT"),
+        _ => reply("unknown command; use NONCE, LOGIN, or PING"),
     }
 }
 
@@ -306,6 +484,100 @@ mod tests {
             "expected an authenticated non-loopback PING to be admitted, got: {}",
             ping_reply.text
         );
+    }
+
+    // Bind the web surface on an ephemeral NON-loopback port, serve one HTTP
+    // request in a background thread, and assert `GET /` yields a real
+    // HTTP/1.1 2xx response with a body — the exact contract traefik/curl (and
+    // the flux `pillar-web-ingress-tls` check) depend on.
+    #[test]
+    fn get_root_over_http_yields_a_2xx_response_with_a_body() {
+        use std::io::Read as _;
+
+        let listener = bind(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0).expect("bind non-loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(!addr.ip().is_loopback(), "must bind a non-loopback address");
+
+        let handle = std::thread::spawn(move || {
+            let (mut ctx, _subkey) = fresh_ctx_with_subkey();
+            // Serve exactly one connection then return.
+            let stream = listener.incoming().next().expect("one connection").expect("accept");
+            super::handle_connection(stream, &mut ctx);
+        });
+
+        // Connect to the bound port over the loopback route (the OS routes a
+        // 0.0.0.0 bind via 127.0.0.1) and speak raw HTTP/1.1.
+        let connect = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
+        let mut client = TcpStream::connect(connect).expect("connect");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: pillar.example.com\r\n\r\n")
+            .expect("write request");
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).expect("read response");
+        handle.join().expect("server thread");
+
+        let status_line = raw.lines().next().expect("a status line");
+        assert!(
+            status_line.starts_with("HTTP/1.1 2"),
+            "expected an HTTP/1.1 2xx status line, got: {status_line}"
+        );
+        let (_, body) = raw.split_once("\r\n\r\n").expect("a header/body separator");
+        assert!(!body.is_empty(), "expected a non-empty response body");
+    }
+
+    // Exercise the full HTTP handshake against a synthetic non-loopback peer:
+    // GET /nonce, sign, POST /login (receiving a session token), then a signing
+    // action POST /ping with and without that token — proving the auth gate is
+    // unchanged, only carried over HTTP now.
+    #[test]
+    fn http_login_then_ping_dispatch_preserves_the_auth_gate() {
+        let (mut ctx, subkey) = fresh_ctx_with_subkey();
+        let peer = remote_peer();
+
+        // Unauthenticated signing action against a non-loopback peer: 403.
+        let refused = dispatch_http(
+            &mut ctx,
+            &peer,
+            &HttpRequest { method: "POST".into(), path: "/ping".into(), body: String::new() },
+        );
+        assert_eq!(refused.status, 403, "unauthenticated non-loopback ping must be refused");
+
+        // GET /nonce.
+        let nonce_resp = dispatch_http(
+            &mut ctx,
+            &peer,
+            &HttpRequest { method: "GET".into(), path: "/nonce".into(), body: String::new() },
+        );
+        assert_eq!(nonce_resp.status, 200);
+        let mut parts = nonce_resp.body.split_whitespace();
+        assert_eq!(parts.next(), Some("NONCE"));
+        let id: u64 = parts.next().expect("id").parse().expect("id");
+        let expiry: u64 = parts.next().expect("expiry").parse().expect("expiry");
+
+        // Client-side sign.
+        let encrypted = pillar_web::key_login::EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
+        let unlocked = pillar_web::key_login::unlock_auth_subkey(&encrypted, PASSWORD, SECRET).expect("unlock");
+        let signing_nonce = test_nonce(id, "https://pillar.example.com", expiry);
+        let sig = unlocked.sign_nonce(&signing_nonce);
+
+        // POST /login → 200 + session token.
+        let login_body = format!("{id} {expiry} {} {}", subkey.0, sig.to_wire());
+        let login_resp = dispatch_http(
+            &mut ctx,
+            &peer,
+            &HttpRequest { method: "POST".into(), path: "/login".into(), body: login_body },
+        );
+        assert_eq!(login_resp.status, 200, "login body: {}", login_resp.body);
+        let token = login_resp.session_token.expect("a session token");
+
+        // POST /ping WITH the token → 200 PONG.
+        let ping_resp = dispatch_http(
+            &mut ctx,
+            &peer,
+            &HttpRequest { method: "POST".into(), path: "/ping".into(), body: token },
+        );
+        assert_eq!(ping_resp.status, 200, "authenticated ping body: {}", ping_resp.body);
+        assert!(ping_resp.body.starts_with("PONG"));
     }
 
     // Test-only: reconstruct a `Nonce` with a chosen id for signing, mirroring
