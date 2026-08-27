@@ -137,6 +137,12 @@ jobs:
             echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
           fi
           getent passwd "$(id -u)" || true
+          # With build-users-group disabled (no sandboxed nixbld user), nix
+          # runs unsandboxed builds directly with HOME forced to
+          # /homeless-shelter — and REFUSES to build if that path already
+          # exists ("please remove it to assure purity of builds without
+          # sandboxing"), which it does on this base image. Clear it first.
+          rm -rf /homeless-shelter
           # streamLayeredImage produces `result`, an executable that streams
           # the image tar to stdout. Materialize it to a tarball skopeo can
           # copy.
