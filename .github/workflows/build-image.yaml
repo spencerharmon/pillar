@@ -65,8 +65,12 @@ jobs:
     env:
       # The nixery container has no /etc/passwd entry for the runner's uid,
       # so nix (and anything else that calls getpwuid) fails with "cannot
-      # determine user's home directory" unless HOME is set explicitly.
-      HOME: /root
+      # determine user's home directory" unless HOME is set explicitly. The
+      # image also has no writable /root (docker config load / gitconfig
+      # both fail with "permission denied"/"No such file or directory"
+      # there), so point HOME at a dir actions itself already provisions as
+      # writable for this job.
+      HOME: /github/home
     steps:
       - name: Checkout pillar
         env:
