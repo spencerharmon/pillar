@@ -127,6 +127,7 @@ jobs:
       - name: Build OCI image from flake
         run: |
           set -euo pipefail
+          echo "DEBUG: HOME=${HOME:-<unset>} whoami=$(whoami) id=$(id)"
           # streamLayeredImage produces `result`, an executable that streams
           # the image tar to stdout. Materialize it to a tarball skopeo can
           # copy.
