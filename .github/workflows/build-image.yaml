@@ -70,8 +70,23 @@ jobs:
           # nix/skopeo shell image doesn't provide, so check out with a bare
           # git clone instead (git is pulled in via the nixery image path
           # above).
-          git -c http.extraHeader="Authorization: Bearer ${GITHUB_TOKEN}" \
-            clone --no-checkout "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+          #
+          # NOTE: `git -c http.extraHeader="Authorization: Bearer <token>"`
+          # does NOT work against github.com's git-over-HTTP endpoint — it
+          # fails with "could not read Username ... No such device or
+          # address" even with a valid token (verified against the real
+          # github.com API, not just this sandbox). GitHub's git HTTP layer
+          # wants the token as the HTTP Basic password, so embed it in the
+          # clone URL instead (`x-access-token:<token>@`), which is the
+          # scheme GitHub's own docs and actions/checkout itself use.
+          #
+          # The nixery container runs as root while the workspace dir is
+          # owned by a different uid on the runner host, so git's ownership
+          # check refuses to operate on it ("detected dubious ownership") —
+          # mark it as a safe/trusted directory before cloning into it.
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
           git checkout --detach "${GITHUB_SHA}"
 
       - name: Enable nix flakes
