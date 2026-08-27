@@ -45,6 +45,30 @@ cargo test --all          # build + unit/property tests
 ( cd specs && ./check.sh ) # model-check every TLA+ spec (needs a JVM 17+)
 ```
 
+## Container image
+
+A reproducible OCI image (nix `dockerTools.streamLayeredImage`, see
+[`flake.nix`](flake.nix)) is built and published to the GitHub Container
+Registry by [`.github/workflows/build-image.yaml`](.github/workflows/build-image.yaml)
+on every push to `main` that touches the flake/workspace, and weekly to pick
+up base-image rebuilds. It authenticates with the repo's built-in
+`GITHUB_TOKEN` — no infra secrets or private-registry credentials live in this
+public repo.
+
+- `ghcr.io/spencerharmon/pillar:<version>` — the immutable release tag (the
+  workspace `Cargo.toml` `[workspace.package] version`).
+- `ghcr.io/spencerharmon/pillar:latest` — the moving pointer to the newest
+  build. Consumers should pin by the registry-served digest resolved from
+  whichever tag they reference, so the moving `latest` tag never causes an
+  unpinned pull.
+
+**One-time setup:** after the workflow's first run, the `pillar` package
+under this GitHub account/org defaults to **private** visibility even though
+the repo is public. Set it to **public** once, in the package's own Settings
+(Package settings → Danger Zone → Change visibility) — this cannot be done
+from within the workflow itself with `GITHUB_TOKEN` alone — so consumers
+(e.g. flux) can pull the image without credentials.
+
 ## Status
 
 Early foundational rearchitecture. The previous Python prototype

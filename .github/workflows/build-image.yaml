@@ -1,0 +1,147 @@
+# build-image — GitHub Actions workflow that builds the `pillar` container
+# image from the repo-root `flake.nix` (nix `dockerTools.streamLayeredImage`,
+# packaging the `pillar node run` entrypoint — see
+# crates/pillar-cli/src/run.rs) and publishes it to the **GitHub Container
+# Registry** (`ghcr.io/spencerharmon/pillar`).
+#
+# ROI addendum (operator, 2026-08-26): pillar is public, so its flake-built
+# OCI image is hosted on ghcr.io instead of the private Gitea OCI registry.
+# This workflow authenticates with the built-in `GITHUB_TOKEN` — no infra
+# secrets, no private-registry credentials anywhere in this public repo. It
+# SUPERSEDES the former `.gitea/workflows/build-image.yaml` Gitea Actions
+# publish target for this artifact (removed by this same change): the flake
+# output itself stays infra-agnostic (no registry/host/credential baked in),
+# so a Gitea Actions mirror remains a drop-in addition later if ever wanted,
+# it is just not filed here.
+#
+# The job runs inside the same nixery build image used by the retired Gitea
+# workflow (`nixery.dev/shell/nix/skopeo`, extended with `/git` so
+# `actions/checkout@v4`'s node.js-based runtime requirement is sidestepped via
+# a plain `git clone` — the plain nix/skopeo shell image has no node.js and
+# checkout fails with `exec: "node": executable file not found"`), runs
+# `nix build .#pillar-oci-image`, and pushes the streamed tar with `skopeo
+# copy docker-archive:... docker://ghcr.io/spencerharmon/pillar:<tag>`.
+#
+# Tag scheme (ROI addendum, operator, 2026-08-26): push BOTH `:<version>` (the
+# immutable release tag — the workspace Cargo.toml `[workspace.package]
+# version`) AND `:latest` (the moving pointer to the newest build). Consumers
+# (flux) pin by the registry-served DIGEST resolved from whichever tag they
+# reference, so the moving `:latest` never causes an unpinned pull.
+name: build-image
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - .github/workflows/build-image.yaml
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+  schedule:
+    # Weekly, so the pinned nixpkgs base picks up rebuilds even absent a
+    # source change.
+    - cron: "0 5 * * 1"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: spencerharmon/pillar
+
+# The GITHUB_TOKEN needs write access to this repo's ghcr.io packages.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/skopeo/git
+    steps:
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # actions/checkout@v4 requires a node.js runtime the plain
+          # nix/skopeo shell image doesn't provide, so check out with a bare
+          # git clone instead (git is pulled in via the nixery image path
+          # above).
+          git -c http.extraHeader="Authorization: Bearer ${GITHUB_TOKEN}" \
+            clone --no-checkout "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          {
+            echo "experimental-features = nix-command flakes"
+            # The job container runs as root with no nixbld user/group
+            # provisioned (single-container CI, not a real nix multi-user
+            # install), so the default multi-user sandboxed build fails with
+            # "the group 'nixbld' specified in 'build-users-group' does not
+            # exist". Disable the build-users-group so nix builds directly
+            # as the current (root) user instead of trying to sandbox to
+            # nixbld1..N.
+            echo "build-users-group ="
+          } > ~/.config/nix/nix.conf
+
+      - name: Compute image tags
+        id: tag
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build OCI image from flake
+        run: |
+          set -euo pipefail
+          # streamLayeredImage produces `result`, an executable that streams
+          # the image tar to stdout. Materialize it to a tarball skopeo can
+          # copy.
+          nix build .#pillar-oci-image
+          ./result > pillar-image.tar
+
+      - name: Log in to ghcr.io
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push to GitHub Container Registry
+        run: |
+          set -euo pipefail
+          # skopeo requires a container trust policy file; this build image
+          # has none provisioned by default ("no policy.json file found").
+          # Accept anything — the registry destination + creds are what
+          # actually gate the push, this policy only controls skopeo's own
+          # local signature verification (irrelevant for a same-host
+          # build->push).
+          mkdir -p /etc/containers
+          echo '{"default":[{"type":"insecureAcceptAnything"}]}' > /etc/containers/policy.json
+          version="${{ steps.tag.outputs.version }}"
+          dest_version="docker://${REGISTRY}/${IMAGE}:${version}"
+          dest_latest="docker://${REGISTRY}/${IMAGE}:latest"
+          # Push both the immutable version tag and the moving `latest` tag
+          # from the single built tarball. skopeo reuses the docker
+          # credential store populated by `docker login` above.
+          skopeo copy \
+            --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            docker-archive:pillar-image.tar "$dest_version"
+          skopeo copy \
+            --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            docker-archive:pillar-image.tar "$dest_latest"
+
+      - name: Resolve registry-served digest
+        run: |
+          set -euo pipefail
+          version="${{ steps.tag.outputs.version }}"
+          digest="$(skopeo inspect \
+            --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            --format '{{.Digest}}' \
+            "docker://${REGISTRY}/${IMAGE}:${version}")"
+          echo "Published ${REGISTRY}/${IMAGE}:${version} (and :latest) @ ${digest}"
