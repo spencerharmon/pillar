@@ -210,6 +210,25 @@ impl AuthSubkey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature(u64);
 
+impl Signature {
+    /// The opaque wire encoding of this signature — the exact bytes (as a
+    /// single integer, for this crate's no-real-crypto stand-in) that cross
+    /// the network from client to server. Never contains the password or
+    /// plaintext key (see
+    /// `password_and_plaintext_key_never_appear_in_any_server_observable_payload`).
+    #[must_use]
+    pub fn to_wire(&self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct a signature received over the wire (the server side of
+    /// [`to_wire`](Self::to_wire)).
+    #[must_use]
+    pub fn from_wire(value: u64) -> Self {
+        Signature(value)
+    }
+}
+
 /// Client-side unlock of a password-protected auth subkey fetched by CID.
 ///
 /// Runs the argon2id KDF over the password to recover the plaintext key

@@ -23,7 +23,7 @@ fn usage() -> &'static str {
      USAGE:\n\
      \x20 pillar apply    <manifest.txt>            validate, authorize, sign, emit a signed event\n\
      \x20 pillar get      <api> <kind> <name>       render a resource from the materialized view\n\
-     \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...]  boot a full peer and block\n\
+     \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\

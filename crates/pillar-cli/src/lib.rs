@@ -31,6 +31,7 @@
 
 pub mod onboard;
 pub mod run;
+pub mod web_serve;
 
 use std::collections::BTreeMap;
 use std::fmt;

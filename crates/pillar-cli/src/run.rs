@@ -46,6 +46,7 @@
 //! tests below; [`run`] itself only wires those results into the async swarm
 //! loop and blocks.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use libp2p::identity::Keypair;
@@ -63,6 +64,17 @@ const ENV_IDENTITY_KEY: &str = "PILLAR_IDENTITY_KEY";
 const ENV_DATA_DIR: &str = "PILLAR_DATA_DIR";
 const ENV_LISTEN: &str = "PILLAR_LISTEN";
 const ENV_DIAL: &str = "PILLAR_DIAL";
+/// `--web-bind` / `PILLAR_WEB_BIND`: the address the web UI listens on.
+/// Unset (the default) disables the web surface entirely — `node run` never
+/// opens a web listener unless explicitly configured.
+const ENV_WEB_BIND: &str = "PILLAR_WEB_BIND";
+/// `--web-port` / `PILLAR_WEB_PORT`: the port the web UI listens on, only
+/// consulted when a bind address is configured.
+const ENV_WEB_PORT: &str = "PILLAR_WEB_PORT";
+
+/// The default web UI port when `--web-bind`/`PILLAR_WEB_BIND` is set but no
+/// port is given.
+pub const DEFAULT_WEB_PORT: u16 = 8642;
 
 /// Integration-rig-only: the value to publish once to the event-log
 /// gossipsub topic after boot settles. Unset in every production boot.
@@ -87,6 +99,16 @@ pub struct NodeConfig {
     /// libp2p multiaddrs (of already-running peers) to dial at boot — the
     /// rig's mesh-formation mechanism. May be empty (a first/seed node).
     pub dial: Vec<Multiaddr>,
+    /// The address the web UI listens on, if configured. `None` (the
+    /// default) means `node run` serves no web surface at all. When set to
+    /// a **non-loopback** address (e.g. `0.0.0.0`, so a k8s Service can
+    /// reach it), every signing action over that surface is gated through
+    /// [`pillar_web::authorize_nonloopback_signing_action`] — the loopback-
+    /// only bootstrap exemption never applies here.
+    pub web_bind: Option<IpAddr>,
+    /// The port the web UI listens on; only consulted when `web_bind` is
+    /// `Some`.
+    pub web_port: u16,
 }
 
 /// A failure resolving a [`NodeConfig`] from flags/env.
@@ -103,6 +125,22 @@ pub enum ConfigError {
     },
     /// An argument was not recognized.
     Unknown(String),
+    /// A `--web-bind` / `PILLAR_WEB_BIND` value did not parse as an IP
+    /// address.
+    BadWebBind {
+        /// The offending value.
+        value: String,
+        /// The parser's reason.
+        reason: String,
+    },
+    /// A `--web-port` / `PILLAR_WEB_PORT` value did not parse as a port
+    /// number.
+    BadWebPort {
+        /// The offending value.
+        value: String,
+        /// The parser's reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -113,6 +151,12 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "invalid listen multiaddr `{value}`: {reason}")
             }
             ConfigError::Unknown(arg) => write!(f, "unknown `node run` argument `{arg}`"),
+            ConfigError::BadWebBind { value, reason } => {
+                write!(f, "invalid --web-bind value `{value}`: {reason}")
+            }
+            ConfigError::BadWebPort { value, reason } => {
+                write!(f, "invalid --web-port value `{value}`: {reason}")
+            }
         }
     }
 }
@@ -139,6 +183,8 @@ impl NodeConfig {
         let mut data_dir: Option<PathBuf> = None;
         let mut listen: Vec<Multiaddr> = Vec::new();
         let mut dial: Vec<Multiaddr> = Vec::new();
+        let mut web_bind: Option<IpAddr> = None;
+        let mut web_port: Option<u16> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -167,6 +213,20 @@ impl NodeConfig {
                 "--dial" => {
                     let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--dial"))?;
                     dial.push(parse_listen(v)?);
+                    i += 2;
+                }
+                "--web-bind" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--web-bind"))?;
+                    web_bind = Some(parse_web_bind(v)?);
+                    i += 2;
+                }
+                "--web-port" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--web-port"))?;
+                    web_port = Some(parse_web_port(v)?);
                     i += 2;
                 }
                 other => return Err(ConfigError::Unknown(other.to_owned())),
@@ -210,11 +270,26 @@ impl NodeConfig {
             }
         }
 
+        // web_bind: explicit flag wins; else env; else disabled (no web
+        // surface). `node run` never opens a web listener unless configured.
+        if web_bind.is_none() {
+            if let Some(v) = env(ENV_WEB_BIND) {
+                web_bind = Some(parse_web_bind(&v)?);
+            }
+        }
+        if web_port.is_none() {
+            if let Some(v) = env(ENV_WEB_PORT) {
+                web_port = Some(parse_web_port(&v)?);
+            }
+        }
+
         Ok(NodeConfig {
             identity_key,
             data_dir,
             listen,
             dial,
+            web_bind,
+            web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
         })
     }
 
@@ -231,6 +306,20 @@ fn parse_listen(value: &str) -> Result<Multiaddr, ConfigError> {
             value: value.to_owned(),
             reason: e.to_string(),
         })
+}
+
+fn parse_web_bind(value: &str) -> Result<IpAddr, ConfigError> {
+    value.parse::<IpAddr>().map_err(|e| ConfigError::BadWebBind {
+        value: value.to_owned(),
+        reason: e.to_string(),
+    })
+}
+
+fn parse_web_port(value: &str) -> Result<u16, ConfigError> {
+    value.parse::<u16>().map_err(|e| ConfigError::BadWebPort {
+        value: value.to_owned(),
+        reason: e.to_string(),
+    })
 }
 
 /// A failure booting the peer.
@@ -369,6 +458,37 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
 
     tracing::info!("pillar peer running; press Ctrl-C to stop");
 
+    // Serve the web UI on a configurable, possibly non-loopback bind (see
+    // `crate::web_serve` for the auth-gate contract) — only when
+    // `--web-bind`/`PILLAR_WEB_BIND` was actually configured; unset, `node
+    // run` opens no web listener at all.
+    if let Some(web_bind) = config.web_bind {
+        match crate::web_serve::bind(web_bind, config.web_port) {
+            Ok(listener) => {
+                let bound = listener
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| format!("{web_bind}:{}", config.web_port));
+                tracing::info!(bound = %bound, "pillar web UI listening");
+                // Real deployments register auth keys / admit subjects out of
+                // band (the manifest-driven onboarding flow); this boot
+                // sequence opens the gated listener with an empty
+                // `WebAuthContext` — every non-loopback signing action is
+                // refused until a key is registered and its subject admitted,
+                // matching the "exposed ⇒ authenticated" invariant exactly.
+                let mut ctx = crate::web_serve::WebAuthContext::new(
+                    format!("https://{peer_id}"),
+                    pillar_core::NodeId::from("pillar-node"),
+                    16,
+                );
+                std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %web_bind, port = config.web_port, "pillar web UI failed to bind; continuing without it");
+            }
+        }
+    }
+
     // Integration-rig-only: once the listening addr(s) are confirmed and a
     // grace period elapses (letting `--dial` connections/gossipsub mesh
     // settle), publish PILLAR_TEST_PUBLISH's value once to the event-log
@@ -475,6 +595,41 @@ mod tests {
             cfg.listen,
             vec![DEFAULT_LISTEN.parse::<Multiaddr>().unwrap()]
         );
+        // No web surface unless explicitly configured.
+        assert_eq!(cfg.web_bind, None);
+        assert_eq!(cfg.web_port, DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn web_bind_flag_configures_a_non_loopback_surface() {
+        let args = vec![
+            s("--web-bind"),
+            s("0.0.0.0"),
+            s("--web-port"),
+            s("9999"),
+        ];
+        let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
+        assert_eq!(cfg.web_bind, Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+        assert_eq!(cfg.web_port, 9999);
+    }
+
+    #[test]
+    fn web_bind_env_configures_a_non_loopback_surface() {
+        let env = |k: &str| match k {
+            "PILLAR_WEB_BIND" => Some("0.0.0.0".to_owned()),
+            "PILLAR_WEB_PORT" => Some("7777".to_owned()),
+            _ => None,
+        };
+        let cfg = NodeConfig::from_args_env(&[], env).unwrap();
+        assert_eq!(cfg.web_bind, Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+        assert_eq!(cfg.web_port, 7777);
+    }
+
+    #[test]
+    fn bad_web_bind_value_errors() {
+        let args = vec![s("--web-bind"), s("not-an-ip")];
+        let err = NodeConfig::from_args_env(&args, no_env).unwrap_err();
+        assert!(matches!(err, ConfigError::BadWebBind { .. }));
     }
 
     #[test]

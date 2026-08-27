@@ -67,6 +67,9 @@ pub enum AuthError {
     NotLocalhost,
     /// A second factor was required but missing or did not match.
     SecondFactorRequired,
+    /// The request reached a non-loopback bind with no admitted WoT-key
+    /// login session — see [`authorize_nonloopback_signing_action`].
+    NotAuthenticated,
 }
 
 impl AuthMode {
@@ -430,6 +433,56 @@ pub fn bind_localhost(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind(("127.0.0.1", port))
 }
 
+/// Bind a TCP listener for the web interface on a caller-chosen — including
+/// **non-loopback** (e.g. `0.0.0.0`) — address, so a k8s Service can reach
+/// it (flux's `pillar-web-ingress-tls` gate on this task).
+///
+/// Unlike [`bind_localhost`], this makes NO reachability claim by itself:
+/// every accepted connection MUST be gated through
+/// [`authorize_nonloopback_signing_action`] before a signing action is
+/// honored — binding non-loopback never implies the bootstrap exemption.
+///
+/// # Errors
+///
+/// Propagates [`std::io::Error`] if the address/port cannot be bound.
+pub fn bind_web(addr: std::net::IpAddr, port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind((addr, port))
+}
+
+/// Gate a signing action reaching the web UI when the listening socket may
+/// be non-loopback (see [`bind_web`]).
+///
+/// A **loopback** peer keeps the existing bootstrap exemption unchanged
+/// (same invariant [`AuthMode::authorize`] enforces): `Ok(())` regardless of
+/// `session`.
+///
+/// A **non-loopback** peer never gets that exemption — reachability off
+/// localhost REQUIRES an already-admitted WoT-key login `session`
+/// ([`key_login::KeyLoginVerifier::admit`]), the ROI's default gate for the
+/// exposed surface. Passkey/WebAuthn remains available as an OPTIONAL
+/// signer feeding the very same [`key_login`] decider
+/// ([`key_login::is_passkey_attested`]) rather than a parallel gate — so a
+/// passkey-attested login admits through here identically to a
+/// software-unlocked one, and an unauthenticated request (`session: None`)
+/// is always refused.
+///
+/// # Errors
+///
+/// [`AuthError::NotAuthenticated`] if `peer` is not loopback and no
+/// `session` is presented.
+pub fn authorize_nonloopback_signing_action(
+    peer: &SocketAddr,
+    session: Option<&key_login::LoginSession>,
+) -> Result<(), AuthError> {
+    if peer.ip().is_loopback() {
+        return Ok(());
+    }
+    match session {
+        Some(_) => Ok(()),
+        None => Err(AuthError::NotAuthenticated),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +611,65 @@ mod tests {
         let listener = bind_localhost(0).expect("bind an ephemeral localhost port");
         let addr = listener.local_addr().expect("local_addr");
         assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn bind_web_binds_a_non_loopback_address_on_an_ephemeral_port() {
+        let listener =
+            bind_web(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0).expect("bind an ephemeral non-loopback port");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(!addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn nonloopback_signing_action_with_no_session_is_refused() {
+        assert_eq!(
+            authorize_nonloopback_signing_action(&remote(8080), None),
+            Err(AuthError::NotAuthenticated)
+        );
+    }
+
+    #[test]
+    fn loopback_signing_action_keeps_the_bootstrap_exemption_even_without_a_session() {
+        assert_eq!(authorize_nonloopback_signing_action(&loopback(8080), None), Ok(()));
+    }
+
+    #[test]
+    fn nonloopback_signing_action_with_an_admitted_wot_key_session_is_allowed() {
+        use key_login::{EncryptedAuthSubkey, KeyLoginVerifier, NonceIssuer, RegisteredAuthKey};
+        use pillar_identity::NodeSubkey;
+        use pillar_wot_authority::{FencedActor, WotAuthority};
+
+        const PASSWORD: &str = "correct horse battery staple";
+        const SECRET: &str = "plaintext-auth-subkey-secret";
+
+        let subkey = NodeSubkey::from("auth-subkey-nonloopback");
+        let encrypted = EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
+
+        let mut verifier = KeyLoginVerifier::new();
+        verifier.register_auth_key(RegisteredAuthKey::register(&encrypted, PASSWORD, SECRET));
+
+        let mut issuer = NonceIssuer::new("https://pillar.example.com");
+        let nonce = issuer.issue(10);
+        verifier.track_issued(nonce.clone());
+
+        let unlocked = key_login::unlock_auth_subkey(&encrypted, PASSWORD, SECRET).expect("unlock");
+        let signature = unlocked.sign_nonce(&nonce);
+
+        let owner = NodeId::from("owner");
+        let mut authority = WotAuthority::new(owner.clone(), 4);
+        authority.issue_edge(owner, subkey.node_id(), 4);
+        let mut actor = FencedActor::new();
+        actor.refresh(&authority);
+
+        let session = verifier
+            .admit(&nonce, &signature, &subkey, issuer.origin(), 0, &authority, &actor)
+            .expect("admitted");
+
+        assert_eq!(
+            authorize_nonloopback_signing_action(&remote(8080), Some(&session)),
+            Ok(())
+        );
     }
 
     #[test]
