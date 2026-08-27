@@ -164,12 +164,6 @@ jobs:
           # copy.
           ./result > pillar-image.tar
 
-      - name: Log in to ghcr.io
-        run: |
-          set -euo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
       - name: Push to GitHub Container Registry
         run: |
           set -euo pipefail
@@ -185,8 +179,10 @@ jobs:
           dest_version="docker://${REGISTRY}/${IMAGE}:${version}"
           dest_latest="docker://${REGISTRY}/${IMAGE}:latest"
           # Push both the immutable version tag and the moving `latest` tag
-          # from the single built tarball. skopeo reuses the docker
-          # credential store populated by `docker login` above.
+          # from the single built tarball. Auth is passed directly via
+          # `--dest-creds` (this build image has no `docker` binary at all,
+          # so a prior `docker login` step is neither possible nor needed —
+          # skopeo never reads/needs a docker credential store here).
           skopeo copy \
             --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
             docker-archive:pillar-image.tar "$dest_version"
