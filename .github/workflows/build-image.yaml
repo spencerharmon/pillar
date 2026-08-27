@@ -62,6 +62,11 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: nixery.dev/shell/nix/skopeo/git/gnused
+    env:
+      # The nixery container has no /etc/passwd entry for the runner's uid,
+      # so nix (and anything else that calls getpwuid) fails with "cannot
+      # determine user's home directory" unless HOME is set explicitly.
+      HOME: /root
     steps:
       - name: Checkout pillar
         env:
