@@ -129,11 +129,18 @@ jobs:
           set -euo pipefail
           echo "DEBUG: HOME=${HOME:-<unset>} whoami=$(whoami 2>&1 || true) id=$(id)"
           ls -la "$HOME" || true
-          env | sort
+          # The nixery base image has no /etc/passwd entry for uid 0 at all
+          # (whoami/getpwuid both fail), and nix's home-dir resolution
+          # apparently still consults NSS/getpwuid in a path that ignores
+          # $HOME on this uid — add an explicit passwd entry so it resolves.
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+          getent passwd "$(id -u)" || true
           # streamLayeredImage produces `result`, an executable that streams
           # the image tar to stdout. Materialize it to a tarball skopeo can
           # copy.
-          nix -vvvv build .#pillar-oci-image
+          nix build .#pillar-oci-image
           ./result > pillar-image.tar
 
       - name: Log in to ghcr.io
