@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
 
 use pillar_cli::{parse_crd, HelmChart};
+use pillar_identity::bootstrap::CellGenesis;
 use pillar_identity::{NodeSubkey, UserPrimary};
 use pillar_web::{AuthMode, Bootstrap};
 
@@ -26,6 +27,7 @@ fn usage() -> &'static str {
      \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
+     \x20 pillar bootstrap-cell --cell-key K --cell-name N --node-key K [--user-key K --user-handle H]  derive a cell genesis CID + node subkey (+ a user genesis CID within the cell)\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
      \x20 pillar render kustomize <base.txt>        (see library API for overlay construction)\n\
      \x20 pillar --web [--port N]                  serve the localhost-only bootstrap/web UI\n\
@@ -46,7 +48,7 @@ fn main() -> ExitCode {
         Some("node") => node(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("onboard") => onboard(),
-        Some("apply") | Some("get") | Some("describe") => {
+        Some("bootstrap-cell") => bootstrap_cell(&args[1..]),        Some("apply") | Some("get") | Some("describe") => {
             // These verbs act over a live, persistent platform, which this
             // demonstration shell does not host. The library `Platform` API is
             // the authoritative entry point; print guidance rather than fake
@@ -83,8 +85,72 @@ fn onboard() -> ExitCode {
     }
 }
 
-/// `pillar node run [flags]`: boot a full peer and block until shutdown.
+/// `pillar bootstrap-cell`: derive a cell genesis CID + its node subkey, and
+/// (optionally) a user genesis CID scoped to that cell.
 ///
+/// This is the deployment primitive behind ROI P2 "Deploy target:
+/// spencer@pillar on flux": it drives [`pillar_identity::bootstrap`] to
+/// content-address the cell (cold root) from its root key + name, chain the
+/// deployed node to it, and — when a user is named — derive the user's
+/// genesis CID within that cell. All derivation is pure and deterministic;
+/// this shell only parses flags and prints the CIDs an operator (or the
+/// NEEDS-HUMAN login-verification handoff) needs.
+fn bootstrap_cell(args: &[String]) -> ExitCode {
+    let mut cell_key: Option<String> = None;
+    let mut cell_name: Option<String> = None;
+    let mut node_key: Option<String> = None;
+    let mut user_key: Option<String> = None;
+    let mut user_handle: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let Some(value) = args.get(i + 1) else {
+            eprintln!("{flag} requires a value");
+            return ExitCode::from(2);
+        };
+        match flag {
+            "--cell-key" => cell_key = Some(value.clone()),
+            "--cell-name" => cell_name = Some(value.clone()),
+            "--node-key" => node_key = Some(value.clone()),
+            "--user-key" => user_key = Some(value.clone()),
+            "--user-handle" => user_handle = Some(value.clone()),
+            other => {
+                eprintln!("unknown bootstrap-cell argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+        i += 2;
+    }
+
+    let (Some(cell_key), Some(cell_name), Some(node_key)) = (cell_key, cell_name, node_key) else {
+        eprintln!(
+            "usage: pillar bootstrap-cell --cell-key <fpr> --cell-name <name> --node-key <fpr> \
+             [--user-key <fpr> --user-handle <handle>]"
+        );
+        return ExitCode::from(2);
+    };
+
+    let cell = CellGenesis::bootstrap(&cell_key, &cell_name, &node_key);
+    println!("cell-cid {}", cell.cell_cid());
+    println!("node-subkey {}", cell.node.0);
+
+    match (user_key, user_handle) {
+        (Some(key), Some(handle)) => {
+            let user = cell.create_user(&key, &handle);
+            println!("user-handle {handle}");
+            println!("user-cid {}", user.user_cid());
+        }
+        (None, None) => {}
+        _ => {
+            eprintln!("--user-key and --user-handle must be given together");
+            return ExitCode::from(2);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `pillar node run [flags]`: boot a full peer and block until shutdown.
 /// Delegates entirely to the unit-tested [`pillar_cli::run`] module: it
 /// resolves a [`pillar_cli::run::NodeConfig`] from flags layered over env,
 /// then drives the async boot sequence (identity load, streamdb open, libp2p

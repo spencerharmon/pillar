@@ -2249,6 +2249,7 @@ name = "pillar-identity"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-streamdb",
 ]
 
 [[package]]
