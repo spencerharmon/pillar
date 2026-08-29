@@ -1,0 +1,19 @@
+[package]
+name = "pillar-recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Layered backup & recovery: encrypted-to-recovery-key backup blob over the sealed-artifact transport, Shamir k-of-n social split, and WoT social re-vouch, refining specs/Recovery.tla."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
+pillar-rbac = { path = "../pillar-rbac" }
+pillar-key-distribution = { path = "../pillar-key-distribution" }
+pillar-net = { path = "../pillar-net" }
+sha3 = "0.10.9"
+
+[lints]
+workspace = true

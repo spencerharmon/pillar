@@ -2307,6 +2307,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-recovery"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+ "pillar-key-distribution",
+ "pillar-net",
+ "pillar-rbac",
+ "pillar-wot-authority",
+ "sha3",
+]
+
+[[package]]
 name = "pillar-streamdb"
 version = "0.0.0"
 dependencies = [
