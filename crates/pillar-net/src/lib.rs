@@ -24,8 +24,12 @@
 //!   reached (e.g. because they are behind a NAT).
 
 use libp2p::{
-    dcutr, gossipsub, identify, identity::Keypair, kad, noise, relay,
-    swarm::behaviour::toggle::Toggle, tcp, upnp, yamux, PeerId, Swarm,
+    core::{muxing::StreamMuxerBox, upgrade::Version},
+    dcutr, gossipsub, identify, identity::Keypair, kad, noise,
+    pnet::{PnetConfig, PreSharedKey},
+    relay,
+    swarm::behaviour::toggle::Toggle,
+    tcp, upnp, yamux, PeerId, Swarm, Transport,
 };
 
 pub mod blob;
@@ -138,27 +142,93 @@ fn identify_config(keypair: &Keypair) -> identify::Config {
 /// Builds a [`Swarm`] running [`EventBehaviour`] (gossipsub + kademlia +
 /// identify) over TCP and QUIC transports, using a freshly generated
 /// identity.
+///
+/// This is the OPEN default: no pnet pre-shared key, TCP + QUIC both
+/// available, free to dial/be-dialed by any peer that speaks the
+/// `/pillar/kad` protocol. Use [`build_event_swarm_with_root`] to build a
+/// node bound to a configured [`PrivateSwarmKey`] instead.
 pub fn build_event_swarm(
     keypair: Keypair,
 ) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
-    let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_quic()
-        .with_behaviour(|key| {
-            let peer_id = key.public().to_peer_id();
-            EventBehaviour {
-                gossipsub: gossipsub_behaviour(key),
-                kademlia: new_kademlia(peer_id),
-                identify: identify::Behaviour::new(identify_config(key)),
-            }
-        })?
-        .build();
+    build_event_swarm_with_root(keypair, PrivateSwarmKey::disabled())
+}
+
+/// Builds a [`Swarm`] running [`EventBehaviour`] whose TRANSPORT is bound to
+/// `root`'s configured [`PrivateSwarmKey`].
+///
+/// - `root.is_enabled() == false` (the public default): identical to
+///   [`build_event_swarm`] — TCP + QUIC, open to any peer.
+/// - `root.is_enabled() == true` (a configured private network root): the
+///   swarm runs over TCP ONLY, wrapped in the libp2p pnet pre-shared-key
+///   handshake ([`libp2p::pnet::PnetConfig`]) derived from the root. A peer
+///   whose transport-level handshake carries a DIFFERENT (or no) key can
+///   never complete the pnet XSalsa20 handshake at all — the connection is
+///   refused below every higher protocol (noise, yamux, kademlia), so a
+///   mismatched-root peer cannot even reach the point of speaking
+///   `/pillar/kad` to probe the DHT. This is the "two swarms configured with
+///   different roots do not discover each other" guarantee: it is enforced
+///   by the pnet handshake refusing to complete, not by any DHT-level check.
+///   QUIC is not offered in this mode: QUIC's own TLS handshake is not
+///   pnet-wrapped by this crate, so admitting it would open a side channel
+///   that bypasses the root check.
+pub fn build_event_swarm_with_root(
+    keypair: Keypair,
+    root: PrivateSwarmKey,
+) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    let swarm = match root.0 {
+        None => libp2p::SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_quic()
+            .with_behaviour(|key| {
+                let peer_id = key.public().to_peer_id();
+                EventBehaviour {
+                    gossipsub: gossipsub_behaviour(key),
+                    kademlia: new_kademlia(peer_id),
+                    identify: identify::Behaviour::new(identify_config(key)),
+                }
+            })?
+            .build(),
+        Some(key) => {
+            let psk = PreSharedKey::new(key);
+            libp2p::SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_other_transport(|kp| pnet_tcp_transport(kp, psk))?
+                .with_behaviour(|key| {
+                    let peer_id = key.public().to_peer_id();
+                    EventBehaviour {
+                        gossipsub: gossipsub_behaviour(key),
+                        kademlia: new_kademlia(peer_id),
+                        identify: identify::Behaviour::new(identify_config(key)),
+                    }
+                })?
+                .build()
+        }
+    };
     Ok(swarm)
+}
+
+/// Builds a TCP transport wrapped in the pnet pre-shared-key handshake, then
+/// noise-authenticated and yamux-multiplexed exactly like the open
+/// [`build_event_swarm`]'s TCP leg — the only difference is the pnet layer
+/// interposed BELOW noise, so a peer without the matching key never gets far
+/// enough to attempt the noise handshake at all.
+fn pnet_tcp_transport(
+    keypair: &Keypair,
+    psk: PreSharedKey,
+) -> libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)> {
+    let pnet_config = PnetConfig::new(psk);
+    tcp::tokio::Transport::new(tcp::Config::default())
+        .and_then(move |socket, _| pnet_config.handshake(socket))
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(keypair).expect("static noise config is valid"))
+        .multiplex(yamux::Config::default())
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
+        .boxed()
 }
 
 /// Builds a [`Swarm`] running [`RelayServerBehaviour`] over TCP, acting as a
@@ -314,30 +384,72 @@ pub fn seed_event_dht(
     seeds.len()
 }
 
-/// OFF-by-default hook for a libp2p private-swarm (pnet) pre-shared key.
+/// A libp2p private-swarm (pnet) pre-shared key, OFF by default.
 ///
 /// A pnet key XORs a per-connection stream cipher over every transport byte, so
 /// only peers holding the SAME key can complete a handshake — a fully-closed
 /// federation variant on top of the protocol-level restriction the `/pillar/kad`
-/// protocol name and seed-only bootstrap already give. This is reserved for that
-/// closed variant and is intentionally NOT wired into [`build_event_swarm`]: the
-/// default federation is open-to-invited-peers (join via a seed), not key-walled.
+/// protocol name and seed-only bootstrap already give.
 ///
-/// [`None`] (the default everywhere in core today) means "no pnet" — the swarm
-/// is built exactly as it is now. A future closed-variant build path threads a
-/// `Some(key)` through `SwarmBuilder::with_other_transport` to wrap the base
-/// transport in `libp2p::pnet::PnetConfig`; that path is deliberately left
-/// unbuilt here so public-IPFS interop and the open default stay untouched.
-#[derive(Debug, Clone, Default)]
+/// This is Pillar's **network root**: the identity of the physical swarm a
+/// node's packets can reach, completely distinct from a `cell` key (WoT/
+/// identity genesis *within* whichever network the node joined — a private
+/// network still has cells, authority is untouched by this value). The
+/// public default (`disabled()` / [`PrivateSwarmKey::default`]) means the
+/// well-known OPEN federation: [`build_event_swarm`] wires no pnet layer at
+/// all, so any peer that knows a seed can join, matching the ROI's "public
+/// pillar ships a well-known public root" default.
+///
+/// Configuring a root ([`PrivateSwarmKey::from_root_secret`]) derives a
+/// pre-shared key from an operator-chosen secret and, threaded through
+/// [`build_event_swarm_with_root`], makes the swarm's TRANSPORT itself
+/// refuse any peer whose configured root differs: the pnet handshake below
+/// noise/yamux never completes, so a mismatched-root peer never reaches far
+/// enough to speak `/pillar/kad` — DHT membership is validated at the
+/// transport layer, not by a higher-level check that a malicious/mismatched
+/// peer could bypass. Every pillar node is inherently a seed node; there is
+/// no separate seed daemon — standing up a private/app-specific network is
+/// exactly "configure the same root on each node, then point each node at
+/// one or more owned nodes as its `--seed`s" via the existing
+/// `federation-seed-bootstrap` seed-dial mechanism ([`parse_seed_multiaddr`]
+/// / [`seed_event_dht`]), reused unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrivateSwarmKey(pub Option<[u8; 32]>);
 
 impl PrivateSwarmKey {
-    /// The default: no private-swarm key, i.e. the open federation substrate.
+    /// The default: no private-swarm key, i.e. the open, well-known public
+    /// federation substrate.
     pub fn disabled() -> Self {
         Self(None)
     }
 
-    /// Whether a pre-shared key is configured (the fully-closed variant).
+    /// Derives a private-swarm pre-shared key from an operator-configured
+    /// network root secret (the `--network-root` / `PILLAR_NETWORK_ROOT`
+    /// value).
+    ///
+    /// The derivation is a single SHAKE256 pass over the raw secret bytes,
+    /// producing a fixed 32-byte pnet key: same root text always derives the
+    /// SAME key (so every node an operator configures with that root secret
+    /// converges on one pnet swarm), and two DIFFERENT root secrets derive
+    /// two keys that are indistinguishable from independent random keys to
+    /// the pnet handshake — there is no feasible way for a peer holding one
+    /// root to derive or guess the pnet key of a different root, so a
+    /// mismatched root is refused exactly as if the peer held no key at
+    /// all. This is deliberately a plain hash (not a slow KDF like argon2):
+    /// pnet is a network-membership gate, not a password store, and the
+    /// "secret" here is expected to be a generated high-entropy value the
+    /// operator distributes to their own nodes, not a guessable password.
+    pub fn from_root_secret(root_secret: &str) -> Self {
+        use sha3::digest::{ExtendableOutput, Update, XofReader};
+        let mut hasher = sha3::Shake256::default();
+        hasher.update(b"pillar-network-root-psk-v1");
+        hasher.update(root_secret.as_bytes());
+        let mut key = [0u8; 32];
+        hasher.finalize_xof().read(&mut key);
+        Self(Some(key))
+    }
+
+    /// Whether a pre-shared key is configured (a private network root).
     pub fn is_enabled(&self) -> bool {
         self.0.is_some()
     }
@@ -911,12 +1023,26 @@ mod tests {
         assert!(parse_seed_multiaddr(no_p2p).is_err());
     }
 
-    /// The pnet hook is OFF by default and is a pure, unbuilt reservation.
+    /// The private-swarm key is OFF by default (the public root); a root
+    /// secret derives a stable, deterministic key.
     #[test]
     fn private_swarm_key_is_off_by_default() {
         assert!(!PrivateSwarmKey::default().is_enabled());
         assert!(!PrivateSwarmKey::disabled().is_enabled());
         assert!(PrivateSwarmKey(Some([7u8; 32])).is_enabled());
+    }
+
+    /// The same root secret always derives the SAME pnet key (so every node
+    /// an operator configures with that root converges on one swarm), and
+    /// two different root secrets derive two different keys.
+    #[test]
+    fn root_secret_derivation_is_stable_and_distinct() {
+        let a1 = PrivateSwarmKey::from_root_secret("my-private-network");
+        let a2 = PrivateSwarmKey::from_root_secret("my-private-network");
+        let b = PrivateSwarmKey::from_root_secret("a-different-network");
+        assert!(a1.is_enabled());
+        assert_eq!(a1, a2, "same root secret must derive the identical key");
+        assert_ne!(a1, b, "different root secrets must derive different keys");
     }
 
     /// Federation join via a seed: a local seed peer listens, and a separate
@@ -989,6 +1115,168 @@ mod tests {
         assert!(
             found,
             "joiner configured only with the seed must enter the DHT and resolve it"
+        );
+    }
+
+    /// The public-root default path is unchanged: [`build_event_swarm`] (no
+    /// root configured) still bootstraps a real gossipsub + kademlia swarm,
+    /// exactly as `gossipsub_delivers_across_local_swarm` /
+    /// `kademlia_discovers_peer` already exercise. This proves
+    /// [`build_event_swarm_with_root`] with a disabled root degrades to
+    /// EXACTLY [`build_event_swarm`]'s behaviour — the private-root wiring is
+    /// strictly additive.
+    #[tokio::test]
+    async fn public_root_default_path_unchanged() {
+        let mut a =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), PrivateSwarmKey::disabled())
+                .unwrap();
+        let mut b = build_event_swarm(Keypair::generate_ed25519()).unwrap();
+        let b_peer_id = *b.local_peer_id();
+
+        let b_addr = listen_and_get_addr(&mut b).await;
+        a.behaviour_mut()
+            .kademlia
+            .add_address(&b_peer_id, b_addr.clone());
+        a.dial(b_addr.with(Protocol::P2p(b_peer_id))).unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                b.select_next_some().await;
+            }
+        });
+
+        drive_until(&mut a, Duration::from_secs(10), |event| match event {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == b_peer_id => Some(()),
+            _ => None,
+        })
+        .await;
+
+        let query_id = a.behaviour_mut().kademlia.get_closest_peers(b_peer_id);
+        let found = drive_until(&mut a, Duration::from_secs(15), |event| match event {
+            SwarmEvent::Behaviour(EventBehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    id,
+                    result: kad::QueryResult::GetClosestPeers(Ok(result)),
+                    step,
+                    ..
+                },
+            )) if *id == query_id && step.last => {
+                Some(result.peers.iter().any(|p| p.peer_id == b_peer_id))
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            found,
+            "the unconfigured (public) root path must still bootstrap/discover exactly as before"
+        );
+    }
+
+    /// Two nodes configured with DIFFERENT network roots do NOT discover each
+    /// other: the pnet pre-shared-key handshake mismatches below noise/yamux,
+    /// so the transport-level connection never completes and no
+    /// `ConnectionEstablished` event is ever produced on either side within a
+    /// bounded window — proving the refusal happens at the pnet layer, not
+    /// merely "the DHT query timed out for some other reason".
+    #[tokio::test]
+    async fn mismatched_roots_never_establish_a_connection() {
+        let root_a = PrivateSwarmKey::from_root_secret("network-alpha");
+        let root_b = PrivateSwarmKey::from_root_secret("network-beta");
+
+        let mut a =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_a).unwrap();
+        let mut b =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_b).unwrap();
+        let b_peer_id = *b.local_peer_id();
+
+        let b_addr = listen_and_get_addr(&mut b).await;
+        a.dial(b_addr.with(Protocol::P2p(b_peer_id))).unwrap();
+
+        // Drive both swarms concurrently for a bounded window: a matching-key
+        // pair would establish a connection within a couple of seconds (see
+        // `same_root_and_seed_converges_in_the_dht` below); a mismatched pair
+        // must NOT, because the pnet handshake itself never completes.
+        let drive_a = async {
+            loop {
+                if let SwarmEvent::ConnectionEstablished { .. } = a.select_next_some().await {
+                    return true;
+                }
+            }
+        };
+        let drive_b = async {
+            loop {
+                if let SwarmEvent::ConnectionEstablished { .. } = b.select_next_some().await {
+                    return true;
+                }
+            }
+        };
+        let raced = futures::future::select(Box::pin(drive_a), Box::pin(drive_b));
+        let established = timeout(Duration::from_secs(5), raced).await;
+        assert!(
+            established.is_err(),
+            "peers configured with DIFFERENT network roots must never establish a connection \
+             (the pnet pre-shared-key handshake must refuse the mismatch)"
+        );
+    }
+
+    /// Two nodes configured with the SAME private root, pointed at each other
+    /// purely via `--seed` (never a raw `--dial`, and no public root/seed in
+    /// their config), converge: the joiner's Kademlia routing table becomes
+    /// non-empty and a discovery query resolves the seed — proving the
+    /// private-root + seed combination is sufficient to stand up an
+    /// independent swarm with the existing federation-seed-bootstrap
+    /// mechanism, no new mechanism required.
+    #[tokio::test]
+    async fn same_root_and_seed_converges_in_the_dht() {
+        let root = PrivateSwarmKey::from_root_secret("shared-private-root");
+
+        let mut seed =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root.clone()).unwrap();
+        let seed_peer_id = *seed.local_peer_id();
+        let seed_addr = listen_and_get_addr(&mut seed).await;
+        let seed_multiaddr = seed_addr.with(Protocol::P2p(seed_peer_id));
+
+        tokio::spawn(async move {
+            loop {
+                seed.select_next_some().await;
+            }
+        });
+
+        let mut joiner =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root).unwrap();
+        let seeds = vec![parse_seed_multiaddr(seed_multiaddr).unwrap()];
+        let added = seed_event_dht(&mut joiner, &seeds);
+        assert_eq!(added, 1, "one seed configured");
+
+        drive_until(&mut joiner, Duration::from_secs(15), |event| match event {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == seed_peer_id => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+
+        let query_id = joiner
+            .behaviour_mut()
+            .kademlia
+            .get_closest_peers(seed_peer_id);
+        let found = drive_until(&mut joiner, Duration::from_secs(15), |event| match event {
+            SwarmEvent::Behaviour(EventBehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    id,
+                    result: kad::QueryResult::GetClosestPeers(Ok(result)),
+                    step,
+                    ..
+                },
+            )) if *id == query_id && step.last => {
+                Some(result.peers.iter().any(|p| p.peer_id == seed_peer_id))
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            found,
+            "two nodes sharing the same private root, joined only via --seed, must converge in the DHT"
         );
     }
 }

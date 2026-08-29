@@ -26,6 +26,8 @@
 //! | `--data-dir` | `PILLAR_DATA_DIR` | `./pillar-data` |
 //! | `--listen` (repeatable) | `PILLAR_LISTEN` (comma/space list) | `/ip4/0.0.0.0/tcp/0` |
 //! | `--dial` (repeatable) | `PILLAR_DIAL` (comma/space list) | none |
+//! | `--seed` (repeatable) | `PILLAR_SEED_MULTIADDR` (comma/space list) | none (this node is itself a seed) |
+//! | `--network-root` | `PILLAR_NETWORK_ROOT` | none (the well-known public root) |
 //!
 //! `--dial` names peer multiaddrs to connect out to at boot — the rootless,
 //! multi-process integration rig's only mesh-formation mechanism, since this
@@ -72,6 +74,21 @@ const ENV_DIAL: &str = "PILLAR_DIAL";
 /// node. Seeds are discovery helpers, never a control plane — authority stays
 /// with the WoT.
 const ENV_SEED: &str = "PILLAR_SEED_MULTIADDR";
+/// `--network-root` / `PILLAR_NETWORK_ROOT`: the secret that defines this
+/// node's NETWORK — the physical libp2p swarm its packets can reach, not the
+/// WoT/cell identity within whichever network it joins. Unset (the default)
+/// means the well-known public root: [`pillar_net::PrivateSwarmKey::disabled`],
+/// the same open federation `build_event_swarm` has always built. Set to a
+/// secret value, the node derives a libp2p pnet pre-shared key from it
+/// ([`pillar_net::PrivateSwarmKey::from_root_secret`]) and only ever completes
+/// a transport handshake with a peer configured with the SAME root — a
+/// mismatched or absent root on the other side refuses the handshake below
+/// every higher protocol, so it can never dial into or be dialed by the
+/// public federation. Standing up a private/app-specific network needs no new
+/// mechanism: set the SAME `--network-root` on each owned node and point them
+/// at each other via the existing `--seed`/`PILLAR_SEED_MULTIADDR` — every
+/// pillar node is inherently a seed node.
+const ENV_NETWORK_ROOT: &str = "PILLAR_NETWORK_ROOT";
 /// `--web-bind` / `PILLAR_WEB_BIND`: the address the web UI listens on.
 /// Unset (the default) disables the web surface entirely — `node run` never
 /// opens a web listener unless explicitly configured.
@@ -113,6 +130,14 @@ pub struct NodeConfig {
     /// rather than merely opening a point-to-point connection. May be empty
     /// (this node is itself a seed / first node). Distinct from `dial`.
     pub seed: Vec<Multiaddr>,
+    /// The configured network root secret (`--network-root` /
+    /// `PILLAR_NETWORK_ROOT`), if any. `None` is the public default — the
+    /// well-known OPEN federation, no pnet pre-shared key. `Some(secret)`
+    /// derives a private-swarm key via
+    /// [`pillar_net::PrivateSwarmKey::from_root_secret`] so this node's
+    /// transport only ever completes a handshake with a peer configured with
+    /// the identical root.
+    pub network_root: Option<String>,
     /// The address the web UI listens on, if configured. `None` (the
     /// default) means `node run` serves no web surface at all. When set to
     /// a **non-loopback** address (e.g. `0.0.0.0`, so a k8s Service can
@@ -198,6 +223,7 @@ impl NodeConfig {
         let mut listen: Vec<Multiaddr> = Vec::new();
         let mut dial: Vec<Multiaddr> = Vec::new();
         let mut seed: Vec<Multiaddr> = Vec::new();
+        let mut network_root: Option<String> = None;
         let mut web_bind: Option<IpAddr> = None;
         let mut web_port: Option<u16> = None;
 
@@ -233,6 +259,13 @@ impl NodeConfig {
                 "--seed" => {
                     let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--seed"))?;
                     seed.push(parse_listen(v)?);
+                    i += 2;
+                }
+                "--network-root" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--network-root"))?;
+                    network_root = Some(v.clone());
                     i += 2;
                 }
                 "--web-bind" => {
@@ -300,6 +333,12 @@ impl NodeConfig {
             }
         }
 
+        // Network root: explicit flag wins; else env; else the public
+        // default (`None` — no pnet key, the well-known open federation).
+        if network_root.is_none() {
+            network_root = env(ENV_NETWORK_ROOT);
+        }
+
         // web_bind: explicit flag wins; else env; else disabled (no web
         // surface). `node run` never opens a web listener unless configured.
         if web_bind.is_none() {
@@ -319,6 +358,7 @@ impl NodeConfig {
             listen,
             dial,
             seed,
+            network_root,
             web_bind,
             web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
         })
@@ -486,9 +526,18 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         "pillar streaming DB opened (durable, content-addressed)"
     );
 
-    // Transport: bring up the libp2p event swarm and subscribe to the log topic.
-    let mut swarm =
-        pillar_net::build_event_swarm(keypair).map_err(|e| BootError::Transport(e.to_string()))?;
+    // Transport: bring up the libp2p event swarm and subscribe to the log
+    // topic. The configured network root (`None` == the public default)
+    // selects whether the transport is pnet-walled to a private swarm.
+    let root = match &config.network_root {
+        Some(secret) => {
+            tracing::info!("pillar peer configured with a PRIVATE network root (pnet-walled transport)");
+            pillar_net::PrivateSwarmKey::from_root_secret(secret)
+        }
+        None => pillar_net::PrivateSwarmKey::disabled(),
+    };
+    let mut swarm = pillar_net::build_event_swarm_with_root(keypair, root)
+        .map_err(|e| BootError::Transport(e.to_string()))?;
     let topic = pillar_net::event_log_topic();
     swarm
         .behaviour_mut()
@@ -902,5 +951,48 @@ mod tests {
     fn missing_seed_value_errors() {
         let err = NodeConfig::from_args_env(&[s("--seed")], no_env).unwrap_err();
         assert_eq!(err, ConfigError::MissingValue("--seed"));
+    }
+
+    #[test]
+    fn network_root_defaults_unset_the_public_default() {
+        let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
+        assert_eq!(
+            cfg.network_root, None,
+            "no configured root means the well-known public federation"
+        );
+    }
+
+    #[test]
+    fn network_root_flag_configures_a_private_root() {
+        let args = vec![s("--network-root"), s("my-app-secret-root")];
+        let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
+        assert_eq!(cfg.network_root, Some(s("my-app-secret-root")));
+    }
+
+    #[test]
+    fn network_root_env_fills_when_flag_absent() {
+        let env = |k: &str| match k {
+            ENV_NETWORK_ROOT => Some(s("env-root-secret")),
+            _ => None,
+        };
+        let cfg = NodeConfig::from_args_env(&[], env).unwrap();
+        assert_eq!(cfg.network_root, Some(s("env-root-secret")));
+    }
+
+    #[test]
+    fn network_root_flag_wins_over_env() {
+        let env = |k: &str| match k {
+            ENV_NETWORK_ROOT => Some(s("env-root-secret")),
+            _ => None,
+        };
+        let args = vec![s("--network-root"), s("flag-root-secret")];
+        let cfg = NodeConfig::from_args_env(&args, env).unwrap();
+        assert_eq!(cfg.network_root, Some(s("flag-root-secret")));
+    }
+
+    #[test]
+    fn missing_network_root_value_errors() {
+        let err = NodeConfig::from_args_env(&[s("--network-root")], no_env).unwrap_err();
+        assert_eq!(err, ConfigError::MissingValue("--network-root"));
     }
 }
