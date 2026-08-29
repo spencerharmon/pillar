@@ -19,6 +19,7 @@ trusted. Each document below links to the specification that proves its claims.
 | [identity.md](identity.md) | The OpenPGP key hierarchy and node-admission handshake (`specs/Registration.tla`) |
 | [plugin-surface.md](plugin-surface.md) | The complete out-of-tree plugin surface and each plugin's interface contract |
 | [observability.md](observability.md) | Built-in distributed observability: signal event schema, retention/sampling policy, and RBAC-decider read authority (`specs/Observability.tla`) |
+| [private-pillar.md](private-pillar.md) | Configuring a private network root + owned seeds to run an isolated, app-specific pillar deployment |
 
 ## Design principles
 
