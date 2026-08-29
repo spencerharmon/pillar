@@ -2260,6 +2260,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-key-distribution"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+ "pillar-net",
+]
+
+[[package]]
 name = "pillar-manifest"
 version = "0.0.0"
 dependencies = [
