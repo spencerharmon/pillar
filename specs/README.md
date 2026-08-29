@@ -21,6 +21,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `IPAM.tla` | `NoDoubleAllocation`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-ipam` (IPv4/IPv6 allocation from a delegated pool) | ROI P3 distributed-authority |
 | `WoTAuthority.tla` | `NoActionAfterRevocation`, `FailClosedUnderStaleView`, `TypeOK`, `CaughtUpBounded` | Web-of-Trust authority & RBAC (`wot-authority-impl`, `rbac-decider`): owner-anchored bounded-depth tsig reachability, 3 revocation kinds, revoke-before-act | ROI P1 WoT authority |
 | `AntiEntropy.tla` | `CausallyClosed`, `LogSubsetOfWritten`, `NoLostWrite`, `SelfComplete`, `TypeOK`, + liveness `Completeness` (`<>[]`) | anti-entropy sync (fills gossipsub's best-effort gaps): hypercore / SSB-EBT style range-based set reconciliation over a lossy channel | ROI P1 event order & integrity |
+| `IdentityLogin.tla` | `LoginRequiresValidChain`, `NoAmbientAuthority`, `TypeOK` | identity/keys/credentials/login (extends `Registration.tla` + `WoTAuthority.tla`): cold-root/operational-key/device-subkey hierarchy, certification + delegation-grant enrollment, self-revocation without the cold key, client-side-signature login primitive | ROI P1 identity, keys, credentials & login |
 
 ## Running the checker
 
