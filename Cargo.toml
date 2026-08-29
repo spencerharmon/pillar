@@ -14,6 +14,7 @@ members = [
     "crates/pillar-wot-authority",
     "crates/pillar-rbac",
     "crates/pillar-key-distribution",
+    "crates/pillar-cells",
     "crates/pillar-recovery",
     "crates/pillar-cli",
     "crates/pillar-web",
