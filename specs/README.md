@@ -24,6 +24,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `IdentityLogin.tla` | `LoginRequiresValidChain`, `NoAmbientAuthority`, `TypeOK` | identity/keys/credentials/login (extends `Registration.tla` + `WoTAuthority.tla`): cold-root/operational-key/device-subkey hierarchy, certification + delegation-grant enrollment, self-revocation without the cold key, client-side-signature login primitive | ROI P1 identity, keys, credentials & login |
 | `Recovery.tla` | `RecoveryPreservesAuthority`, `NoRecoveryFromNothing`, `ShamirThreshold`, `NoActionAfterRevocation`, `FailClosedUnderStaleView`, `FreshMarkBounded`, `TypeOK` | backup & recovery (extends the `Registration.tla`/`WoTAuthority.tla`/`IdentityLogin.tla` authority discipline): three layered recovery mechanisms — WoT social re-vouch, encrypted-to-recovery-keys backup blob with optional Shamir k-of-n split on the federation-restricted swarm, total-device-loss — at both the cell and user tiers; a recovered key regains a subset-or-equal of prior authority, never more | ROI P1 identity, keys, credentials & login -> backup & recovery |
 | `KeyDistribution.tla` | `TypeOK`, `SealedMatchesAllowlist`, `BiDirectionalConsent`, `FailClosedRevocation`, `CrossOwnerGate`, `EscrowTypeBound`, `NoRootEscrow`, `OpaqueConfidentiality` | key distribution & the offer system (conceptually extends `IdentityLogin.tla`'s device-subkey model): L0 sealed-artifact transport, L1 bi-directional offer/accept admission, L2 tag-based policy auto-distribution, escrow type-bound to operational keys only + OPAQUE-shaped confidentiality, cross-owner(-cell) offer explicit-confirmation gate | ROI P1 key distribution & the offer system |
+| `Cells.tla` | `TypeOK`, `VisibilitySound`, `ForwardSecrecyOnLeave`, `AtomicRotation`, `GrantScopeRespected`, `NamePtrResolves` | cells & confidentiality (conceptually extends `WoTAuthority.tla` + `KeyDistribution.tla`): public/cell-encrypted/recipient-sealed (per-node/per-cell/per-user) visibility classes, offer-system cell membership, cross-cell user-access grants (read-only/read-write, all-or-tags), group-key rotation with forward secrecy on member-leave atomic against writers, IPNS-format cell naming pointer | ROI P1 cells & confidentiality |
 
 ## Running the checker
 
@@ -109,3 +110,18 @@ pinned release into `./.tools/` (the path CI uses).
   spec is scoped to the per-author linear-chain range-sync contract that
   hypercore/SSB-EBT replicate; a follow-up spec composing the two would prove
   full-DAG anti-entropy.
+- `Cells` models a single cell as the unit of confidentiality: three visibility
+  classes (`Public` / `CellEncrypted` / `RecipientSealed`, the last at
+  per-node/per-cell/per-user granularity) whose decryptability is DERIVED from
+  the class + current world, never a separate mutable fact. Membership is
+  consumed as `KeyDistribution` ground truth (offer-system admitted). The group
+  key is an epoch counter re-sealed per epoch to its member set; a member-leave
+  rotates the key in the SAME transition it drops the member
+  (`ForwardSecrecyOnLeave`), and a `rotating` fence bars a write from straddling
+  a rotation (`AtomicRotation`). Cross-cell grants are `<<user, mode, scope>>`
+  (read-only/read-write x all-or-tags), proven to confine read/write to scope
+  (`GrantScopeRespected`). The IPNS-format `namePtr` only ever resolves to a
+  published root (`NamePtrResolves`). Safety-only (`-deadlock`): a quiesced cell
+  (stable membership, no pending write/rotation) is expected idle, not a fault.
+  The per-node-vs-per-cell cost/security posture is spelled out in
+  `docs/cells-confidentiality.md`.
