@@ -2257,6 +2257,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-observability"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+ "pillar-streamdb",
+ "pillar-wot-authority",
+]
+
+[[package]]
 name = "pillar-rbac"
 version = "0.0.0"
 dependencies = [

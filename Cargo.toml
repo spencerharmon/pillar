@@ -10,6 +10,7 @@ members = [
     "crates/pillar-identity",
     "crates/pillar-net",
     "crates/pillar-streamdb",
+    "crates/pillar-observability",
     "crates/pillar-wot-authority",
     "crates/pillar-rbac",
     "crates/pillar-cli",
