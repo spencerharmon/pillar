@@ -218,6 +218,131 @@ pub fn peer_id_of(keypair: &Keypair) -> PeerId {
     keypair.public().to_peer_id()
 }
 
+/// A federation seed peer: a well-known bootstrap node's dialable multiaddr
+/// paired with the [`PeerId`] it terminates at.
+///
+/// Seeds are how a joining node enters Pillar's OWN Kademlia DHT — the swarm
+/// that runs the `/pillar/kad/1.0.0` protocol, NOT the public IPFS DHT. Pillar
+/// never seeds Kademlia with the public IPFS bootstrap nodes and never announces
+/// itself as a public-IPFS provider, so the substrate is natively federation-
+/// restricted: content is reachable only to peers that joined via a federation
+/// seed. A seed is purely a discovery helper (it teaches the routing table where
+/// to start); it is NOT a control plane — authority stays with the WoT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedPeer {
+    /// The seed's `PeerId` (parsed from the `/p2p/<id>` component of its
+    /// multiaddr).
+    pub peer_id: PeerId,
+    /// The seed's dialable multiaddr WITHOUT the trailing `/p2p/<id>` — the
+    /// address Kademlia stores for the peer.
+    pub address: libp2p::Multiaddr,
+}
+
+/// A multiaddr offered as a federation seed did not carry a terminating
+/// `/p2p/<peer-id>` component, so the peer it identifies is unknown and it
+/// cannot be added to the routing table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedAddrMissingPeerId {
+    /// The offending multiaddr, rendered for the error message.
+    pub addr: String,
+}
+
+impl std::fmt::Display for SeedAddrMissingPeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "seed multiaddr {:?} has no /p2p/<peer-id> component; a federation seed \
+             must name the peer it dials (e.g. /ip4/…/tcp/…/p2p/12D3Koo…)",
+            self.addr
+        )
+    }
+}
+
+impl std::error::Error for SeedAddrMissingPeerId {}
+
+/// Parses a federation seed multiaddr into its [`SeedPeer`] parts.
+///
+/// The multiaddr MUST terminate in a `/p2p/<peer-id>` component; that peer id
+/// is what Kademlia keys its routing table on, and dialing an address with no
+/// known peer id cannot populate the DHT. Returns [`SeedAddrMissingPeerId`] when
+/// the `/p2p` component is absent.
+pub fn parse_seed_multiaddr(
+    addr: libp2p::Multiaddr,
+) -> Result<SeedPeer, SeedAddrMissingPeerId> {
+    use libp2p::multiaddr::Protocol;
+    let rendered = addr.to_string();
+    // The peer id lives in the LAST /p2p component; strip it off to get the
+    // bare dial address Kademlia stores.
+    let mut address = addr;
+    let peer_id = match address.pop() {
+        Some(Protocol::P2p(peer_id)) => peer_id,
+        _ => return Err(SeedAddrMissingPeerId { addr: rendered }),
+    };
+    Ok(SeedPeer { peer_id, address })
+}
+
+/// Seeds a node's [`EventBehaviour`] Kademlia routing table with one or more
+/// federation seed peers and kicks off a DHT bootstrap so the node actually
+/// enters the swarm.
+///
+/// For each seed this adds the `(peer_id, address)` pair to Kademlia (so the
+/// routing table is non-empty and the peer is dialable through the DHT) and
+/// then issues a single `kademlia.bootstrap()` — the query that walks outward
+/// from the seeds to fill the routing table with the rest of the federation.
+///
+/// Returns the number of seeds added. A bootstrap with an empty routing table
+/// is a no-op, so this only calls `bootstrap()` when at least one seed was
+/// added; the caller can treat a zero return as "no seeds configured — this is
+/// itself a seed/first node".
+pub fn seed_event_dht(
+    swarm: &mut Swarm<EventBehaviour>,
+    seeds: &[SeedPeer],
+) -> usize {
+    for seed in seeds {
+        swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(&seed.peer_id, seed.address.clone());
+    }
+    if !seeds.is_empty() {
+        // A bootstrap over an empty table errors (`NoKnownPeers`); we only get
+        // here with at least one seed added, so it always has a peer to start
+        // from. The error is still non-fatal — log-and-continue at the call
+        // site — because a joining node retries discovery as peers appear.
+        let _ = swarm.behaviour_mut().kademlia.bootstrap();
+    }
+    seeds.len()
+}
+
+/// OFF-by-default hook for a libp2p private-swarm (pnet) pre-shared key.
+///
+/// A pnet key XORs a per-connection stream cipher over every transport byte, so
+/// only peers holding the SAME key can complete a handshake — a fully-closed
+/// federation variant on top of the protocol-level restriction the `/pillar/kad`
+/// protocol name and seed-only bootstrap already give. This is reserved for that
+/// closed variant and is intentionally NOT wired into [`build_event_swarm`]: the
+/// default federation is open-to-invited-peers (join via a seed), not key-walled.
+///
+/// [`None`] (the default everywhere in core today) means "no pnet" — the swarm
+/// is built exactly as it is now. A future closed-variant build path threads a
+/// `Some(key)` through `SwarmBuilder::with_other_transport` to wrap the base
+/// transport in `libp2p::pnet::PnetConfig`; that path is deliberately left
+/// unbuilt here so public-IPFS interop and the open default stay untouched.
+#[derive(Debug, Clone, Default)]
+pub struct PrivateSwarmKey(pub Option<[u8; 32]>);
+
+impl PrivateSwarmKey {
+    /// The default: no private-swarm key, i.e. the open federation substrate.
+    pub fn disabled() -> Self {
+        Self(None)
+    }
+
+    /// Whether a pre-shared key is configured (the fully-closed variant).
+    pub fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 /// Optional decentralized overlay mesh: reliability resources (liveness), not
 /// safety.
 ///
@@ -735,5 +860,135 @@ mod tests {
         let decoded = MeshPeerRecord::decode(stored_op.payload())
             .expect("a record encoded by MeshPeerRecord::encode always decodes");
         assert_eq!(decoded, record);
+    }
+
+    /// Pillar's Kademlia runs its OWN protocol, not the public IPFS DHT's, and
+    /// is seeded with no bootstrap peers by default — so a freshly built node
+    /// carries neither the public-IPFS protocol name nor the public IPFS
+    /// bootstrap set. This is the federation-restriction invariant at the
+    /// config layer.
+    #[test]
+    fn kademlia_uses_pillar_protocol_not_public_ipfs() {
+        // The DHT protocol is Pillar's own, never the public IPFS `/ipfs/kad`.
+        assert_eq!(KAD_PROTOCOL_NAME, "/pillar/kad/1.0.0");
+        assert!(
+            !KAD_PROTOCOL_NAME.starts_with("/ipfs/"),
+            "pillar must not run the public IPFS DHT protocol"
+        );
+
+        // A freshly built node has an EMPTY routing table: no hardcoded
+        // public-IPFS bootstrap nodes are ever added. `kbuckets` iterates the
+        // routing table; on a fresh node it yields no entries.
+        let mut swarm = build_event_swarm(Keypair::generate_ed25519()).unwrap();
+        let entries: usize = swarm
+            .behaviour_mut()
+            .kademlia
+            .kbuckets()
+            .map(|b| b.num_entries())
+            .sum();
+        assert_eq!(
+            entries, 0,
+            "a fresh pillar node must carry no bootstrap peers (no public IPFS set)"
+        );
+    }
+
+    /// A seed multiaddr with a terminating `/p2p/<id>` parses into its peer id
+    /// and bare address; one without a `/p2p` component is rejected.
+    #[test]
+    fn seed_multiaddr_parsing() {
+        let peer = PeerId::random();
+        let full: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let parsed = parse_seed_multiaddr(full).expect("a /p2p seed parses");
+        assert_eq!(parsed.peer_id, peer);
+        assert_eq!(
+            parsed.address,
+            "/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap()
+        );
+
+        let no_p2p: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        assert!(parse_seed_multiaddr(no_p2p).is_err());
+    }
+
+    /// The pnet hook is OFF by default and is a pure, unbuilt reservation.
+    #[test]
+    fn private_swarm_key_is_off_by_default() {
+        assert!(!PrivateSwarmKey::default().is_enabled());
+        assert!(!PrivateSwarmKey::disabled().is_enabled());
+        assert!(PrivateSwarmKey(Some([7u8; 32])).is_enabled());
+    }
+
+    /// Federation join via a seed: a local seed peer listens, and a separate
+    /// joining node — configured ONLY with the seed's multiaddr, never a raw
+    /// dial — is seeded through [`seed_event_dht`], dials the seed, and enters
+    /// the DHT (its routing table becomes non-empty and a discovery query
+    /// resolves the seed).
+    #[tokio::test]
+    async fn joiner_enters_dht_via_seed_only() {
+        // The seed / first node: listens, and is otherwise a plain event node.
+        let mut seed = build_event_swarm(Keypair::generate_ed25519()).unwrap();
+        let seed_peer_id = *seed.local_peer_id();
+        let seed_addr = listen_and_get_addr(&mut seed).await;
+        let seed_multiaddr = seed_addr.with(Protocol::P2p(seed_peer_id));
+
+        // Keep the seed answering in the background for the rest of the test.
+        tokio::spawn(async move {
+            loop {
+                seed.select_next_some().await;
+            }
+        });
+
+        // The joiner: knows ONLY the seed multiaddr. Parse it and seed the DHT.
+        let mut joiner = build_event_swarm(Keypair::generate_ed25519()).unwrap();
+        let seeds = vec![parse_seed_multiaddr(seed_multiaddr).unwrap()];
+        let added = seed_event_dht(&mut joiner, &seeds);
+        assert_eq!(added, 1, "one seed configured");
+
+        // The routing table must now be non-empty: the seed is in it.
+        let entries: usize = joiner
+            .behaviour_mut()
+            .kademlia
+            .kbuckets()
+            .map(|b| b.num_entries())
+            .sum();
+        assert_eq!(
+            entries, 1,
+            "seeding must place the seed peer in the joiner's routing table"
+        );
+
+        // Driving the joiner: it dials the seed (the bootstrap query does) and
+        // establishes a connection, then a discovery query resolves the seed —
+        // proving it entered the DHT purely via the seed, with no raw --dial.
+        drive_until(&mut joiner, Duration::from_secs(15), |event| match event {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == seed_peer_id => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+
+        let query_id = joiner
+            .behaviour_mut()
+            .kademlia
+            .get_closest_peers(seed_peer_id);
+        let found = drive_until(&mut joiner, Duration::from_secs(15), |event| match event {
+            SwarmEvent::Behaviour(EventBehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    id,
+                    result: kad::QueryResult::GetClosestPeers(Ok(result)),
+                    step,
+                    ..
+                },
+            )) if *id == query_id && step.last => {
+                Some(result.peers.iter().any(|p| p.peer_id == seed_peer_id))
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            found,
+            "joiner configured only with the seed must enter the DHT and resolve it"
+        );
     }
 }

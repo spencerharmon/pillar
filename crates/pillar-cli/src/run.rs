@@ -64,6 +64,14 @@ const ENV_IDENTITY_KEY: &str = "PILLAR_IDENTITY_KEY";
 const ENV_DATA_DIR: &str = "PILLAR_DATA_DIR";
 const ENV_LISTEN: &str = "PILLAR_LISTEN";
 const ENV_DIAL: &str = "PILLAR_DIAL";
+/// `--seed` / `PILLAR_SEED_MULTIADDR`: one or more federation seed multiaddrs
+/// (each terminating in `/p2p/<peer-id>`) used to JOIN Pillar's own Kademlia
+/// DHT. Unlike `--dial` (a raw libp2p dial), a seed is added to the Kademlia
+/// routing table and a DHT bootstrap is issued from it, so the node actually
+/// enters the federation swarm. Unset means this node is itself a seed/first
+/// node. Seeds are discovery helpers, never a control plane — authority stays
+/// with the WoT.
+const ENV_SEED: &str = "PILLAR_SEED_MULTIADDR";
 /// `--web-bind` / `PILLAR_WEB_BIND`: the address the web UI listens on.
 /// Unset (the default) disables the web surface entirely — `node run` never
 /// opens a web listener unless explicitly configured.
@@ -99,6 +107,12 @@ pub struct NodeConfig {
     /// libp2p multiaddrs (of already-running peers) to dial at boot — the
     /// rig's mesh-formation mechanism. May be empty (a first/seed node).
     pub dial: Vec<Multiaddr>,
+    /// Federation seed multiaddrs used to JOIN Pillar's own Kademlia DHT: each
+    /// (terminating in `/p2p/<peer-id>`) is added to the routing table and a
+    /// DHT bootstrap is issued from it, so the node enters the federation swarm
+    /// rather than merely opening a point-to-point connection. May be empty
+    /// (this node is itself a seed / first node). Distinct from `dial`.
+    pub seed: Vec<Multiaddr>,
     /// The address the web UI listens on, if configured. `None` (the
     /// default) means `node run` serves no web surface at all. When set to
     /// a **non-loopback** address (e.g. `0.0.0.0`, so a k8s Service can
@@ -183,6 +197,7 @@ impl NodeConfig {
         let mut data_dir: Option<PathBuf> = None;
         let mut listen: Vec<Multiaddr> = Vec::new();
         let mut dial: Vec<Multiaddr> = Vec::new();
+        let mut seed: Vec<Multiaddr> = Vec::new();
         let mut web_bind: Option<IpAddr> = None;
         let mut web_port: Option<u16> = None;
 
@@ -213,6 +228,11 @@ impl NodeConfig {
                 "--dial" => {
                     let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--dial"))?;
                     dial.push(parse_listen(v)?);
+                    i += 2;
+                }
+                "--seed" => {
+                    let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--seed"))?;
+                    seed.push(parse_listen(v)?);
                     i += 2;
                 }
                 "--web-bind" => {
@@ -270,6 +290,16 @@ impl NodeConfig {
             }
         }
 
+        // Seed: explicit flags win; else a single env list; no default (a
+        // seed/first node has no seed to join through).
+        if seed.is_empty() {
+            if let Some(v) = env(ENV_SEED) {
+                for entry in v.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+                    seed.push(parse_listen(entry)?);
+                }
+            }
+        }
+
         // web_bind: explicit flag wins; else env; else disabled (no web
         // surface). `node run` never opens a web listener unless configured.
         if web_bind.is_none() {
@@ -288,6 +318,7 @@ impl NodeConfig {
             data_dir,
             listen,
             dial,
+            seed,
             web_bind,
             web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
         })
@@ -476,6 +507,28 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 tracing::warn!(%addr, error = %e, "pillar peer failed to dial configured peer")
             }
         }
+    }
+
+    // Federation join: parse each configured seed multiaddr and seed the
+    // Kademlia routing table, then kick a DHT bootstrap so this node enters
+    // Pillar's own swarm (NOT the public IPFS DHT). A malformed seed (no
+    // `/p2p/<peer-id>`) is logged and skipped — one bad seed never aborts boot.
+    // Seeds are discovery helpers only; authority stays with the WoT.
+    let mut seeds = Vec::with_capacity(config.seed.len());
+    for addr in &config.seed {
+        match pillar_net::parse_seed_multiaddr(addr.clone()) {
+            Ok(seed) => {
+                tracing::info!(%addr, peer_id = %seed.peer_id, "pillar peer configured federation seed");
+                seeds.push(seed);
+            }
+            Err(e) => tracing::warn!(%addr, error = %e, "ignoring malformed federation seed"),
+        }
+    }
+    let added = pillar_net::seed_event_dht(&mut swarm, &seeds);
+    if added > 0 {
+        tracing::info!(seeds = added, "pillar peer bootstrapping DHT from federation seed(s)");
+    } else {
+        tracing::info!("pillar peer has no federation seed; acting as a seed/first node");
     }
 
     tracing::info!("pillar peer running; press Ctrl-C to stop");
@@ -787,5 +840,67 @@ mod tests {
         assert!(!nested.exists());
         prepare_data_dir(&nested).unwrap();
         assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn seed_defaults_empty_and_is_distinct_from_dial() {
+        let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
+        assert!(cfg.seed.is_empty(), "no seed by default (a seed/first node)");
+        assert!(cfg.dial.is_empty(), "no dial by default");
+    }
+
+    #[test]
+    fn seed_flags_are_collected_and_repeatable() {
+        let args = vec![
+            s("--seed"),
+            s("/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWA6qcyKq9Ph8jNKa2P4kHwxwyF3vD4t5xNfBqkQ8mQmVn"),
+            s("--seed"),
+            s("/ip4/10.0.0.2/tcp/4001/p2p/12D3KooWA6qcyKq9Ph8jNKa2P4kHwxwyF3vD4t5xNfBqkQ8mQmVn"),
+        ];
+        let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
+        assert_eq!(cfg.seed.len(), 2);
+        // --dial and --seed are independent knobs.
+        assert!(cfg.dial.is_empty());
+    }
+
+    #[test]
+    fn seed_env_list_fills_when_flag_absent() {
+        let env = |k: &str| match k {
+            ENV_SEED => Some(s(
+                "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWA6qcyKq9Ph8jNKa2P4kHwxwyF3vD4t5xNfBqkQ8mQmVn, \
+                 /ip4/10.0.0.2/tcp/4001/p2p/12D3KooWA6qcyKq9Ph8jNKa2P4kHwxwyF3vD4t5xNfBqkQ8mQmVn",
+            )),
+            _ => None,
+        };
+        let cfg = NodeConfig::from_args_env(&[], env).unwrap();
+        assert_eq!(cfg.seed.len(), 2);
+    }
+
+    #[test]
+    fn seed_flag_wins_over_env_list() {
+        let env = |k: &str| match k {
+            ENV_SEED => Some(s(
+                "/ip4/10.0.0.9/tcp/4001/p2p/12D3KooWA6qcyKq9Ph8jNKa2P4kHwxwyF3vD4t5xNfBqkQ8mQmVn",
+            )),
+            _ => None,
+        };
+        let args = vec![
+            s("--seed"),
+            s("/ip4/127.0.0.1/tcp/1/p2p/12D3KooWA6qcyKq9Ph8jNKa2P4kHwxwyF3vD4t5xNfBqkQ8mQmVn"),
+        ];
+        let cfg = NodeConfig::from_args_env(&args, env).unwrap();
+        assert_eq!(cfg.seed.len(), 1);
+        assert_eq!(
+            cfg.seed[0],
+            "/ip4/127.0.0.1/tcp/1/p2p/12D3KooWA6qcyKq9Ph8jNKa2P4kHwxwyF3vD4t5xNfBqkQ8mQmVn"
+                .parse::<Multiaddr>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_seed_value_errors() {
+        let err = NodeConfig::from_args_env(&[s("--seed")], no_env).unwrap_err();
+        assert_eq!(err, ConfigError::MissingValue("--seed"));
     }
 }
