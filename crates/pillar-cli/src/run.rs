@@ -341,6 +341,13 @@ pub enum BootError {
     },
     /// The libp2p swarm could not be built or bound.
     Transport(String),
+    /// The durable streaming DB could not be opened under the data dir.
+    StreamDb {
+        /// The streaming DB root directory.
+        path: PathBuf,
+        /// A human-readable reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for BootError {
@@ -353,6 +360,9 @@ impl std::fmt::Display for BootError {
                 write!(f, "identity key {}: {reason}", path.display())
             }
             BootError::Transport(e) => write!(f, "transport bring-up: {e}"),
+            BootError::StreamDb { path, reason } => {
+                write!(f, "streaming DB {}: {reason}", path.display())
+            }
         }
     }
 }
@@ -430,8 +440,20 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let peer_id = pillar_net::peer_id_of(&keypair);
     tracing::info!(%peer_id, data_dir = %config.data_dir.display(), "pillar peer identity loaded");
 
-    // Streaming DB: the durable op store the controller reconciles against.
-    let mut stream = pillar_streamdb::Stream::new();
+    // Streaming DB: the durable, content-addressed op store the controller
+    // reconciles against, rooted under the data dir so ops survive a restart.
+    let streamdb_root = config.data_dir.join("streamdb");
+    let mut stream = pillar_streamdb::PersistentStream::open(&streamdb_root).map_err(|e| {
+        BootError::StreamDb {
+            path: streamdb_root.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    tracing::info!(
+        streamdb_root = %streamdb_root.display(),
+        ops = stream.stream().log().len(),
+        "pillar streaming DB opened (durable, content-addressed)"
+    );
 
     // Transport: bring up the libp2p event swarm and subscribe to the log topic.
     let mut swarm =
@@ -542,11 +564,14 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     let payload_text = String::from_utf8_lossy(&message.data).into_owned();
                     tracing::info!(payload = %payload_text, "pillar peer received gossip event");
                     // Every gossiped event-log message is an append-only op the
-                    // controller folds into the local stream view.
-                    let _ = stream.try_append(
+                    // controller folds into the local stream view AND durably
+                    // persists under the content-addressed data-dir store.
+                    if let Err(e) = stream.append(
                         message.data,
                         pillar_core::SideEffect::Convergent,
-                    );
+                    ) {
+                        tracing::warn!(error = %e, "pillar streaming DB append failed");
+                    }
                 }
             }
         }

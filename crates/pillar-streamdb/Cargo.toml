@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Content-addressed op-log CRDT + materialized view + snapshot/compaction: the Rust refinement of specs/StreamingDB.tla."
+description = "Content-addressed op-log CRDT + materialized view + snapshot/compaction, with a durable content-addressed on-disk backend: the Rust refinement of specs/StreamingDB.tla."
 
 [dependencies]
 pillar-core = { path = "../pillar-core" }

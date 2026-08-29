@@ -23,6 +23,9 @@ use std::fmt;
 
 use pillar_core::{SideEffect, ViewPolicy};
 
+mod persist;
+pub use persist::{PersistError, PersistentStream};
+
 /// A content address: the identity of an [`Op`], derived purely from its
 /// payload bytes.
 ///
@@ -333,6 +336,14 @@ impl Stream {
     pub fn log(&self) -> &OpLog {
         &self.log
     }
+
+    /// Mutable access to the underlying op-log, for the durable backend
+    /// ([`PersistentStream`]) to record an op whose admission it has already
+    /// enforced and whose bytes it has already persisted. Not a general-purpose
+    /// bypass of [`Stream::try_append`]'s policy gate.
+    pub(crate) fn log_mut(&mut self) -> &mut OpLog {
+        &mut self.log
+    }
 }
 
 /// A read-only view over a [`Stream`], carrying the policy it inherited from
@@ -387,6 +398,13 @@ pub struct PolicyViolation {
 }
 
 impl PolicyViolation {
+    /// Construct a policy violation for a refused effect. Used by the durable
+    /// backend ([`PersistentStream`]) to surface the same refusal the in-memory
+    /// [`Stream::try_append`] raises.
+    pub(crate) fn new(policy: ViewPolicy, effect: SideEffect) -> Self {
+        PolicyViolation { policy, effect }
+    }
+
     /// The policy that refused the effect.
     #[must_use]
     pub fn policy(&self) -> ViewPolicy {
