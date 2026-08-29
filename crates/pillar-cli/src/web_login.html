@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pillar — sign in</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #171c24;
+      --panel-2: #1f2733;
+      --accent: #5b9dff;
+      --accent-2: #7c5bff;
+      --text: #e6ebf2;
+      --muted: #8a97a8;
+      --ok: #3ddc97;
+      --err: #ff6b6b;
+      --border: #2a3340;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 20% -10%, #1b2740 0%, var(--bg) 55%);
+      color: var(--text);
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 420px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.45);
+      overflow: hidden;
+    }
+    .brand {
+      padding: 28px 28px 8px;
+      display: flex; align-items: center; gap: 12px;
+    }
+    .logo {
+      width: 40px; height: 40px; border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; color: #fff; font-size: 20px;
+    }
+    .brand h1 { font-size: 20px; margin: 0; letter-spacing: 0.5px; }
+    .brand .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    form, .portal { padding: 20px 28px 28px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 6px; }
+    input {
+      width: 100%; padding: 12px 14px;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 10px;
+      font-size: 15px; outline: none;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+      width: 100%; margin-top: 20px; padding: 13px 16px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff; border: none; border-radius: 10px;
+      font-size: 15px; font-weight: 600; cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: default; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 16px; line-height: 1.5; }
+    .msg { margin-top: 16px; font-size: 14px; min-height: 18px; }
+    .msg.err { color: var(--err); }
+    .msg.ok { color: var(--ok); }
+    .hidden { display: none; }
+    .portal h2 { margin: 4px 0 2px; font-size: 22px; }
+    .portal .who { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+    .tile {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 12px; padding: 16px; margin-top: 12px;
+    }
+    .tile h3 { margin: 0 0 6px; font-size: 15px; }
+    .tile p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .row { display: flex; gap: 12px; }
+    .row .tile { flex: 1; }
+    .signout { background: none; border: 1px solid var(--border); color: var(--muted); margin-top: 22px; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="brand">
+      <div class="logo">P</div>
+      <div>
+        <h1>pillar</h1>
+        <div class="sub">Sign in to manage your node</div>
+      </div>
+    </div>
+
+    <!-- Login view -->
+    <form id="login-form" autocomplete="off">
+      <label for="handle">User handle or genesis CID</label>
+      <input id="handle" name="handle" type="text" placeholder="you@pillar" required>
+
+      <label for="password">Unlock password</label>
+      <input id="password" name="password" type="password" placeholder="Unlocks your key on this device" required>
+
+      <label for="keymat">Encrypted auth key material (CID / local secret)</label>
+      <input id="keymat" name="keymat" type="text" placeholder="Your device-local auth subkey material" required>
+
+      <button id="submit" type="submit">Sign in</button>
+      <div id="msg" class="msg" role="status" aria-live="polite"></div>
+      <p class="hint">
+        Your password and plaintext key never leave this browser. The page unlocks
+        your auth subkey locally and signs a one-time server challenge; only the
+        signature is sent.
+      </p>
+    </form>
+
+    <!-- Authenticated portal view -->
+    <section id="portal" class="portal hidden">
+      <h2 id="greeting">Welcome</h2>
+      <div class="who" id="portal-who"></div>
+      <div class="row">
+        <div class="tile">
+          <h3>Node status</h3>
+          <p id="node-status">Session admitted. Your node is reachable.</p>
+        </div>
+      </div>
+      <div class="tile">
+        <h3>Manage node</h3>
+        <p>Review peers, rotate keys, and dispatch signed actions from this portal.
+           Signing actions run through the same admitted session.</p>
+      </div>
+      <button id="signout" class="signout" type="button">Sign out</button>
+    </section>
+  </main>
+
+  <script>
+  // --- Client-side crypto stand-ins, mirroring pillar_web::key_login exactly. ---
+  // The server's digest() is Rust's DefaultHasher (SipHash-1-3, keys (0,0)); a
+  // `str` hashes as its UTF-8 bytes followed by a 0xFF terminator byte. We
+  // reproduce that here so the unlock + signature computed locally in this
+  // browser verify against the server's admitted PUBLIC key — the password and
+  // plaintext key never leave this page.
+  const U64 = (1n << 64n) - 1n;
+  const mask = (x) => x & U64;
+  const rotl = (x, b) => mask((x << BigInt(b)) | (x >> BigInt(64 - b)));
+
+  function sipRound(v) {
+    v[0] = mask(v[0] + v[1]); v[1] = rotl(v[1], 13); v[1] ^= v[0]; v[0] = rotl(v[0], 32);
+    v[2] = mask(v[2] + v[3]); v[3] = rotl(v[3], 16); v[3] ^= v[2];
+    v[0] = mask(v[0] + v[3]); v[3] = rotl(v[3], 21); v[3] ^= v[0];
+    v[2] = mask(v[2] + v[1]); v[1] = rotl(v[1], 17); v[1] ^= v[2]; v[2] = rotl(v[2], 32);
+  }
+
+  // SipHash-1-3 over a byte array with keys k0=k1=0 (Rust's DefaultHasher seed).
+  function sipHash13(bytes) {
+    let v = [
+      0x736f6d6570736575n, // "somepseu" ^ k0
+      0x646f72616e646f6dn, // "dorandom" ^ k1
+      0x6c7967656e657261n, // "lygenera" ^ k0
+      0x7465646279746573n, // "tedbytes" ^ k1
+    ];
+    const len = bytes.length;
+    const end = len - (len % 8);
+    let i = 0;
+    for (; i < end; i += 8) {
+      let m = 0n;
+      for (let j = 0; j < 8; j++) m |= BigInt(bytes[i + j]) << BigInt(8 * j);
+      v[3] ^= m;
+      sipRound(v);            // c = 1 compression round
+      v[0] ^= m;
+    }
+    // last block: remaining bytes, high byte = len & 0xff
+    let b = BigInt(len & 0xff) << 56n;
+    for (let j = 0; j < len - end; j++) b |= BigInt(bytes[end + j]) << BigInt(8 * j);
+    v[3] ^= b;
+    sipRound(v);
+    v[0] ^= b;
+    v[2] ^= 0xffn;
+    sipRound(v); sipRound(v); sipRound(v); // d = 3 finalization rounds
+    return mask(v[0] ^ v[1] ^ v[2] ^ v[3]);
+  }
+
+  const enc = new TextEncoder();
+
+  // digest(parts): mirror of Rust `fn digest(&[&str])` — feed each str's bytes
+  // then a single 0xFF (str's Hash framing) into one running SipHash-1-3.
+  function digest(parts) {
+    let bytes = [];
+    for (const p of parts) {
+      for (const byte of enc.encode(p)) bytes.push(byte);
+      bytes.push(0xff);
+    }
+    return sipHash13(bytes);
+  }
+
+  // argon2id(password, subkey, secret) stand-in (client-side only).
+  const argon2id = (password, subkey, secret) =>
+    digest(["pillar-argon2id-v1", password, subkey, secret]);
+
+  // Nonce.signing_material(): "pillar-web-nonce:{id}:{origin}:{expiry}".
+  const signingMaterial = (id, origin, expiry) =>
+    `pillar-web-nonce:${id}:${origin}:${expiry}`;
+
+  // AuthSubkey.sign_nonce: digest(["pillar-web-login-sig", secret_material, signing_material]).
+  function signNonce(secretMaterial, id, origin, expiry) {
+    return digest(["pillar-web-login-sig", secretMaterial.toString(), signingMaterial(id, origin, expiry)]);
+  }
+
+  // The origin the server binds nonces to is derived from the browser at
+  // runtime — never embedded in this public source.
+  function serverOrigin() {
+    return window.location.origin;
+  }
+
+  const $ = (id) => document.getElementById(id);
+  function setMsg(text, kind) {
+    const m = $("msg");
+    m.textContent = text || "";
+    m.className = "msg" + (kind ? " " + kind : "");
+  }
+
+  async function doLogin(handle, password, keymat) {
+    setMsg("Requesting challenge…", "");
+    // 1. Fetch the origin+expiry-bound challenge nonce (hidden plumbing).
+    const nonceResp = await fetch("/nonce");
+    if (!nonceResp.ok) throw new Error("could not reach the server");
+    const nonceText = (await nonceResp.text()).trim();
+    const parts = nonceText.split(/\s+/);
+    if (parts[0] !== "NONCE") throw new Error("unexpected challenge from server");
+    const id = parts[1];
+    const expiry = parts[2];
+
+    // 2. Unlock the auth subkey LOCALLY (password + device-local key material).
+    //    `keymat` carries both the public subkey id and its protected secret,
+    //    formatted "<subkey> <secret>"; a bare token is treated as both.
+    const km = keymat.trim().split(/\s+/);
+    const subkey = km[0];
+    const secret = km.length > 1 ? km.slice(1).join(" ") : km[0];
+    const secretMaterial = argon2id(password, subkey, secret);
+
+    // 3. Sign the origin+expiry-bound nonce locally.
+    setMsg("Unlocking and signing locally…", "");
+    const sig = signNonce(secretMaterial, id, serverOrigin(), expiry);
+
+    // 4. POST only the signature — password and plaintext key never transit.
+    const body = `${id} ${expiry} ${subkey} ${sig.toString()}`;
+    const loginResp = await fetch("/login", { method: "POST", body });
+    const loginText = (await loginResp.text()).trim();
+    if (loginResp.ok && loginText === "OK") {
+      const token = loginResp.headers.get("X-Pillar-Session") || "";
+      return { ok: true, token };
+    }
+    // Map protocol denials onto clear in-UI messages.
+    const reason = loginText.replace(/^DENIED\s*/, "");
+    return { ok: false, reason };
+  }
+
+  function friendlyError(reason) {
+    const r = (reason || "").toLowerCase();
+    if (r.includes("origin")) return "This login is bound to a different site.";
+    if (r.includes("expired")) return "The challenge expired — please try again.";
+    if (r.includes("nonce") || r.includes("replay")) return "The challenge was invalid — please try again.";
+    if (r.includes("key") || r.includes("auth") || r.includes("wot") || r.includes("depth"))
+      return "Your key is not admitted (or was revoked). Contact your node operator.";
+    if (r.includes("argument") || r.includes("signature"))
+      return "Wrong password or key material — unlock failed.";
+    return reason ? ("Login failed: " + reason) : "Wrong password or key material — unlock failed.";
+  }
+
+  function showPortal(handle) {
+    $("login-form").classList.add("hidden");
+    const portal = $("portal");
+    portal.classList.remove("hidden");
+    $("greeting").textContent = "Welcome, " + handle;
+    $("portal-who").textContent = "Signed in as " + handle;
+  }
+
+  document.getElementById("login-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const handle = $("handle").value.trim();
+    const password = $("password").value;
+    const keymat = $("keymat").value;
+    const btn = $("submit");
+    btn.disabled = true;
+    try {
+      const res = await doLogin(handle, password, keymat);
+      if (res.ok) {
+        setMsg("", "");
+        showPortal(handle);
+      } else {
+        setMsg(friendlyError(res.reason), "err");
+      }
+    } catch (err) {
+      setMsg(friendlyError(err && err.message), "err");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("signout").addEventListener("click", () => {
+    $("portal").classList.add("hidden");
+    $("login-form").classList.remove("hidden");
+    $("password").value = "";
+    setMsg("", "");
+  });
+  </script>
+</body>
+</html>

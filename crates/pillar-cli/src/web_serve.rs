@@ -26,10 +26,14 @@
 //! Endpoints (the SAME auth-gate decisions as before — only the transport
 //! changed; `handle_line` still holds the pure protocol logic and its tests):
 //!
-//! - `GET /` — the UNAUTHENTICATED WoT-key login landing page (HTML, 200). It
-//!   is the client-side challenge/signature gate: the browser unlocks a
-//!   WoT-trusted auth subkey locally and signs the server nonce. Serving this
-//!   page exposes NO authenticated action.
+//! - `GET /` — the UNAUTHENTICATED, self-guided WoT-key login UI (HTML, 200):
+//!   a real graphical login page (see [`LANDING_PAGE`] / `web_login.html`), not
+//!   a protocol description. The human enters their handle + unlock password;
+//!   the embedded script performs the whole `GET /nonce` → local unlock+sign →
+//!   `POST /login` handshake as hidden plumbing and, on success, transitions
+//!   into an authenticated portal view greeting the user by handle. The browser
+//!   unlocks a WoT-trusted auth subkey LOCALLY and signs the server nonce;
+//!   serving this page exposes NO authenticated action.
 //! - `GET /nonce` — issue a fresh challenge nonce bound to this origin; body
 //!   `NONCE <id> <expiry>`.
 //! - `POST /login` — body `<id> <expiry> <subkey> <sig>`: admit a WoT-key
@@ -51,7 +55,9 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 
 use pillar_core::NodeId;
 use pillar_identity::NodeSubkey;
-use pillar_web::key_login::{KeyLoginVerifier, LoginSession, Nonce, NonceIssuer, RegisteredAuthKey, Signature};
+use pillar_web::key_login::{
+    KeyLoginVerifier, LoginSession, Nonce, NonceIssuer, RegisteredAuthKey, Signature,
+};
 use pillar_web::{authorize_nonloopback_signing_action, bind_web};
 use pillar_wot_authority::{FencedActor, WotAuthority};
 
@@ -147,8 +153,15 @@ impl WebAuthContext {
             return Err(pillar_web::key_login::LoginError::UnknownNonce);
         }
         let origin = self.issuer.origin().clone();
-        self.verifier
-            .admit(&nonce, sig, subkey, &origin, clock, &self.authority, &self.actor)
+        self.verifier.admit(
+            &nonce,
+            sig,
+            subkey,
+            &origin,
+            clock,
+            &self.authority,
+            &self.actor,
+        )
     }
 
     /// Store an admitted `session` under a freshly minted bearer token,
@@ -188,10 +201,29 @@ pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
     }
 }
 
-/// The unauthenticated WoT-key login landing page. Client-side only: it
-/// unlocks a WoT-trusted auth subkey locally and signs the server nonce —
-/// serving it exposes no authenticated action.
-const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>pillar — WoT-key login</title></head>\n<body>\n<h1>pillar</h1>\n<p>WoT-key login. Unlock your auth subkey locally and sign the server nonce; your password and key never leave this browser.</p>\n<ol><li>GET <code>/nonce</code> for a challenge.</li><li>Sign it with your auth subkey.</li><li>POST the signature to <code>/login</code>.</li></ol>\n</body>\n</html>\n";
+/// The unauthenticated, self-guided WoT-key login UI (HTML + CSS + JS) served
+/// at `GET /`. It is a real graphical login page — NOT a protocol description:
+/// the human supplies exactly two inputs (their handle and the password that
+/// LOCALLY unlocks their auth subkey), and the page's embedded script performs
+/// the whole handshake as hidden plumbing — `GET /nonce`, local unlock + sign,
+/// `POST /login` — then transitions into an authenticated portal view greeting
+/// the user by handle and exposing node management.
+///
+/// SECURITY INVARIANTS (identical to `web-key-auth-impl`; this is presentation
+/// over that mechanism, not a new auth model): the password and the plaintext
+/// key NEVER leave the browser — unlock is a purely local computation; only the
+/// nonce SIGNATURE (never the password or plaintext key) is POSTed. The origin
+/// the signature is bound to is derived from the browser (`location`) at
+/// runtime, so no infrastructure identifier is embedded in this public source.
+///
+/// The embedded script mirrors, in JS, the crate's deterministic no-real-crypto
+/// KDF/signature stand-ins (`pillar_web::key_login`'s `argon2id`/`sign_nonce`,
+/// both built on Rust's `DefaultHasher` = SipHash-1-3 seeded with keys (0,0)
+/// and `str`'s hash framing of "bytes then 0xFF"), so the client-side unlock +
+/// sign it performs is genuine end-to-end against this server — in a real
+/// deployment these stand-ins are the real memory-hard argon2id + signature,
+/// unchanged in shape.
+const LANDING_PAGE: &str = include_str!("web_login.html");
 
 /// A parsed HTTP request: method, path, and body.
 struct HttpRequest {
@@ -288,7 +320,11 @@ fn handle_connection(mut stream: TcpStream, ctx: &mut WebAuthContext) {
 /// [`handle_line`], preserving every auth-gate rule (only the transport
 /// changed). The signing action's session is resolved from the
 /// `X-Pillar-Session` bearer the client echoes.
-fn dispatch_http(ctx: &mut WebAuthContext, peer: &SocketAddr, request: &HttpRequest) -> HttpResponse {
+fn dispatch_http(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
     // Strip any query string; match on the path prefix.
     let path = request.path.split('?').next().unwrap_or(&request.path);
     match (request.method.as_str(), path) {
@@ -368,7 +404,12 @@ fn reply(text: impl Into<String>) -> Reply {
 /// is exercised directly by unit tests rather than relying on a real TCP
 /// connection's observed peer address (which is loopback whenever the test
 /// client and server share a host, regardless of the bind address).
-fn handle_line(ctx: &mut WebAuthContext, session: &mut Option<LoginSession>, peer: &SocketAddr, line: &str) -> Reply {
+fn handle_line(
+    ctx: &mut WebAuthContext,
+    session: &mut Option<LoginSession>,
+    peer: &SocketAddr,
+    line: &str,
+) -> Reply {
     let mut parts = line.split_whitespace();
     match parts.next() {
         Some("NONCE") => {
@@ -381,7 +422,9 @@ fn handle_line(ctx: &mut WebAuthContext, session: &mut Option<LoginSession>, pee
             else {
                 return reply("usage: LOGIN <id> <expiry> <subkey> <sig>");
             };
-            let (Ok(id), Ok(expiry), Ok(sig)) = (id.parse::<u64>(), expiry.parse::<u64>(), sig.parse::<u64>()) else {
+            let (Ok(id), Ok(expiry), Ok(sig)) =
+                (id.parse::<u64>(), expiry.parse::<u64>(), sig.parse::<u64>())
+            else {
                 return reply("DENIED bad-arguments");
             };
             let subkey = NodeSubkey::from(subkey);
@@ -419,7 +462,8 @@ mod tests {
         let mut ctx = WebAuthContext::new("https://pillar.example.com", NodeId::from("owner"), 4);
         ctx.admit_subject(subkey.node_id(), 4);
 
-        let encrypted = pillar_web::key_login::EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
+        let encrypted =
+            pillar_web::key_login::EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
         ctx.register_auth_key(pillar_web::key_login::RegisteredAuthKey::register(
             &encrypted, PASSWORD, SECRET,
         ));
@@ -464,19 +508,28 @@ mod tests {
         let mut parts = nonce_reply.text.split_whitespace();
         assert_eq!(parts.next(), Some("NONCE"));
         let id: u64 = parts.next().expect("id").parse().expect("id parses");
-        let expiry: u64 = parts.next().expect("expiry").parse().expect("expiry parses");
+        let expiry: u64 = parts
+            .next()
+            .expect("expiry")
+            .parse()
+            .expect("expiry parses");
 
         // Client side: unlock the auth subkey and sign the nonce locally —
         // the password/plaintext key never cross the wire.
-        let encrypted = pillar_web::key_login::EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
-        let unlocked = pillar_web::key_login::unlock_auth_subkey(&encrypted, PASSWORD, SECRET).expect("unlock");
+        let encrypted =
+            pillar_web::key_login::EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
+        let unlocked = pillar_web::key_login::unlock_auth_subkey(&encrypted, PASSWORD, SECRET)
+            .expect("unlock");
         let signing_nonce = test_nonce(id, "https://pillar.example.com", expiry);
         let sig = unlocked.sign_nonce(&signing_nonce);
 
         let login_line = format!("LOGIN {id} {expiry} {} {}", subkey.0, sig.to_wire());
         let login_reply = handle_line(&mut ctx, &mut session, &peer, &login_line);
         assert_eq!(login_reply.text, "OK", "login reply: {}", login_reply.text);
-        assert!(session.is_some(), "an admitted login must populate the connection session");
+        assert!(
+            session.is_some(),
+            "an admitted login must populate the connection session"
+        );
 
         let ping_reply = handle_line(&mut ctx, &mut session, &peer, "PING");
         assert_eq!(
@@ -501,7 +554,11 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (mut ctx, _subkey) = fresh_ctx_with_subkey();
             // Serve exactly one connection then return.
-            let stream = listener.incoming().next().expect("one connection").expect("accept");
+            let stream = listener
+                .incoming()
+                .next()
+                .expect("one connection")
+                .expect("accept");
             super::handle_connection(stream, &mut ctx);
         });
 
@@ -525,6 +582,66 @@ mod tests {
         assert!(!body.is_empty(), "expected a non-empty response body");
     }
 
+    // The `/` page must be a real, self-guided GRAPHICAL login UI — the two
+    // human inputs (handle + unlock password) plus the client-side script that
+    // fetches `/nonce`, unlocks + signs LOCALLY, and POSTs `/login` — and must
+    // transition into an authenticated portal view. It must NOT be the old
+    // bare protocol-description text that merely told the human to run the
+    // `GET /nonce` / sign / `POST /login` steps by hand. This is the exact
+    // presentation contract `portal-login-ui` gates the operator login-test on.
+    #[test]
+    fn root_page_is_the_interactive_login_ui_not_the_protocol_description() {
+        let (mut ctx, _subkey) = fresh_ctx_with_subkey();
+        let resp = dispatch_http(
+            &mut ctx,
+            &remote_peer(),
+            &HttpRequest {
+                method: "GET".into(),
+                path: "/".into(),
+                body: String::new(),
+            },
+        );
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.content_type.contains("text/html"),
+            "the login page must be served as HTML"
+        );
+        let body = &resp.body;
+
+        // A real graphical login FORM with the two human inputs.
+        assert!(body.contains("<form"), "must render a login form");
+        assert!(
+            body.contains("id=\"handle\"") && body.contains("id=\"password\""),
+            "must present the handle + unlock-password inputs"
+        );
+
+        // The client-side script that performs the handshake as hidden plumbing.
+        assert!(body.contains("<script"), "must embed a client-side script");
+        assert!(
+            body.contains("/nonce") && body.contains("/login"),
+            "the script must drive the /nonce and /login endpoints itself"
+        );
+        assert!(
+            body.to_lowercase().contains("sign"),
+            "the script must sign the challenge client-side"
+        );
+
+        // On success it transitions into an authenticated portal view.
+        assert!(
+            body.contains("id=\"portal\""),
+            "must transition into an authenticated portal view"
+        );
+
+        // It must NOT be the old protocol-description landing page that
+        // instructed the human to run the steps by hand.
+        let lower = body.to_lowercase();
+        assert!(
+            !(lower.contains("get <code>/nonce</code> for a challenge")
+                || lower.contains("post the signature to")),
+            "the page must NOT be the bare protocol-description text"
+        );
+    }
+
     // Exercise the full HTTP handshake against a synthetic non-loopback peer:
     // GET /nonce, sign, POST /login (receiving a session token), then a signing
     // action POST /ping with and without that token — proving the auth gate is
@@ -538,15 +655,26 @@ mod tests {
         let refused = dispatch_http(
             &mut ctx,
             &peer,
-            &HttpRequest { method: "POST".into(), path: "/ping".into(), body: String::new() },
+            &HttpRequest {
+                method: "POST".into(),
+                path: "/ping".into(),
+                body: String::new(),
+            },
         );
-        assert_eq!(refused.status, 403, "unauthenticated non-loopback ping must be refused");
+        assert_eq!(
+            refused.status, 403,
+            "unauthenticated non-loopback ping must be refused"
+        );
 
         // GET /nonce.
         let nonce_resp = dispatch_http(
             &mut ctx,
             &peer,
-            &HttpRequest { method: "GET".into(), path: "/nonce".into(), body: String::new() },
+            &HttpRequest {
+                method: "GET".into(),
+                path: "/nonce".into(),
+                body: String::new(),
+            },
         );
         assert_eq!(nonce_resp.status, 200);
         let mut parts = nonce_resp.body.split_whitespace();
@@ -555,8 +683,10 @@ mod tests {
         let expiry: u64 = parts.next().expect("expiry").parse().expect("expiry");
 
         // Client-side sign.
-        let encrypted = pillar_web::key_login::EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
-        let unlocked = pillar_web::key_login::unlock_auth_subkey(&encrypted, PASSWORD, SECRET).expect("unlock");
+        let encrypted =
+            pillar_web::key_login::EncryptedAuthSubkey::seal(subkey.clone(), PASSWORD, SECRET);
+        let unlocked = pillar_web::key_login::unlock_auth_subkey(&encrypted, PASSWORD, SECRET)
+            .expect("unlock");
         let signing_nonce = test_nonce(id, "https://pillar.example.com", expiry);
         let sig = unlocked.sign_nonce(&signing_nonce);
 
@@ -565,7 +695,11 @@ mod tests {
         let login_resp = dispatch_http(
             &mut ctx,
             &peer,
-            &HttpRequest { method: "POST".into(), path: "/login".into(), body: login_body },
+            &HttpRequest {
+                method: "POST".into(),
+                path: "/login".into(),
+                body: login_body,
+            },
         );
         assert_eq!(login_resp.status, 200, "login body: {}", login_resp.body);
         let token = login_resp.session_token.expect("a session token");
@@ -574,9 +708,17 @@ mod tests {
         let ping_resp = dispatch_http(
             &mut ctx,
             &peer,
-            &HttpRequest { method: "POST".into(), path: "/ping".into(), body: token },
+            &HttpRequest {
+                method: "POST".into(),
+                path: "/ping".into(),
+                body: token,
+            },
         );
-        assert_eq!(ping_resp.status, 200, "authenticated ping body: {}", ping_resp.body);
+        assert_eq!(
+            ping_resp.status, 200,
+            "authenticated ping body: {}",
+            ping_resp.body
+        );
         assert!(ping_resp.body.starts_with("PONG"));
     }
 
