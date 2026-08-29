@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bootstrap;
 pub mod capability;
 pub mod login;
 
