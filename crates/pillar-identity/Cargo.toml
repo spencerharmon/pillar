@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "OpenPGP key-type hierarchy and node-admission handshake: the Rust refinement of specs/Registration.tla."
+description = "OpenPGP key-type hierarchy, node admission, and the cold-root/op-key/device identity-login model: the Rust refinement of specs/Registration.tla and specs/IdentityLogin.tla."
 
 [dependencies]
 pillar-core = { path = "../pillar-core" }
