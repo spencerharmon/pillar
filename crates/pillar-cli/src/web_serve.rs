@@ -52,8 +52,11 @@
 //!   `DENIED <reason>`.
 //! - `GET /bootstrap/status` — `FRESH` (unbootstrapped) or `BOOTSTRAPPED`.
 //! - `POST /bootstrap/create-cell` — body `<cell-id>`: operator step (a).
-//! - `POST /bootstrap/create-user` — body `<handle>`: operator step (b),
-//!   consuming the one-shot capability.
+//! - `POST /bootstrap/create-user` — body `<handle>\n<password>`: operator
+//!   step (b), consuming the one-shot capability AND, atomically, applying
+//!   the key-distribution label to this node + escrowing the new user's
+//!   node-sealed operational-key offer to it, so this node can resolve it at
+//!   the very next login.
 //! - `POST /ping` — a stand-in signing action gated through
 //!   [`pillar_web::authorize_nonloopback_signing_action`]; a non-loopback
 //!   peer must present an admitted session (`X-Pillar-Session`).
@@ -63,6 +66,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 
 use pillar_core::NodeId;
+use pillar_identity::NodeSubkey;
 use pillar_web::key_login::{LoginSession, Origin};
 use pillar_web::node_custody::{
     BootstrapError, CellBootstrap, CellNameRegistry, Cid, InMemoryCellNameRegistry,
@@ -160,6 +164,52 @@ impl WebAuthContext {
     /// bootstrap flow drives this.
     pub fn bootstrap_mut(&mut self) -> &mut CellBootstrap {
         &mut self.bootstrap
+    }
+
+    /// Step (b) of the bootstrap flow, DONE ATOMICALLY: create the first user
+    /// AND seal their operational key's offer to THIS node — applying the
+    /// key-distribution label + escrowing the node-sealed L1 offer (per the
+    /// always-node-sealed offer mechanism) — so the very node that created
+    /// the user can immediately resolve, strip, and unlock it at first login.
+    /// Without this, a fresh bootstrap node correctly reports the untrusted-
+    /// node `no-offer-for-user` mode even for the user it just created — the
+    /// observed bug. Shared by both the CLI and the web-UI create-first-user
+    /// steps (crates/pillar-cli/src/web_serve.rs) so neither drifts.
+    ///
+    /// `password` is the user's chosen unlock factor (never retained in the
+    /// clear beyond this call); the scoped, revocable OPERATIONAL key is what
+    /// gets escrowed — the cold root is never touched, and node authority is
+    /// unchanged (this node only ever holds what the cell explicitly seals to
+    /// it, per-node/opt-in/revocable).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`BootstrapError`] from the underlying [`CellBootstrap`]
+    /// step (no cell yet / capability already spent) — the offer is escrowed
+    /// only once that step succeeds.
+    pub fn bootstrap_create_first_user(
+        &mut self,
+        handle: impl Into<String>,
+        password: &str,
+    ) -> Result<(), BootstrapError> {
+        let handle = handle.into();
+        self.bootstrap.create_first_user(handle.clone())?;
+
+        // (1) Apply the key-distribution label: chain the new user's
+        // operational subkey into the WoT authority at the root's own
+        // budget, so it is authoritative once admitted.
+        let subkey = NodeSubkey::from(format!("op-subkey-{handle}").as_str());
+        let level = self.authority.max_depth();
+        self.admit_subject(subkey.node_id(), level);
+
+        // (2) Escrow the scoped operational key as a node-sealed L1 offer to
+        // THIS bootstrap node's own node key — the per-node seal IS the
+        // access control; no other node custodies this offer.
+        let cid = Cid::from(format!("cid-{handle}").as_str());
+        let secret = format!("operational-key-material-{handle}");
+        self.provision_offer(handle.clone(), handle, cid, subkey, password, &secret);
+
+        Ok(())
     }
 
     /// The bootstrap capability state.
@@ -376,11 +426,16 @@ fn dispatch_http(
             }
         }
         ("POST", "/bootstrap/create-user") => {
-            let handle = request.body.trim();
-            if handle.is_empty() {
-                return text_response(400, "Bad Request", "MISSING handle".to_owned());
+            // Body: "<handle>\n<password>" — the operator's chosen unlock
+            // factor for the new user, escrowed atomically (see
+            // `bootstrap_create_first_user`) so login works immediately.
+            let mut lines = request.body.lines();
+            let handle = lines.next().unwrap_or("").trim();
+            let password = lines.next().unwrap_or("").trim();
+            if handle.is_empty() || password.is_empty() {
+                return text_response(400, "Bad Request", "MISSING handle-or-password".to_owned());
             }
-            match ctx.bootstrap_mut().create_first_user(handle) {
+            match ctx.bootstrap_create_first_user(handle, password) {
                 Ok(()) => text_response(200, "OK", format!("USER-CREATED {handle}")),
                 Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
             }
@@ -740,7 +795,7 @@ mod tests {
         assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
 
         // Cannot create a user before the cell.
-        let early = post(&mut ctx, "/bootstrap/create-user", "spencer");
+        let early = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
         assert_eq!(early.status, 409);
         assert!(early.body.contains("NoCellYet"), "got: {}", early.body);
 
@@ -750,7 +805,7 @@ mod tests {
         assert!(cell.body.contains("CELL-CREATED"));
 
         // (b) create the first user — consumes the one-shot capability.
-        let user = post(&mut ctx, "/bootstrap/create-user", "spencer");
+        let user = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
         assert_eq!(user.status, 200);
         assert!(user.body.contains("USER-CREATED spencer"));
 
@@ -762,7 +817,7 @@ mod tests {
         assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
 
         // A SECOND cell-key create-user is refused (capability spent).
-        let second = post(&mut ctx, "/bootstrap/create-user", "second-user");
+        let second = post(&mut ctx, "/bootstrap/create-user", &format!("second-user\n{PASSWORD}"));
         assert_eq!(second.status, 409);
         assert!(
             second.body.contains("CapabilitySpent"),
@@ -770,6 +825,49 @@ mod tests {
             second.body
         );
     }
+
+    // Regression: the observed bug — after create-cell -> create-first-user
+    // on a fresh bootstrap node, login used to fail "no offer for you" for
+    // the very user just created. The bootstrap create-first-user step MUST
+    // atomically apply the key-distribution label + escrow the new user's
+    // node-sealed offer to this node, so the FIRST login succeeds
+    // immediately, with no separate operator provisioning step.
+    #[test]
+    fn first_login_immediately_after_bootstrap_succeeds_with_no_extra_provisioning() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+
+        let cell = post(&mut ctx, "/bootstrap/create-cell", "cell-genesis");
+        assert_eq!(cell.status, 200);
+        let user = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
+        assert_eq!(user.status, 200, "got: {}", user.body);
+
+        // Log in as the just-created user with NO further offer provisioning.
+        let nonce_resp = get(&mut ctx, "/nonce");
+        let id: u64 = nonce_resp.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let login = post(&mut ctx, "/login", &format!("spencer\n{PASSWORD}\n{id}"));
+        assert_eq!(
+            login.status, 200,
+            "first login right after bootstrap must succeed, got: {}",
+            login.body
+        );
+        assert!(login.body.contains("spencer"), "got: {}", login.body);
+
+        // A wrong password on the same identifier is still a plain
+        // unlock-failed, never the no-offer mode — proving the offer really
+        // is present and the failure mode is unlock-specific.
+        let nonce_resp2 = get(&mut ctx, "/nonce");
+        let id2: u64 = nonce_resp2.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let bad = post(&mut ctx, "/login", &format!("spencer\nwrong\n{id2}"));
+        assert_eq!(bad.status, 401);
+        assert!(bad.body.contains("unlock-failed"), "got: {}", bad.body);
+    }
+
 
     #[test]
     fn a_bootstrapped_node_reports_bootstrapped_directly() {

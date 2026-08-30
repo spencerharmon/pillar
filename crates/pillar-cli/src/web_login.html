@@ -301,10 +301,16 @@
         }
       } else {
         const handle = $("first-handle").value.trim();
+        const factor = $("first-factor").value;
         setMsg("bootstrap-msg", "Creating the first user…", "");
         // The first user's unlock factor is set by the operator here; this
-        // one-shot create links the cell to its initial user.
-        const resp = await fetch("/bootstrap/create-user", { method: "POST", body: handle });
+        // one-shot create links the cell to its initial user AND, atomically,
+        // seals the new user's key offer to this node so they can log in
+        // immediately (the node applies its own key-distribution label).
+        const resp = await fetch("/bootstrap/create-user", {
+          method: "POST",
+          body: `${handle}\n${factor}`,
+        });
         const text = (await resp.text()).trim();
         if (resp.ok && text.includes("USER-CREATED")) {
           setMsg("bootstrap-msg", "First user created. This node is now bootstrapped — sign in below.", "ok");
