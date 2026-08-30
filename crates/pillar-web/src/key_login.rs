@@ -92,6 +92,25 @@ impl Nonce {
     fn signing_material(&self) -> String {
         format!("pillar-web-nonce:{}:{}:{}", self.id, self.origin.0, self.expiry)
     }
+
+    /// The signing material as a public accessor, so the node-side custody
+    /// path ([`crate::node_custody`]) can sign a nonce SERVER-SIDE with the
+    /// SAME framing a client uses — the two custody models share one nonce
+    /// contract, never a divergent one.
+    #[must_use]
+    pub fn signing_material_public(&self) -> String {
+        self.signing_material()
+    }
+
+    /// Mint a `Nonce` with a chosen `(id, origin, expiry)` directly.
+    /// Used by [`crate::node_custody::NodeCustodyVerifier`], which mints and
+    /// tracks its own challenge nonces server-side (it does not route them
+    /// through a client-facing [`NonceIssuer`]); the id/origin/expiry binding
+    /// is identical to what `NonceIssuer::issue` produces.
+    #[must_use]
+    pub fn mint(id: u64, origin: Origin, expiry: u64) -> Self {
+        Nonce { id, origin, expiry }
+    }
 }
 
 /// Mints challenge nonces bound to this server's own origin, from a

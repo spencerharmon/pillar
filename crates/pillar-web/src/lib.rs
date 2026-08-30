@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod key_login;
+pub mod node_custody;
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;

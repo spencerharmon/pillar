@@ -594,14 +594,18 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| format!("{web_bind}:{}", config.web_port));
                 tracing::info!(bound = %bound, "pillar web UI listening");
-                // Real deployments register auth keys / admit subjects out of
-                // band (the manifest-driven onboarding flow); this boot
-                // sequence opens the gated listener with an empty
-                // `WebAuthContext` — every non-loopback signing action is
-                // refused until a key is registered and its subject admitted,
-                // matching the "exposed ⇒ authenticated" invariant exactly.
+                // Real deployments register offers / admit subjects out of
+                // band (the manifest-driven onboarding + key-distribution
+                // flow); this boot sequence opens the gated listener with an
+                // empty node-side-custody `WebAuthContext` (a fresh,
+                // unbootstrapped node whose `/` serves the create-cell ->
+                // create-first-user flow) — every non-loopback signing action
+                // is refused until a login admits, matching the
+                // "exposed ⇒ authenticated" invariant exactly.
                 let mut ctx = crate::web_serve::WebAuthContext::new(
                     format!("https://{peer_id}"),
+                    pillar_core::NodeId::from("pillar-node"),
+                    format!("pillar-node-key-{peer_id}"),
                     pillar_core::NodeId::from("pillar-node"),
                     16,
                 );
