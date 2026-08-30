@@ -65,7 +65,8 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use pillar_core::NodeId;
 use pillar_web::key_login::{LoginSession, Origin};
 use pillar_web::node_custody::{
-    CellBootstrap, Cid, NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey,
+    BootstrapError, CellBootstrap, CellNameRegistry, Cid, InMemoryCellNameRegistry,
+    NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey, CELL_NAME_IN_USE_MESSAGE,
 };
 use pillar_web::{authorize_nonloopback_signing_action, bind_web};
 use pillar_wot_authority::{FencedActor, WotAuthority};
@@ -80,6 +81,14 @@ pub struct WebAuthContext {
     authority: WotAuthority,
     actor: FencedActor,
     bootstrap: CellBootstrap,
+    /// The best-effort, peer-sourced cell-name registry the create-cell step
+    /// queries BEFORE generating the cell key, so the web-UI bootstrap enforces
+    /// the SAME network name-uniqueness rule as the CLI (both call the shared
+    /// [`CellBootstrap::create_cell_checked`]). A real node resolves the
+    /// pillar-scoped cell-name pointer over the swarm; the default here is an
+    /// empty [`InMemoryCellNameRegistry`] (every name FREE) until a swarm-backed
+    /// resolver is injected via [`WebAuthContext::with_cell_name_registry`].
+    name_registry: Box<dyn CellNameRegistry + Send + Sync>,
     /// Admitted node-custody portal sessions, keyed by the `X-Pillar-Session`
     /// bearer. HTTP is connection-per-request, so an admitted session must
     /// outlive the connection it was minted on.
@@ -112,6 +121,7 @@ impl WebAuthContext {
             authority,
             actor,
             bootstrap: CellBootstrap::new(),
+            name_registry: Box::new(InMemoryCellNameRegistry::new()),
             sessions: HashMap::new(),
             login_sessions: HashMap::new(),
             next_session: 0,
@@ -156,6 +166,34 @@ impl WebAuthContext {
     #[must_use]
     pub fn bootstrap(&self) -> &CellBootstrap {
         &self.bootstrap
+    }
+
+    /// Inject the swarm-backed cell-name registry used for the create-cell
+    /// network name-uniqueness pre-check. A real node passes a resolver that
+    /// queries the pillar-scoped cell-name pointer over the swarm; tests pass a
+    /// deterministic [`InMemoryCellNameRegistry`].
+    #[must_use]
+    pub fn with_cell_name_registry(
+        mut self,
+        registry: Box<dyn CellNameRegistry + Send + Sync>,
+    ) -> Self {
+        self.name_registry = registry;
+        self
+    }
+
+    /// The create-cell step BOTH surfaces route through: run the shared network
+    /// name-uniqueness pre-check (`CellBootstrap::create_cell_checked` over this
+    /// context's registry) BEFORE the cell key is generated, refusing a name a
+    /// peer already serves. This is the single shared implementation the web UI
+    /// uses; the CLI bootstrap calls the same `create_cell_checked`.
+    ///
+    /// # Errors
+    ///
+    /// The matching [`BootstrapError`] — notably
+    /// [`BootstrapError::CellNameInUse`] when the network already claims it.
+    pub fn create_cell(&mut self, cell: NodeId) -> Result<(), BootstrapError> {
+        self.bootstrap
+            .create_cell_checked(cell, self.name_registry.as_ref())
     }
 
     fn store_session(&mut self, session: NodeCustodySession) -> String {
@@ -327,8 +365,13 @@ fn dispatch_http(
             if cell.is_empty() {
                 return text_response(400, "Bad Request", "MISSING cell id".to_owned());
             }
-            match ctx.bootstrap_mut().create_cell(NodeId::from(cell)) {
+            match ctx.create_cell(NodeId::from(cell)) {
                 Ok(()) => text_response(200, "OK", "CELL-CREATED".to_owned()),
+                Err(BootstrapError::CellNameInUse) => text_response(
+                    409,
+                    "Conflict",
+                    format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
+                ),
                 Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
             }
         }
@@ -344,7 +387,11 @@ fn dispatch_http(
         }
         ("GET", "/nonce") => {
             let nonce = ctx.verifier.issue_nonce(u64::MAX);
-            text_response(200, "OK", format!("NONCE {} {}", nonce.id(), nonce.expiry()))
+            text_response(
+                200,
+                "OK",
+                format!("NONCE {} {}", nonce.id(), nonce.expiry()),
+            )
         }
         ("POST", "/login") => dispatch_login(ctx, request),
         ("POST", "/ping") => {
@@ -373,7 +420,12 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
     let mut lines = request.body.lines();
     let identifier = lines.next().unwrap_or("").trim();
     let password = lines.next().unwrap_or("").trim();
-    let nonce_id: u64 = lines.next().unwrap_or("").trim().parse().unwrap_or(u64::MAX);
+    let nonce_id: u64 = lines
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .unwrap_or(u64::MAX);
 
     if identifier.is_empty() || password.is_empty() {
         return text_response(401, "Unauthorized", "DENIED missing-field".to_owned());
@@ -509,7 +561,10 @@ mod tests {
 
         // Unauthenticated signing action against a non-loopback peer: 403.
         let refused = post(&mut ctx, "/ping", "");
-        assert_eq!(refused.status, 403, "unauthenticated non-loopback ping must be refused");
+        assert_eq!(
+            refused.status, 403,
+            "unauthenticated non-loopback ping must be refused"
+        );
 
         // GET /nonce.
         let nonce_resp = get(&mut ctx, "/nonce");
@@ -531,7 +586,11 @@ mod tests {
 
         // POST /ping WITH the token → 200 PONG.
         let ping_resp = post(&mut ctx, "/ping", &token);
-        assert_eq!(ping_resp.status, 200, "authenticated ping: {}", ping_resp.body);
+        assert_eq!(
+            ping_resp.status, 200,
+            "authenticated ping: {}",
+            ping_resp.body
+        );
         assert!(ping_resp.body.starts_with("PONG"));
     }
 
@@ -619,7 +678,13 @@ mod tests {
     fn a_wrong_password_surfaces_a_clear_unlock_failed_message() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let nonce_resp = get(&mut ctx, "/nonce");
-        let id: u64 = nonce_resp.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let id: u64 = nonce_resp
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let resp = post(&mut ctx, "/login", &format!("alice@pillar\nwrong\n{id}"));
         assert_eq!(resp.status, 401);
         assert!(resp.body.contains("unlock-failed"), "got: {}", resp.body);
@@ -637,10 +702,24 @@ mod tests {
             4,
         );
         let nonce_resp = get(&mut ctx, "/nonce");
-        let id: u64 = nonce_resp.body.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let resp = post(&mut ctx, "/login", &format!("nobody@pillar\n{PASSWORD}\n{id}"));
+        let id: u64 = nonce_resp
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let resp = post(
+            &mut ctx,
+            "/login",
+            &format!("nobody@pillar\n{PASSWORD}\n{id}"),
+        );
         assert_eq!(resp.status, 401);
-        assert!(resp.body.contains("no-offer-for-user"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("no-offer-for-user"),
+            "got: {}",
+            resp.body
+        );
     }
 
     // The first-run BOOTSTRAP flow: a fresh node serves the create-cell ->
@@ -676,19 +755,70 @@ mod tests {
         assert!(user.body.contains("USER-CREATED spencer"));
 
         // Now BOOTSTRAPPED, cell<->user linked.
-        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "BOOTSTRAPPED");
+        assert_eq!(
+            get(&mut ctx, "/bootstrap/status").body.trim(),
+            "BOOTSTRAPPED"
+        );
         assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
 
         // A SECOND cell-key create-user is refused (capability spent).
         let second = post(&mut ctx, "/bootstrap/create-user", "second-user");
         assert_eq!(second.status, 409);
-        assert!(second.body.contains("CapabilitySpent"), "got: {}", second.body);
+        assert!(
+            second.body.contains("CapabilitySpent"),
+            "got: {}",
+            second.body
+        );
     }
 
     #[test]
     fn a_bootstrapped_node_reports_bootstrapped_directly() {
         let (mut ctx, _subkey) = provisioned_ctx();
-        ctx.bootstrap_mut().create_cell(NodeId::from("cell-genesis")).unwrap();
-        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "BOOTSTRAPPED");
+        ctx.bootstrap_mut()
+            .create_cell(NodeId::from("cell-genesis"))
+            .unwrap();
+        assert_eq!(
+            get(&mut ctx, "/bootstrap/status").body.trim(),
+            "BOOTSTRAPPED"
+        );
+    }
+
+    #[test]
+    fn create_cell_refuses_a_name_already_claimed_on_the_network_with_a_clear_message() {
+        use pillar_web::node_custody::InMemoryCellNameRegistry;
+        // A node whose swarm view already serves a pointer for "cell-genesis".
+        let mut registry = InMemoryCellNameRegistry::new();
+        registry.claim("cell-genesis");
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        )
+        .with_cell_name_registry(Box::new(registry));
+
+        // The web-UI create-cell step must REFUSE with the clear message and
+        // must NOT create the colliding cell.
+        let resp = post(&mut ctx, "/bootstrap/create-cell", "cell-genesis");
+        assert_eq!(resp.status, 409);
+        assert!(
+            resp.body
+                .contains("cell name already in use — choose another"),
+            "got: {}",
+            resp.body
+        );
+        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
+        assert!(!ctx.bootstrap().is_bootstrapped());
+
+        // A DIFFERENT, free name is accepted (best-effort check does not block
+        // an unclaimed name).
+        let ok = post(&mut ctx, "/bootstrap/create-cell", "cell-unique");
+        assert_eq!(ok.status, 200);
+        assert!(ok.body.contains("CELL-CREATED"), "got: {}", ok.body);
+        assert_eq!(
+            get(&mut ctx, "/bootstrap/status").body.trim(),
+            "BOOTSTRAPPED"
+        );
     }
 }

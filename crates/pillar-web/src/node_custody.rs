@@ -42,8 +42,8 @@
 //! server-side, and admits through the one shared authority — is modelled
 //! precisely.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
@@ -220,7 +220,8 @@ impl NodeCellDb {
         offer: SealedOffer,
     ) {
         let identifier = identifier.into();
-        self.identifier_to_cid.insert(identifier.clone(), cid.clone());
+        self.identifier_to_cid
+            .insert(identifier.clone(), cid.clone());
         self.handles.insert(identifier, handle.into());
         self.offers.insert(cid, offer);
     }
@@ -503,7 +504,8 @@ impl NodeCustodyVerifier {
 
         // Step 3: unlock the operational key server-side (argon2id last line).
         let secret = self.secrets.get(&cid).cloned().unwrap_or_default();
-        let Some(material) = unlock_operational_key(inner, offer.subkey(), password, &secret) else {
+        let Some(material) = unlock_operational_key(inner, offer.subkey(), password, &secret)
+        else {
             return Err(NodeCustodyError::UnlockFailed);
         };
 
@@ -569,6 +571,115 @@ pub enum BootstrapError {
     /// The one-shot capability is spent — the first user already exists, so a
     /// cell-key create-user is refused; further admin uses the admin user key.
     CapabilitySpent,
+    /// The proposed cell name is ALREADY CLAIMED on the network: the pre-create
+    /// network check resolved a pillar-scoped cell-name pointer for this name
+    /// served by some peer, so creating it here would collide. The bootstrap
+    /// surfaces this as "cell name already in use — choose another" rather than
+    /// creating a colliding cell. This is a best-effort accidental-collision
+    /// guard, not a global strong-uniqueness guarantee (a name no peer serves
+    /// is treated as FREE — see [`CellNameRegistry`]).
+    CellNameInUse,
+}
+
+/// The clear, surfaced message for [`BootstrapError::CellNameInUse`] — one
+/// string, so the CLI and the web UI display the SAME wording.
+pub const CELL_NAME_IN_USE_MESSAGE: &str = "cell name already in use — choose another";
+
+/// A best-effort, peer-sourced check of whether a proposed cell NAME is already
+/// claimed on the pillar network, resolving the pillar-scoped IPNS/cell-name
+/// pointer for the name through the SAME peer-sourced resolution the node
+/// already uses (the node is on the swarm at bootstrap time).
+///
+/// This is the ONE validation contract shared by every create-cell surface —
+/// the CLI bootstrap and the web-UI bootstrap flow implement the same query
+/// through this trait, so the uniqueness rule can never diverge between them.
+///
+/// Semantics are deliberately best-effort, mirroring the platform's "if no peer
+/// serves a stream it is unavailable regardless" rule: a name is claimed ONLY
+/// when a peer actually serves a cell-name pointer for it. A name unreachable
+/// because no peer answers is treated as FREE — the check catches the common
+/// accidental collision at create time; it is NOT a global strong-uniqueness
+/// guarantee. An implementation therefore MUST fail open (return
+/// [`CellNameStatus::Free`]) on an unreachable / no-peer-serving name, never
+/// refuse a create merely because the network could not be reached.
+pub trait CellNameRegistry {
+    /// Resolve `name` on the network. Returns [`CellNameStatus::Claimed`] only
+    /// if a peer actually serves a cell-name pointer for `name`; otherwise —
+    /// including when no peer answers — [`CellNameStatus::Free`].
+    fn lookup(&self, name: &NodeId) -> CellNameStatus;
+}
+
+/// The best-effort resolution outcome for a proposed cell name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellNameStatus {
+    /// A peer serves a cell-name pointer for this name — it is taken.
+    Claimed,
+    /// No peer serves a pointer for this name (reachable-and-absent OR simply
+    /// unreachable) — treat as FREE per the best-effort rule.
+    Free,
+}
+
+impl<F> CellNameRegistry for F
+where
+    F: Fn(&NodeId) -> CellNameStatus,
+{
+    fn lookup(&self, name: &NodeId) -> CellNameStatus {
+        (self)(name)
+    }
+}
+
+/// An in-memory [`CellNameRegistry`] over a fixed set of already-claimed names
+/// — the deterministic stand-in the tests drive (a real node resolves the
+/// pointer over the swarm). Names NOT in the set resolve [`CellNameStatus::Free`],
+/// modelling both a genuinely-free name and an unreachable one identically, per
+/// the best-effort rule.
+#[derive(Clone, Debug, Default)]
+pub struct InMemoryCellNameRegistry {
+    claimed: std::collections::BTreeSet<NodeId>,
+}
+
+impl InMemoryCellNameRegistry {
+    /// An empty registry — every name resolves FREE (models a node whose swarm
+    /// view serves no cell-name pointers yet).
+    #[must_use]
+    pub fn new() -> Self {
+        InMemoryCellNameRegistry::default()
+    }
+
+    /// Mark `name` as already claimed on the network.
+    pub fn claim(&mut self, name: impl Into<NodeId>) {
+        self.claimed.insert(name.into());
+    }
+}
+
+impl CellNameRegistry for InMemoryCellNameRegistry {
+    fn lookup(&self, name: &NodeId) -> CellNameStatus {
+        if self.claimed.contains(name) {
+            CellNameStatus::Claimed
+        } else {
+            CellNameStatus::Free
+        }
+    }
+}
+
+/// The ONE shared pre-create cell-name validation both surfaces (CLI + web UI)
+/// call before generating the cell key. Consults `registry` for `name` and
+/// returns [`BootstrapError::CellNameInUse`] iff a peer serves a pointer for it;
+/// `Ok(())` when the name is free (including unreachable — best-effort). This is
+/// the single implementation that guarantees the CLI and web bootstrap enforce
+/// IDENTICAL uniqueness behaviour.
+///
+/// # Errors
+///
+/// [`BootstrapError::CellNameInUse`] if the network already claims `name`.
+pub fn check_cell_name_available(
+    registry: &(impl CellNameRegistry + ?Sized),
+    name: &NodeId,
+) -> Result<(), BootstrapError> {
+    match registry.lookup(name) {
+        CellNameStatus::Claimed => Err(BootstrapError::CellNameInUse),
+        CellNameStatus::Free => Ok(()),
+    }
 }
 
 impl Default for CellBootstrap {
@@ -626,6 +737,29 @@ impl CellBootstrap {
         }
         self.cell = Some(cell);
         Ok(())
+    }
+
+    /// Step (a) with the network NAME-UNIQUENESS pre-check the ROI requires:
+    /// query the network for the proposed cell name FIRST (via the shared
+    /// [`check_cell_name_available`] over `registry`), and REFUSE — before the
+    /// cell key is generated — if a peer already serves a cell-name pointer for
+    /// it ([`BootstrapError::CellNameInUse`], surfaced as
+    /// [`CELL_NAME_IN_USE_MESSAGE`]). Only on a free (or unreachable, per the
+    /// best-effort rule) name does it proceed to [`Self::create_cell`]. This is
+    /// the single entry point the CLI and web-UI bootstrap flows share.
+    ///
+    /// # Errors
+    ///
+    /// [`BootstrapError::CellNameInUse`] if the network already claims the
+    /// name; [`BootstrapError::CellAlreadyExists`] if the cell already exists.
+    pub fn create_cell_checked(
+        &mut self,
+        cell: NodeId,
+        registry: &(impl CellNameRegistry + ?Sized),
+    ) -> Result<(), BootstrapError> {
+        // Network check FIRST — before generating the cell key.
+        check_cell_name_available(registry, &cell)?;
+        self.create_cell(cell)
     }
 
     /// Step (b): create the first user in the same guided step, CONSUMING the
@@ -827,8 +961,14 @@ mod tests {
                 std::iter::once(NodeId::from("this-node")),
             );
             let blob = format!("{}", offer.node_sealed);
-            assert!(!blob.contains(&password), "password leaked into blob: {blob}");
-            assert!(!blob.contains(&secret), "plaintext key leaked into blob: {blob}");
+            assert!(
+                !blob.contains(&password),
+                "password leaked into blob: {blob}"
+            );
+            assert!(
+                !blob.contains(&secret),
+                "plaintext key leaked into blob: {blob}"
+            );
         }
     }
 
@@ -845,7 +985,8 @@ mod tests {
     #[test]
     fn create_cell_then_first_user_consumes_the_one_shot_capability_and_links_them() {
         let mut boot = CellBootstrap::new();
-        boot.create_cell(NodeId::from("cell-genesis")).expect("cell");
+        boot.create_cell(NodeId::from("cell-genesis"))
+            .expect("cell");
         assert!(boot.is_bootstrapped());
         assert!(boot.can_create_user(), "capability primed until first user");
 
@@ -897,5 +1038,58 @@ mod tests {
         // The ONLY way back to true.
         boot.deliberate_re_enable();
         assert!(boot.can_create_user());
+    }
+
+    // ---- network cell-name uniqueness pre-check ----
+
+    #[test]
+    fn a_name_already_claimed_on_the_network_is_refused_before_the_cell_is_created() {
+        let mut registry = InMemoryCellNameRegistry::new();
+        registry.claim("cell-genesis");
+        let mut boot = CellBootstrap::new();
+        // The network already serves a pointer for this name → refuse.
+        assert_eq!(
+            boot.create_cell_checked(NodeId::from("cell-genesis"), &registry),
+            Err(BootstrapError::CellNameInUse)
+        );
+        // The cell key was NEVER generated — the check ran FIRST.
+        assert!(!boot.is_bootstrapped());
+        assert_eq!(boot.cell(), None);
+    }
+
+    #[test]
+    fn a_free_name_passes_the_network_check_and_creates_the_cell() {
+        let registry = InMemoryCellNameRegistry::new();
+        let mut boot = CellBootstrap::new();
+        boot.create_cell_checked(NodeId::from("cell-fresh"), &registry)
+            .expect("free name creates");
+        assert!(boot.is_bootstrapped());
+        assert_eq!(boot.cell(), Some(&NodeId::from("cell-fresh")));
+    }
+
+    #[test]
+    fn an_unreachable_name_no_peer_serves_is_treated_as_free_best_effort() {
+        // A registry that answers Free for everything models a name no peer
+        // serves (unreachable OR genuinely absent) — best-effort: create proceeds.
+        let registry = |_: &NodeId| CellNameStatus::Free;
+        let mut boot = CellBootstrap::new();
+        boot.create_cell_checked(NodeId::from("unreachable-name"), &registry)
+            .expect("unreachable/no-peer name is FREE");
+        assert!(boot.is_bootstrapped());
+    }
+
+    #[test]
+    fn the_shared_validation_helper_is_the_single_uniqueness_decider() {
+        // check_cell_name_available is the ONE function both surfaces call.
+        let mut registry = InMemoryCellNameRegistry::new();
+        registry.claim("taken");
+        assert_eq!(
+            check_cell_name_available(&registry, &NodeId::from("taken")),
+            Err(BootstrapError::CellNameInUse)
+        );
+        assert_eq!(
+            check_cell_name_available(&registry, &NodeId::from("open")),
+            Ok(())
+        );
     }
 }
