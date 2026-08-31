@@ -21,7 +21,7 @@ if [[ -z "$JAR" ]]; then
 fi
 
 # spec name : extra TLC flags. Order is fixed so output is deterministic.
-SPECS=(CoordinationCore Registration StreamingDB EventDAG IPAM WoTAuthority WebKeyAuth AntiEntropy Bootstrap Observability IdentityLogin KeyDistribution Recovery Cells NodeCustodyLogin BootstrapRequest LoginToken NamingAuthorityPlane GlobalIdentity)
+SPECS=(CoordinationCore Registration StreamingDB EventDAG IPAM WoTAuthority WebKeyAuth AntiEntropy Bootstrap Observability IdentityLogin KeyDistribution Recovery Cells NodeCustodyLogin BootstrapRequest LoginToken NamingAuthorityPlane GlobalIdentity TrustArtifacts)
 declare -A FLAGS=(
   [CoordinationCore]="-deadlock"
   [Registration]="-deadlock"
@@ -42,6 +42,7 @@ declare -A FLAGS=(
   [LoginToken]="-deadlock"
   [NamingAuthorityPlane]="-deadlock"
   [GlobalIdentity]="-deadlock"
+  [TrustArtifacts]="-deadlock"
 )
 
 rc=0
