@@ -19,6 +19,7 @@ members = [
     "crates/pillar-recovery",
     "crates/pillar-cli",
     "crates/pillar-web",
+    "crates/pillar-trust-artifacts",
 ]
 
 [workspace.package]

@@ -2347,6 +2347,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-trust-artifacts"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+ "pillar-rbac",
+]
+
+[[package]]
 name = "pillar-web"
 version = "0.0.0"
 dependencies = [
