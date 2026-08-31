@@ -2213,6 +2213,7 @@ dependencies = [
  "futures",
  "libp2p",
  "pillar-bootstrap",
+ "pillar-cells",
  "pillar-controller",
  "pillar-coordination",
  "pillar-core",

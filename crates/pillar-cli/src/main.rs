@@ -65,7 +65,20 @@ fn usage() -> &'static str {
      \x20 pillar obs metadata {query|current|history|series}\n\
      \x20 pillar obs explore  <metric|log|trace|profile|metadata>\n\
      \x20 pillar obs query    -f <q.pql>\n\
-     \x20 pillar obs dashboard {create|update|delete|get} ...\n"
+     \x20 pillar obs dashboard {create|update|delete|get} ...\n\
+     \n\
+     `pillar {domain|cell|space|node|peer|lease|request|stream} …` (the naming,\n\
+     topology, and data-plane families of docs/cli-surface.md §§ 3.4-3.6) act\n\
+     over a live node's materialized substrate via the pillar_cli library API\n\
+     — same boundary as apply/get/describe/session/obs above:\n\
+     \x20 pillar domain  list|show|new|add-cell|rm-cell        (pillar_cli::cluster::DomainCli — naming-only, signs nothing)\n\
+     \x20 pillar cell    status|members|health|rotate-key      (pillar_cli::cluster::CellCli)\n\
+     \x20 pillar space   get|describe|create|label|delete      (pillar_cli::cluster::SpaceCli)\n\
+     \x20 pillar node    list|describe|cordon|uncordon|drain|taint  (pillar_cli::cluster::NodeCli)\n\
+     \x20 pillar peer    ls|dial|ping|addrs                    (pillar_cli::cluster::PeerCli)\n\
+     \x20 pillar lease   list|show|acquire|release|status      (pillar_cli::cluster::LeaseCli over pillar-coordination)\n\
+     \x20 pillar request ls|approve|reject                     (pillar_cli::cluster::RequestCli; node-approve returns the sealed-cell-key CID)\n\
+     \x20 pillar stream  ls|tip|log|get|verify|snapshot|sync|sub|unsub|head  (pillar_cli::stream_cli::StreamCli over pillar-streamdb)\n"
 }
 
 fn main() -> ExitCode {
@@ -84,6 +97,8 @@ fn main() -> ExitCode {
             identity_trust(&args[0], &args[1..])
         }
         Some("login") => login(&args[1..]),
+        Some("domain") | Some("cell") | Some("space") | Some("peer") | Some("lease")
+        | Some("request") | Some("stream") => cluster_stream(&args[0], &args[1..]),
         Some("render") => render(&args[1..]),
         Some("onboard") => onboard(),
         Some("obs") => {
@@ -217,23 +232,46 @@ fn session(args: &[String]) -> ExitCode {
     }
 }
 
-/// `pillar node run [flags]`: boot a full peer and block until shutdown.
-///
-/// Delegates entirely to the unit-tested [`pillar_cli::run`] module: it
-/// resolves a [`pillar_cli::run::NodeConfig`] from flags layered over env,
-/// then drives the async boot sequence (identity load, streamdb open, libp2p
-/// transport bring-up, controller loop) on a Tokio runtime until SIGINT/
-/// SIGTERM. `node run` is the only `node` subcommand today.
+/// `pillar node {run|list|describe|cordon|uncordon|drain|taint}`: `run` boots
+/// a full peer (delegates to [`pillar_cli::run`], below); every other
+/// subcommand is the cluster-scoped topology family
+/// ([`pillar_cli::cluster::NodeCli`]) — see [`cluster_stream`].
 fn node(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("run") => node_run(&args[1..]),
-        _ => {
+        Some(_) => cluster_stream("node", args),
+        None => {
             eprintln!(
                 "usage: pillar node run [--identity-key <path>] [--data-dir <path>] [--listen <multiaddr> ...]"
             );
             ExitCode::from(2)
         }
     }
+}
+
+/// `pillar {domain|cell|space|node|peer|lease|request|stream} …`: the
+/// naming, topology, and data-plane families of `docs/cli-surface.md` §§
+/// 3.4-3.6. Each acts over a live node's materialized substrate — the same
+/// "no live platform in this demonstration shell" boundary `apply`/`get`/
+/// `session`/`obs` already document. The authoritative, fully unit-tested
+/// engines are [`pillar_cli::cluster`] (`DomainCli`, `CellCli`, `SpaceCli`,
+/// `NodeCli`, `PeerCli`, `LeaseCli`, `RequestCli`) and
+/// [`pillar_cli::stream_cli::StreamCli`].
+fn cluster_stream(verb: &str, _args: &[String]) -> ExitCode {
+    let module = match verb {
+        "stream" => "pillar_cli::stream_cli::StreamCli",
+        "domain" => "pillar_cli::cluster::DomainCli",
+        "cell" => "pillar_cli::cluster::CellCli",
+        "space" => "pillar_cli::cluster::SpaceCli",
+        "node" => "pillar_cli::cluster::NodeCli",
+        "peer" => "pillar_cli::cluster::PeerCli",
+        "lease" => "pillar_cli::cluster::LeaseCli",
+        "request" => "pillar_cli::cluster::RequestCli",
+        _ => "pillar_cli::cluster",
+    };
+    eprintln!("`pillar {verb} …` reads/acts over a live node's materialized substrate via the {module} library API.");
+    eprintln!("Run `pillar --help` for the full verb list of this family.");
+    ExitCode::from(2)
 }
 
 fn node_run(args: &[String]) -> ExitCode {

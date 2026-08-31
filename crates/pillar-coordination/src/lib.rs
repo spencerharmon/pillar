@@ -103,6 +103,30 @@ impl LeaseRegister {
     pub fn holder(&self, epoch: Epoch) -> Option<&NodeId> {
         self.holders.get(&epoch)
     }
+
+    /// Release `epoch` on behalf of `holder` — the round-trip counterpart of
+    /// [`Self::try_acquire`]. Frees the epoch's holder record so a later
+    /// `try_acquire` at that SAME epoch can re-decide from the (unchanged)
+    /// grant set, rather than being permanently wedged to one holder.
+    ///
+    /// This never weakens `AtMostOneHolderPerEpoch`: it only clears the
+    /// cached decision, it does not touch `grants` (still monotonic) or admit
+    /// a second concurrent holder — a subsequent `try_acquire` still requires
+    /// a live majority.
+    ///
+    /// Returns `true` if `holder` held `epoch` and it was released; `false`
+    /// if `epoch` had no holder, or a DIFFERENT node held it (release is a
+    /// no-op for a non-holder — releasing what you do not hold changes
+    /// nothing).
+    pub fn release(&mut self, holder: &NodeId, epoch: Epoch) -> bool {
+        match self.holders.get(&epoch) {
+            Some(existing) if existing == holder => {
+                self.holders.remove(&epoch);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +168,44 @@ mod tests {
             Err(GrantError::StaleEpoch { current: Epoch(2) })
         );
         r.grant(n("n2"), n("n3"), Epoch(3)).unwrap();
+    }
+
+    /// `release` is the round-trip counterpart of `try_acquire`: the holder
+    /// releases, the epoch has no holder, and the SAME candidate (still
+    /// backed by its unchanged grants) can re-acquire it.
+    #[test]
+    fn release_then_reacquire_round_trips() {
+        let mut r = LeaseRegister::new(3);
+        r.grant(n("n1"), n("n1"), Epoch(1)).unwrap();
+        r.grant(n("n2"), n("n1"), Epoch(1)).unwrap();
+        assert!(r.try_acquire(&n("n1"), Epoch(1)));
+        assert_eq!(r.holder(Epoch(1)), Some(&n("n1")));
+
+        assert!(r.release(&n("n1"), Epoch(1)));
+        assert_eq!(r.holder(Epoch(1)), None, "release clears the holder");
+
+        // Grants are untouched (still monotonic, still majority), so the
+        // same candidate re-acquires cleanly.
+        assert!(r.try_acquire(&n("n1"), Epoch(1)));
+        assert_eq!(r.holder(Epoch(1)), Some(&n("n1")));
+    }
+
+    /// Releasing an epoch you do not hold (wrong holder, or never held) is a
+    /// no-op: it changes nothing.
+    #[test]
+    fn release_by_non_holder_is_a_no_op() {
+        let mut r = LeaseRegister::new(3);
+        r.grant(n("n1"), n("n1"), Epoch(1)).unwrap();
+        r.grant(n("n2"), n("n1"), Epoch(1)).unwrap();
+        assert!(r.try_acquire(&n("n1"), Epoch(1)));
+
+        // n2 never held epoch 1; releasing it is a no-op.
+        assert!(!r.release(&n("n2"), Epoch(1)));
+        assert_eq!(r.holder(Epoch(1)), Some(&n("n1")), "still held by n1");
+
+        // Releasing an epoch nobody ever acquired is likewise a no-op.
+        assert!(!r.release(&n("n1"), Epoch(2)));
+        assert_eq!(r.holder(Epoch(2)), None);
     }
 
     /// `AtMostOneHolderPerEpoch` from `specs/CoordinationCore.tla`, exercised

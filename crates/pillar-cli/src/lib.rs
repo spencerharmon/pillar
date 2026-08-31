@@ -30,12 +30,14 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod cluster;
 pub mod identity_trust_cli;
 pub mod observability_ui;
 pub mod onboard;
 pub mod resource;
 pub mod run;
 pub mod session_cli;
+pub mod stream_cli;
 pub mod web_serve;
 
 use std::collections::BTreeMap;
