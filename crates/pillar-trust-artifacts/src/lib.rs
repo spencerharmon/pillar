@@ -518,6 +518,68 @@ impl TrustStore {
             .iter()
             .filter(move |(cid, _)| !self.revoked.contains(*cid) && self.verify(cid).is_ok())
     }
+
+    /// A PURE view of the trust graph: one [`GraphEdge`] per currently-live
+    /// (non-revoked, chain-verified) attest, `issuer -> subject` labeled
+    /// with the capacity/predicate it authorizes. Reads only — signs and
+    /// stores nothing, exactly the trust-graph visualization tile needs.
+    #[must_use]
+    pub fn graph_edges(&self) -> Vec<GraphEdge> {
+        let mut edges: Vec<GraphEdge> = self
+            .live_attests()
+            .map(|(cid, a)| GraphEdge {
+                cid: cid.clone(),
+                from: a.issuer.clone(),
+                to: a.subject.clone(),
+                label: format!(
+                    "{}:{}({})",
+                    a.capacity.tag(),
+                    a.predicate.action,
+                    a.predicate.resource
+                ),
+            })
+            .collect();
+        edges.sort_by(|a, b| a.cid.cmp(&b.cid));
+        edges
+    }
+}
+
+/// One edge in the pure trust-graph view: `from` (the issuer) `-> to` (the
+/// subject), carrying the capacity/predicate `label` the underlying attest
+/// authorizes and the attest's own [`Cid`] (so a viewer can cross-reference
+/// the full [`Proof`] chain via [`TrustStore::verify`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphEdge {
+    /// The underlying attest's content address.
+    pub cid: Cid,
+    /// The issuing identity.
+    pub from: NodeId,
+    /// The subject the attest is about.
+    pub to: NodeId,
+    /// A short rendering of the capacity + predicate this edge authorizes.
+    pub label: String,
+}
+
+/// Parse a `--quota <resource>=<amount>[m]` budget form (e.g. `cpu=1000m`)
+/// into a raw milli-unit amount, matching [`Predicate::with_quota`]'s unit.
+/// A bare integer amount (no trailing `m`) is treated as WHOLE units and
+/// scaled by 1000 (`cpu=2` == `cpu=2000m`). Returns `None` for anything not
+/// shaped `<key>=<amount>[m]` with a parseable non-negative integer amount.
+#[must_use]
+pub fn parse_quota(spec: &str) -> Option<(String, u64)> {
+    let (key, amount) = spec.split_once('=')?;
+    let key = key.trim();
+    let amount = amount.trim();
+    if key.is_empty() || amount.is_empty() {
+        return None;
+    }
+    if let Some(milli) = amount.strip_suffix('m') {
+        let milli: u64 = milli.parse().ok()?;
+        Some((key.to_owned(), milli))
+    } else {
+        let whole: u64 = amount.parse().ok()?;
+        Some((key.to_owned(), whole.checked_mul(1000)?))
+    }
 }
 
 fn render_sentence(chain: &[Cid], store: &TrustStore) -> String {
