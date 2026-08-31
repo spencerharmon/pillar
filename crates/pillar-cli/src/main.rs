@@ -29,6 +29,16 @@ fn usage() -> &'static str {
      \x20 pillar bootstrap request list|approve <id> [--domain D]  review/decide join requests\n\
      \x20 pillar login --domain <D> --user <id> [--password P]    print export PILLAR_DOMAIN/PILLAR_TOKEN\n\
      \x20 pillar session ls|show <id>|revoke <id>|revoke-all       server-side sessions (ls/show view; revoke acts)\n\
+     \x20 pillar identity new|show|enroll|rotate-primary|link|unlink|backup|recover   global identity (identity_trust_cli::IdentityCli)\n\
+     \x20 pillar user add|invite|rm|rename|suspend|resume|passwd|roles|attestations   cell members (identity_trust_cli::UserCli)\n\
+     \x20 pillar key gen|fingerprint|label|custody|rotate|revoke|verify|export|import|escrow|recover   subkeys (identity_trust_cli::KeyCli)\n\
+     \x20 pillar offer seal|escrow|resolve|revoke|status         operational-key offers (identity_trust_cli::OfferCli)\n\
+     \x20 pillar trust <id> [--depth N]|path|graph               WoT trust edges (identity_trust_cli::TrustCli)\n\
+     \x20 pillar attest --as <role>@<scope> --subject --allow --quota --in cell   authorization claims (identity_trust_cli::AttestCli)\n\
+     \x20 pillar grant add|rm|check(can-i)|who-can                explicit grants (identity_trust_cli::GrantCli)\n\
+     \x20 pillar caps [<user>]                                    effective capability set (identity_trust_cli::CapsCli)\n\
+     \x20 pillar revoke trust|grant|key|attest <ref>               authority-reducing acts (identity_trust_cli::RevokeCli)\n\
+     \x20 pillar audit <cid>                                      proof chain + sentence (identity_trust_cli::AuditCli)\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
@@ -66,6 +76,10 @@ fn main() -> ExitCode {
         Some("node") => node(&args[1..]),
         Some("bootstrap") => bootstrap(&args[1..]),
         Some("session") => session(&args[1..]),
+        Some("identity") | Some("user") | Some("key") | Some("offer") | Some("trust")
+        | Some("attest") | Some("grant") | Some("caps") | Some("revoke") | Some("audit") => {
+            identity_trust(&args[0], &args[1..])
+        }
         Some("login") => login(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("onboard") => onboard(),
@@ -150,6 +164,25 @@ fn login(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `pillar {identity|user|key|offer|trust|attest|grant|caps|revoke|audit} …`:
+/// the identity/user/key/offer + trust/attest/grant/caps/revoke/audit
+/// families of `docs/cli-surface.md` § "Identity, trust, and authority
+/// families". Each verb acts over a live node's materialized identity/trust
+/// substrate — the same "no live platform in this demonstration shell"
+/// boundary `apply`/`get`/`session`/`obs` already document. The
+/// authoritative, fully unit-tested engine for every verb this help text
+/// lists is `pillar_cli::identity_trust_cli` (`IdentityCli`, `UserCli`,
+/// `KeyCli`, `OfferCli`, `TrustCli`, `AttestCli`, `GrantCli`, `CapsCli`,
+/// `RevokeCli`, `AuditCli`).
+fn identity_trust(verb: &str, _args: &[String]) -> ExitCode {
+    eprintln!(
+        "`pillar {verb} …` reads/acts over a live node's identity/trust substrate via the \
+         pillar_cli::identity_trust_cli library API."
+    );
+    eprintln!("Run `pillar --help` for the full verb list of this family.");
+    ExitCode::from(2)
 }
 
 /// `pillar session {ls|show <id>|revoke <id>|revoke-all}`: the SERVER-SIDE

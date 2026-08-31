@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod identity_trust_cli;
 pub mod observability_ui;
 pub mod onboard;
 pub mod run;

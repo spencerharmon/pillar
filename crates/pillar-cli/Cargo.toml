@@ -19,6 +19,8 @@ pillar-eventlog = { path = "../pillar-eventlog" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-rbac = { path = "../pillar-rbac" }
 pillar-identity = { path = "../pillar-identity" }
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+pillar-key-distribution = { path = "../pillar-key-distribution" }
 pillar-web = { path = "../pillar-web" }
 pillar-net = { path = "../pillar-net" }
 pillar-streamdb = { path = "../pillar-streamdb" }
