@@ -2220,6 +2220,7 @@ dependencies = [
  "pillar-identity",
  "pillar-manifest",
  "pillar-net",
+ "pillar-observability",
  "pillar-rbac",
  "pillar-streamdb",
  "pillar-web",
