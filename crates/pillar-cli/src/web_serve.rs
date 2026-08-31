@@ -113,6 +113,7 @@ use pillar_identity::global_identity::{
     Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
     Rotation as IdentityRotation, Sig as IdentitySig,
 };
+use pillar_identity::session_registry::{RevokeError, Session, SessionRegistry};
 use pillar_identity::NodeSubkey;
 use pillar_streamdb::{OpId, OpLog};
 use pillar_web::key_login::{LoginSession, Origin};
@@ -206,7 +207,43 @@ pub struct WebAuthContext {
     /// This cell's members and their roles — the user/member management UI's
     /// substrate. `(handle -> role)`.
     members: BTreeMap<String, String>,
+    /// The server-side, per-principal [`SessionRegistry`] (ROI "Web portal /
+    /// UI rework: Session management UI") — the session-management panel's
+    /// substrate: lists every ADMITTED-login-token's principal's active
+    /// sessions with a countdown-able expiry, and backs individual
+    /// (`revoke <id>`) and sign-out-everywhere (`revoke-all`) revocation. A
+    /// portal session token doubles as this registry's slot id, so revoking
+    /// it here is what makes the corresponding entry in `sessions` /
+    /// `login_sessions` (the bearer-admission maps every other tile checks)
+    /// fail closed. No server-side database — see module docs.
+    session_registry: SessionRegistry,
+    /// A monotonically increasing logical clock ticked on every mint —
+    /// stands in for the wall clock so `issued_at`/`expiry` are deterministic
+    /// in tests while still ordering real logins correctly.
+    session_clock: u64,
 }
+
+/// A portal session-management panel's per-session view: `(id, node/domain,
+/// issued-at, expiry, whether this IS the caller's own current session)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// The session id (== the portal bearer token it was minted for).
+    pub id: String,
+    /// The node/domain this session was issued on (this node's own peer id
+    /// — a portal session is always local-node scoped).
+    pub node: String,
+    /// Logical issue time.
+    pub issued_at: u64,
+    /// Logical expiry time — the panel derives its live countdown from this.
+    pub expiry: u64,
+    /// Whether this is the session the panel's own caller is viewing under.
+    pub is_current: bool,
+}
+
+/// The fixed session lifetime (logical-clock ticks) every portal login mints
+/// under — long enough that a same-pass test sequence never trips it, short
+/// enough to be a real bound.
+const SESSION_TTL_TICKS: u64 = 1_000_000;
 
 impl WebAuthContext {
     /// A fresh context for a node identified by `node`, holding node key
@@ -259,6 +296,8 @@ impl WebAuthContext {
             }),
             domain_cells: BTreeMap::new(),
             members: BTreeMap::new(),
+            session_registry: SessionRegistry::new(),
+            session_clock: 0,
         }
     }
 
@@ -578,12 +617,89 @@ impl WebAuthContext {
                 watermark: session.watermark,
             },
         );
+        // Mint the SAME token as a slot id in the server-side
+        // `SessionRegistry`, principal-keyed on the admitted subject — the
+        // session-management panel's substrate (list/revoke/revoke-all).
+        let issued_at = self.session_clock;
+        self.session_clock += 1;
+        self.session_registry.mint(
+            session.subject.to_string(),
+            token.clone(),
+            issued_at,
+            issued_at + SESSION_TTL_TICKS,
+        );
         self.sessions.insert(token.clone(), session);
         token
     }
 
     fn login_session_for(&self, token: &str) -> Option<&LoginSession> {
         self.login_sessions.get(token)
+    }
+
+    /// Drop token `token`'s admitted-session bearer state — the shared step
+    /// [`revoke_session`](Self::revoke_session) and
+    /// [`revoke_all_sessions`](Self::revoke_all_sessions) both take after
+    /// bumping the [`SessionRegistry`]'s revocation stamp, so every OTHER
+    /// tile's admission check (`login_session_for`, `/ping`, layout, member
+    /// management, …) fails closed on the very next call — the registry
+    /// revocation and the bearer-map drop happen atomically in the same
+    /// call, never one without the other.
+    fn drop_session_bearer(&mut self, token: &str) {
+        self.login_sessions.remove(token);
+        self.sessions.remove(token);
+    }
+
+    /// Every currently-active session belonging to `principal` (the
+    /// session-management panel's list), each flagged whether it is
+    /// `viewer_token`'s own current session.
+    #[must_use]
+    pub fn list_sessions(&self, principal: &str, viewer_token: &str) -> Vec<SessionSummary> {
+        let now = self.session_clock;
+        self.session_registry
+            .ls(principal, now)
+            .into_iter()
+            .map(|s: &Session| SessionSummary {
+                id: s.id.clone(),
+                node: self.identity.peer_id.clone(),
+                issued_at: s.issued_at,
+                expiry: s.expiry,
+                is_current: s.id == viewer_token,
+            })
+            .collect()
+    }
+
+    /// Revoke exactly ONE of `principal`'s sessions by id — a
+    /// decider-authorized act (the caller already proved `principal` via
+    /// their own admitted session; see `dispatch_sessions_revoke`). Bumps the
+    /// registry's global epoch and drops the matching bearer-map entry so the
+    /// session's bearer actions fail closed starting the very next call.
+    ///
+    /// # Errors
+    ///
+    /// [`RevokeError::NoSuchSession`] if `principal` has no session `id`.
+    pub fn revoke_session(&mut self, principal: &str, id: &str) -> Result<(), RevokeError> {
+        self.session_registry.revoke_one(principal, id)?;
+        self.drop_session_bearer(id);
+        Ok(())
+    }
+
+    /// Sign out everywhere: revoke every one of `principal`'s sessions
+    /// atomically (one epoch bump), then drop each one's bearer-map entry so
+    /// none of them admits any further bearer action.
+    pub fn revoke_all_sessions(&mut self, principal: &str) {
+        // Snapshot ids first (an immutable borrow over the pre-sweep active
+        // set), then revoke + drop — avoids mutating `session_registry` and
+        // `sessions`/`login_sessions` while still holding that borrow.
+        let ids: Vec<String> = self
+            .session_registry
+            .ls(principal, self.session_clock)
+            .into_iter()
+            .map(|s| s.id.clone())
+            .collect();
+        self.session_registry.revoke_all(principal);
+        for id in ids {
+            self.drop_session_bearer(&id);
+        }
     }
 }
 
@@ -843,6 +959,9 @@ fn dispatch_http(
         ("GET", "/portal/members") => dispatch_members_view(ctx, request),
         ("POST", "/portal/members/add") => dispatch_members_add(ctx, request),
         ("POST", "/portal/members/role") => dispatch_members_role(ctx, request),
+        ("GET", "/portal/sessions") => dispatch_sessions_view(ctx, request),
+        ("POST", "/portal/sessions/revoke") => dispatch_sessions_revoke(ctx, request),
+        ("POST", "/portal/sessions/revoke-all") => dispatch_sessions_revoke_all(ctx, request),
         _ => text_response(404, "Not Found", "not found".to_owned()),
     }
 }
@@ -1087,6 +1206,71 @@ fn dispatch_members_role(ctx: &mut WebAuthContext, request: &HttpRequest) -> Htt
     } else {
         text_response(404, "Not Found", "DENIED unknown-member".to_owned())
     }
+}
+
+/// The session-management panel: `GET /portal/sessions?token=<session>`.
+/// Requires an admitted session. Lists every ACTIVE server-side session
+/// belonging to the caller's own principal (never another principal's — the
+/// caller has no way to name one), one per line: `SESSION <id> NODE <node>
+/// ISSUED <issued_at> EXPIRY <expiry> CURRENT <yes|no>`. The panel derives
+/// its live expiry COUNTDOWN client-side from `EXPIRY` (a logical-clock
+/// tick count here; a real deployment reports wall-clock seconds).
+fn dispatch_sessions_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    let Some(session) = ctx.login_session_for(token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let principal = session.subject.to_string();
+    let mut body = String::new();
+    for s in ctx.list_sessions(&principal, token) {
+        body.push_str(&format!(
+            "SESSION {} NODE {} ISSUED {} EXPIRY {} CURRENT {}\n",
+            s.id,
+            s.node,
+            s.issued_at,
+            s.expiry,
+            if s.is_current { "yes" } else { "no" },
+        ));
+    }
+    text_response(200, "OK", body)
+}
+
+/// Revoke ONE of the caller's own sessions: `POST /portal/sessions/revoke`,
+/// body `<token>\n<id>`. A decider-authorized act — `token` proves the
+/// caller's own principal, and only THAT principal's sessions are ever
+/// revocable through this endpoint (never another's). The revoked session's
+/// bearer actions fail closed starting the very next call.
+fn dispatch_sessions_revoke(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let id = lines.next().unwrap_or("").trim();
+    let Some(session) = ctx.login_session_for(token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let principal = session.subject.to_string();
+    if id.is_empty() {
+        return text_response(400, "Bad Request", "MISSING id".to_owned());
+    }
+    match ctx.revoke_session(&principal, id) {
+        Ok(()) => text_response(200, "OK", format!("REVOKED {id}")),
+        Err(RevokeError::NoSuchSession) => {
+            text_response(404, "Not Found", "DENIED unknown-session".to_owned())
+        }
+    }
+}
+
+/// Sign out everywhere: `POST /portal/sessions/revoke-all`, body `<token>`.
+/// Revokes every one of the caller's own sessions (never another
+/// principal's) in one atomic sweep; each one's bearer actions fail closed
+/// starting the very next call.
+fn dispatch_sessions_revoke_all(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = request.body.lines().next().unwrap_or("").trim();
+    let Some(session) = ctx.login_session_for(token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let principal = session.subject.to_string();
+    ctx.revoke_all_sessions(&principal);
+    text_response(200, "OK", "REVOKED-ALL".to_owned())
 }
 
 /// Drive one node-side custody login: parse the TWO fields (identifier +
@@ -1939,6 +2123,12 @@ mod tests {
         assert!(body.contains("id=\"domain-tile\""), "must render the domain grouping view");
         assert!(body.contains("id=\"members-tile\""), "must render user/member management");
         assert!(body.contains("id=\"member-add-form\""), "must offer add/invite");
+        assert!(body.contains("id=\"sessions-tile\""), "must render the session-management panel");
+        assert!(body.contains("id=\"session-list\""), "must render the active-sessions list");
+        assert!(
+            body.contains("id=\"signout-everywhere-btn\""),
+            "must offer sign-out-everywhere"
+        );
     }
 
     // The UI-persisted layout resource, signed and content-addressed over the
@@ -2161,5 +2351,124 @@ mod tests {
             body.contains("class=\"explainer\""),
             "explainers must render as a distinct UI affordance"
         );
+    }
+
+    // The session-management panel: lists the registry's active sessions for
+    // the authenticated user with expiry, marking the caller's own current
+    // session; requires an admitted session (unauthenticated refused).
+    #[test]
+    fn session_panel_lists_active_sessions_with_expiry_and_marks_current() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+
+        // Unauthenticated is refused.
+        assert_eq!(get(&mut ctx, "/portal/sessions?token=nope").status, 401);
+
+        let first = login_alice(&mut ctx);
+        let listed = get(&mut ctx, &format!("/portal/sessions?token={first}"));
+        assert_eq!(listed.status, 200, "got: {}", listed.body);
+        assert!(
+            listed.body.contains(&format!("SESSION {first} ")),
+            "got: {}",
+            listed.body
+        );
+        assert!(
+            listed.body.contains("ISSUED") && listed.body.contains("EXPIRY"),
+            "must render issued-at and expiry for a live countdown: {}",
+            listed.body
+        );
+        assert!(
+            listed.body.contains(&format!("SESSION {first} NODE this-node")),
+            "must render the node/domain the session was issued on: {}",
+            listed.body
+        );
+        assert!(
+            listed.body.contains("CURRENT yes"),
+            "the caller's own session must be marked current: {}",
+            listed.body
+        );
+
+        // A second concurrent login for the same principal shows up too, and
+        // is correctly marked NOT current from the first session's own view.
+        let second = login_alice(&mut ctx);
+        assert_ne!(first, second);
+        let listed2 = get(&mut ctx, &format!("/portal/sessions?token={first}"));
+        assert!(
+            listed2.body.contains(&format!("SESSION {second} "))
+                && listed2.body.contains(&format!("SESSION {second} NODE this-node ISSUED"))
+                && listed2
+                    .body
+                    .lines()
+                    .find(|l| l.contains(&format!("SESSION {second} ")))
+                    .expect("second session line")
+                    .contains("CURRENT no"),
+            "got: {}",
+            listed2.body
+        );
+    }
+
+    // Revoke ONE session: emits exactly one decider-authorized act; the
+    // session drops and its bearer actions (here /ping) fail closed, while a
+    // sibling session for the same principal is untouched.
+    #[test]
+    fn revoke_one_session_drops_it_and_fails_its_bearer_actions_closed() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let victim = login_alice(&mut ctx);
+        let survivor = login_alice(&mut ctx);
+
+        // The victim session currently admits a bearer action.
+        assert_eq!(post(&mut ctx, "/ping", &victim).status, 200);
+
+        // Unauthorized revoke attempt (bad caller token) is refused.
+        assert_eq!(
+            post(&mut ctx, "/portal/sessions/revoke", &format!("bad-token\n{victim}")).status,
+            401
+        );
+        // Revoking an unknown id is refused.
+        assert_eq!(
+            post(&mut ctx, "/portal/sessions/revoke", &format!("{survivor}\nno-such-id")).status,
+            404
+        );
+
+        let revoked = post(&mut ctx, "/portal/sessions/revoke", &format!("{survivor}\n{victim}"));
+        assert_eq!(revoked.status, 200, "got: {}", revoked.body);
+        assert!(revoked.body.contains(&format!("REVOKED {victim}")), "got: {}", revoked.body);
+
+        // The revoked session's bearer actions now fail closed.
+        assert_eq!(post(&mut ctx, "/ping", &victim).status, 403);
+        // The surviving sibling session is untouched.
+        assert_eq!(post(&mut ctx, "/ping", &survivor).status, 200);
+
+        // The panel no longer lists the revoked session.
+        let listed = get(&mut ctx, &format!("/portal/sessions?token={survivor}"));
+        assert!(
+            !listed.body.contains(&format!("SESSION {victim} ")),
+            "got: {}",
+            listed.body
+        );
+    }
+
+    // Sign out everywhere: revoke-all drops EVERY one of the caller's
+    // sessions, all of them failing closed afterward.
+    #[test]
+    fn sign_out_everywhere_revokes_all_sessions() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let one = login_alice(&mut ctx);
+        let two = login_alice(&mut ctx);
+        let three = login_alice(&mut ctx);
+
+        // Unauthorized revoke-all attempt is refused.
+        assert_eq!(post(&mut ctx, "/portal/sessions/revoke-all", "bad-token").status, 401);
+
+        let resp = post(&mut ctx, "/portal/sessions/revoke-all", &one);
+        assert_eq!(resp.status, 200, "got: {}", resp.body);
+        assert!(resp.body.contains("REVOKED-ALL"), "got: {}", resp.body);
+
+        for token in [&one, &two, &three] {
+            assert_eq!(
+                post(&mut ctx, "/ping", token).status,
+                403,
+                "every session must fail closed after sign-out-everywhere"
+            );
+        }
     }
 }

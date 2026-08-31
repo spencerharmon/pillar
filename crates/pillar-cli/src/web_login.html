@@ -239,6 +239,13 @@
         </form>
         <p class="msg" id="member-add-msg"></p>
       </div>
+      <div class="tile" id="sessions-tile">
+        <h3>Sessions</h3>
+        <p>Your active server-side sessions on this node, with a live expiry countdown.</p>
+        <div id="session-list"></div>
+        <button id="signout-everywhere-btn" class="signout" type="button">Sign out everywhere</button>
+        <p class="msg" id="session-msg"></p>
+      </div>
       <button id="signout" class="signout" type="button">Sign out</button>
     </section>
   </main>
@@ -362,6 +369,110 @@
     });
   }
 
+  // --- Session-management panel: lists this principal's active server-side
+  // sessions (id, node, issued-at, a live expiry COUNTDOWN, and which one is
+  // this browser's current session), with per-session revoke and a
+  // sign-out-everywhere (revoke-all) action consuming the fail-closed
+  // decider-authorized session-registry revocation path. ---
+  let sessionListCache = [];
+  let sessionCountdownTimer = null;
+
+  function parseSessionLine(line) {
+    // "SESSION <id> NODE <node> ISSUED <t> EXPIRY <t> CURRENT <yes|no>"
+    const m = line.match(/^SESSION (\S+) NODE (\S+) ISSUED (\S+) EXPIRY (\S+) CURRENT (\S+)$/);
+    if (!m) return null;
+    return {
+      id: m[1],
+      node: m[2],
+      issuedAt: m[3],
+      expiry: Number(m[4]),
+      current: m[5] === "yes",
+    };
+  }
+
+  function renderSessionCountdowns() {
+    sessionListCache.forEach((s) => {
+      const el = $("session-expiry-" + s.id);
+      if (!el) return;
+      // The server reports a logical-clock expiry (not wall-clock seconds
+      // here); render the raw tick count as the countdown value so the UI
+      // still reflects a live, shrinking distance-to-expiry as later ticks
+      // advance, without assuming a wall-clock unit the harness doesn't model.
+      el.textContent = String(s.expiry);
+    });
+  }
+
+  async function refreshSessions() {
+    if (!sessionToken) return;
+    try {
+      const resp = await fetch("/portal/sessions?token=" + encodeURIComponent(sessionToken));
+      if (!resp.ok) return;
+      const text = await resp.text();
+      sessionListCache = text
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map(parseSessionLine)
+        .filter(Boolean);
+      $("session-list").innerHTML = sessionListCache
+        .map((s) => {
+          return (
+            '<div class="tile session-row" data-session-id="' + s.id + '">' +
+            "<p><strong>" + s.id + "</strong>" +
+            (s.current ? ' <span class="current-marker">(this session)</span>' : "") +
+            "</p>" +
+            "<p>Node/domain: " + s.node + "</p>" +
+            "<p>Issued at: " + s.issuedAt + "</p>" +
+            '<p>Expires: <span id="session-expiry-' + s.id + '">' + s.expiry + "</span></p>" +
+            (s.current
+              ? ""
+              : '<button type="button" class="session-revoke" data-id="' + s.id + '">Revoke</button>') +
+            "</div>"
+          );
+        })
+        .join("");
+      $("session-list").querySelectorAll(".session-revoke").forEach((btn) => {
+        btn.addEventListener("click", () => revokeSession(btn, btn.dataset.id));
+      });
+      renderSessionCountdowns();
+      if (!sessionCountdownTimer) {
+        sessionCountdownTimer = setInterval(renderSessionCountdowns, 1000);
+      }
+    } catch (_) {
+      // best-effort — the tile stays showing its last-known state.
+    }
+  }
+
+  async function revokeSession(btn, id) {
+    await withPending(btn, async () => {
+      const resp = await fetch("/portal/sessions/revoke", {
+        method: "POST",
+        body: sessionToken + "\n" + id,
+      });
+      const text = await resp.text();
+      setMsg("session-msg", text, resp.ok ? "ok" : "err");
+      if (resp.ok) refreshSessions();
+    });
+  }
+
+  if ($("signout-everywhere-btn")) {
+    $("signout-everywhere-btn").addEventListener("click", async () => {
+      await withPending($("signout-everywhere-btn"), async () => {
+        const resp = await fetch("/portal/sessions/revoke-all", {
+          method: "POST",
+          body: sessionToken,
+        });
+        const text = await resp.text();
+        setMsg("session-msg", text, resp.ok ? "ok" : "err");
+        if (resp.ok) {
+          // This session was revoked too — return to the login screen.
+          $("portal").classList.add("hidden");
+          $("login-form").classList.remove("hidden");
+          sessionToken = "";
+        }
+      });
+    });
+  }
+
   // --- Pending/disabled state for a mutating control whose signed event is in
   // flight. The button shows pending + is disabled (no double-submit) for the
   // duration of `action`, and re-enables on the result (success OR failure). ---
@@ -481,6 +592,7 @@
     refreshIdentity();
     refreshDomains();
     refreshMembers();
+    refreshSessions();
   }
 
   // --- Node identity / peers / lease holder, from the real node state. ---

@@ -33,6 +33,7 @@ pub mod bootstrap;
 pub mod observability_ui;
 pub mod onboard;
 pub mod run;
+pub mod session_cli;
 pub mod web_serve;
 
 use std::collections::BTreeMap;
