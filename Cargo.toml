@@ -21,6 +21,7 @@ members = [
     "crates/pillar-web",
     "crates/pillar-trust-artifacts",
     "crates/pillar-quota-ledger",
+    "crates/pillar-topology",
 ]
 
 [workspace.package]

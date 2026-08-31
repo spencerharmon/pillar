@@ -1,0 +1,15 @@
+[package]
+name = "pillar-topology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Label-driven node grouping over a config-ordered tier hierarchy (region>…>node), self-declared advisory vs attested topology labels (reusing pillar-trust-artifacts' attest), and placement payoff: failure-domain spread/anti-affinity, quorum safety, per-tier rollups, locality routing."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+
+[lints]
+workspace = true
