@@ -143,8 +143,8 @@ use pillar_core::{Epoch, NodeId};
 use pillar_coordination::LeaseRegister;
 use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_rbac::{
-    Capability as RbacCapability, Decision, PolicyEvent, PolicyTarget, RbacDecider, Request as RbacRequest,
-    ResourceClass,
+    default_resource_class_policies, Capability as RbacCapability, Decision, PolicyEvent, PolicyTarget,
+    RbacDecider, Request as RbacRequest, ResourceClass,
 };
 use pillar_identity::global_identity::{
     Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
@@ -173,7 +173,6 @@ use pillar_trust_artifacts::{
 use pillar_manifest::{
     Crd, Metadata as CrdMetadata, SchemaRegistry, Schema, FieldType, Value as CrdValue,
 };
-use pillar_rbac::{default_resource_class_policies, Capability as RbacCapability};
 use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
 use crate::Platform;
 
