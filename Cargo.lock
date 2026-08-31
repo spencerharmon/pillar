@@ -2320,6 +2320,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-quota-ledger"
+version = "0.0.0"
+dependencies = [
+ "pillar-coordination",
+ "pillar-core",
+ "pillar-streamdb",
+ "pillar-trust-artifacts",
+]
+
+[[package]]
 name = "pillar-rbac"
 version = "0.0.0"
 dependencies = [
