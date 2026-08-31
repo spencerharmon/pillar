@@ -69,9 +69,12 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::time::Instant;
 
-use pillar_core::NodeId;
+use pillar_core::{Epoch, NodeId};
+use pillar_coordination::LeaseRegister;
 use pillar_identity::NodeSubkey;
+use pillar_streamdb::{OpId, OpLog};
 use pillar_web::key_login::{LoginSession, Origin};
 use pillar_web::node_custody::{
     BootstrapError, CellBootstrap, CellNameRegistry, Cid, InMemoryCellNameRegistry,
@@ -84,6 +87,23 @@ use pillar_bootstrap::{
     RequestError,
 };
 use pillar_wot_authority::{FencedActor, WotAuthority};
+
+/// A read-only snapshot of this node's identity/reachability, as the
+/// authenticated portal renders it: [`NodeId`]-derived peer id, the
+/// multiaddrs this node listens on, and the peers it currently considers
+/// connected. Real values are supplied by the boot-time `pillar-net` swarm
+/// (see `crates/pillar-cli/src/run.rs`); the default here is an empty view
+/// (a node with no configured listen/dial peers yet) until wired via
+/// [`WebAuthContext::with_identity`].
+#[derive(Clone, Debug, Default)]
+pub struct NodeIdentitySnapshot {
+    /// This node's libp2p-style peer id (derived from its identity keypair).
+    pub peer_id: String,
+    /// The multiaddrs this node listens on.
+    pub listen_addrs: Vec<String>,
+    /// The peers this node currently considers connected (peer ids).
+    pub connected_peers: Vec<String>,
+}
 
 /// The server-side state the node-side-custody portal needs: the node-custody
 /// verifier (holding this node's node key + its cell-DB view of node-sealed
@@ -113,6 +133,28 @@ pub struct WebAuthContext {
     /// The node/user bootstrap-request queue for the cell this node serves.
     /// `None` until the cell is created (a request joins an EXISTING cell).
     requests: Option<BootstrapRequestQueue>,
+    /// This node's identity/reachability snapshot (PeerId, listen addrs, the
+    /// peers it considers connected) — the authenticated portal's "node
+    /// status" tile reads this. Defaults empty; wire the real swarm-derived
+    /// values via [`WebAuthContext::with_identity`].
+    identity: NodeIdentitySnapshot,
+    /// When this context was created — the portal reports uptime as the
+    /// elapsed time since.
+    started_at: Instant,
+    /// The quorum-fenced lease register backing the portal's "lease holder"
+    /// tile (see `pillar-coordination`). A fresh node is its own single
+    /// voter/candidate, self-granting `lease_epoch` at construction so a
+    /// solo node reports itself as holder; a real multi-node cell wires
+    /// additional voters over the streaming DB / gossip layer.
+    lease: LeaseRegister,
+    /// The epoch the portal reads the lease holder at.
+    lease_epoch: Epoch,
+    /// UI-persisted layouts, stored as signed, content-addressed ops riding
+    /// the streaming DB (`pillar-streamdb`) — never a server-side database.
+    /// Each stored op's payload is `<signer-handle>\n<layout-content>`; its
+    /// content-addressed [`OpId`] is the resource's CID, and
+    /// `OpLog::root()` is the resource's streaming tip.
+    layouts: OpLog,
 }
 
 impl WebAuthContext {
@@ -129,10 +171,18 @@ impl WebAuthContext {
         max_depth: u8,
     ) -> Self {
         let origin = origin.into();
+        let owner_for_lease = owner.clone();
+        let node_for_identity = node.clone();
         let authority = WotAuthority::new(owner, max_depth);
         let mut actor = FencedActor::new();
         actor.refresh(&authority);
         let node_key = NodeKey::new(node, node_secret);
+        let mut lease = LeaseRegister::new(1);
+        let lease_epoch = Epoch(1);
+        // A solo node is its own voter and candidate: self-grant + acquire so
+        // a fresh node reports itself as the lease holder out of the box.
+        let _ = lease.grant(owner_for_lease.clone(), owner_for_lease.clone(), lease_epoch);
+        let _ = lease.try_acquire(&owner_for_lease, lease_epoch);
         WebAuthContext {
             verifier: NodeCustodyVerifier::new(node_key, Origin::from(origin.as_str())),
             authority,
@@ -143,7 +193,71 @@ impl WebAuthContext {
             login_sessions: HashMap::new(),
             next_session: 0,
             requests: None,
+            identity: NodeIdentitySnapshot {
+                peer_id: node_for_identity.to_string(),
+                listen_addrs: Vec::new(),
+                connected_peers: Vec::new(),
+            },
+            started_at: Instant::now(),
+            lease,
+            lease_epoch,
+            layouts: OpLog::new(),
         }
+    }
+
+    /// Inject this node's real identity/reachability snapshot (PeerId, listen
+    /// addrs, connected peers) as `run.rs` observes it from the live swarm.
+    #[must_use]
+    pub fn with_identity(mut self, identity: NodeIdentitySnapshot) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// The current identity/reachability snapshot the portal renders.
+    #[must_use]
+    pub fn identity(&self) -> &NodeIdentitySnapshot {
+        &self.identity
+    }
+
+    /// Seconds elapsed since this context was created — the portal's uptime.
+    #[must_use]
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// The current holder of this node's lease epoch, if any.
+    #[must_use]
+    pub fn lease_holder(&self) -> Option<&NodeId> {
+        self.lease.holder(self.lease_epoch)
+    }
+
+    /// Persist a UI layout as a signed, content-addressed op riding the
+    /// streaming DB — no server-side database. `signer` is the authenticated
+    /// handle that produced `content` (the portal only ever calls this for an
+    /// admitted session). Returns the resource's content-addressed [`OpId`]
+    /// (its CID).
+    pub fn store_layout(&mut self, signer: &str, content: &str) -> OpId {
+        let payload = format!("{signer}\n{content}");
+        self.layouts.append(payload.into_bytes())
+    }
+
+    /// Resolve a previously stored layout by its CID, returning
+    /// `(signer, content)`.
+    #[must_use]
+    pub fn get_layout(&self, id: OpId) -> Option<(String, String)> {
+        self.layouts.order().into_iter().find(|op| op.id() == id).and_then(|op| {
+            let text = String::from_utf8_lossy(op.payload());
+            let mut lines = text.splitn(2, '\n');
+            let signer = lines.next()?.to_owned();
+            let content = lines.next().unwrap_or("").to_owned();
+            Some((signer, content))
+        })
+    }
+
+    /// The streaming tip (Merkle root) of the layout resource log.
+    #[must_use]
+    pub fn layout_tip(&self) -> u64 {
+        self.layouts.root()
     }
 
     /// Chain `subject` to the authority root at `level`, admitting it as
@@ -540,7 +654,94 @@ fn dispatch_http(
                 Err(e) => text_response(403, "Forbidden", format!("REFUSED {e:?}")),
             }
         }
+        ("GET", "/portal/status") => dispatch_portal_status(ctx, request),
+        ("POST", "/portal/layout") => dispatch_layout_store(ctx, request),
+        ("GET", "/portal/layout") => dispatch_layout_get(ctx, request),
         _ => text_response(404, "Not Found", "not found".to_owned()),
+    }
+}
+
+/// Extract `key`'s value from `path`'s query string (`GET /x?a=1&b=2`), if
+/// present. A bare helper — this portal has no framework, so query params are
+/// parsed by hand exactly like the existing header/body parsing above.
+fn query_value<'a>(path: &'a str, key: &str) -> Option<&'a str> {
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// The real authenticated portal's identity/reachability + lease-holder tile:
+/// `GET /portal/status?token=<session>`. Requires an admitted session — an
+/// unauthenticated (or unknown/expired-token) request is refused, exactly
+/// like every other signing/read action gated behind login. Renders PeerId,
+/// listen addrs, connected peer count + list, uptime, and the current lease
+/// holder — all read from this node's live [`WebAuthContext`] state, never a
+/// server-side database.
+fn dispatch_portal_status(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let identity = ctx.identity();
+    let lease_holder = ctx
+        .lease_holder()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    let mut body = String::new();
+    body.push_str(&format!("PEER-ID {}\n", identity.peer_id));
+    body.push_str(&format!("LISTEN {}\n", identity.listen_addrs.join(",")));
+    body.push_str(&format!("PEER-COUNT {}\n", identity.connected_peers.len()));
+    body.push_str(&format!("PEERS {}\n", identity.connected_peers.join(",")));
+    body.push_str(&format!("UPTIME-SECS {}\n", ctx.uptime_secs()));
+    body.push_str(&format!("LEASE-HOLDER {lease_holder}\n"));
+    text_response(200, "OK", body)
+}
+
+/// Persist a UI layout as a signed, content-addressed streaming-DB resource:
+/// `POST /portal/layout`, body `<token>\n<content>`. Requires an admitted
+/// session (the resource is signed by that session's handle); returns the
+/// resource's content address (CID) and the log's new streaming tip.
+fn dispatch_layout_store(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let content: String = lines.collect::<Vec<_>>().join("\n");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let cid = ctx.store_layout(&session.subject.to_string(), &content);
+    text_response(
+        200,
+        "OK",
+        format!("LAYOUT-CID {} TIP {}", cid.0, ctx.layout_tip()),
+    )
+}
+
+/// Retrieve a previously stored UI layout: `GET
+/// /portal/layout?token=<session>&cid=<id>`. Requires an admitted session;
+/// the resource's own signer + content are returned so a differently
+/// authenticated viewer can see who produced the layout.
+fn dispatch_layout_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(cid_raw) = query_value(&request.path, "cid") else {
+        return text_response(400, "Bad Request", "MISSING cid".to_owned());
+    };
+    let Ok(cid) = cid_raw.parse::<u64>() else {
+        return text_response(400, "Bad Request", "BAD cid".to_owned());
+    };
+    match ctx.get_layout(OpId(cid)) {
+        Some((signer, content)) => {
+            text_response(200, "OK", format!("SIGNER {signer}\nCONTENT {content}"))
+        }
+        None => text_response(404, "Not Found", "DENIED unknown-layout".to_owned()),
     }
 }
 
@@ -1234,5 +1435,140 @@ mod tests {
         let approved = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
         assert_eq!(approved.status, 200, "got: {}", approved.body);
         assert!(approved.body.contains("ESCROWED"), "got: {}", approved.body);
+    }
+
+    // The real authenticated portal: an unauthenticated request for node
+    // identity/peer/lease status is refused, exactly like every other
+    // signing/read action gated behind login.
+    #[test]
+    fn portal_status_requires_an_admitted_session() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get(&mut ctx, "/portal/status?token=not-a-token");
+        assert_eq!(resp.status, 401);
+        assert!(resp.body.contains("not-authenticated"), "got: {}", resp.body);
+    }
+
+    // Once admitted, the portal renders node/identity status (PeerId, listen
+    // addrs, uptime), peer list + count, and the lease holder — all from this
+    // node's live view, never a server-side database.
+    #[test]
+    fn authenticated_portal_renders_identity_status_peer_list_and_lease_holder() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        ctx = ctx.with_identity(NodeIdentitySnapshot {
+            peer_id: "12D3KooWThisNode".to_owned(),
+            listen_addrs: vec!["/ip4/0.0.0.0/tcp/4001".to_owned()],
+            connected_peers: vec!["peer-a".to_owned(), "peer-b".to_owned()],
+        });
+        let token = login_alice(&mut ctx);
+
+        let resp = get(&mut ctx, &format!("/portal/status?token={token}"));
+        assert_eq!(resp.status, 200, "got: {}", resp.body);
+        assert!(resp.body.contains("PEER-ID 12D3KooWThisNode"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("LISTEN /ip4/0.0.0.0/tcp/4001"),
+            "got: {}",
+            resp.body
+        );
+        assert!(resp.body.contains("PEER-COUNT 2"), "got: {}", resp.body);
+        assert!(resp.body.contains("PEERS peer-a,peer-b"), "got: {}", resp.body);
+        assert!(resp.body.contains("UPTIME-SECS"), "got: {}", resp.body);
+        // A solo node self-grants its lease at construction, so it reports
+        // itself ("owner") as holder out of the box.
+        assert!(resp.body.contains("LEASE-HOLDER owner"), "got: {}", resp.body);
+    }
+
+    // A UI-persisted layout is a signed, content-addressed resource riding the
+    // streaming DB (`pillar-streamdb`) — never a server-side database. Storing
+    // requires an admitted session (the resource is signed by that session's
+    // subject); it round-trips by its content-addressed CID and advances the
+    // log's streaming tip.
+    #[test]
+    fn ui_persisted_layout_round_trips_as_a_signed_streaming_db_resource() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Unauthenticated store is refused.
+        let refused = post(&mut ctx, "/portal/layout", "bad-token\n{\"widgets\":[]}");
+        assert_eq!(refused.status, 401);
+
+        let tip_before = ctx.layout_tip();
+        let stored = post(
+            &mut ctx,
+            "/portal/layout",
+            &format!("{token}\n{{\"widgets\":[\"peers\",\"inbox\"]}}"),
+        );
+        assert_eq!(stored.status, 200, "got: {}", stored.body);
+        assert!(stored.body.starts_with("LAYOUT-CID "), "got: {}", stored.body);
+        let cid: u64 = stored
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        // The streaming tip (Merkle root) advanced once the op was appended.
+        assert_ne!(ctx.layout_tip(), tip_before);
+
+        // Unauthenticated fetch is refused.
+        let refused_get = get(&mut ctx, &format!("/portal/layout?token=nope&cid={cid}"));
+        assert_eq!(refused_get.status, 401);
+
+        // Authenticated fetch round-trips the signed content, attributed to
+        // the storing session's subject.
+        let fetched = get(&mut ctx, &format!("/portal/layout?token={token}&cid={cid}"));
+        assert_eq!(fetched.status, 200, "got: {}", fetched.body);
+        assert!(fetched.body.contains("SIGNER"), "got: {}", fetched.body);
+        assert!(
+            fetched.body.contains("CONTENT {\"widgets\":[\"peers\",\"inbox\"]}"),
+            "got: {}",
+            fetched.body
+        );
+    }
+
+    // The request-approval inbox UI: the portal HTML renders the pending
+    // request's fields and Approve/Reject controls wired to the existing
+    // backend endpoints (no bare protocol description — a real UI).
+    #[test]
+    fn request_inbox_ui_renders_list_and_approve_reject_controls() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get(&mut ctx, "/");
+        let body = &resp.body;
+        assert!(body.contains("id=\"inbox-list\""), "must render an inbox list container");
+        assert!(
+            body.contains("/bootstrap/request/list"),
+            "must fetch the pending request list"
+        );
+        assert!(
+            body.contains("/bootstrap/request/approve") && body.contains("/bootstrap/request/reject"),
+            "must dispatch Approve/Reject through the existing endpoints"
+        );
+        assert!(body.contains("Approve") && body.contains("Reject"), "got: {}", body);
+        // The identity/peer/lease-holder tile is also rendered.
+        assert!(body.contains("id=\"portal-peer-id\""), "must render node identity");
+        assert!(body.contains("id=\"portal-lease-holder\""), "must render lease holder");
+    }
+
+    // The shipped bootstrap flow + status semantics still pass unchanged —
+    // regression guard against this task's additions.
+    #[test]
+    fn bootstrap_flow_and_status_semantics_are_unregressed_by_the_portal_additions() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
+        let done = post(
+            &mut ctx,
+            "/bootstrap/create",
+            &format!("regress-cell\nspencer\n{PASSWORD}"),
+        );
+        assert_eq!(done.status, 200, "got: {}", done.body);
+        assert_eq!(
+            get(&mut ctx, "/bootstrap/status").body.trim(),
+            "BOOTSTRAPPED"
+        );
     }
 }

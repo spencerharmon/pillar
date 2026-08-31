@@ -2214,6 +2214,7 @@ dependencies = [
  "libp2p",
  "pillar-bootstrap",
  "pillar-controller",
+ "pillar-coordination",
  "pillar-core",
  "pillar-eventlog",
  "pillar-identity",

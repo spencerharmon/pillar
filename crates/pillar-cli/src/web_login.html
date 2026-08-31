@@ -162,9 +162,17 @@
         </div>
       </div>
       <div class="tile">
-        <h3>Manage node</h3>
-        <p>Review peers, rotate keys, and dispatch signed actions from this portal.
-           Signing actions run through the same admitted session.</p>
+        <h3>Node identity</h3>
+        <p>PeerId: <span id="portal-peer-id">—</span></p>
+        <p>Listen addrs: <span id="portal-listen-addrs">—</span></p>
+        <p>Uptime: <span id="portal-uptime">—</span>s</p>
+        <p>Peers: <span id="portal-peer-count">0</span> — <span id="portal-peer-list">none</span></p>
+        <p>Lease holder: <span id="portal-lease-holder">—</span></p>
+      </div>
+      <div class="tile" id="inbox-tile">
+        <h3>Request inbox</h3>
+        <p>Pending node/user join requests for this cell.</p>
+        <div id="inbox-list"></div>
       </div>
       <button id="signout" class="signout" type="button">Sign out</button>
     </section>
@@ -229,6 +237,86 @@
     portal.classList.remove("hidden");
     $("greeting").textContent = "Welcome, " + handle;
     $("portal-who").textContent = "Signed in as " + handle;
+    refreshPortalStatus();
+    refreshInbox();
+  }
+
+  // --- Node identity / peers / lease holder, from the real node state. ---
+  let sessionToken = "";
+
+  async function refreshPortalStatus() {
+    if (!sessionToken) return;
+    try {
+      const resp = await fetch("/portal/status?token=" + encodeURIComponent(sessionToken));
+      if (!resp.ok) return;
+      const text = await resp.text();
+      const fields = {};
+      for (const line of text.split("\n")) {
+        const sp = line.indexOf(" ");
+        if (sp === -1) continue;
+        fields[line.slice(0, sp)] = line.slice(sp + 1);
+      }
+      $("portal-peer-id").textContent = fields["PEER-ID"] || "—";
+      $("portal-listen-addrs").textContent = fields["LISTEN"] || "none";
+      $("portal-uptime").textContent = fields["UPTIME-SECS"] || "0";
+      const peers = (fields["PEERS"] || "").split(",").filter(Boolean);
+      $("portal-peer-count").textContent = fields["PEER-COUNT"] || peers.length;
+      $("portal-peer-list").textContent = peers.length ? peers.join(", ") : "none";
+      $("portal-lease-holder").textContent = fields["LEASE-HOLDER"] || "none";
+    } catch (_) { /* leave placeholders */ }
+  }
+
+  // --- Request-approval inbox: list pending node/user join requests, with
+  // Approve/Reject actions dispatched through the admitted session. ---
+  async function refreshInbox() {
+    const list = $("inbox-list");
+    try {
+      const resp = await fetch("/bootstrap/request/list");
+      if (!resp.ok) {
+        list.textContent = "No cell yet.";
+        return;
+      }
+      const text = (await resp.text()).trim();
+      if (!text) {
+        list.textContent = "No pending requests.";
+        return;
+      }
+      list.innerHTML = "";
+      for (const line of text.split("\n")) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 3) continue;
+        const [id, kind, subject] = parts;
+        const row = document.createElement("div");
+        row.className = "tile";
+        row.innerHTML =
+          '<p><strong>#' + id + '</strong> ' + kind + ' — ' + subject + '</p>' +
+          '<div class="row">' +
+          '<button type="button" class="inbox-approve" data-id="' + id + '">Approve</button>' +
+          '<button type="button" class="inbox-reject" data-id="' + id + '">Reject</button>' +
+          '</div><p class="msg" id="inbox-msg-' + id + '"></p>';
+        list.appendChild(row);
+      }
+      list.querySelectorAll(".inbox-approve").forEach((btn) => {
+        btn.addEventListener("click", () => decideRequest(btn.dataset.id, true));
+      });
+      list.querySelectorAll(".inbox-reject").forEach((btn) => {
+        btn.addEventListener("click", () => decideRequest(btn.dataset.id, false));
+      });
+    } catch (_) {
+      list.textContent = "Could not load the request inbox.";
+    }
+  }
+
+  async function decideRequest(id, approve) {
+    const path = approve ? "/bootstrap/request/approve" : "/bootstrap/request/reject";
+    const resp = await fetch(path, { method: "POST", body: `${id}\n${sessionToken}` });
+    const text = (await resp.text()).trim();
+    const msg = $("inbox-msg-" + id);
+    if (msg) {
+      msg.textContent = resp.ok ? text : "Failed: " + text.replace(/^DENIED\s*/, "");
+      msg.className = "msg " + (resp.ok ? "ok" : "err");
+    }
+    if (resp.ok) refreshInbox();
   }
 
   $("login-form").addEventListener("submit", async (e) => {
@@ -241,6 +329,7 @@
       const res = await doLogin(identifier, password);
       if (res.ok) {
         setMsg("msg", "", "");
+        sessionToken = res.token || "";
         showPortal(res.handle);
       } else {
         setMsg("msg", friendlyError(res.reason), "err");
@@ -257,6 +346,7 @@
     $("login-form").classList.remove("hidden");
     $("password").value = "";
     setMsg("msg", "", "");
+    sessionToken = "";
   });
 
   // --- First-run bootstrap flow (operator-driven). ---
