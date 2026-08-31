@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bootstrap;
 pub mod onboard;
 pub mod run;
 pub mod web_serve;

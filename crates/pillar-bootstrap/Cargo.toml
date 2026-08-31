@@ -1,0 +1,17 @@
+[package]
+name = "pillar-bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared bootstrap library: cell/user/node onboarding sequence, name-uniqueness, bootstrap requests, and login-token issuance, reused by pillar-web and pillar-cli."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-identity = { path = "../pillar-identity" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
+pillar-rbac = { path = "../pillar-rbac" }
+
+[lints]
+workspace = true

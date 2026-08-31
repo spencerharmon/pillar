@@ -13,6 +13,7 @@ members = [
     "crates/pillar-observability",
     "crates/pillar-wot-authority",
     "crates/pillar-rbac",
+    "crates/pillar-bootstrap",
     "crates/pillar-key-distribution",
     "crates/pillar-cells",
     "crates/pillar-recovery",

@@ -73,6 +73,11 @@ use pillar_web::node_custody::{
     NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey, CELL_NAME_IN_USE_MESSAGE,
 };
 use pillar_web::{authorize_nonloopback_signing_action, bind_web};
+use pillar_bootstrap::custody::parse_custody_kind;
+use pillar_bootstrap::{
+    BootstrapRequestId, BootstrapRequestKind, BootstrapRequestQueue, CustodyKind, NodeIdentity,
+    RequestError,
+};
 use pillar_wot_authority::{FencedActor, WotAuthority};
 
 /// The server-side state the node-side-custody portal needs: the node-custody
@@ -100,6 +105,9 @@ pub struct WebAuthContext {
     /// The `pillar_web` login-session view (for the shared non-loopback gate).
     login_sessions: HashMap<String, LoginSession>,
     next_session: u64,
+    /// The node/user bootstrap-request queue for the cell this node serves.
+    /// `None` until the cell is created (a request joins an EXISTING cell).
+    requests: Option<BootstrapRequestQueue>,
 }
 
 impl WebAuthContext {
@@ -129,6 +137,7 @@ impl WebAuthContext {
             sessions: HashMap::new(),
             login_sessions: HashMap::new(),
             next_session: 0,
+            requests: None,
         }
     }
 
@@ -243,7 +252,11 @@ impl WebAuthContext {
     /// [`BootstrapError::CellNameInUse`] when the network already claims it.
     pub fn create_cell(&mut self, cell: NodeId) -> Result<(), BootstrapError> {
         self.bootstrap
-            .create_cell_checked(cell, self.name_registry.as_ref())
+            .create_cell_checked(cell.clone(), self.name_registry.as_ref())?;
+        // The cell now exists: open the bootstrap-request queue for it so fresh
+        // nodes/users can request to join.
+        self.requests = Some(BootstrapRequestQueue::new(cell, std::iter::empty()));
+        Ok(())
     }
 
     fn store_session(&mut self, session: NodeCustodySession) -> String {
@@ -449,6 +462,11 @@ fn dispatch_http(
             )
         }
         ("POST", "/login") => dispatch_login(ctx, request),
+        ("POST", "/bootstrap/request/node") => dispatch_request_submit(ctx, request, true),
+        ("POST", "/bootstrap/request/user") => dispatch_request_submit(ctx, request, false),
+        ("GET", "/bootstrap/request/list") => dispatch_request_list(ctx),
+        ("POST", "/bootstrap/request/approve") => dispatch_request_decide(ctx, request, true),
+        ("POST", "/bootstrap/request/reject") => dispatch_request_decide(ctx, request, false),
         ("POST", "/ping") => {
             // Resolve the admitted session from the bearer token, then run the
             // UNCHANGED shared gate: a non-loopback peer with no admitted
@@ -507,6 +525,127 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
             let reason = login_reason(&e);
             text_response(401, "Unauthorized", format!("DENIED {reason}"))
         }
+    }
+}
+
+fn parse_custody_field(token: &str) -> CustodyKind {
+    parse_custody_kind(token).unwrap_or(CustodyKind::Password)
+}
+
+/// Submit a node/user bootstrap request. `is_node` selects the kind; the body
+/// carries the requester's identifying info as newline-separated fields (see
+/// the CLI `pillar bootstrap node`/`user` clients for the exact framing).
+/// Requires the cell to exist (a request joins an EXISTING cell).
+fn dispatch_request_submit(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+    is_node: bool,
+) -> HttpResponse {
+    let Some(queue) = ctx.requests.as_mut() else {
+        return text_response(409, "Conflict", "DENIED no-cell-yet".to_owned());
+    };
+    let mut lines = request.body.lines();
+    let subject = lines.next().unwrap_or("").trim();
+    if subject.is_empty() {
+        return text_response(400, "Bad Request", "MISSING subject".to_owned());
+    }
+    let subject = NodeId::from(subject);
+    let id = if is_node {
+        // Fields: <subject>\n<peer_id>\n<version>\n<os>\n<public_key_cid>\n<custody>
+        // then any number of `pub=<addr>` / `priv=<addr>` / `label=<l>` lines.
+        let peer_id = lines.next().unwrap_or("").trim().to_owned();
+        let version = lines.next().unwrap_or("").trim().to_owned();
+        let os = lines.next().unwrap_or("").trim().to_owned();
+        let public_key_cid = lines.next().unwrap_or("").trim().to_owned();
+        let custody = parse_custody_field(lines.next().unwrap_or("").trim());
+        let mut identity = NodeIdentity::new(peer_id);
+        identity.version = version;
+        identity.os = os;
+        identity.public_key_cid = public_key_cid;
+        let mut labels = Vec::new();
+        for line in lines {
+            let line = line.trim();
+            if let Some(a) = line.strip_prefix("pub=") {
+                identity.public_addrs.push(a.to_owned());
+            } else if let Some(a) = line.strip_prefix("priv=") {
+                identity.private_addrs.push(a.to_owned());
+            } else if let Some(l) = line.strip_prefix("label=") {
+                labels.push(l.to_owned());
+            }
+        }
+        queue.submit_node(subject, identity, custody, labels)
+    } else {
+        // Fields: <subject>\n<custody> then any number of `label=<l>` lines.
+        let custody = parse_custody_field(lines.next().unwrap_or("").trim());
+        let labels: Vec<String> = lines
+            .filter_map(|l| l.trim().strip_prefix("label=").map(str::to_owned))
+            .collect();
+        queue.submit_user(subject, custody, labels)
+    };
+    text_response(200, "OK", format!("REQUEST {}", id.0))
+}
+
+/// List the pending bootstrap requests, one per line: `<id> <kind> <subject>`.
+fn dispatch_request_list(ctx: &WebAuthContext) -> HttpResponse {
+    let Some(queue) = ctx.requests.as_ref() else {
+        return text_response(409, "Conflict", "DENIED no-cell-yet".to_owned());
+    };
+    let mut body = String::new();
+    for req in queue.pending() {
+        let kind = match req.kind() {
+            BootstrapRequestKind::Node => "node",
+            BootstrapRequestKind::User => "user",
+        };
+        body.push_str(&format!("{} {} {}\n", req.id().0, kind, req.subject().0));
+    }
+    text_response(200, "OK", body)
+}
+
+/// Approve or reject a pending request. The body is `<id>\n<session-token>`.
+/// The presented session token must resolve to an admitted login session; its
+/// subject is the authorized member that decides the request. A NODE approval
+/// seals the cell key and returns its CID; a USER approval escrows the offer.
+fn dispatch_request_decide(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+    approve: bool,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let id_raw = lines.next().unwrap_or("").trim();
+    let token = lines.next().unwrap_or("").trim();
+    let Ok(id) = id_raw.parse::<u64>() else {
+        return text_response(400, "Bad Request", "MISSING request-id".to_owned());
+    };
+    // Authenticated member = the subject of a valid login session.
+    let Some(session) = ctx.login_sessions.get(token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let member = session.subject.clone();
+    let Some(queue) = ctx.requests.as_mut() else {
+        return text_response(409, "Conflict", "DENIED no-cell-yet".to_owned());
+    };
+    // An authenticated (WoT-authoritative) login IS an authorized member.
+    queue.add_member(member.clone());
+    let id = BootstrapRequestId(id);
+    if approve {
+        match queue.approve(id, &member) {
+            Ok(Some(sealed)) => text_response(200, "OK", format!("APPROVED {}", sealed.cid)),
+            Ok(None) => text_response(200, "OK", format!("ESCROWED {}", id.0)),
+            Err(e) => text_response(409, "Conflict", format!("DENIED {}", request_reason(&e))),
+        }
+    } else {
+        match queue.reject(id, &member) {
+            Ok(()) => text_response(200, "OK", format!("REJECTED {}", id.0)),
+            Err(e) => text_response(409, "Conflict", format!("DENIED {}", request_reason(&e))),
+        }
+    }
+}
+
+fn request_reason(e: &RequestError) -> &'static str {
+    match e {
+        RequestError::UnknownRequest => "unknown-request",
+        RequestError::NotPending => "already-decided",
+        RequestError::NotAuthorizedMember => "not-authorized-member",
     }
 }
 
@@ -918,5 +1057,63 @@ mod tests {
             get(&mut ctx, "/bootstrap/status").body.trim(),
             "BOOTSTRAPPED"
         );
+    }
+
+    // Log alice in through the real HTTP handshake and return her session token.
+    fn login_alice(ctx: &mut WebAuthContext) -> String {
+        let nonce = get(ctx, "/nonce");
+        let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
+        let login = post(ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nonce_id}"));
+        assert_eq!(login.status, 200, "login body: {}", login.body);
+        login.session_token.expect("session token")
+    }
+
+    #[test]
+    fn node_bootstrap_request_can_be_submitted_listed_and_approved_returning_a_cid() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        // A request can only join an EXISTING cell.
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/node", "new-node").status,
+            409
+        );
+        assert_eq!(post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status, 200);
+
+        // Submit a node request carrying identifying info.
+        let body = "new-node\n12D3KooWpeer\npillar 0.0.0\nlinux\nbafy-nodekey\ntpm\npub=/ip4/203.0.113.7/tcp/4001\nlabel=edge";
+        let submitted = post(&mut ctx, "/bootstrap/request/node", body);
+        assert_eq!(submitted.status, 200);
+        assert!(submitted.body.starts_with("REQUEST "), "got: {}", submitted.body);
+        let id = submitted.body.trim_start_matches("REQUEST ").trim();
+
+        // It shows up in the pending list.
+        let list = get(&mut ctx, "/bootstrap/request/list");
+        assert!(list.body.contains("node new-node"), "got: {}", list.body);
+
+        // Approving without authentication is refused.
+        let unauth = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\nnot-a-token"));
+        assert_eq!(unauth.status, 401);
+
+        // Authenticated approval seals the cell key and returns its CID.
+        let token = login_alice(&mut ctx);
+        let approved = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        assert_eq!(approved.status, 200, "got: {}", approved.body);
+        assert!(approved.body.contains("APPROVED bafy-cellkey-"), "got: {}", approved.body);
+
+        // The request is terminal: a second decision is refused.
+        let again = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        assert_eq!(again.status, 409);
+    }
+
+    #[test]
+    fn user_bootstrap_request_approval_escrows_and_returns_no_cell_key() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        assert_eq!(post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status, 200);
+        let submitted = post(&mut ctx, "/bootstrap/request/user", "new-user\npassword\nlabel=ops");
+        assert_eq!(submitted.status, 200);
+        let id = submitted.body.trim_start_matches("REQUEST ").trim().to_owned();
+        let token = login_alice(&mut ctx);
+        let approved = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        assert_eq!(approved.status, 200, "got: {}", approved.body);
+        assert!(approved.body.contains("ESCROWED"), "got: {}", approved.body);
     }
 }

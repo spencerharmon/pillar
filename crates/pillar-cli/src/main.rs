@@ -24,6 +24,10 @@ fn usage() -> &'static str {
      \x20 pillar apply    <manifest.txt>            validate, authorize, sign, emit a signed event\n\
      \x20 pillar get      <api> <kind> <name>       render a resource from the materialized view\n\
      \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
+     \x20 pillar bootstrap cell <name> --user <handle> [opts]  combined single-step cell+user bootstrap\n\
+     \x20 pillar bootstrap node|user --domain <D> [opts]       submit a node/user join request\n\
+     \x20 pillar bootstrap request list|approve <id> [--domain D]  review/decide join requests\n\
+     \x20 pillar login --domain <D> --user <id> [--password P]    print export PILLAR_DOMAIN/PILLAR_TOKEN\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
@@ -44,6 +48,8 @@ fn main() -> ExitCode {
         }
         Some("--web") => web(&args[1..]),
         Some("node") => node(&args[1..]),
+        Some("bootstrap") => bootstrap(&args[1..]),
+        Some("login") => login(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("onboard") => onboard(),
         Some("apply") | Some("get") | Some("describe") => {
@@ -76,6 +82,38 @@ fn main() -> ExitCode {
 fn onboard() -> ExitCode {
     match pillar_cli::onboard::run() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar bootstrap …`: the combined cell+user bootstrap, node/user join
+/// requests, and request approval, over the shared `pillar_cli::bootstrap`
+/// library and the node's HTTP endpoints.
+fn bootstrap(args: &[String]) -> ExitCode {
+    match pillar_cli::bootstrap::run(args) {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `pillar login …`: obtain a temporary token and print `export` lines for
+/// `PILLAR_DOMAIN` / `PILLAR_TOKEN`. Intended to be `eval`'d:
+/// `eval "$(pillar login --domain D --user U)"`.
+fn login(args: &[String]) -> ExitCode {
+    match pillar_cli::bootstrap::login(args) {
+        Ok(exports) => {
+            print!("{exports}");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
