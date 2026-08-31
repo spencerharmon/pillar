@@ -28,6 +28,7 @@ fn usage() -> &'static str {
      \x20 pillar bootstrap node|user --domain <D> [opts]       submit a node/user join request\n\
      \x20 pillar bootstrap request list|approve <id> [--domain D]  review/decide join requests\n\
      \x20 pillar login --domain <D> --user <id> [--password P]    print export PILLAR_DOMAIN/PILLAR_TOKEN\n\
+     \x20 pillar session ls|show <id>|revoke <id>|revoke-all       server-side sessions (ls/show view; revoke acts)\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
@@ -64,6 +65,7 @@ fn main() -> ExitCode {
         Some("--web") => web(&args[1..]),
         Some("node") => node(&args[1..]),
         Some("bootstrap") => bootstrap(&args[1..]),
+        Some("session") => session(&args[1..]),
         Some("login") => login(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("onboard") => onboard(),
@@ -146,6 +148,35 @@ fn login(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar session {ls|show <id>|revoke <id>|revoke-all}`: the SERVER-SIDE
+/// session family. `ls`/`show` are VIEWS (sign nothing); `revoke`/`revoke-all`
+/// are ACTS (emit one signed, decider-authorized revocation event). Distinct
+/// from the local `ctx`/context family. The authoritative, fully unit-tested
+/// engine is [`pillar_cli::session_cli::SessionCli`], which this shell operates
+/// over a live node's materialized session substrate — the same "no live
+/// platform in this demonstration shell" boundary `apply`/`get`/`obs` document.
+fn session(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("ls") | Some("show") | Some("revoke") | Some("revoke-all") => {
+            eprintln!(
+                "`pillar session …` reads/acts over a live node's server-side session substrate \
+                 via the pillar_cli::session_cli::SessionCli library API."
+            );
+            eprintln!(
+                "ls/show are views (sign nothing); revoke/revoke-all emit one signed, \
+                 decider-authorized revocation event."
+            );
+            ExitCode::from(2)
+        }
+        _ => {
+            eprintln!(
+                "usage: pillar session {{ls | show <id> | revoke <id> | revoke-all}} [--principal <p>]"
+            );
+            ExitCode::from(2)
         }
     }
 }
