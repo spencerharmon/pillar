@@ -2359,6 +2359,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-topology"
+version = "0.0.0"
+dependencies = [
+ "pillar-core",
+ "pillar-trust-artifacts",
+]
+
+[[package]]
 name = "pillar-trust-artifacts"
 version = "0.0.0"
 dependencies = [
