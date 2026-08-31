@@ -2281,6 +2281,8 @@ version = "0.0.0"
 dependencies = [
  "pillar-coordination",
  "pillar-core",
+ "pillar-topology",
+ "pillar-trust-artifacts",
 ]
 
 [[package]]

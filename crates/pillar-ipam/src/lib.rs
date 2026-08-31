@@ -213,6 +213,295 @@ impl DelegatedAllocator {
     }
 }
 
+// =====================================================================
+// Topology-scoped, multi-site, multi-prefix, dual-stack allocation.
+// =====================================================================
+//
+// The [`DelegatedAllocator`] above fences ONE contiguous pool. A real
+// deployment is multi-site: distinct regions/zones own distinct IPv4 *and*
+// IPv6 prefixes, and a node must only ever be handed an address out of the
+// pool bound to its OWN topology label — an allocation must never cross a
+// site. [`TopologyScopedIpam`] layers exactly that binding on top, reusing
+// [`pillar_topology`]'s config-ordered [`TierHierarchy`] for the tier order
+// (never a hardcoded one) and its [`Topology`] registry to resolve which
+// failure domain a node lives in.
+//
+// This layer assumes NO public anycast address and NO pillar ASN: a pool is
+// just a delegated prefix bound to a `tier = value` label; addresses are the
+// operator's own (private or delegated) space. Nothing here reaches the
+// network.
+
+use std::collections::BTreeMap;
+
+use pillar_topology::{Label, TierHierarchy, Topology};
+
+/// Why a topology-scoped allocation could not be satisfied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScopedError {
+    /// The node carries no resolved label at the pools' binding tier, so its
+    /// topology-scoped pool cannot be determined — a node with no site is
+    /// never given a cross-site address by default.
+    NoScopeForNode {
+        /// The node whose placement lacks a value at the binding tier.
+        node: NodeId,
+        /// The tier the pools are bound to.
+        tier: String,
+    },
+    /// No pool is bound to the node's failure domain for the requested family.
+    NoPoolForScope {
+        /// The `tier = value` domain that has no bound pool.
+        scope: Label,
+        /// Whether an IPv6 (vs IPv4) address was requested.
+        want_v6: bool,
+    },
+    /// The binding tier is not a member of the active hierarchy.
+    UnknownTier(String),
+    /// An underlying single-pool allocation error (out-of-pool / grant).
+    Alloc(AllocError),
+}
+
+impl From<AllocError> for ScopedError {
+    fn from(e: AllocError) -> Self {
+        ScopedError::Alloc(e)
+    }
+}
+
+/// A dual-stack pair of topology-scoped pools bound to ONE failure domain.
+///
+/// A site/region owns disjoint IPv4 and/or IPv6 prefixes; each is fenced by
+/// its own [`DelegatedAllocator`]. Either family may be absent (a v6-only or
+/// v4-only site), but at least one must be present.
+#[derive(Clone, Debug)]
+struct ScopedPools {
+    v4: Option<DelegatedAllocator>,
+    v6: Option<DelegatedAllocator>,
+}
+
+/// Multi-site, multi-prefix, dual-stack, topology-scoped IPAM.
+///
+/// Prefix pools are scoped to a topology label (`tier = value`) drawn from a
+/// config-ordered [`TierHierarchy`]: distinct sites/regions own distinct
+/// prefixes, and [`allocate_for`](Self::allocate_for) hands a node an address
+/// ONLY out of the pool bound to the node's own resolved failure domain — an
+/// allocation can never cross a site. A [`diversity_addrs`](Self::diversity_addrs)
+/// query returns K addresses spread across the most diverse available topology
+/// tiers, the primitive the UDP transport calls to pick dispersed reply-node
+/// source addresses.
+#[derive(Clone, Debug)]
+pub struct TopologyScopedIpam {
+    /// The tier the prefix pools are bound to (e.g. `"region"` or `"site"`).
+    tier: String,
+    /// Failure-domain value -> its dual-stack pools.
+    pools: BTreeMap<String, ScopedPools>,
+    /// The active topology registry (resolves a node -> its failure domain)
+    /// and its config-ordered hierarchy.
+    topology: Topology,
+}
+
+impl TopologyScopedIpam {
+    /// A new topology-scoped IPAM whose prefix pools are bound at `tier`,
+    /// resolving node placement through `topology`. `tier` must be a member of
+    /// `topology`'s hierarchy.
+    ///
+    /// # Errors
+    /// [`ScopedError::UnknownTier`] if `tier` is not in the hierarchy.
+    pub fn new(topology: Topology, tier: impl Into<String>) -> Result<Self, ScopedError> {
+        let tier = tier.into();
+        if topology.hierarchy().rank(&tier).is_none() {
+            return Err(ScopedError::UnknownTier(tier));
+        }
+        Ok(Self {
+            tier,
+            pools: BTreeMap::new(),
+            topology,
+        })
+    }
+
+    /// The tier the prefix pools are bound to.
+    #[must_use]
+    pub fn tier(&self) -> &str {
+        &self.tier
+    }
+
+    /// The active hierarchy (config-ordered), for tier-diversity queries.
+    #[must_use]
+    pub fn hierarchy(&self) -> &TierHierarchy {
+        self.topology.hierarchy()
+    }
+
+    /// The topology registry.
+    #[must_use]
+    pub fn topology(&self) -> &Topology {
+        &self.topology
+    }
+
+    /// Bind a delegated `pool` to the failure domain `value` at the binding
+    /// tier, fenced by `cluster_size` voters. The family (v4/v6) is taken from
+    /// the pool's base; binding a second pool of the same family to the same
+    /// domain replaces the first.
+    pub fn bind_pool(&mut self, value: impl Into<String>, pool: Pool, cluster_size: usize) {
+        let entry = self
+            .pools
+            .entry(value.into())
+            .or_insert(ScopedPools { v4: None, v6: None });
+        let alloc = DelegatedAllocator::new(pool.clone(), cluster_size);
+        match pool.base() {
+            IpAddr::V4(_) => entry.v4 = Some(alloc),
+            IpAddr::V6(_) => entry.v6 = Some(alloc),
+        }
+    }
+
+    /// The failure-domain value a `node` lives in at the binding tier, from
+    /// its resolved (attested-then-declared) placement.
+    fn scope_of(&self, node: &NodeId) -> Result<String, ScopedError> {
+        self.topology
+            .placement(node)
+            .at(&self.tier)
+            .map(str::to_owned)
+            .ok_or_else(|| ScopedError::NoScopeForNode {
+                node: node.clone(),
+                tier: self.tier.clone(),
+            })
+    }
+
+    /// Mutable access to the [`DelegatedAllocator`] bound to `node`'s failure
+    /// domain for the requested family, so grants can be recorded before an
+    /// allocation. `want_v6` selects the family.
+    ///
+    /// # Errors
+    /// [`ScopedError::NoScopeForNode`] if the node has no label at the tier, or
+    /// [`ScopedError::NoPoolForScope`] if no pool of that family is bound to
+    /// the node's domain.
+    pub fn allocator_for(
+        &mut self,
+        node: &NodeId,
+        want_v6: bool,
+    ) -> Result<&mut DelegatedAllocator, ScopedError> {
+        let scope = self.scope_of(node)?;
+        let entry = self
+            .pools
+            .get_mut(&scope)
+            .ok_or_else(|| ScopedError::NoPoolForScope {
+                scope: Label::new(self.tier.clone(), scope.clone()),
+                want_v6,
+            })?;
+        let slot = if want_v6 {
+            &mut entry.v6
+        } else {
+            &mut entry.v4
+        };
+        slot.as_mut().ok_or(ScopedError::NoPoolForScope {
+            scope: Label::new(self.tier.clone(), scope),
+            want_v6,
+        })
+    }
+
+    /// Record a `voter`'s grant of `addr` to `node` in the pool bound to
+    /// `node`'s own failure domain. `addr`'s family selects the pool.
+    ///
+    /// # Errors
+    /// A [`ScopedError`] if the node has no scoped pool of that family, or the
+    /// address is out of that pool / the grant is refused.
+    pub fn grant_for(
+        &mut self,
+        voter: NodeId,
+        node: &NodeId,
+        addr: IpAddr,
+    ) -> Result<(), ScopedError> {
+        let want_v6 = addr.is_ipv6();
+        let alloc = self.allocator_for(node, want_v6)?;
+        alloc.grant(voter, node.clone(), addr)?;
+        Ok(())
+    }
+
+    /// Attempt to allocate `addr` to `node` from `node`'s OWN topology-scoped
+    /// pool. The address MUST be a member of the pool bound to the node's
+    /// failure domain — an address from another site's prefix is out-of-pool
+    /// there and is refused, so an allocation can never cross a site.
+    ///
+    /// Returns `Ok(true)` iff a quorum currently backs `node` for `addr`.
+    ///
+    /// # Errors
+    /// A [`ScopedError`] if the node has no scoped pool of that family, or the
+    /// address is out of the node's pool.
+    pub fn allocate_for(&mut self, node: &NodeId, addr: IpAddr) -> Result<bool, ScopedError> {
+        let want_v6 = addr.is_ipv6();
+        let alloc = self.allocator_for(node, want_v6)?;
+        Ok(alloc.try_allocate(node, addr)?)
+    }
+
+    /// **Topology-diversity query.** Given a redundancy count `k`, return up to
+    /// `k` addresses (one per distinct failure domain) spread across the most
+    /// diverse available topology tiers, refined by an optional per-domain
+    /// `preference` ranking (GeoIP / measured latency — lower is better) when
+    /// available. This is the primitive the UDP transport calls to pick
+    /// dispersed reply-node *source* addresses.
+    ///
+    /// Each returned address comes from a DISTINCT bound failure domain, so a
+    /// K=3 query over ≥2 sites always spans ≥2 sites. `want_v6` selects the
+    /// family. Domains are visited best-first by `preference` (ties by domain
+    /// name for determinism); the base (slot 0) address of each domain's pool
+    /// is returned.
+    #[must_use]
+    pub fn diversity_addrs(
+        &self,
+        k: usize,
+        want_v6: bool,
+        preference: Option<&BTreeMap<String, u64>>,
+    ) -> Vec<IpAddr> {
+        // Rank the bound domains: refined by preference (lower first) when
+        // available, else lexical for determinism.
+        let mut ranked: Vec<(&String, &ScopedPools)> = self
+            .pools
+            .iter()
+            .filter(|(_, p)| {
+                let slot = if want_v6 { &p.v6 } else { &p.v4 };
+                slot.as_ref().is_some_and(|a| !a.pool().is_empty())
+            })
+            .collect();
+        ranked.sort_by(|(av, _), (bv, _)| {
+            let ap = preference
+                .and_then(|m| m.get(*av))
+                .copied()
+                .unwrap_or(u64::MAX);
+            let bp = preference
+                .and_then(|m| m.get(*bv))
+                .copied()
+                .unwrap_or(u64::MAX);
+            ap.cmp(&bp).then_with(|| av.cmp(bv))
+        });
+
+        let mut out = Vec::new();
+        for (_value, pools) in ranked {
+            if out.len() == k {
+                break;
+            }
+            // Each distinct domain contributes at most one address, guaranteeing
+            // the returned set spreads across distinct failure domains.
+            let slot = if want_v6 { &pools.v6 } else { &pools.v4 };
+            if let Some(alloc) = slot {
+                if let Some(addr) = alloc.pool().addr_at(0) {
+                    out.push(addr);
+                }
+            }
+        }
+        out
+    }
+
+    /// The number of distinct failure domains (bound sites) that have a pool
+    /// of the requested family — the maximum diversity a query can achieve.
+    #[must_use]
+    pub fn available_diversity(&self, want_v6: bool) -> usize {
+        self.pools
+            .values()
+            .filter(|p| {
+                let slot = if want_v6 { &p.v6 } else { &p.v4 };
+                slot.as_ref().is_some_and(|a| !a.pool().is_empty())
+            })
+            .count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +662,253 @@ mod tests {
         // The first allocation is untouched.
         assert_eq!(alloc.allocator_of(a1), Some(&n("actorA")));
         assert_eq!(alloc.allocator_of(a2), Some(&n("actorB")));
+    }
+
+    // =================================================================
+    // Topology-scoped, multi-site, multi-prefix, dual-stack tests.
+    // =================================================================
+
+    use pillar_topology::{Label, TierHierarchy, Topology};
+
+    /// Two disjoint sites at the `region` tier, each with its own v4 + v6
+    /// prefix; nodes labeled into a region.
+    fn two_region_ipam() -> TopologyScopedIpam {
+        let mut topo = Topology::new(TierHierarchy::default());
+        // west nodes
+        topo.declare(n("w1"), &[Label::new("region", "west")]);
+        topo.declare(n("w2"), &[Label::new("region", "west")]);
+        // east nodes
+        topo.declare(n("e1"), &[Label::new("region", "east")]);
+
+        let mut ipam = TopologyScopedIpam::new(topo, "region").unwrap();
+        // Disjoint prefixes per region, dual-stack.
+        ipam.bind_pool("west", Pool::new(v4("10.1.0.0"), 256), 3);
+        ipam.bind_pool("west", Pool::new(v6("2001:db8:1::"), 65536), 3);
+        ipam.bind_pool("east", Pool::new(v4("10.2.0.0"), 256), 3);
+        ipam.bind_pool("east", Pool::new(v6("2001:db8:2::"), 65536), 3);
+        ipam
+    }
+
+    /// A node is only ever handed an address out of its own region's pool; an
+    /// address from another region is out-of-pool and refused — allocation
+    /// never crosses a site.
+    #[test]
+    fn scoped_allocation_never_crosses_sites() {
+        let mut ipam = two_region_ipam();
+        // w1 is in west: a west address allocates after a quorum.
+        let west_addr = v4("10.1.0.5");
+        ipam.grant_for(n("va"), &n("w1"), west_addr).unwrap();
+        ipam.grant_for(n("vb"), &n("w1"), west_addr).unwrap();
+        assert!(ipam.allocate_for(&n("w1"), west_addr).unwrap());
+
+        // The SAME node cannot be granted or allocated an EAST address: it is
+        // out of w1's (west) pool entirely.
+        let east_addr = v4("10.2.0.5");
+        assert_eq!(
+            ipam.grant_for(n("va"), &n("w1"), east_addr),
+            Err(ScopedError::Alloc(AllocError::OutOfPool {
+                addr: east_addr
+            }))
+        );
+        assert_eq!(
+            ipam.allocate_for(&n("w1"), east_addr),
+            Err(ScopedError::Alloc(AllocError::OutOfPool {
+                addr: east_addr
+            }))
+        );
+    }
+
+    /// A node with no label at the binding tier has no scoped pool: it is never
+    /// handed a cross-site address by default.
+    #[test]
+    fn node_without_scope_is_refused() {
+        let mut ipam = two_region_ipam();
+        let unlabeled = n("stray");
+        assert_eq!(
+            ipam.allocate_for(&unlabeled, v4("10.1.0.1")),
+            Err(ScopedError::NoScopeForNode {
+                node: unlabeled,
+                tier: "region".to_owned(),
+            })
+        );
+    }
+
+    /// Multi-site config with two disjoint prefixes each bound to a distinct
+    /// region allocates correctly per region, for both families.
+    #[test]
+    fn multi_site_allocates_correctly_per_region_dual_stack() {
+        let mut ipam = two_region_ipam();
+
+        // west node -> west v4
+        let wa = v4("10.1.0.9");
+        ipam.grant_for(n("va"), &n("w1"), wa).unwrap();
+        ipam.grant_for(n("vb"), &n("w1"), wa).unwrap();
+        assert!(ipam.allocate_for(&n("w1"), wa).unwrap());
+
+        // east node -> east v6
+        let ea = v6("2001:db8:2::dead");
+        ipam.grant_for(n("va"), &n("e1"), ea).unwrap();
+        ipam.grant_for(n("vb"), &n("e1"), ea).unwrap();
+        assert!(ipam.allocate_for(&n("e1"), ea).unwrap());
+
+        // Cross-family within the correct region also works: west v6.
+        let wv6 = v6("2001:db8:1::beef");
+        ipam.grant_for(n("va"), &n("w2"), wv6).unwrap();
+        ipam.grant_for(n("vb"), &n("w2"), wv6).unwrap();
+        assert!(ipam.allocate_for(&n("w2"), wv6).unwrap());
+    }
+
+    /// Diversity query for K=3 across ≥2 zones returns addresses spread across
+    /// ≥2 zones (here regions/sites).
+    #[test]
+    fn diversity_query_spreads_across_multiple_zones() {
+        let ipam = two_region_ipam();
+        assert_eq!(ipam.available_diversity(false), 2);
+
+        let addrs = ipam.diversity_addrs(3, false, None);
+        // Only 2 distinct sites bound, so at most 2 addresses (one per site).
+        assert_eq!(addrs.len(), 2);
+
+        // The two addresses come from DISTINCT sites' prefixes.
+        assert!(addrs.contains(&v4("10.1.0.0")));
+        assert!(addrs.contains(&v4("10.2.0.0")));
+
+        // Distinct addresses => distinct sites.
+        let set: std::collections::BTreeSet<_> = addrs.iter().collect();
+        assert_eq!(set.len(), 2);
+    }
+
+    /// Three sites: a K=3 diversity query spreads across all three, and a
+    /// GeoIP/latency preference orders the returned set best-first.
+    #[test]
+    fn diversity_query_k3_across_three_sites_prefers_lowest_latency() {
+        let mut topo = Topology::new(TierHierarchy::default());
+        topo.declare(n("x"), &[Label::new("region", "a")]);
+        let mut ipam = TopologyScopedIpam::new(topo, "region").unwrap();
+        ipam.bind_pool("a", Pool::new(v4("10.10.0.0"), 16), 3);
+        ipam.bind_pool("b", Pool::new(v4("10.20.0.0"), 16), 3);
+        ipam.bind_pool("c", Pool::new(v4("10.30.0.0"), 16), 3);
+
+        // Measured latency: b < a < c.
+        let mut pref = BTreeMap::new();
+        pref.insert("a".to_owned(), 20u64);
+        pref.insert("b".to_owned(), 5u64);
+        pref.insert("c".to_owned(), 50u64);
+
+        let addrs = ipam.diversity_addrs(3, false, Some(&pref));
+        assert_eq!(addrs.len(), 3);
+        // best-first: b, a, c.
+        assert_eq!(
+            addrs,
+            vec![v4("10.20.0.0"), v4("10.10.0.0"), v4("10.30.0.0")]
+        );
+        // Spans all three distinct sites.
+        let set: std::collections::BTreeSet<_> = addrs.iter().collect();
+        assert_eq!(set.len(), 3);
+    }
+
+    /// A v6-only site is honored: a v6 diversity query includes it, a v4 query
+    /// does not.
+    #[test]
+    fn diversity_respects_requested_family() {
+        let mut topo = Topology::new(TierHierarchy::default());
+        topo.declare(n("x"), &[Label::new("region", "a")]);
+        let mut ipam = TopologyScopedIpam::new(topo, "region").unwrap();
+        ipam.bind_pool("a", Pool::new(v4("10.1.0.0"), 16), 3);
+        ipam.bind_pool("b", Pool::new(v6("2001:db8:99::"), 256), 3); // v6-only site
+
+        assert_eq!(ipam.available_diversity(false), 1); // only site a has v4
+        assert_eq!(ipam.available_diversity(true), 1); // only site b has v6
+
+        let v4s = ipam.diversity_addrs(3, false, None);
+        assert_eq!(v4s, vec![v4("10.1.0.0")]);
+        let v6s = ipam.diversity_addrs(3, true, None);
+        assert_eq!(v6s, vec![v6("2001:db8:99::")]);
+    }
+
+    /// No code path assumes a public anycast address or a pillar ASN: pools are
+    /// plain private/delegated prefixes, and the diversity primitive returns
+    /// site-scoped unicast addresses — never a shared anycast one. This test
+    /// asserts distinct sites yield DISTINCT (non-shared) addresses.
+    #[test]
+    fn no_anycast_addresses_are_shared_across_sites() {
+        let ipam = two_region_ipam();
+        let addrs = ipam.diversity_addrs(2, false, None);
+        assert_eq!(addrs.len(), 2);
+        // Distinct unicast addresses per site — nothing anycast/shared.
+        assert_ne!(addrs[0], addrs[1]);
+    }
+
+    /// Binding an unknown tier is refused up front.
+    #[test]
+    fn unknown_binding_tier_is_refused() {
+        let topo = Topology::new(TierHierarchy::default());
+        assert_eq!(
+            TopologyScopedIpam::new(topo, "no-such-tier").err(),
+            Some(ScopedError::UnknownTier("no-such-tier".to_owned()))
+        );
+    }
+
+    /// Attested placement takes precedence: a node that declares one region but
+    /// is attested into another is scoped by the ATTESTED region's pool.
+    #[test]
+    fn attested_region_governs_scope() {
+        use pillar_trust_artifacts::{Attest, Capacity, Predicate, Sig, TrustStore};
+
+        let mut store = TrustStore::new(n("owner"));
+        let mut topo = Topology::new(TierHierarchy::default());
+        let node = n("liar");
+        // Node lies: declares west.
+        topo.declare(node.clone(), &[Label::new("region", "west")]);
+
+        // Authority attests the truth: east.
+        let auth = n("auth");
+        let grant = Attest {
+            issuer: n("owner"),
+            capacity: Capacity::Role {
+                role: "cell-authority".to_owned(),
+                scope: "cell-b".to_owned(),
+            },
+            authority: None,
+            subject: auth.clone(),
+            predicate: Predicate::new("topology:sign", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: store.epoch(),
+            sig: Sig::by(n("owner")),
+        };
+        let grant_cid = store.issue_attest(grant).unwrap();
+        let assignment = pillar_topology::Assignment::attested(
+            auth.clone(),
+            node.clone(),
+            &Label::new("region", "east"),
+            Capacity::Role {
+                role: "cell-authority".to_owned(),
+                scope: "cell-b".to_owned(),
+            },
+            Some(grant_cid),
+            "cell-b",
+            store.epoch(),
+        );
+        if let pillar_topology::Assignment::Attested { attest, .. } = &assignment {
+            store.issue_attest((**attest).clone()).unwrap();
+        }
+        topo.attest(&assignment, &store).unwrap();
+
+        let mut ipam = TopologyScopedIpam::new(topo, "region").unwrap();
+        ipam.bind_pool("west", Pool::new(v4("10.1.0.0"), 256), 3);
+        ipam.bind_pool("east", Pool::new(v4("10.2.0.0"), 256), 3);
+
+        // The node is scoped to EAST (attested), so a west address is refused
+        // and an east address is accepted.
+        let east = v4("10.2.0.7");
+        ipam.grant_for(n("va"), &node, east).unwrap();
+        ipam.grant_for(n("vb"), &node, east).unwrap();
+        assert!(ipam.allocate_for(&node, east).unwrap());
+        assert_eq!(
+            ipam.allocate_for(&node, v4("10.1.0.7")),
+            Err(ScopedError::Alloc(AllocError::OutOfPool {
+                addr: v4("10.1.0.7")
+            }))
+        );
     }
 }
