@@ -113,11 +113,12 @@
       </p>
     </form>
 
-    <!-- First-run bootstrap flow (operator-driven), shown only on a FRESH,
-         unbootstrapped node: (a) create the cell, then (b) create the first
-         user in the same guided step, consuming the one-shot capability. -->
+    <!-- First-run bootstrap flow (operator-driven), shown on a FRESH,
+         unbootstrapped node: create the cell AND the first user in ONE
+         atomic step, so there is no reachable half-created state (a cell with
+         no first user) that a page reload / back button could strand on. -->
     <form id="bootstrap-form" class="hidden" autocomplete="off">
-      <div class="step" id="bootstrap-step">Step 1 of 2 — create the cell</div>
+      <div class="step" id="bootstrap-step">Set up this node — create your cell and first user</div>
 
       <div id="cell-fields">
         <label for="cell-id">Cell name</label>
@@ -131,21 +132,22 @@
         </select>
       </div>
 
-      <div id="user-fields" class="hidden">
+      <div id="user-fields">
         <label for="first-handle">First user handle</label>
-        <input id="first-handle" name="first-handle" type="text" placeholder="e.g. spencer">
+        <input id="first-handle" name="first-handle" type="text" placeholder="e.g. spencer" required>
         <label for="first-factor">Unlock factor</label>
-        <input id="first-factor" name="first-factor" type="password" placeholder="Password or passkey token">
+        <input id="first-factor" name="first-factor" type="password" placeholder="Password or passkey token" required>
       </div>
 
-      <button id="bootstrap-submit" type="submit">Create cell</button>
+      <button id="bootstrap-submit" type="submit">Create cell &amp; first user</button>
       <div id="bootstrap-msg" class="msg" role="status" aria-live="polite"></div>
       <p class="hint">
-        This node has not been bootstrapped yet. Create the cell (its genesis
-        key), then create the first user in the same guided step — that first
-        create consumes the one-shot cell-key create-user capability and links
-        the cell to its initial user. Afterward, user administration routes
-        through the admin user key.
+        This node has not been bootstrapped yet. Creating the cell (its genesis
+        key) and the first user happens in ONE atomic step: the cell key signs
+        the first user's key, grants that user the add-users right, and revokes
+        its own — so you can never be left with a cell but no way to add the
+        first user. Afterward, user administration routes through the admin
+        user key.
       </p>
     </form>
 
@@ -258,7 +260,10 @@
   });
 
   // --- First-run bootstrap flow (operator-driven). ---
-  let bootstrapPhase = "cell"; // "cell" -> "user"
+  // ONE atomic step: create the cell AND the first user in a single request,
+  // so there is no reachable intermediate state (cell created, no user) that a
+  // reload or the back button could strand on — the exact failure the old
+  // two-step flow had.
 
   async function refreshBootstrapState() {
     try {
@@ -273,58 +278,38 @@
     } catch (_) { /* leave the login form up */ }
   }
 
-  function showUserStep() {
-    bootstrapPhase = "user";
-    $("cell-fields").classList.add("hidden");
-    $("user-fields").classList.remove("hidden");
-    $("bootstrap-step").textContent = "Step 2 of 2 — create the first user";
-    $("bootstrap-submit").textContent = "Create first user";
-    $("first-handle").required = true;
-    $("first-factor").required = true;
-  }
-
   $("bootstrap-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const btn = $("bootstrap-submit");
     btn.disabled = true;
     try {
-      if (bootstrapPhase === "cell") {
-        const cell = $("cell-id").value.trim();
-        setMsg("bootstrap-msg", "Creating the cell…", "");
-        const resp = await fetch("/bootstrap/create-cell", { method: "POST", body: cell });
-        const text = (await resp.text()).trim();
-        if (resp.ok && text.includes("CELL-CREATED")) {
-          setMsg("bootstrap-msg", "Cell created. Now create the first user.", "ok");
-          showUserStep();
-        } else {
-          setMsg("bootstrap-msg", "Could not create the cell: " + text.replace(/^DENIED\s*/, ""), "err");
-        }
+      const cell = $("cell-id").value.trim();
+      const handle = $("first-handle").value.trim();
+      const factor = $("first-factor").value;
+      setMsg("bootstrap-msg", "Creating the cell and first user…", "");
+      // ONE request does the whole atomic sequence server-side: cell key
+      // genesis -> sign the first user's key -> grant that user add-users ->
+      // revoke the cell key's add-users, then seal the new user's key offer to
+      // THIS node so they can sign in immediately. If a cell already exists
+      // from an older half-completed bootstrap, the node completes the missing
+      // first-user step instead of erroring.
+      const resp = await fetch("/bootstrap/create", {
+        method: "POST",
+        body: `${cell}\n${handle}\n${factor}`,
+      });
+      const text = (await resp.text()).trim();
+      if (resp.ok && text.includes("BOOTSTRAPPED")) {
+        setMsg("bootstrap-msg", "Cell and first user created. This node is now bootstrapped — sign in below.", "ok");
+        // Reveal the normal two-field login, pre-filled with the new handle.
+        $("bootstrap-form").classList.add("hidden");
+        $("login-form").classList.remove("hidden");
+        $("brand-sub").textContent = "Sign in to manage your node";
+        $("identifier").value = handle;
       } else {
-        const handle = $("first-handle").value.trim();
-        const factor = $("first-factor").value;
-        setMsg("bootstrap-msg", "Creating the first user…", "");
-        // The first user's unlock factor is set by the operator here; this
-        // one-shot create links the cell to its initial user AND, atomically,
-        // seals the new user's key offer to this node so they can log in
-        // immediately (the node applies its own key-distribution label).
-        const resp = await fetch("/bootstrap/create-user", {
-          method: "POST",
-          body: `${handle}\n${factor}`,
-        });
-        const text = (await resp.text()).trim();
-        if (resp.ok && text.includes("USER-CREATED")) {
-          setMsg("bootstrap-msg", "First user created. This node is now bootstrapped — sign in below.", "ok");
-          // Reveal the normal two-field login.
-          $("bootstrap-form").classList.add("hidden");
-          $("login-form").classList.remove("hidden");
-          $("brand-sub").textContent = "Sign in to manage your node";
-          $("identifier").value = handle;
-        } else {
-          setMsg("bootstrap-msg", "Could not create the user: " + text.replace(/^DENIED\s*/, ""), "err");
-        }
+        setMsg("bootstrap-msg", "Could not bootstrap the node: " + text.replace(/^DENIED\s*/, ""), "err");
       }
     } catch (err) {
-      setMsg("bootstrap-msg", "Bootstrap step failed — please try again.", "err");
+      setMsg("bootstrap-msg", "Bootstrap failed — please try again.", "err");
     } finally {
       btn.disabled = false;
     }

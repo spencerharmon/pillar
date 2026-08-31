@@ -51,7 +51,12 @@
 //!   login; 200 `OK` (+ `X-Pillar-Session`) with the greeted handle, or 401
 //!   `DENIED <reason>`.
 //! - `GET /bootstrap/status` — `FRESH` (unbootstrapped) or `BOOTSTRAPPED`.
-//! - `POST /bootstrap/create-cell` — body `<cell-id>`: operator step (a).
+//! - `POST /bootstrap/create` — body `<cell-id>\n<handle>\n<password>`: the
+//!   ONE atomic bootstrap the portal drives — create the cell AND the first
+//!   user together, so a reload between steps can never strand a cell with no
+//!   first user. 200 `OK BOOTSTRAPPED <handle>` or 409 `DENIED <reason>`.
+//! - `POST /bootstrap/create-cell` — body `<cell-id>`: operator step (a), the
+//!   lower-level cell-only step (also used by the CLI + request flow).
 //! - `POST /bootstrap/create-user` — body `<handle>\n<password>`: operator
 //!   step (b), consuming the one-shot capability AND, atomically, applying
 //!   the key-distribution label to this node + escrowing the new user's
@@ -259,6 +264,32 @@ impl WebAuthContext {
         Ok(())
     }
 
+    /// The ONE atomic bootstrap step the web portal drives: create the cell AND
+    /// the first user in a single call, so the node is only ever FRESH or fully
+    /// BOOTSTRAPPED — never stranded with a cell but no first user (the bug the
+    /// split create-cell/create-user flow left behind when the operator hit the
+    /// back button / reloaded between the two steps). If a cell already exists
+    /// from an older half-completed bootstrap, the cell step is skipped and only
+    /// the missing first-user step runs, so this endpoint also RECOVERS such a
+    /// stranded node.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`BootstrapError`] — a name a peer already serves
+    /// ([`BootstrapError::CellNameInUse`]) from the cell step, or a spent
+    /// capability from the first-user step.
+    pub fn bootstrap_cell_and_first_user(
+        &mut self,
+        cell: NodeId,
+        handle: &str,
+        password: &str,
+    ) -> Result<(), BootstrapError> {
+        if self.bootstrap.cell().is_none() {
+            self.create_cell(cell)?;
+        }
+        self.bootstrap_create_first_user(handle, password)
+    }
+
     fn store_session(&mut self, session: NodeCustodySession) -> String {
         let token = format!("s{}", self.next_session);
         self.next_session += 1;
@@ -416,7 +447,12 @@ fn dispatch_http(
             body: LANDING_PAGE.to_owned(),
         },
         ("GET", "/bootstrap/status") => {
-            let status = if ctx.bootstrap().is_bootstrapped() {
+            // BOOTSTRAPPED only once the first USER exists — not merely the
+            // cell. A cell-created-but-no-user node is still FRESH so the
+            // portal keeps showing the (atomic) bootstrap form; reporting
+            // BOOTSTRAPPED on a cell alone is exactly what stranded the
+            // operator (the login form showed but no user could log in).
+            let status = if ctx.bootstrap().initial_user().is_some() {
                 "BOOTSTRAPPED"
             } else {
                 "FRESH"
@@ -450,6 +486,32 @@ fn dispatch_http(
             }
             match ctx.bootstrap_create_first_user(handle, password) {
                 Ok(()) => text_response(200, "OK", format!("USER-CREATED {handle}")),
+                Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+            }
+        }
+        ("POST", "/bootstrap/create") => {
+            // Body: "<cell>\n<handle>\n<password>" — the ONE atomic bootstrap
+            // action the portal uses (cell + first user together, so a reload
+            // between steps can never strand a cell with no first user). See
+            // `bootstrap_cell_and_first_user`.
+            let mut lines = request.body.lines();
+            let cell = lines.next().unwrap_or("").trim();
+            let handle = lines.next().unwrap_or("").trim();
+            let password = lines.next().unwrap_or("").trim();
+            if cell.is_empty() || handle.is_empty() || password.is_empty() {
+                return text_response(
+                    400,
+                    "Bad Request",
+                    "MISSING cell-handle-or-password".to_owned(),
+                );
+            }
+            match ctx.bootstrap_cell_and_first_user(NodeId::from(cell), handle, password) {
+                Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
+                Err(BootstrapError::CellNameInUse) => text_response(
+                    409,
+                    "Conflict",
+                    format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
+                ),
                 Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
             }
         }
@@ -1011,9 +1073,15 @@ mod tests {
     #[test]
     fn a_bootstrapped_node_reports_bootstrapped_directly() {
         let (mut ctx, _subkey) = provisioned_ctx();
-        ctx.bootstrap_mut()
-            .create_cell(NodeId::from("cell-genesis"))
-            .unwrap();
+        // A node is BOOTSTRAPPED only once it has a cell AND its first user;
+        // a cell alone is still FRESH (see the status endpoint). Bootstrap it
+        // fully through the atomic step.
+        let done = post(
+            &mut ctx,
+            "/bootstrap/create",
+            &format!("cell-genesis\nspencer\n{PASSWORD}"),
+        );
+        assert_eq!(done.status, 200, "got: {}", done.body);
         assert_eq!(
             get(&mut ctx, "/bootstrap/status").body.trim(),
             "BOOTSTRAPPED"
@@ -1053,10 +1121,61 @@ mod tests {
         let ok = post(&mut ctx, "/bootstrap/create-cell", "cell-unique");
         assert_eq!(ok.status, 200);
         assert!(ok.body.contains("CELL-CREATED"), "got: {}", ok.body);
+        // Cell created but NO first user yet — still FRESH (BOOTSTRAPPED is
+        // reserved for a cell WITH its first user), so a reload keeps showing
+        // the bootstrap form instead of stranding on the login form.
+        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
+    }
+
+    // The atomic single-step bootstrap (POST /bootstrap/create): one request
+    // creates the cell AND the first user, leaving the node fully
+    // BOOTSTRAPPED, and the just-created user can log in immediately.
+    #[test]
+    fn atomic_bootstrap_creates_cell_and_first_user_in_one_step() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
+
+        let done = post(
+            &mut ctx,
+            "/bootstrap/create",
+            &format!("spencer-cell\nspencer\n{PASSWORD}"),
+        );
+        assert_eq!(done.status, 200, "got: {}", done.body);
+        assert!(done.body.contains("BOOTSTRAPPED spencer"), "got: {}", done.body);
         assert_eq!(
             get(&mut ctx, "/bootstrap/status").body.trim(),
             "BOOTSTRAPPED"
         );
+        assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
+
+        // The just-created user logs in immediately (offer escrowed atomically).
+        let nonce = get(&mut ctx, "/nonce");
+        let id: u64 = nonce.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let login = post(&mut ctx, "/login", &format!("spencer\n{PASSWORD}\n{id}"));
+        assert_eq!(login.status, 200, "got: {}", login.body);
+    }
+
+    // Recovery: a node stranded in the OLD bug's half-state (cell created, no
+    // first user) is completed by the atomic endpoint rather than erroring —
+    // exactly the reload/back-button situation the operator hit.
+    #[test]
+    fn atomic_bootstrap_recovers_a_half_created_cell_without_a_user() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        // Simulate the stranded state: only the cell was created (old step a).
+        let cell = post(&mut ctx, "/bootstrap/create-cell", "spencer-cell");
+        assert_eq!(cell.status, 200);
+        // Status is still FRESH (no first user yet) — so the portal re-shows the
+        // bootstrap form on reload, and the atomic create completes it.
+        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
+
+        let done = post(
+            &mut ctx,
+            "/bootstrap/create",
+            &format!("spencer-cell\nspencer\n{PASSWORD}"),
+        );
+        assert_eq!(done.status, 200, "got: {}", done.body);
+        assert!(done.body.contains("BOOTSTRAPPED spencer"), "got: {}", done.body);
+        assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
     }
 
     // Log alice in through the real HTTP handshake and return her session token.
