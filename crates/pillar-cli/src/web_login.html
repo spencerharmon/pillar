@@ -207,6 +207,38 @@
         <p>Pending node/user join requests for this cell.</p>
         <div id="inbox-list"></div>
       </div>
+      <div class="tile" id="identity-tile">
+        <h3>Identity &amp; domains</h3>
+        <p>Global identity: <span class="copyable"><span id="identity-cid" data-copy-field="CID">—</span></span> (generation <span id="identity-gen">0</span>)</p>
+        <p>One global identity across its domains/cells with per-domain keys.</p>
+        <div id="identity-domain-keys"></div>
+        <form id="identity-enroll-form">
+          <label for="identity-domain-input">Enroll in a domain</label>
+          <input id="identity-domain-input" name="domain" type="text" placeholder="domain" required />
+          <button id="identity-enroll-btn" type="submit">Enroll</button>
+        </form>
+        <p class="msg" id="identity-enroll-msg"></p>
+        <button id="identity-rotate-btn" type="button">Rotate primary key</button>
+        <button id="identity-recover-btn" type="button">Recover identity</button>
+        <p class="msg" id="identity-rotate-msg"></p>
+      </div>
+      <div class="tile" id="domain-tile">
+        <h3>Domains</h3>
+        <p>A domain groups cells under a name — naming only; a domain signs nothing.</p>
+        <div id="domain-list"></div>
+      </div>
+      <div class="tile" id="members-tile">
+        <h3>Members</h3>
+        <p>Add, invite, and manage member roles for this cell.</p>
+        <div id="member-list"></div>
+        <form id="member-add-form">
+          <label for="member-handle-input">Add / invite member</label>
+          <input id="member-handle-input" name="handle" type="text" placeholder="handle" required />
+          <input id="member-role-input" name="role" type="text" placeholder="role" value="member" />
+          <button id="member-add-btn" type="submit">Add / invite</button>
+        </form>
+        <p class="msg" id="member-add-msg"></p>
+      </div>
       <button id="signout" class="signout" type="button">Sign out</button>
     </section>
   </main>
@@ -219,6 +251,115 @@
     const m = $(id);
     m.textContent = text || "";
     m.className = "msg" + (kind ? " " + kind : "");
+  }
+
+  // --- Identity & domain UI: enroll in a domain (one per-domain subkey),
+  // view per-domain keys, rotate/recover the primary — the CID never
+  // changes across a rotation or recovery. ---
+  async function refreshIdentity() {
+    try {
+      const resp = await fetch("/portal/identity?token=" + encodeURIComponent(sessionToken));
+      const text = await resp.text();
+      const lines = text.split("\n").filter((l) => l.length > 0);
+      const domains = [];
+      for (const line of lines) {
+        if (line.startsWith("CID ")) $("identity-cid").textContent = line.slice(4);
+        else if (line.startsWith("GEN ")) $("identity-gen").textContent = line.slice(4);
+        else if (line.startsWith("DOMAIN ")) domains.push(line);
+      }
+      $("identity-domain-keys").innerHTML = domains
+        .map((l) => "<p class=\"identity-domain-key\">" + l + "</p>")
+        .join("");
+    } catch (e) {
+      // best-effort — the tile stays showing its last-known state.
+    }
+  }
+
+  async function refreshDomains() {
+    try {
+      const resp = await fetch("/portal/domains?token=" + encodeURIComponent(sessionToken));
+      const text = await resp.text();
+      $("domain-list").innerHTML = text
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map((l) => "<p class=\"domain-row\">" + l + "</p>")
+        .join("");
+    } catch (e) {
+      // best-effort
+    }
+  }
+
+  async function refreshMembers() {
+    try {
+      const resp = await fetch("/portal/members?token=" + encodeURIComponent(sessionToken));
+      const text = await resp.text();
+      $("member-list").innerHTML = text
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map((l) => "<p class=\"member-row\">" + l + "</p>")
+        .join("");
+    } catch (e) {
+      // best-effort
+    }
+  }
+
+  if ($("identity-enroll-form")) {
+    $("identity-enroll-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const domain = $("identity-domain-input").value.trim();
+      await withPending($("identity-enroll-btn"), async () => {
+        const resp = await fetch("/portal/identity/enroll", {
+          method: "POST",
+          body: sessionToken + "\n" + domain,
+        });
+        const text = await resp.text();
+        setMsg("identity-enroll-msg", text, resp.ok ? "ok" : "err");
+        if (resp.ok) refreshIdentity(), refreshDomains();
+      });
+    });
+  }
+  if ($("identity-rotate-btn")) {
+    $("identity-rotate-btn").addEventListener("click", async () => {
+      await withPending($("identity-rotate-btn"), async () => {
+        const newKey = "primary-" + Date.now();
+        const resp = await fetch("/portal/identity/rotate", {
+          method: "POST",
+          body: sessionToken + "\n" + newKey,
+        });
+        const text = await resp.text();
+        setMsg("identity-rotate-msg", text, resp.ok ? "ok" : "err");
+        if (resp.ok) refreshIdentity();
+      });
+    });
+  }
+  if ($("identity-recover-btn")) {
+    $("identity-recover-btn").addEventListener("click", async () => {
+      await withPending($("identity-recover-btn"), async () => {
+        const resp = await fetch("/portal/identity/recover", {
+          method: "POST",
+          body: sessionToken,
+        });
+        const text = await resp.text();
+        setMsg("identity-rotate-msg", text, resp.ok ? "ok" : "err");
+        if (resp.ok) refreshIdentity();
+      });
+    });
+  }
+  if ($("member-add-form")) {
+    $("member-add-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const handle = $("member-handle-input").value.trim();
+      const role = $("member-role-input").value.trim() || "member";
+      await withPending($("member-add-btn"), async () => {
+        const resp = await fetch("/portal/members/add", {
+          method: "POST",
+          body: sessionToken + "\n" + handle + "\n" + role,
+        });
+        const text = await resp.text();
+        setMsg("member-add-msg", text, resp.ok ? "ok" : "err");
+        if (resp.ok) refreshMembers();
+      });
+    });
   }
 
   // --- Pending/disabled state for a mutating control whose signed event is in
@@ -337,6 +478,9 @@
     $("portal-who").textContent = "Signed in as " + handle;
     refreshPortalStatus();
     refreshInbox();
+    refreshIdentity();
+    refreshDomains();
+    refreshMembers();
   }
 
   // --- Node identity / peers / lease holder, from the real node state. ---
