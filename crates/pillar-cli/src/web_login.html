@@ -79,6 +79,31 @@
     .row .tile { flex: 1; }
     .signout { background: none; border: 1px solid var(--border); color: var(--muted); margin-top: 22px; }
     .step { color: var(--muted); font-size: 12px; letter-spacing: 0.4px; text-transform: uppercase; margin-top: 6px; }
+    /* Live inline validation hint (e.g. cell-name uniqueness), shown under a
+       field BEFORE submit. */
+    .field-hint { font-size: 12px; margin-top: 6px; min-height: 15px; }
+    .field-hint.err { color: var(--err); }
+    .field-hint.ok { color: var(--ok); }
+    .field-hint.checking { color: var(--muted); }
+    /* Copy-to-clipboard affordance next to a CID / PeerId / fingerprint. */
+    .copyable { display: inline-flex; align-items: center; gap: 6px; }
+    .copy-btn {
+      width: auto; margin: 0; padding: 2px 8px; font-size: 11px; font-weight: 600;
+      background: var(--panel-2); color: var(--muted);
+      border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+    .copy-btn.copied { color: var(--ok); border-color: var(--ok); }
+    /* "What happens next" plain-language explainer before a signed act. */
+    .explainer {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: 8px; padding: 10px 12px; margin-top: 10px;
+      font-size: 12px; color: var(--muted); line-height: 1.5;
+    }
+    .explainer strong { color: var(--text); }
+    /* A control whose signed event is in flight: pending + disabled. */
+    button[aria-busy="true"] { opacity: 0.6; cursor: progress; }
   </style>
 </head>
 <body>
@@ -123,6 +148,7 @@
       <div id="cell-fields">
         <label for="cell-id">Cell name</label>
         <input id="cell-id" name="cell-id" type="text" placeholder="e.g. spencer-cell" required>
+        <div id="cell-name-hint" class="field-hint" role="status" aria-live="polite"></div>
         <label for="custody">Cell key custody</label>
         <select id="custody" name="custody">
           <option value="tpm">TPM (hardware-bound)</option>
@@ -140,6 +166,13 @@
       </div>
 
       <button id="bootstrap-submit" type="submit">Create cell &amp; first user</button>
+      <div class="explainer" id="bootstrap-explainer">
+        <strong>What happens next:</strong> signing this creates the cell's
+        genesis key, has it sign your first user's key and grant that user the
+        add-users right, then revokes its own — one atomic signed act. Nothing
+        is sent to any third party; the keys are generated and sealed on this
+        node.
+      </div>
       <div id="bootstrap-msg" class="msg" role="status" aria-live="polite"></div>
       <p class="hint">
         This node has not been bootstrapped yet. Creating the cell (its genesis
@@ -163,11 +196,11 @@
       </div>
       <div class="tile">
         <h3>Node identity</h3>
-        <p>PeerId: <span id="portal-peer-id">—</span></p>
+        <p>PeerId: <span class="copyable"><span id="portal-peer-id" data-copy-field="PeerId">—</span></span></p>
         <p>Listen addrs: <span id="portal-listen-addrs">—</span></p>
         <p>Uptime: <span id="portal-uptime">—</span>s</p>
         <p>Peers: <span id="portal-peer-count">0</span> — <span id="portal-peer-list">none</span></p>
-        <p>Lease holder: <span id="portal-lease-holder">—</span></p>
+        <p>Lease holder: <span class="copyable"><span id="portal-lease-holder" data-copy-field="fingerprint">—</span></span></p>
       </div>
       <div class="tile" id="inbox-tile">
         <h3>Request inbox</h3>
@@ -186,6 +219,71 @@
     const m = $(id);
     m.textContent = text || "";
     m.className = "msg" + (kind ? " " + kind : "");
+  }
+
+  // --- Pending/disabled state for a mutating control whose signed event is in
+  // flight. The button shows pending + is disabled (no double-submit) for the
+  // duration of `action`, and re-enables on the result (success OR failure). ---
+  async function withPending(btn, action) {
+    if (!btn || btn.getAttribute("aria-busy") === "true") return; // guard double-submit
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+    btn.dataset.pendingLabel = label;
+    btn.textContent = "Working…";
+    try {
+      return await action();
+    } finally {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+      btn.textContent = btn.dataset.pendingLabel || label;
+    }
+  }
+
+  // --- Copy-to-clipboard affordance: renders a small "Copy" button next to a
+  // CID / PeerId / fingerprint value and copies the current text on click. ---
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) { /* fall through to legacy path */ }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch (_) { return false; }
+  }
+
+  function attachCopyButton(valueEl) {
+    if (!valueEl || valueEl.dataset.copyWired === "1") return;
+    const field = valueEl.dataset.copyField || "value";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "copy-btn";
+    btn.textContent = "Copy";
+    btn.title = "Copy " + field + " to clipboard";
+    btn.setAttribute("aria-label", "Copy " + field);
+    btn.addEventListener("click", async () => {
+      const val = (valueEl.textContent || "").trim();
+      if (!val || val === "—") return;
+      const ok = await copyText(val);
+      btn.textContent = ok ? "Copied" : "Copy failed";
+      btn.classList.toggle("copied", ok);
+      setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("copied"); }, 1500);
+    });
+    valueEl.insertAdjacentElement("afterend", btn);
+    valueEl.dataset.copyWired = "1";
+  }
+
+  // Wire a copy button beside every value marked data-copy-field within `root`.
+  function wireCopyables(root) {
+    (root || document).querySelectorAll("[data-copy-field]").forEach(attachCopyButton);
   }
 
   // --- Node-side custody login: TWO fields, node does the custody work. ---
@@ -263,6 +361,7 @@
       $("portal-peer-count").textContent = fields["PEER-COUNT"] || peers.length;
       $("portal-peer-list").textContent = peers.length ? peers.join(", ") : "none";
       $("portal-lease-holder").textContent = fields["LEASE-HOLDER"] || "none";
+      wireCopyables($("portal"));
     } catch (_) { /* leave placeholders */ }
   }
 
@@ -290,6 +389,14 @@
         row.className = "tile";
         row.innerHTML =
           '<p><strong>#' + id + '</strong> ' + kind + ' — ' + subject + '</p>' +
+          // "What happens next" plain-language explainer for the signed act
+          // this approval authorizes (an attestation over the joining key).
+          '<div class="explainer">' +
+          '<strong>What happens next:</strong> approving signs an attestation ' +
+          'admitting <em>' + subject + '</em> into this cell — your key vouches ' +
+          'for their ' + kind + ' key. Rejecting signs nothing and drops the ' +
+          'request. This is a signed act by your admitted session.' +
+          '</div>' +
           '<div class="row">' +
           '<button type="button" class="inbox-approve" data-id="' + id + '">Approve</button>' +
           '<button type="button" class="inbox-reject" data-id="' + id + '">Reject</button>' +
@@ -297,26 +404,38 @@
         list.appendChild(row);
       }
       list.querySelectorAll(".inbox-approve").forEach((btn) => {
-        btn.addEventListener("click", () => decideRequest(btn.dataset.id, true));
+        btn.addEventListener("click", () => decideRequest(btn, btn.dataset.id, true));
       });
       list.querySelectorAll(".inbox-reject").forEach((btn) => {
-        btn.addEventListener("click", () => decideRequest(btn.dataset.id, false));
+        btn.addEventListener("click", () => decideRequest(btn, btn.dataset.id, false));
       });
     } catch (_) {
       list.textContent = "Could not load the request inbox.";
     }
   }
 
-  async function decideRequest(id, approve) {
+  async function decideRequest(btn, id, approve) {
     const path = approve ? "/bootstrap/request/approve" : "/bootstrap/request/reject";
-    const resp = await fetch(path, { method: "POST", body: `${id}\n${sessionToken}` });
-    const text = (await resp.text()).trim();
-    const msg = $("inbox-msg-" + id);
-    if (msg) {
-      msg.textContent = resp.ok ? text : "Failed: " + text.replace(/^DENIED\s*/, "");
-      msg.className = "msg " + (resp.ok ? "ok" : "err");
-    }
-    if (resp.ok) refreshInbox();
+    await withPending(btn, async () => {
+      const resp = await fetch(path, { method: "POST", body: `${id}\n${sessionToken}` });
+      const text = (await resp.text()).trim();
+      const msg = $("inbox-msg-" + id);
+      if (msg) {
+        // An approval returns a CID (e.g. "APPROVED bafy…"); surface it with a
+        // copy-to-clipboard affordance so the operator can copy the CID.
+        const cidMatch = resp.ok ? text.match(/\b(bafy\S+)\b/) : null;
+        if (cidMatch) {
+          msg.innerHTML = text.replace(cidMatch[1],
+            '<span class="copyable"><span data-copy-field="CID">' + cidMatch[1] + '</span></span>');
+          msg.className = "msg ok";
+          wireCopyables(msg);
+        } else {
+          msg.textContent = resp.ok ? text : "Failed: " + text.replace(/^DENIED\s*/, "");
+          msg.className = "msg " + (resp.ok ? "ok" : "err");
+        }
+      }
+      if (resp.ok) refreshInbox();
+    });
   }
 
   $("login-form").addEventListener("submit", async (e) => {
@@ -404,6 +523,47 @@
       btn.disabled = false;
     }
   });
+
+  // --- Inline, live cell-name UNIQUENESS validation (best-effort, peer
+  // sourced): as the operator types the cell name, ask the node whether a peer
+  // already serves a pointer for it, and surface "already in use" INLINE before
+  // submit. Unreachable/free => no error (best-effort). ---
+  let nameCheckTimer = null;
+  async function checkCellName(name) {
+    const hint = $("cell-name-hint");
+    if (!name) { hint.textContent = ""; hint.className = "field-hint"; return; }
+    hint.textContent = "Checking availability…";
+    hint.className = "field-hint checking";
+    try {
+      const resp = await fetch("/bootstrap/name-check?name=" + encodeURIComponent(name));
+      const text = (await resp.text()).trim();
+      // Only apply if the field still holds this name (avoid stale results).
+      if ($("cell-id").value.trim() !== name) return;
+      if (resp.ok && text.startsWith("IN-USE")) {
+        hint.textContent = text.replace(/^IN-USE\s*/, "") || "cell name already in use — choose another";
+        hint.className = "field-hint err";
+      } else if (resp.ok && text.startsWith("FREE")) {
+        hint.textContent = "Available.";
+        hint.className = "field-hint ok";
+      } else {
+        hint.textContent = "";
+        hint.className = "field-hint";
+      }
+    } catch (_) {
+      // Best-effort: a failed check never blocks; clear the hint.
+      hint.textContent = "";
+      hint.className = "field-hint";
+    }
+  }
+
+  const cellIdInput = $("cell-id");
+  if (cellIdInput) {
+    cellIdInput.addEventListener("input", () => {
+      const name = cellIdInput.value.trim();
+      if (nameCheckTimer) clearTimeout(nameCheckTimer);
+      nameCheckTimer = setTimeout(() => checkCellName(name), 250);
+    });
+  }
 
   // On load, ask the node whether it is fresh (show bootstrap) or already
   // bootstrapped (show the two-field login, the default).

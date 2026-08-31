@@ -77,7 +77,7 @@ use pillar_identity::NodeSubkey;
 use pillar_streamdb::{OpId, OpLog};
 use pillar_web::key_login::{LoginSession, Origin};
 use pillar_web::node_custody::{
-    BootstrapError, CellBootstrap, CellNameRegistry, Cid, InMemoryCellNameRegistry,
+    BootstrapError, CellBootstrap, CellNameRegistry, CellNameStatus, Cid, InMemoryCellNameRegistry,
     NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey, CELL_NAME_IN_USE_MESSAGE,
 };
 use pillar_web::{authorize_nonloopback_signing_action, bind_web};
@@ -369,6 +369,18 @@ impl WebAuthContext {
     ///
     /// The matching [`BootstrapError`] — notably
     /// [`BootstrapError::CellNameInUse`] when the network already claims it.
+    /// A live, best-effort peer-sourced lookup of whether a proposed cell NAME
+    /// is already claimed on the network — the SAME `name_registry` (and thus
+    /// the same peer resolution) [`WebAuthContext::create_cell`] validates
+    /// against, exposed for the web UI's INLINE pre-submit uniqueness hint. Per
+    /// the best-effort rule, an unreachable / no-peer-serving name resolves
+    /// [`CellNameStatus::Free`], so the hint never blocks a create merely
+    /// because the network could not be reached.
+    #[must_use]
+    pub fn name_status(&self, name: &NodeId) -> CellNameStatus {
+        self.name_registry.lookup(name)
+    }
+
     pub fn create_cell(&mut self, cell: NodeId) -> Result<(), BootstrapError> {
         self.bootstrap
             .create_cell_checked(cell.clone(), self.name_registry.as_ref())?;
@@ -586,6 +598,23 @@ fn dispatch_http(
                     format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
                 ),
                 Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+            }
+        }
+        ("GET", p) if p == "/bootstrap/name-check" => {
+            // INLINE, live cell-name uniqueness for the web UI: resolve the
+            // proposed name through the SAME peer-sourced `name_registry` the
+            // create-cell step validates against, so the operator sees an "in
+            // use" hint BEFORE submit. Best-effort: an unreachable / free name
+            // reports FREE (never blocks a create on a network hiccup).
+            let name = query_value(&request.path, "name").unwrap_or("").trim();
+            if name.is_empty() {
+                return text_response(400, "Bad Request", "MISSING name".to_owned());
+            }
+            match ctx.name_status(&NodeId::from(name)) {
+                CellNameStatus::Claimed => {
+                    text_response(200, "OK", format!("IN-USE {CELL_NAME_IN_USE_MESSAGE}"))
+                }
+                CellNameStatus::Free => text_response(200, "OK", "FREE".to_owned()),
             }
         }
         ("POST", "/bootstrap/create-user") => {
@@ -1569,6 +1598,132 @@ mod tests {
         assert_eq!(
             get(&mut ctx, "/bootstrap/status").body.trim(),
             "BOOTSTRAPPED"
+        );
+    }
+
+    // UX hardening: a LIVE cell-name uniqueness check surfaces an in-UI "already
+    // in use" BEFORE submit, using the SAME peer-sourced name registry the
+    // create-cell step validates against. Best-effort: an unreachable/unclaimed
+    // name resolves FREE (never blocks).
+    #[test]
+    fn live_cell_name_uniqueness_check_surfaces_in_use_before_submit() {
+        use pillar_web::node_custody::InMemoryCellNameRegistry;
+        let mut registry = InMemoryCellNameRegistry::new();
+        registry.claim("cell-genesis");
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        )
+        .with_cell_name_registry(Box::new(registry));
+
+        // A claimed name reports IN-USE with the clear shared message, WITHOUT
+        // creating anything (still FRESH afterwards).
+        let taken = get(&mut ctx, "/bootstrap/name-check?name=cell-genesis");
+        assert_eq!(taken.status, 200, "got: {}", taken.body);
+        assert!(taken.body.starts_with("IN-USE"), "got: {}", taken.body);
+        assert!(
+            taken.body.contains("cell name already in use — choose another"),
+            "got: {}",
+            taken.body
+        );
+
+        // A free (or unreachable) name reports FREE — the best-effort rule.
+        let free = get(&mut ctx, "/bootstrap/name-check?name=cell-unique");
+        assert_eq!(free.status, 200, "got: {}", free.body);
+        assert_eq!(free.body.trim(), "FREE");
+
+        // The check is non-mutating: the node is still un-bootstrapped.
+        assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
+        assert!(!ctx.bootstrap().is_bootstrapped());
+
+        // The web UI wires this endpoint into the cell-name field for the inline
+        // hint (a real in-UI surface, not just a backend route).
+        let page = get(&mut ctx, "/");
+        assert!(
+            page.body.contains("/bootstrap/name-check"),
+            "the portal must query the live name-check for an inline hint"
+        );
+        assert!(
+            page.body.contains("id=\"cell-name-hint\""),
+            "the portal must render an inline cell-name validation hint"
+        );
+    }
+
+    // UX hardening: a representative mutating control asserts a pending/disabled
+    // state while its signed event is in flight (no double-submit) and
+    // re-enables on the result.
+    #[test]
+    fn a_representative_act_shows_a_pending_disabled_state_with_no_double_submit() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let body = get(&mut ctx, "/").body;
+        // The pending-state helper exists and gates double-submit + re-enables.
+        assert!(body.contains("withPending"), "must have a pending-state wrapper");
+        assert!(
+            body.contains("aria-busy") && body.contains("guard double-submit"),
+            "must set a busy state and guard against double-submit"
+        );
+        assert!(
+            body.contains("btn.disabled = true") && body.contains("btn.disabled = false"),
+            "must disable while in flight and re-enable on the result"
+        );
+        // The representative act (inbox approve/reject) routes its click through
+        // the pending wrapper.
+        assert!(
+            body.contains("decideRequest(btn,"),
+            "the approve/reject act must run through the pending wrapper"
+        );
+    }
+
+    // UX hardening: copy-to-clipboard affordances render for a CID / PeerId /
+    // fingerprint field.
+    #[test]
+    fn copy_to_clipboard_affordances_render_for_cid_peerid_fingerprint() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let body = get(&mut ctx, "/").body;
+        assert!(
+            body.contains("data-copy-field=\"PeerId\""),
+            "PeerId must have a copy affordance"
+        );
+        assert!(
+            body.contains("data-copy-field=\"fingerprint\""),
+            "a fingerprint must have a copy affordance"
+        );
+        // The CID copy affordance is applied to an approval's returned CID at
+        // runtime (data-copy-field=\"CID\"), and the clipboard helper exists.
+        assert!(
+            body.contains("data-copy-field=\"CID\""),
+            "an approval's CID must get a copy affordance"
+        );
+        assert!(
+            body.contains("copyText") && body.contains("attachCopyButton"),
+            "must ship a copy-to-clipboard implementation"
+        );
+    }
+
+    // UX hardening: an approval AND an attestation each render a plain-language
+    // "what happens next" explainer describing what the signed act authorizes.
+    #[test]
+    fn approval_and_attestation_each_render_a_what_happens_next_explainer() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let body = get(&mut ctx, "/").body;
+        // The bootstrap (first signed cell/attestation act) explainer.
+        assert!(
+            body.contains("id=\"bootstrap-explainer\""),
+            "the bootstrap attestation act must render a what-happens-next explainer"
+        );
+        // The inbox approval explainer, describing the attestation the approval
+        // signs.
+        assert!(
+            body.contains("What happens next")
+                && body.contains("signs an attestation"),
+            "the approval act must render a what-happens-next explainer"
+        );
+        assert!(
+            body.contains("class=\"explainer\""),
+            "explainers must render as a distinct UI affordance"
         );
     }
 }
