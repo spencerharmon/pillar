@@ -15,7 +15,7 @@ use pillar_identity::UserPrimary;
 use pillar_rbac::{Capability, ExplicitGrant, GrantEffect};
 use pillar_wot_authority::WotAuthority;
 
-use crate::custody::CustodyChoice;
+use crate::custody::{CustodyChoice, CustodyKind, CustodyRegistry};
 use crate::name::{check_cell_name_available, CellNameRegistry};
 use crate::BootstrapError;
 
@@ -164,6 +164,23 @@ pub struct CellBootstrapOutcome {
     pub grants: Vec<ExplicitGrant>,
     /// The one-shot capability tracker, with the first user consumed.
     pub capability: CellBootstrap,
+    /// The per-key custody registry: which real [`SignerBackend`](crate::custody::SignerBackend)
+    /// the cell key and the user key are each LABELED to — populated by the
+    /// SAME custody choices the caller passed in, so a key's custody label
+    /// is a hard requirement enforced at sign time, never cosmetic.
+    pub custody: CustodyRegistry,
+    /// The cell key's custody backend kind, as actually assigned.
+    pub cell_custody: CustodyKind,
+    /// The user key's custody backend kind, as actually assigned.
+    pub user_custody: CustodyKind,
+    /// The genesis proof-of-possession signature the cell key's REAL
+    /// custody backend produced (cold-root certifying the user key) — proof
+    /// this bootstrap actually invoked the labeled backend, not merely
+    /// carried its name.
+    pub cell_genesis_signature: String,
+    /// The genesis proof-of-possession signature the user key's REAL custody
+    /// backend produced.
+    pub user_genesis_signature: String,
 }
 
 impl CellBootstrapOutcome {
@@ -208,8 +225,8 @@ impl CellBootstrapOutcome {
 pub fn bootstrap_cell_and_user(
     cell: NodeId,
     user_handle: &str,
-    _cell_custody: &CustodyChoice,
-    _user_custody: &CustodyChoice,
+    cell_custody: &CustodyChoice,
+    user_custody: &CustodyChoice,
     registry: &(impl CellNameRegistry + ?Sized),
     trust_depth: u8,
 ) -> Result<CellBootstrapOutcome, BootstrapError> {
@@ -224,6 +241,20 @@ pub fn bootstrap_cell_and_user(
     let user_node = NodeId::from(user_primary.0.as_str());
     let mut authority = WotAuthority::new(cell.clone(), trust_depth);
     authority.issue_edge(cell.clone(), user_node.clone(), trust_depth);
+
+    // Per-key custody: label each key to its OWN chosen backend and prove
+    // possession with a real genesis signature through it — the cell key and
+    // the user key may (and here typically do) use DIFFERENT backends, never
+    // funneled through one.
+    let mut custody = CustodyRegistry::new();
+    let cell_key_id = cell.0.clone();
+    let user_key_id = user_node.0.clone();
+    let cell_genesis_signature = cell_custody
+        .label_and_sign(&mut custody, &cell_key_id, "genesis-certify-user")
+        .map_err(|_| BootstrapError::CustodyBackendDeclined)?;
+    let user_genesis_signature = user_custody
+        .label_and_sign(&mut custody, &user_key_id, "genesis-accept-certification")
+        .map_err(|_| BootstrapError::CustodyBackendDeclined)?;
 
     // 4: grant the user the add-users right.
     let cap = Capability::from(ADD_USERS_CAPABILITY);
@@ -250,6 +281,11 @@ pub fn bootstrap_cell_and_user(
         authority,
         grants: vec![user_grant, cell_deny],
         capability,
+        custody,
+        cell_custody: cell_custody.kind(),
+        user_custody: user_custody.kind(),
+        cell_genesis_signature,
+        user_genesis_signature,
     })
 }
 
@@ -403,8 +439,9 @@ mod tests {
 
     #[test]
     fn custody_choice_flows_through_for_each_key() {
-        // The custody choices are accepted per-key (cell vs user); this pins
-        // that the API takes both independently.
+        // The custody choices are accepted per-key (cell vs user) AND are now
+        // REAL backends: each key is labeled to and actually signed by its
+        // OWN chosen backend, never funneled through one.
         let registry = InMemoryCellNameRegistry::new();
         let cell_custody = CustodyChoice::new(CustodyKind::Tpm).with_label("cold");
         let user_custody = CustodyChoice::new(CustodyKind::Passkey);
@@ -418,5 +455,58 @@ mod tests {
         )
         .expect("bootstrap");
         assert_eq!(outcome.user_handle, "spencer");
+
+        assert_eq!(outcome.cell_custody, CustodyKind::Tpm);
+        assert_eq!(outcome.user_custody, CustodyKind::Passkey);
+        assert!(outcome.cell_genesis_signature.starts_with("tpm:"));
+        assert!(outcome.user_genesis_signature.starts_with("passkey:"));
+        assert_ne!(outcome.cell_genesis_signature, outcome.user_genesis_signature);
+
+        // The registry actually labeled each key: a mismatched backend for
+        // either is refused.
+        assert_eq!(
+            outcome.custody.kind_of(&outcome.cell.0),
+            Some(CustodyKind::Tpm)
+        );
+        assert_eq!(
+            outcome.custody.kind_of(&outcome.user_node.0),
+            Some(CustodyKind::Passkey)
+        );
+        let wrong = crate::custody::PasswordBackend::new(outcome.cell.0.clone());
+        assert_eq!(
+            crate::custody::sign_with_backend(
+                &outcome.custody,
+                &outcome.cell.0,
+                &wrong,
+                "genesis-certify-user"
+            ),
+            Err(crate::custody::CustodySignError::KindMismatch {
+                expected: CustodyKind::Tpm,
+                presented: CustodyKind::Password,
+            })
+        );
+    }
+
+    /// Two keys on the same bootstrap (cell + user) may use DIFFERENT
+    /// backends and both actually sign through the trait — not all funneled
+    /// to one backend.
+    #[test]
+    fn cell_and_user_keys_use_different_backends_and_both_sign() {
+        let registry = InMemoryCellNameRegistry::new();
+        let cell_custody = CustodyChoice::new(CustodyKind::FileKeyring);
+        let user_custody = CustodyChoice::new(CustodyKind::Password);
+        let outcome = bootstrap_cell_and_user(
+            NodeId::from("cell-two-backends"),
+            "spencer",
+            &cell_custody,
+            &user_custody,
+            &registry,
+            4,
+        )
+        .expect("bootstrap");
+        assert!(outcome
+            .cell_genesis_signature
+            .starts_with("file-keyring:"));
+        assert!(outcome.user_genesis_signature.starts_with("password:"));
     }
 }

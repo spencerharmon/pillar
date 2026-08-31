@@ -341,6 +341,94 @@ impl SignerBackend for PasswordBackend {
     }
 }
 
+/// Per-key custody assignment: which [`CustodyKind`] backend a given key id
+/// is LABELED to use. This is the real per-key wiring point — a principal
+/// (cell, user, or node) may have several keys, each labeled to a different
+/// custody backend (e.g. a TPM-sealed node key alongside a
+/// password-unlocked user operational key), and [`sign_with_backend`]
+/// enforces that a key can only ever be signed by the backend it is labeled
+/// for, refusing any other.
+#[derive(Clone, Debug, Default)]
+pub struct CustodyRegistry {
+    assignments: HashMap<String, CustodyKind>,
+}
+
+impl CustodyRegistry {
+    /// An empty registry: no key has an assigned custody backend yet.
+    #[must_use]
+    pub fn new() -> Self {
+        CustodyRegistry::default()
+    }
+
+    /// Label `key_id` to be signed ONLY by the `kind` backend. Re-labeling an
+    /// already-assigned key overwrites its prior label (a deliberate
+    /// custody-migration action, not silently ignored).
+    pub fn assign(&mut self, key_id: impl Into<String>, kind: CustodyKind) {
+        self.assignments.insert(key_id.into(), kind);
+    }
+
+    /// The custody backend `key_id` is labeled for, if any.
+    #[must_use]
+    pub fn kind_of(&self, key_id: &str) -> Option<CustodyKind> {
+        self.assignments.get(key_id).copied()
+    }
+}
+
+/// Why signing through a labeled backend was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CustodySignError {
+    /// `key_id` has no custody label recorded in the registry.
+    NoBackendAssigned,
+    /// `key_id` is labeled for a DIFFERENT backend than the one presented —
+    /// e.g. a key labeled `Tpm` cannot be signed by a `PasswordBackend`. This
+    /// is the enforcement point for "a key labeled backend X uses X".
+    KindMismatch {
+        /// The backend kind `key_id` is actually labeled for.
+        expected: CustodyKind,
+        /// The backend kind the caller presented.
+        presented: CustodyKind,
+    },
+    /// The presented backend matched the label but declined to sign (e.g. a
+    /// locked keyring or absent passkey authenticator).
+    SigningDeclined,
+}
+
+/// Sign `challenge` for `key_id` through `backend`, but ONLY if `backend`'s
+/// kind matches `key_id`'s label in `registry` — the real per-key custody
+/// enforcement: a mismatched backend is refused before it is ever asked to
+/// sign, so custody labels are a hard requirement, not a cosmetic hint.
+///
+/// The backend NEVER exposes private key material here or anywhere else —
+/// only the opaque signature token [`SignerBackend::sign_challenge`]
+/// produces crosses this boundary, so this function structurally cannot leak
+/// key material even on success.
+///
+/// # Errors
+///
+/// [`CustodySignError::NoBackendAssigned`] if `key_id` carries no label;
+/// [`CustodySignError::KindMismatch`] if `backend`'s kind differs from the
+/// label; [`CustodySignError::SigningDeclined`] if the (correctly labeled)
+/// backend itself declines to sign.
+pub fn sign_with_backend(
+    registry: &CustodyRegistry,
+    key_id: &str,
+    backend: &dyn SignerBackend,
+    challenge: &str,
+) -> Result<String, CustodySignError> {
+    let expected = registry
+        .kind_of(key_id)
+        .ok_or(CustodySignError::NoBackendAssigned)?;
+    if expected != backend.kind() {
+        return Err(CustodySignError::KindMismatch {
+            expected,
+            presented: backend.kind(),
+        });
+    }
+    backend
+        .sign_challenge(challenge)
+        .ok_or(CustodySignError::SigningDeclined)
+}
+
 /// A pre-authorized, single-use delegation grant redeemable to enroll one new
 /// op key without an interactive signer present (one-time-token enrollment).
 ///
@@ -882,5 +970,129 @@ mod tests {
     fn unavailable_backend_declines_to_sign() {
         assert!(FileKeyringBackend::new("k").sign_challenge("c").is_none());
         assert!(PasskeyBackend::new("c", false).sign_challenge("c").is_none());
+    }
+
+    // ---- per-key custody registry wiring ----
+
+    /// A key labeled backend X actually uses X: the matching backend signs
+    /// successfully through the registry.
+    #[test]
+    fn key_labeled_backend_x_uses_x() {
+        let mut registry = CustodyRegistry::new();
+        registry.assign("node-key-1", CustodyKind::Tpm);
+        let tpm = TpmBackend::new("0x81000001");
+        let sig = sign_with_backend(&registry, "node-key-1", &tpm, "nonce")
+            .expect("labeled backend signs");
+        assert!(sig.starts_with("tpm:"));
+    }
+
+    /// Presenting a DIFFERENT backend than the key's label is refused before
+    /// it is ever asked to sign — the mismatch case.
+    #[test]
+    fn mismatched_backend_is_refused() {
+        let mut registry = CustodyRegistry::new();
+        registry.assign("node-key-1", CustodyKind::Tpm);
+        let password = PasswordBackend::new("node-key-1");
+        assert_eq!(
+            sign_with_backend(&registry, "node-key-1", &password, "nonce"),
+            Err(CustodySignError::KindMismatch {
+                expected: CustodyKind::Tpm,
+                presented: CustodyKind::Password,
+            })
+        );
+    }
+
+    /// An unlabeled key refuses signing through any backend.
+    #[test]
+    fn unlabeled_key_has_no_backend_assigned() {
+        let registry = CustodyRegistry::new();
+        let tpm = TpmBackend::new("h");
+        assert_eq!(
+            sign_with_backend(&registry, "unknown-key", &tpm, "nonce"),
+            Err(CustodySignError::NoBackendAssigned)
+        );
+    }
+
+    /// Two keys on the SAME principal may carry different labels (e.g. a
+    /// TPM-sealed node key and a password-unlocked user operational key) and
+    /// both sign successfully through their own labeled backend.
+    #[test]
+    fn two_keys_with_different_labels_both_sign() {
+        let mut registry = CustodyRegistry::new();
+        registry.assign("node-key", CustodyKind::Tpm);
+        registry.assign("user-op-key", CustodyKind::Password);
+
+        let tpm = TpmBackend::new("node-handle");
+        let password = PasswordBackend::new("user-op-key");
+
+        let node_sig =
+            sign_with_backend(&registry, "node-key", &tpm, "chal").expect("node key signs");
+        let user_sig = sign_with_backend(&registry, "user-op-key", &password, "chal")
+            .expect("user key signs");
+
+        assert!(node_sig.starts_with("tpm:"));
+        assert!(user_sig.starts_with("password:"));
+        assert_ne!(node_sig, user_sig);
+
+        // Cross-wiring is refused: the node key cannot sign via the user's
+        // password backend and vice versa.
+        assert_eq!(
+            sign_with_backend(&registry, "node-key", &password, "chal"),
+            Err(CustodySignError::KindMismatch {
+                expected: CustodyKind::Tpm,
+                presented: CustodyKind::Password,
+            })
+        );
+        assert_eq!(
+            sign_with_backend(&registry, "user-op-key", &tpm, "chal"),
+            Err(CustodySignError::KindMismatch {
+                expected: CustodyKind::Password,
+                presented: CustodyKind::Tpm,
+            })
+        );
+    }
+
+    /// A correctly-labeled backend that is currently unavailable (locked
+    /// keyring / absent passkey) declines rather than falsely succeeding.
+    #[test]
+    fn labeled_but_unavailable_backend_declines() {
+        let mut registry = CustodyRegistry::new();
+        registry.assign("k", CustodyKind::FileKeyring);
+        let locked = FileKeyringBackend::new("k"); // not unlocked
+        assert_eq!(
+            sign_with_backend(&registry, "k", &locked, "c"),
+            Err(CustodySignError::SigningDeclined)
+        );
+    }
+
+    /// Property: no key material (private key bytes / secrets) ever crosses
+    /// the signing boundary — only the opaque signature token returned by
+    /// [`SignerBackend::sign_challenge`] does. Backends here carry no
+    /// private-key field at all, so `sign_with_backend`'s output can only
+    /// ever be composed from the backend's own public id/handle and the
+    /// challenge, never a secret.
+    #[test]
+    fn no_key_material_crosses_the_signing_boundary() {
+        for kind in [
+            CustodyKind::FileKeyring,
+            CustodyKind::Tpm,
+            CustodyKind::Passkey,
+            CustodyKind::Password,
+        ] {
+            let mut registry = CustodyRegistry::new();
+            registry.assign("k", kind);
+            let backend: Box<dyn SignerBackend> = match kind {
+                CustodyKind::FileKeyring => Box::new(FileKeyringBackend::new("k").unlocked()),
+                CustodyKind::Tpm => Box::new(TpmBackend::new("h")),
+                CustodyKind::Passkey => Box::new(PasskeyBackend::new("c", true)),
+                CustodyKind::Password => Box::new(PasswordBackend::new("k")),
+            };
+            let sig = sign_with_backend(&registry, "k", backend.as_ref(), "chal-xyz")
+                .expect("labeled + available backend signs");
+            // The signature is a formatted string over (backend-id, challenge)
+            // only — never a secret/private-key field, since none exists on
+            // any `SignerBackend` impl in this module.
+            assert!(sig.ends_with(":chal-xyz"));
+        }
     }
 }

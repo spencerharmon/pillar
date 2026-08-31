@@ -82,6 +82,11 @@ pub enum BootstrapError {
     /// guard, not a global strong-uniqueness guarantee (a name no peer serves
     /// is treated as FREE — see [`name::CellNameRegistry`]).
     CellNameInUse,
+    /// A key's chosen custody backend declined to prove possession at
+    /// genesis time (e.g. a passkey ceremony that failed, a keyring that
+    /// could not unlock) — bootstrap refuses rather than proceed with an
+    /// unproven key.
+    CustodyBackendDeclined,
 }
 
 impl std::fmt::Display for BootstrapError {
@@ -93,6 +98,9 @@ impl std::fmt::Display for BootstrapError {
                 f.write_str("the first user already exists; use the admin user key to add more")
             }
             BootstrapError::CellNameInUse => f.write_str(CELL_NAME_IN_USE_MESSAGE),
+            BootstrapError::CustodyBackendDeclined => {
+                f.write_str("a key's custody backend declined to prove possession at genesis")
+            }
         }
     }
 }
