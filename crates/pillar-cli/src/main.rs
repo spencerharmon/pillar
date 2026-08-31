@@ -33,10 +33,25 @@ fn usage() -> &'static str {
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
      \x20 pillar render kustomize <base.txt>        (see library API for overlay construction)\n\
      \x20 pillar --web [--port N]                  serve the localhost-only bootstrap/web UI\n\
+     \x20 pillar obs <family> <verb> [args]         per-signal observability views (see below)\n\
      \n\
      apply/get/describe act over a live platform (schema registry + WoT/RBAC\n\
      authority + event log). This shell renders and validates manifests; the\n\
-     authoritative engine is the `pillar_cli` library.\n"
+     authoritative engine is the `pillar_cli` library.\n\
+     \n\
+     `pillar obs` families (every verb below is a VIEW — reads state, signs\n\
+     nothing — except `obs dashboard {create|update|delete}`, which is an ACT\n\
+     emitting one signed IPFS+streaming-tip resource; see `pillar_cli::\n\
+     observability_ui::ObservabilityBuilders`, the authoritative engine this\n\
+     shell operates over a per-invocation substrate of):\n\
+     \x20 pillar obs metric   {query|series|tail|top|retention}\n\
+     \x20 pillar obs log      {query|tail|fields}\n\
+     \x20 pillar obs trace    {get|search|graph}\n\
+     \x20 pillar obs profile  {get|flame|top}\n\
+     \x20 pillar obs metadata {query|current|history|series}\n\
+     \x20 pillar obs explore  <metric|log|trace|profile|metadata>\n\
+     \x20 pillar obs query    -f <q.pql>\n\
+     \x20 pillar obs dashboard {create|update|delete|get} ...\n"
 }
 
 fn main() -> ExitCode {
@@ -52,6 +67,20 @@ fn main() -> ExitCode {
         Some("login") => login(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("onboard") => onboard(),
+        Some("obs") => {
+            // Every `obs` verb reads (or, for `dashboard create/update/delete`,
+            // signs) a live node's materialized observability substrate — the
+            // same "no live platform in this shell" boundary `apply`/`get`/
+            // `describe` already document below. The authoritative, fully
+            // unit-tested engine for every verb this help text lists is
+            // `pillar_cli::observability_ui::ObservabilityBuilders`.
+            eprintln!(
+                "`pillar obs …` reads/acts over a live node's observability substrate via the \
+                 pillar_cli::observability_ui::ObservabilityBuilders library API."
+            );
+            eprintln!("Run `pillar --help` for the full `obs` verb list.");
+            ExitCode::from(2)
+        }
         Some("apply") | Some("get") | Some("describe") => {
             // These verbs act over a live, persistent platform, which this
             // demonstration shell does not host. The library `Platform` API is

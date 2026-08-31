@@ -249,6 +249,180 @@ impl ObservabilityBuilders {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Per-signal-kind CLI verbs (`docs/cli-surface.md` § "obs"): each of the
+    // five signal kinds gets its own small verb vocabulary over the SAME
+    // shared substrate above — every one of these is a READ, signing
+    // nothing. `filter` (where present) is a plain case-sensitive substring
+    // match against the signal's rendered payload text — the minimal query
+    // language every verb below shares.
+    // ------------------------------------------------------------------
+
+    /// Filter `records` (already narrowed to one kind) to those whose payload
+    /// contains `filter`, when given.
+    fn filtered(records: Vec<ExploreRecord>, filter: Option<&str>) -> Vec<ExploreRecord> {
+        match filter {
+            None => records,
+            Some(f) => records.into_iter().filter(|r| r.payload.contains(f)).collect(),
+        }
+    }
+
+    /// The last `n` records of `records`, in ingested (ascending id) order —
+    /// the `tail` verb shared by every signal kind that has one.
+    fn tail_n(mut records: Vec<ExploreRecord>, n: usize) -> Vec<ExploreRecord> {
+        if records.len() > n {
+            records.drain(0..records.len() - n);
+        }
+        records
+    }
+
+    // -- metric: query / series / tail / top / retention --
+
+    /// `obs metric query [filter]` — every metric record whose payload
+    /// contains `filter` (or all, if `None`).
+    pub fn metric_query(&mut self, filter: Option<&str>) -> Vec<ExploreRecord> {
+        Self::filtered(self.explore(SignalKind::Metric), filter)
+    }
+
+    /// `obs metric series` — every metric record, in ingestion order (the
+    /// timeseries view over the same substrate `query` reads).
+    pub fn metric_series(&mut self) -> Vec<ExploreRecord> {
+        self.explore(SignalKind::Metric)
+    }
+
+    /// `obs metric tail <n>` — the most recent `n` metric records.
+    pub fn metric_tail(&mut self, n: usize) -> Vec<ExploreRecord> {
+        Self::tail_n(self.explore(SignalKind::Metric), n)
+    }
+
+    /// `obs metric top <n>` — the `n` metric records with the numerically
+    /// largest trailing value in their payload (e.g. `cpu 0.9` -> `0.9`);
+    /// records with no parseable trailing number sort last.
+    pub fn metric_top(&mut self, n: usize) -> Vec<ExploreRecord> {
+        let mut records = self.explore(SignalKind::Metric);
+        records.sort_by(|a, b| {
+            let va = trailing_number(&a.payload).unwrap_or(f64::MIN);
+            let vb = trailing_number(&b.payload).unwrap_or(f64::MIN);
+            vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        records.truncate(n);
+        records
+    }
+
+    /// `obs metric retention` — this store's retention/compaction policy note
+    /// ([`pillar_observability::RETENTION_NOTE`]): resampling/downsampling is
+    /// explicitly deferred; retention itself (bounded, lossless block drop) is
+    /// implemented.
+    #[must_use]
+    pub fn metric_retention(&self) -> &'static str {
+        pillar_observability::RETENTION_NOTE
+    }
+
+    // -- log: query / tail / fields --
+
+    /// `obs log query [filter]` — every log record whose payload contains
+    /// `filter` (or all, if `None`).
+    pub fn log_query(&mut self, filter: Option<&str>) -> Vec<ExploreRecord> {
+        Self::filtered(self.explore(SignalKind::Log), filter)
+    }
+
+    /// `obs log tail <n>` — the most recent `n` log records.
+    pub fn log_tail(&mut self, n: usize) -> Vec<ExploreRecord> {
+        Self::tail_n(self.explore(SignalKind::Log), n)
+    }
+
+    /// `obs log fields` — the distinct `key`s observed across every log
+    /// record's `key=value` pairs (space-separated), e.g. `level=warn` ->
+    /// `level`.
+    pub fn log_fields(&mut self) -> BTreeSet<String> {
+        self.explore(SignalKind::Log)
+            .into_iter()
+            .flat_map(|r| {
+                r.payload
+                    .split_whitespace()
+                    .filter_map(|tok| tok.split_once('=').map(|(k, _)| k.to_owned()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    // -- trace: get / search / graph --
+
+    /// `obs trace get <id>` — the one trace-span record with this id.
+    pub fn trace_get(&mut self, id: SignalId) -> Option<ExploreRecord> {
+        self.explore(SignalKind::TraceSpan).into_iter().find(|r| r.id == id)
+    }
+
+    /// `obs trace search [filter]` — every trace-span record whose payload
+    /// contains `filter` (or all, if `None`).
+    pub fn trace_search(&mut self, filter: Option<&str>) -> Vec<ExploreRecord> {
+        Self::filtered(self.explore(SignalKind::TraceSpan), filter)
+    }
+
+    /// `obs trace graph <correlation>` — the cross-signal pivot for a trace id
+    /// (every signal, of any kind, sharing this correlation id): the graph's
+    /// node set. Thin alias over [`Self::pivot_by_correlation`], named for the
+    /// `trace` family's own verb vocabulary.
+    #[must_use]
+    pub fn trace_graph(&self, correlation: &CorrelationId) -> LabelPivot {
+        self.pivot_by_correlation(correlation)
+    }
+
+    // -- profile: get / flame / top --
+
+    /// `obs profile get <id>` — the one profile-sample record with this id.
+    pub fn profile_get(&mut self, id: SignalId) -> Option<ExploreRecord> {
+        self.explore(SignalKind::ProfileSample).into_iter().find(|r| r.id == id)
+    }
+
+    /// `obs profile flame <id>` — the profile sample's stack frames, split on
+    /// `;` (the collapsed-stack convention `perf`/`pprof` flamegraphs share),
+    /// outermost frame first.
+    pub fn profile_flame(&mut self, id: SignalId) -> Option<Vec<String>> {
+        self.profile_get(id)
+            .map(|r| r.payload.split(';').map(str::to_owned).collect())
+    }
+
+    /// `obs profile top <n>` — the `n` most recent profile-sample records
+    /// (the flat "hottest recent samples" view; per-frame aggregation is a
+    /// future refinement of this same verb).
+    pub fn profile_top(&mut self, n: usize) -> Vec<ExploreRecord> {
+        Self::tail_n(self.explore(SignalKind::ProfileSample), n)
+    }
+
+    // -- metadata: query / current / history / series --
+
+    /// `obs metadata query [prefix]` — every known entity whose id starts with
+    /// `prefix` (or every entity, if `None`), paired with its rendered view.
+    pub fn metadata_query(&self, prefix: Option<&str>) -> Vec<(EntityId, MetadataView)> {
+        self.metadata
+            .entities()
+            .filter(|e| prefix.is_none_or(|p| e.0.starts_with(p)))
+            .map(|e| (e.clone(), self.metadata_view(e)))
+            .collect()
+    }
+
+    /// `obs metadata current <entity>` — the entity's label set in effect NOW.
+    #[must_use]
+    pub fn metadata_current(&self, entity: &EntityId) -> Option<LabelSet> {
+        self.metadata.current_labels(entity).cloned()
+    }
+
+    /// `obs metadata history <entity>` — the entity's ordered label-change
+    /// transition list (each with its diff).
+    #[must_use]
+    pub fn metadata_history(&self, entity: &EntityId) -> Vec<LabelTransition> {
+        self.metadata.transitions(entity).to_vec()
+    }
+
+    /// `obs metadata series <entity>` — same as `history`: the metadata signal
+    /// carries no numeric value, so its "series" IS its label-transition
+    /// timeline (see [`pillar_observability::MetadataStore`] module docs).
+    #[must_use]
+    pub fn metadata_series(&self, entity: &EntityId) -> Vec<LabelTransition> {
+        self.metadata_history(entity)
+    }
+
     // ------------------------ Cross-signal correlation explorer -------------
 
     /// Pivot by a shared correlation/trace id across every signal kind.
@@ -296,6 +470,27 @@ impl ObservabilityBuilders {
     #[must_use]
     pub fn query_tip(&self) -> u64 {
         self.queries.root()
+    }
+
+    /// `obs query -f <file>` — load a previously-saved query by CID and RUN
+    /// it: the saved `spec` is parsed as `kind=<metric|log|trace|profile|
+    /// metadata> [filter text...]` and executed as that kind's plain `query`
+    /// verb (a substring match against the payload). A pure read: loading and
+    /// running a saved query signs nothing.
+    pub fn run_saved_query(&mut self, id: OpId) -> Option<Vec<ExploreRecord>> {
+        let saved = self.load_query(id)?;
+        let mut parts = saved.spec.splitn(2, ' ');
+        let kind_tok = parts.next().unwrap_or("");
+        let kind = match kind_tok.strip_prefix("kind=") {
+            Some("metric") => SignalKind::Metric,
+            Some("log") => SignalKind::Log,
+            Some("trace") => SignalKind::TraceSpan,
+            Some("profile") => SignalKind::ProfileSample,
+            Some("metadata") => SignalKind::MetadataSample,
+            _ => return None,
+        };
+        let filter = parts.next().filter(|f| !f.is_empty());
+        Some(Self::filtered(self.explore(kind), filter))
     }
 
     // ----------------------------- Dashboard builder --------------------------
@@ -383,6 +578,13 @@ impl ObservabilityBuilders {
     pub fn dashboard_tip(&self) -> u64 {
         self.dashboards.root()
     }
+}
+
+/// Parse the last whitespace-separated token of `payload` as an `f64`, e.g.
+/// `"cpu 0.9"` -> `Some(0.9)`. `None` if the payload has no parseable
+/// trailing number — used by [`ObservabilityBuilders::metric_top`].
+fn trailing_number(payload: &str) -> Option<f64> {
+    payload.split_whitespace().next_back()?.parse::<f64>().ok()
 }
 
 #[cfg(test)]
@@ -531,5 +733,105 @@ mod tests {
         // Exactly one save call -> exactly one new signed event.
         b.save_query("alice", "q", "spec");
         assert_eq!(b.queries.order().len(), 1, "one save == one signed resource event");
+    }
+
+    /// `obs metric {query,series,tail,top,retention}`: each verb reads the
+    /// same metric substrate and returns real records.
+    #[test]
+    fn metric_verbs_query_series_tail_top_retention() {
+        let mut b = ObservabilityBuilders::new();
+        b.ingest(SignalKind::Metric, b"cpu 0.1".to_vec(), 0);
+        b.ingest(SignalKind::Metric, b"cpu 0.9".to_vec(), 1);
+        b.ingest(SignalKind::Metric, b"mem 0.5".to_vec(), 2);
+
+        assert_eq!(b.metric_series().len(), 3);
+        assert_eq!(b.metric_query(Some("mem")).len(), 1);
+        assert_eq!(b.metric_query(None).len(), 3);
+
+        let tail = b.metric_tail(2);
+        assert_eq!(tail.len(), 2, "tail returns exactly n records");
+
+        let top = b.metric_top(1);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].payload, "cpu 0.9", "hottest value first");
+
+        assert!(!b.metric_retention().is_empty());
+    }
+
+    /// `obs log {query,tail,fields}`: query/tail read log records; `fields`
+    /// lists the distinct `key=value` keys observed.
+    #[test]
+    fn log_verbs_query_tail_fields() {
+        let mut b = ObservabilityBuilders::new();
+        b.ingest(SignalKind::Log, b"level=warn msg=hot".to_vec(), 0);
+        b.ingest(SignalKind::Log, b"level=info msg=ok".to_vec(), 1);
+
+        assert_eq!(b.log_query(Some("warn")).len(), 1);
+        assert_eq!(b.log_tail(1).len(), 1);
+        let fields = b.log_fields();
+        assert!(fields.contains("level"));
+        assert!(fields.contains("msg"));
+    }
+
+    /// `obs trace {get,search,graph}`: get resolves one span by id, search
+    /// filters, graph pivots by correlation id.
+    #[test]
+    fn trace_verbs_get_search_graph() {
+        let mut b = ObservabilityBuilders::new();
+        let trace = CorrelationId("trace-1".to_string());
+        let span = b.ingest(SignalKind::TraceSpan, b"span=root".to_vec(), 0);
+        b.register_correlation(span, Some(trace.clone()), BTreeSet::new());
+
+        assert_eq!(b.trace_get(span).expect("span exists").payload, "span=root");
+        assert_eq!(b.trace_search(Some("root")).len(), 1);
+        let graph = b.trace_graph(&trace);
+        assert!(graph.signals.contains(&span));
+    }
+
+    /// `obs profile {get,flame,top}`: get resolves one sample, flame splits
+    /// its collapsed stack, top returns recent samples.
+    #[test]
+    fn profile_verbs_get_flame_top() {
+        let mut b = ObservabilityBuilders::new();
+        let id = b.ingest(SignalKind::ProfileSample, b"main;work;sleep".to_vec(), 0);
+
+        assert!(b.profile_get(id).is_some());
+        let flame = b.profile_flame(id).expect("sample exists");
+        assert_eq!(flame, vec!["main", "work", "sleep"]);
+        assert_eq!(b.profile_top(5).len(), 1);
+    }
+
+    /// `obs metadata {query,current,history,series}`: query lists matching
+    /// entities, current/history/series read one entity's derived views.
+    #[test]
+    fn metadata_verbs_query_current_history_series() {
+        let mut b = ObservabilityBuilders::new();
+        let entity = EntityId("node-1".to_string());
+        b.observe_metadata(entity.clone(), labels(&[("role", "worker")]), 0);
+        b.observe_metadata(entity.clone(), labels(&[("role", "drained")]), 5);
+
+        let matches = b.metadata_query(Some("node"));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, entity);
+
+        assert_eq!(b.metadata_current(&entity), Some(labels(&[("role", "drained")])));
+        assert_eq!(b.metadata_history(&entity).len(), 2);
+        assert_eq!(b.metadata_series(&entity), b.metadata_history(&entity));
+    }
+
+    /// `obs query -f q.pql` loads a saved query and RUNS it — a pure read
+    /// that signs nothing.
+    #[test]
+    fn obs_query_dash_f_loads_and_runs_a_saved_query() {
+        let mut b = ObservabilityBuilders::new();
+        b.ingest(SignalKind::Metric, b"cpu 0.9".to_vec(), 0);
+        b.ingest(SignalKind::Metric, b"mem 0.5".to_vec(), 1);
+
+        let cid = b.save_query("alice", "hot-cpu", "kind=metric cpu");
+        let before_tip = b.query_tip();
+        let results = b.run_saved_query(cid).expect("saved query runs");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].payload, "cpu 0.9");
+        assert_eq!(b.query_tip(), before_tip, "running a saved query signs nothing");
     }
 }
