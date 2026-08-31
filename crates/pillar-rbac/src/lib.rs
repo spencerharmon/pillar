@@ -60,6 +60,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use pillar_core::NodeId;
 use pillar_wot_authority::WotAuthority;
@@ -463,6 +464,67 @@ impl<'a> RbacDecider<'a> {
     #[must_use]
     pub fn predict(&self, request: &Request) -> Decision {
         self.decide(request)
+    }
+
+    /// The **exercised authority** behind [`RbacDecider::decide`]'s verdict
+    /// for `request` — WHICH rung of the four-rung precedence lattice
+    /// produced it, for `describe`/audit provenance rendering. Computed by
+    /// literally re-deriving the same rungs `decide` consults (never a
+    /// second, divergent explanation path), so a caller can render "why"
+    /// alongside the boolean `decide`/`predict` verdict.
+    #[must_use]
+    pub fn explain(&self, request: &Request) -> Exercised {
+        match self.explicit_grant(&request.subject, &request.capability) {
+            Some(GrantEffect::Deny) => return Exercised::ExplicitDeny,
+            Some(GrantEffect::Allow) => return Exercised::ExplicitAllow,
+            None => {}
+        }
+        let Some(depth) = self.authority.reachable_depth(&request.subject) else {
+            return Exercised::DenyAll;
+        };
+        match self.most_specific_satisfied_policy(request, depth) {
+            Some(policy) => Exercised::WotDepthDefault {
+                depth,
+                threshold: policy.depth_threshold,
+            },
+            None => Exercised::DenyAll,
+        }
+    }
+}
+
+/// The rung of the RBAC precedence lattice [`RbacDecider::explain`] found
+/// exercised for a request — the "why" behind a `decide`/`predict` verdict,
+/// rendered by `describe`/audit as the resource's "exercised authority".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exercised {
+    /// An explicit signed grant allowed the subject this capability.
+    ExplicitAllow,
+    /// An explicit signed grant denied the subject this capability
+    /// (overriding every other rung).
+    ExplicitDeny,
+    /// The subject's WoT-graph reachable depth satisfied the most specific
+    /// applicable policy's threshold.
+    WotDepthDefault {
+        /// The subject's reachable depth from the trust root.
+        depth: u8,
+        /// The satisfied policy's depth threshold.
+        threshold: u8,
+    },
+    /// No rung authorized the subject — the fail-closed default.
+    DenyAll,
+}
+
+impl fmt::Display for Exercised {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Exercised::ExplicitAllow => write!(f, "explicit grant (allow)"),
+            Exercised::ExplicitDeny => write!(f, "explicit grant (deny)"),
+            Exercised::WotDepthDefault { depth, threshold } => write!(
+                f,
+                "WoT-depth default (reachable at depth {depth}, threshold {threshold})"
+            ),
+            Exercised::DenyAll => write!(f, "none (deny-all default)"),
+        }
     }
 }
 
@@ -982,5 +1044,77 @@ mod tests {
         // hypothetical future edit; assert once more for clarity.
         a.issue_edge(n("owner"), n("bob"), 1);
         assert!(a.reachable_depth(&n("bob")).is_some());
+    }
+
+    // --- explain: the "why" behind decide/predict, for describe/audit -----
+
+    #[test]
+    fn explain_names_the_explicit_grant_rung_allow_and_deny() {
+        let a = owner_authority_with_alice(3, 2);
+        let policies = vec![];
+        let allow_grants = vec![ExplicitGrant {
+            subject: n("alice"),
+            capability: cap("stream:append"),
+            effect: GrantEffect::Allow,
+        }];
+        let decider = RbacDecider::new(&a, &policies, &allow_grants);
+        let request = req("alice", &cap("stream:append"));
+        assert_eq!(decider.explain(&request), Exercised::ExplicitAllow);
+        assert_eq!(decider.decide(&request), Decision::Allow);
+
+        let deny_grants = vec![ExplicitGrant {
+            subject: n("alice"),
+            capability: cap("stream:append"),
+            effect: GrantEffect::Deny,
+        }];
+        let decider = RbacDecider::new(&a, &policies, &deny_grants);
+        assert_eq!(decider.explain(&request), Exercised::ExplicitDeny);
+        assert_eq!(decider.decide(&request), Decision::Deny);
+    }
+
+    #[test]
+    fn explain_names_the_wot_depth_default_rung_when_that_is_what_decided() {
+        let a = owner_authority_with_alice(3, 2);
+        let policies = vec![PolicyEvent {
+            target: PolicyTarget::ResourceClass(ResourceClass::Compute),
+            capability: cap("stream:append"),
+            depth_threshold: 2,
+        }];
+        let grants = vec![];
+        let decider = RbacDecider::new(&a, &policies, &grants);
+        let request = req("alice", &cap("stream:append")).with_resource_class(ResourceClass::Compute);
+        assert_eq!(
+            decider.explain(&request),
+            Exercised::WotDepthDefault {
+                depth: 2,
+                threshold: 2
+            }
+        );
+        assert_eq!(decider.decide(&request), Decision::Allow);
+    }
+
+    #[test]
+    fn explain_names_deny_all_when_nothing_authorized_the_subject() {
+        let a = owner_authority_with_alice(3, 2);
+        let policies = vec![];
+        let grants = vec![];
+        let decider = RbacDecider::new(&a, &policies, &grants);
+        let request = req("alice", &cap("stream:append"));
+        assert_eq!(decider.explain(&request), Exercised::DenyAll);
+        assert_eq!(decider.decide(&request), Decision::Deny);
+        // An entirely unreachable subject also explains as deny-all.
+        let request = req("nobody", &cap("stream:append"));
+        assert_eq!(decider.explain(&request), Exercised::DenyAll);
+    }
+
+    #[test]
+    fn exercised_display_renders_a_readable_sentence() {
+        assert_eq!(Exercised::ExplicitAllow.to_string(), "explicit grant (allow)");
+        assert_eq!(Exercised::ExplicitDeny.to_string(), "explicit grant (deny)");
+        assert_eq!(Exercised::DenyAll.to_string(), "none (deny-all default)");
+        assert_eq!(
+            Exercised::WotDepthDefault { depth: 2, threshold: 2 }.to_string(),
+            "WoT-depth default (reachable at depth 2, threshold 2)"
+        );
     }
 }

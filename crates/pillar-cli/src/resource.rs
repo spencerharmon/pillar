@@ -37,7 +37,7 @@ use pillar_bootstrap::token::{LoginTokenError, TokenIssuer, TokenStore};
 use pillar_core::NodeId;
 use pillar_manifest::{Capability as ManifestCapability, Crd, Metadata, Value};
 
-use crate::{Applied, ApplyError, Platform};
+use crate::{Applied, ApplyError, Platform, Previewed};
 
 // ---------------------------------------------------------------------------
 // Session / context family (§3.1)
@@ -467,6 +467,12 @@ impl std::error::Error for ResourceError {}
 /// §1 — an act emits exactly one authorized event).
 pub type ActResult = Result<Applied, ResourceError>;
 
+/// The result of a `--dry-run` preview of a resource ACT: the SAME
+/// [`ResourceError`] the real act would return (INCLUDING a refusal), or the
+/// content-hash the real act would seal — but with NO event emitted and NO
+/// state mutated either way.
+pub type DryRunResult = Result<Previewed, ResourceError>;
+
 /// The kubectl-parity resource plane over a [`Platform`], polymorphic over
 /// EVERY kind. Every act ([`ResourcePlane::apply`], `create`, `delete`,
 /// `patch`, `label`, `annotate`, `scale`) routes the intended change through the
@@ -553,6 +559,21 @@ impl<'p> ResourcePlane<'p> {
             .map_err(ResourceError::Apply)
     }
 
+    /// `pillar apply -f <file> --dry-run` (VIEW): preview what
+    /// [`ResourcePlane::apply`] of this EXACT body WOULD do — running the
+    /// SAME decider decision `apply` enforces (see [`Platform::preview`]) —
+    /// emitting NO event and mutating NOTHING. Shows the identical outcome
+    /// `apply` would produce, including a refusal (predicted == enforced,
+    /// the single-decider invariant).
+    ///
+    /// # Errors
+    /// The SAME [`ResourceError`] `apply` would return for this body.
+    pub fn dry_run_apply(&self, actor: &NodeId, capability: &str, body: &Crd) -> DryRunResult {
+        self.platform
+            .preview(actor, capability, body)
+            .map_err(ResourceError::Apply)
+    }
+
     /// `pillar create <kind>/<name>` (ACT): imperative create; refuses if the
     /// object already exists in the view.
     ///
@@ -572,6 +593,26 @@ impl<'p> ResourcePlane<'p> {
         self.apply(actor, capability, body)
     }
 
+    /// `pillar create --dry-run` (VIEW): preview [`ResourcePlane::create`) —
+    /// the SAME already-exists check plus the SAME decider decision the real
+    /// create would enforce, with no mutation.
+    ///
+    /// # Errors
+    /// The SAME [`ResourceError`] `create` would return for this body.
+    pub fn dry_run_create(&self, actor: &NodeId, capability: &str, body: &Crd) -> DryRunResult {
+        if self
+            .platform
+            .get(&self.api_version, &body.kind, &body.metadata.name)
+            .is_some()
+        {
+            return Err(ResourceError::AlreadyExists(Address::new(
+                body.kind.clone(),
+                body.metadata.name.clone(),
+            )));
+        }
+        self.dry_run_apply(actor, capability, body)
+    }
+
     /// `pillar delete <kind>/<name>` (ACT): emit a delete/tombstone event. The
     /// tombstone is a signed body carrying the `pillar.dev/deleted` label, so it
     /// rides the identical authorized apply path.
@@ -589,6 +630,25 @@ impl<'p> ResourcePlane<'p> {
             .labels
             .insert("pillar.dev/deleted".to_owned(), "true".to_owned());
         self.apply(actor, capability, tombstone)
+    }
+
+    /// `pillar delete --dry-run` (VIEW): preview [`ResourcePlane::delete`] —
+    /// the SAME not-found check plus the SAME decider decision, with no
+    /// mutation.
+    ///
+    /// # Errors
+    /// The SAME [`ResourceError`] `delete` would return for this address.
+    pub fn dry_run_delete(&self, actor: &NodeId, capability: &str, addr: &Address) -> DryRunResult {
+        let existing = self
+            .platform
+            .get(&self.api_version, &addr.kind, &addr.name)
+            .ok_or_else(|| ResourceError::NotFound(addr.clone()))?;
+        let mut tombstone = existing;
+        tombstone
+            .metadata
+            .labels
+            .insert("pillar.dev/deleted".to_owned(), "true".to_owned());
+        self.dry_run_apply(actor, capability, &tombstone)
     }
 
     /// `pillar label <kind>/<name> k=v` (ACT): add/overwrite an operator label
@@ -619,6 +679,34 @@ impl<'p> ResourcePlane<'p> {
         self.apply(actor, capability, body)
     }
 
+    /// `pillar label --dry-run` (VIEW): preview [`ResourcePlane::label`] with
+    /// no mutation.
+    ///
+    /// # Errors
+    /// The SAME [`ResourceError`] `label` would return.
+    pub fn dry_run_label(
+        &self,
+        actor: &NodeId,
+        capability: &str,
+        addr: &Address,
+        key: &str,
+        value: Option<&str>,
+    ) -> DryRunResult {
+        let mut body = self
+            .platform
+            .get(&self.api_version, &addr.kind, &addr.name)
+            .ok_or_else(|| ResourceError::NotFound(addr.clone()))?;
+        match value {
+            Some(v) => {
+                body.metadata.labels.insert(key.to_owned(), v.to_owned());
+            }
+            None => {
+                body.metadata.labels.remove(key);
+            }
+        }
+        self.dry_run_apply(actor, capability, &body)
+    }
+
     /// `pillar patch <kind>/<name>` (ACT): overwrite a spec field on the object
     /// and re-apply it as one signed event.
     ///
@@ -640,6 +728,27 @@ impl<'p> ResourcePlane<'p> {
         self.apply(actor, capability, body)
     }
 
+    /// `pillar patch --dry-run` (VIEW): preview [`ResourcePlane::patch`] with
+    /// no mutation.
+    ///
+    /// # Errors
+    /// The SAME [`ResourceError`] `patch` would return.
+    pub fn dry_run_patch(
+        &self,
+        actor: &NodeId,
+        capability: &str,
+        addr: &Address,
+        field: &str,
+        value: Value,
+    ) -> DryRunResult {
+        let mut body = self
+            .platform
+            .get(&self.api_version, &addr.kind, &addr.name)
+            .ok_or_else(|| ResourceError::NotFound(addr.clone()))?;
+        body.spec.insert(field.to_owned(), value);
+        self.dry_run_apply(actor, capability, &body)
+    }
+
     /// `pillar scale <kind>/<name> --replicas N` (ACT): patch the object's
     /// `replicas` spec field and re-apply as one signed event.
     ///
@@ -653,6 +762,21 @@ impl<'p> ResourcePlane<'p> {
         replicas: i64,
     ) -> ActResult {
         self.patch(actor, capability, addr, "replicas", Value::Integer(replicas))
+    }
+
+    /// `pillar scale --dry-run` (VIEW): preview [`ResourcePlane::scale`] with
+    /// no mutation.
+    ///
+    /// # Errors
+    /// The SAME [`ResourceError`] `scale` would return.
+    pub fn dry_run_scale(
+        &self,
+        actor: &NodeId,
+        capability: &str,
+        addr: &Address,
+        replicas: i64,
+    ) -> DryRunResult {
+        self.dry_run_patch(actor, capability, addr, "replicas", Value::Integer(replicas))
     }
 }
 
@@ -981,5 +1105,103 @@ mod tests {
             Selector::parse("bogus").unwrap_err(),
             ResourceError::BadSelector(_)
         ));
+    }
+
+    // --- --dry-run: previewed decision == real decision, no event emitted ---
+
+    #[test]
+    fn dry_run_apply_previews_an_allowed_act_and_emits_no_event_incl_an_identity_kind() {
+        let mut p = platform();
+        let plane = ResourcePlane::new(&mut p, API);
+        let before = plane.platform.event_count();
+        // A representative WORKLOAD act.
+        let preview = plane
+            .dry_run_apply(&NodeId::from(OWNER), CAP, &workload("web"))
+            .expect("owner authorized to preview");
+        assert_eq!(plane.platform.event_count(), before, "dry-run emits no event");
+        // An IDENTITY-kind act previews identically.
+        let id_preview = plane
+            .dry_run_apply(&NodeId::from(OWNER), CAP, &identity("alice"))
+            .expect("owner authorized to preview an identity kind too");
+        assert_eq!(plane.platform.event_count(), before, "dry-run emits no event");
+
+        // Now perform the REAL acts: predicted == enforced — same outcome,
+        // same content-hash, and the log only advances on the REAL act.
+        drop(plane);
+        let mut plane = ResourcePlane::new(&mut p, API);
+        let applied = plane
+            .apply(&NodeId::from(OWNER), CAP, workload("web"))
+            .expect("the real act succeeds too, matching the preview");
+        assert_eq!(applied.content_hash, preview.content_hash);
+        let applied_id = plane
+            .apply(&NodeId::from(OWNER), CAP, identity("alice"))
+            .expect("the real identity act succeeds too");
+        assert_eq!(applied_id.content_hash, id_preview.content_hash);
+        assert_eq!(plane.platform.event_count(), before + 2);
+    }
+
+    #[test]
+    fn dry_run_apply_previews_a_denied_act_identically_to_the_real_refusal() {
+        let mut p = platform();
+        let plane = ResourcePlane::new(&mut p, API);
+        let before = plane.platform.event_count();
+        let preview_err = plane
+            .dry_run_apply(&NodeId::from(STRANGER), CAP, &workload("web"))
+            .expect_err("stranger is refused in preview too");
+        assert!(matches!(
+            preview_err,
+            ResourceError::Apply(ApplyError::Unauthorized { .. })
+        ));
+        assert_eq!(plane.platform.event_count(), before, "a denied dry-run emits nothing");
+
+        // The REAL act refuses IDENTICALLY.
+        drop(plane);
+        let mut plane = ResourcePlane::new(&mut p, API);
+        let real_err = plane
+            .apply(&NodeId::from(STRANGER), CAP, workload("web"))
+            .expect_err("stranger is refused for real too");
+        assert!(matches!(
+            real_err,
+            ResourceError::Apply(ApplyError::Unauthorized { .. })
+        ));
+        assert_eq!(plane.platform.event_count(), before, "the real refusal emits nothing either");
+    }
+
+    #[test]
+    fn dry_run_create_delete_label_patch_scale_each_preview_with_no_mutation() {
+        let mut p = platform();
+        let owner = NodeId::from(OWNER);
+        {
+            let mut plane = ResourcePlane::new(&mut p, API);
+            plane.create(&owner, CAP, workload("web")).expect("seed");
+        }
+        let plane = ResourcePlane::new(&mut p, API);
+        let addr = Address::new(WORKLOAD, "web");
+        let before = plane.platform.event_count();
+
+        // create dry-run on an EXISTING name refuses identically to create.
+        assert!(matches!(
+            plane
+                .dry_run_create(&owner, CAP, &workload("web"))
+                .expect_err("dup previewed"),
+            ResourceError::AlreadyExists(_)
+        ));
+        plane
+            .dry_run_label(&owner, CAP, &addr, "env", Some("prod"))
+            .expect("label previewed");
+        plane
+            .dry_run_patch(&owner, CAP, &addr, "replicas", Value::Integer(3))
+            .expect("patch previewed");
+        plane
+            .dry_run_scale(&owner, CAP, &addr, 5)
+            .expect("scale previewed");
+        plane.dry_run_delete(&owner, CAP, &addr).expect("delete previewed");
+
+        // None of the previews mutated the view or emitted an event.
+        assert_eq!(plane.platform.event_count(), before, "no dry-run may append an event");
+        let still_unchanged = plane.platform.get(API, WORKLOAD, "web").unwrap();
+        assert_eq!(still_unchanged.metadata.labels.get("env"), None);
+        assert_eq!(still_unchanged.spec.get("replicas"), Some(&Value::Integer(1)));
+        assert_eq!(still_unchanged.metadata.labels.get("pillar.dev/deleted"), None);
     }
 }

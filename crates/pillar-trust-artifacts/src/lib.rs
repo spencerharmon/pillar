@@ -404,6 +404,25 @@ impl TrustStore {
     /// epoch discipline (`epoch` must equal [`TrustStore::epoch`] exactly).
     /// `self` capacity is unconditional over the issuer's own identity.
     pub fn issue_attest(&mut self, a: Attest) -> Result<Cid, TrustError> {
+        let cid = self.decide_attest(&a)?;
+        self.attests.insert(cid.clone(), a);
+        Ok(cid)
+    }
+
+    /// The PURE decision [`TrustStore::issue_attest`] would enforce for `a`
+    /// — signer match, the fenced epoch check, and (for a `Role` capacity)
+    /// that `issuer` currently holds it — WITHOUT recording anything. This
+    /// is the single decider both the real issuance and a `--dry-run`
+    /// preview call: `issue_attest` computes its `Cid` by calling this
+    /// function first, so `dry_run_attest(a) == Ok(cid)` iff a subsequent
+    /// `issue_attest(a)` would ALSO succeed and mint that same `cid` —
+    /// predicted == enforced, structurally, not merely by test coverage.
+    /// On success returns the [`Cid`] the artifact WOULD be stored under;
+    /// the store is left completely unchanged either way.
+    ///
+    /// # Errors
+    /// The same [`TrustError`] variants `issue_attest` returns.
+    pub fn decide_attest(&self, a: &Attest) -> Result<Cid, TrustError> {
         if a.sig.signer != a.issuer {
             return Err(TrustError::SignerMismatch);
         }
@@ -423,9 +442,51 @@ impl TrustStore {
                 }
             }
         }
-        let cid = a.cid();
-        self.attests.insert(cid.clone(), a);
-        Ok(cid)
+        Ok(a.cid())
+    }
+
+    /// `describe <attest cid>` (VIEW): a human-readable rendering of a
+    /// stored [`Attest`] INCLUDING its provenance — the signer, and the
+    /// **exercised authority**: the `authority` [`Cid`] proof pointer walked
+    /// all the way back to the genesis/self anchor (the same [`Proof`]
+    /// [`TrustStore::verify`] computes), rendered as its natural-language
+    /// sentence. An artifact that needs no prior grant to walk (a `self`
+    /// capacity, or one issued directly by genesis with no `authority`
+    /// pointer) describes cleanly as `"(self-issued; no authority to
+    /// walk)"` — it never FABRICATES a chain where none was exercised.
+    /// Returns `None` if `cid` names no stored artifact. Signs/mutates
+    /// nothing.
+    #[must_use]
+    pub fn describe(&self, cid: &Cid) -> Option<String> {
+        let a = self.attests.get(cid)?;
+        let mut out = String::new();
+        out.push_str(&format!("Cid:         {}\n", cid.0));
+        out.push_str(&format!("Signer:      {}\n", a.sig.signer.0));
+        out.push_str(&format!("Issuer:      {}\n", a.issuer.0));
+        out.push_str(&format!("Capacity:    {}\n", a.capacity.tag()));
+        out.push_str(&format!("Subject:     {}\n", a.subject.0));
+        out.push_str(&format!(
+            "Predicate:   {} {}\n",
+            a.predicate.action, a.predicate.resource
+        ));
+        out.push_str(&format!("Scope:       {}\n", a.scope));
+        out.push_str(&format!("Epoch:       {}\n", a.epoch));
+        out.push_str("Exercised-Authority: ");
+        if a.authority.is_none() {
+            // Nothing was exercised to sign this artifact — never invent a
+            // chain the artifact never walked.
+            out.push_str("(self-issued; no authority to walk)\n");
+        } else {
+            match self.verify(cid) {
+                Ok(proof) => out.push_str(&format!("{}\n", proof.sentence)),
+                Err(e) => out.push_str(&format!("(unverifiable: {e:?})\n")),
+            }
+        }
+        out.push_str(&format!(
+            "Revoked:     {}\n",
+            if self.revoked.contains(cid) { "yes" } else { "no" }
+        ));
+        Some(out)
     }
 
     /// **revoke** — epoch-stamped, fail-closed: marks `target` revoked (a
@@ -1107,5 +1168,133 @@ mod tests {
         };
         store.issue_attest(a).unwrap();
         assert!(as_explicit_grants(&store).is_empty());
+    }
+
+    // --- dry-run: decide_attest previews the SAME decision issue_attest enforces
+
+    #[test]
+    fn decide_attest_previews_an_allowed_issuance_without_recording_it() {
+        let store = TrustStore::new(n("owner"));
+        let a = Attest {
+            issuer: n("owner"),
+            capacity: role("operator", "cell-b"),
+            authority: None,
+            subject: n("alice"),
+            predicate: Predicate::new("stream:append", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: Sig::by(n("owner")),
+        };
+        let previewed = store.decide_attest(&a).expect("owner may issue");
+        assert_eq!(previewed, a.cid());
+        // Nothing was recorded by the preview.
+        assert!(store.verify(&previewed).is_err());
+
+        // The SAME artifact, actually issued: identical decision (the same
+        // Cid), and only NOW does it verify.
+        let mut store = store;
+        let enforced = store.issue_attest(a.clone()).expect("matches the preview");
+        assert_eq!(enforced, previewed, "predicted == enforced");
+        assert!(store.verify(&enforced).is_ok());
+    }
+
+    #[test]
+    fn decide_attest_previews_a_denied_issuance_and_the_real_issuance_agrees() {
+        let mut store = TrustStore::new(n("owner"));
+        // mallory has never been granted the `operator@cell-b` capacity.
+        let a = Attest {
+            issuer: n("mallory"),
+            capacity: role("operator", "cell-b"),
+            authority: None,
+            subject: n("mallory"),
+            predicate: Predicate::new("stream:append", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: Sig::by(n("mallory")),
+        };
+        assert_eq!(
+            store.decide_attest(&a),
+            Err(TrustError::CapacityNotHeld {
+                issuer: n("mallory")
+            })
+        );
+        // The real issuance refuses IDENTICALLY, and records nothing.
+        assert_eq!(
+            store.issue_attest(a),
+            Err(TrustError::CapacityNotHeld {
+                issuer: n("mallory")
+            })
+        );
+        assert!(store.attests.is_empty());
+    }
+
+    // --- describe: signer + exercised authority + no fabricated provenance --
+
+    #[test]
+    fn describe_renders_signer_and_the_exercised_authority_chain_for_an_attestation() {
+        let mut store = TrustStore::new(n("owner"));
+        // owner (genesis) grants alice the operator@cell-b capacity...
+        let grant = Attest {
+            issuer: n("owner"),
+            capacity: role("operator", "cell-b"),
+            authority: None,
+            subject: n("alice"),
+            predicate: Predicate::new("hold", "operator@cell-b"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: Sig::by(n("owner")),
+        };
+        let grant_cid = store.issue_attest(grant).unwrap();
+        // ...which alice then EXERCISES to attest bob may stream:append.
+        let exercised = Attest {
+            issuer: n("alice"),
+            capacity: role("operator", "cell-b"),
+            authority: Some(grant_cid.clone()),
+            subject: n("bob"),
+            predicate: Predicate::new("stream:append", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: Sig::by(n("alice")),
+        };
+        let cid = store.issue_attest(exercised).unwrap();
+        let doc = store.describe(&cid).expect("stored artifact describes");
+        assert!(doc.contains("Signer:      alice"));
+        // The exercised authority's sentence walks the grant_cid's own
+        // attestation all the way back to the genesis anchor.
+        let _ = &grant_cid;
+        assert!(
+            doc.contains("Exercised-Authority:")
+                && doc.contains("owner attests alice may hold operator@cell-b")
+                && doc.contains("rooted at genesis owner"),
+            "describe must show the authority chain walked back to genesis:\n{doc}"
+        );
+        assert!(!doc.contains("self-issued"));
+    }
+
+    #[test]
+    fn describe_never_fabricates_a_chain_for_a_self_issued_artifact() {
+        let mut store = TrustStore::new(n("owner"));
+        let a = Attest {
+            issuer: n("alice"),
+            capacity: Capacity::SelfCap,
+            authority: None,
+            subject: n("alice"),
+            predicate: Predicate::new("identity:describe", "self"),
+            scope: "global".to_owned(),
+            epoch: 0,
+            sig: Sig::by(n("alice")),
+        };
+        let cid = store.issue_attest(a).unwrap();
+        let doc = store.describe(&cid).unwrap();
+        assert!(doc.contains("Signer:      alice"));
+        // No authority pointer was exercised — describe says so plainly,
+        // rather than inventing a genesis walk that never happened.
+        assert!(doc.contains("Exercised-Authority: (self-issued; no authority to walk)"));
+    }
+
+    #[test]
+    fn describe_returns_none_for_an_unknown_cid() {
+        let store = TrustStore::new(n("owner"));
+        assert_eq!(store.describe(&Cid("nope".to_owned())), None);
     }
 }
