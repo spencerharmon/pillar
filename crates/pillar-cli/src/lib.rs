@@ -121,6 +121,19 @@ pub struct Applied {
     pub content_hash: ContentHash,
 }
 
+/// What a `--dry-run` preview of an apply-shaped act WOULD produce, computed
+/// by running the identical validate-then-authorize decision path
+/// [`Platform::apply`] uses (see [`Platform::preview`]) — WITHOUT sealing an
+/// envelope or appending an event. `content_hash` is the SAME content-hash a
+/// real apply of this exact body would seal, so `preview(..).content_hash ==
+/// apply(..).content_hash` holds whenever both succeed: predicted ==
+/// enforced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Previewed {
+    /// The content-hash the sealed envelope would carry if applied for real.
+    pub content_hash: ContentHash,
+}
+
 /// The in-memory platform the CLI acts against: the schema registry, the
 /// WoT/RBAC authority inputs, the content-addressed manifest store, and the
 /// append-only signed event log. `apply` is the ONLY mutator; `get`/`describe`
@@ -202,16 +215,20 @@ impl Platform {
         causal_parents: impl IntoIterator<Item = ContentHash>,
         capability_scope: impl IntoIterator<Item = ManifestCapability>,
     ) -> Result<Applied, ApplyError> {
-        self.registry.validate(&body).map_err(ApplyError::Schema)?;
+        let causal_parents: Vec<ContentHash> = causal_parents.into_iter().collect();
+        let capability_scope: Vec<ManifestCapability> = capability_scope.into_iter().collect();
 
-        if !self.authorized(actor, capability) {
-            return Err(ApplyError::Unauthorized {
-                actor: actor.clone(),
-                capability: capability.to_owned(),
-            });
-        }
+        // Run the IDENTICAL validate-then-authorize decision `preview` (a
+        // `--dry-run`) runs — the single decider both paths share, so a
+        // preview's verdict can never diverge from what this apply enforces.
+        self.preview(actor, capability, &body)?;
 
-        let envelope = Envelope::import(body, actor.0.clone(), causal_parents, capability_scope);
+        let envelope = Envelope::import(
+            body,
+            actor.0.clone(),
+            causal_parents,
+            capability_scope,
+        );
         let content_hash = envelope.content_hash();
 
         // Emit exactly one signed event; its payload names the sealed
@@ -228,6 +245,43 @@ impl Platform {
         Ok(Applied {
             event,
             content_hash,
+        })
+    }
+
+    /// `--dry-run` (VIEW): preview what [`Platform::apply`] of this EXACT
+    /// `(actor, capability, body)` WOULD do — running the identical
+    /// validate-then-authorize decision `apply` itself calls first (see
+    /// `apply`'s implementation) — WITHOUT sealing an envelope or appending
+    /// an event. The decider decision `preview` observes and the one `apply`
+    /// enforces are the SAME call, so `preview(..).is_ok() ==
+    /// apply(..).is_ok()` holds structurally, not merely by test coverage
+    /// (the single-decider invariant, applied to the resource plane).
+    ///
+    /// # Errors
+    /// [`ApplyError::Schema`] if the body fails schema validation;
+    /// [`ApplyError::Unauthorized`] if the decider would refuse `actor` this
+    /// capability — INCLUDING a refusal, since the whole point of a preview
+    /// is to show the SAME decision the real act would produce.
+    pub fn preview(
+        &self,
+        actor: &NodeId,
+        capability: &str,
+        body: &Crd,
+    ) -> Result<Previewed, ApplyError> {
+        self.registry.validate(body).map_err(ApplyError::Schema)?;
+
+        if !self.authorized(actor, capability) {
+            return Err(ApplyError::Unauthorized {
+                actor: actor.clone(),
+                capability: capability.to_owned(),
+            });
+        }
+
+        // Compute the content-hash a real apply of this body would seal,
+        // without storing anything — pure.
+        let envelope = Envelope::import(body.clone(), actor.0.clone(), [], []);
+        Ok(Previewed {
+            content_hash: envelope.content_hash(),
         })
     }
 
@@ -313,6 +367,10 @@ impl Platform {
         if let Some(cid) = self.event_cid(&key) {
             out.push_str(&format!("  Event-CID:     {}\n", cid.0));
         }
+        out.push_str(&format!(
+            "  Exercised-Authority: {}\n",
+            self.exercised_authority(&env)
+        ));
         out.push_str("  Causal-Parents:");
         if env.causal_parents().is_empty() {
             out.push_str(" (none)\n");
@@ -336,6 +394,28 @@ impl Platform {
             if env.verify() { "yes" } else { "no" }
         ));
         Some(out)
+    }
+
+    /// The **exercised authority** behind the signer's admission for an
+    /// envelope's capability-scope — WHICH rung of the RBAC precedence
+    /// lattice ([`pillar_rbac::Exercised`]) the decider actually exercised —
+    /// rendered for `describe`. Uniform across every kind: a workload, an
+    /// identity object, or anything else on this plane. Re-derives the
+    /// decision through the SAME decider `apply`/`authorized` use (never a
+    /// second, divergent explanation path); returns a plain "none declared"
+    /// note (never a fabricated chain) when the envelope carries no
+    /// capability-scope to explain.
+    #[must_use]
+    fn exercised_authority(&self, env: &Envelope) -> String {
+        let Some(capability) = env.capability_scope().iter().next() else {
+            return "(no capability-scope on this envelope; nothing to explain)".to_owned();
+        };
+        let decider = RbacDecider::new(&self.authority, &self.policies, &self.grants);
+        let request = Request::new(
+            NodeId::from(env.signer()),
+            RbacCapability(capability.0.clone()),
+        );
+        decider.explain(&request).to_string()
     }
 }
 
@@ -777,6 +857,11 @@ mod tests {
         assert!(described.contains("Signer:"));
         assert!(described.contains(OWNER));
         assert!(described.contains("Verified:      yes"));
+        // Provenance also names WHICH rung of the RBAC lattice authorized
+        // this signer for its exercised capability — never fabricated, and
+        // uniform across every kind on this plane.
+        assert!(described.contains("Exercised-Authority:"));
+        assert!(described.contains("WoT-depth default"));
 
         // ...and neither wrote anything back to the log.
         assert_eq!(p.event_count(), before);
@@ -784,6 +869,33 @@ mod tests {
         assert!(p.get(API, KIND, "missing").is_none());
         assert!(p.describe(API, KIND, "missing").is_none());
         assert_eq!(p.event_count(), before);
+    }
+
+    #[test]
+    fn describe_exercised_authority_reflects_an_explicit_grant_and_never_fabricates_with_no_scope() {
+        let owner = NodeId::from(OWNER);
+        // An explicit ALLOW grant is the rung actually exercised here.
+        let grants = vec![ExplicitGrant {
+            subject: owner.clone(),
+            capability: RbacCapability(CAP.to_owned()),
+            effect: pillar_rbac::GrantEffect::Allow,
+        }];
+        let mut p = Platform::new(
+            registry(),
+            WotAuthority::new(owner.clone(), 5),
+            default_resource_class_policies(&RbacCapability(CAP.to_owned())),
+            grants,
+        );
+        p.apply(&owner, CAP, route_crd("granted"), [], [ManifestCapability::from(CAP)])
+            .unwrap();
+        let described = p.describe(API, KIND, "granted").unwrap();
+        assert!(described.contains("Exercised-Authority: explicit grant (allow)"));
+
+        // An envelope applied with NO capability-scope has nothing to
+        // explain — describe says so plainly rather than guessing a rung.
+        p.apply(&owner, CAP, route_crd("scopeless"), [], []).unwrap();
+        let described = p.describe(API, KIND, "scopeless").unwrap();
+        assert!(described.contains("Exercised-Authority: (no capability-scope"));
     }
 
     #[test]
