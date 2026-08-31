@@ -160,6 +160,10 @@ use pillar_manifest::{
     Crd, Metadata as CrdMetadata, SchemaRegistry, Schema, FieldType, Value as CrdValue,
 };
 use pillar_rbac::{default_resource_class_policies, Capability as RbacCapability};
+use pillar_topology::{
+    Assignment as TopologyAssignment, Label as TopologyLabel, Mismatch as TopologyMismatch,
+    TierHierarchy, Topology as TopologyRegistry, ATTEST_ACTION as TOPOLOGY_ATTEST_ACTION,
+};
 use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
 use crate::Platform;
 
@@ -286,6 +290,19 @@ pub struct WebAuthContext {
     /// non-admitted one is refused. Kept alongside so `admit_subject` can
     /// re-chain into a freshly rebuilt plane if needed.
     resource_authority: WotAuthority,
+    /// The topology explorer's substrate (ROI "Web portal / UI rework": UI
+    /// half of the P2 topology section) — the derived
+    /// `region->...->rack->chassis->node` tier tree, declared/attested label
+    /// assignments (attestation reuses `pillar_trust_artifacts` verbatim
+    /// through `self.trust`, no new signing primitive), and the placement
+    /// payoff (failure-domain spread/rollup) the explorer's overlays read.
+    /// No server-side database: this is the same in-process registry a real
+    /// node folds from its own topology-label event stream.
+    topology: TopologyRegistry,
+    /// Live per-node health status + capacity the explorer tree renders
+    /// alongside each node's resolved placement path, and rolls up per tier.
+    /// `node-id -> (health, capacity)`.
+    topology_nodes: BTreeMap<String, (String, u64)>,
 }
 
 /// One handle's custody record, as the key & offer UI renders/drives it: the
@@ -425,6 +442,8 @@ impl WebAuthContext {
             resource_platform,
             resource_api: RESOURCE_API.to_owned(),
             resource_authority,
+            topology: TopologyRegistry::new(TierHierarchy::default()),
+            topology_nodes: BTreeMap::new(),
         }
     }
 
@@ -642,6 +661,155 @@ impl WebAuthContext {
     #[must_use]
     pub fn trust_store(&self) -> &TrustStore {
         &self.trust
+    }
+
+    /// Register (or update) a node's LIVE health status + capacity — the
+    /// topology explorer tree's per-node leaf data (ROI "Web portal / UI
+    /// rework": topology UI). A real node folds this from telemetry; the
+    /// swarm's own tests/UI wiring drives it directly.
+    pub fn topology_register_node(&mut self, node: &str, health: &str, capacity: u64) {
+        self.topology_nodes
+            .insert(node.to_owned(), (health.to_owned(), capacity));
+    }
+
+    /// Read-only access to the topology registry (hierarchy + resolved
+    /// placements) — e.g. so a facet filter can resolve a tier=value
+    /// membership set, or a workload panel can consume `spread`/
+    /// `quorum_is_safe` directly.
+    #[must_use]
+    pub fn topology(&self) -> &TopologyRegistry {
+        &self.topology
+    }
+
+    /// Self-declare topology labels for `node` — ADVISORY only, never a
+    /// basis for safety-critical placement (attested labels take
+    /// precedence; see [`TopologyRegistry::placement`]).
+    pub fn topology_declare(&mut self, node: NodeId, labels: Vec<TopologyLabel>) {
+        self.topology.declare(node, &labels);
+    }
+
+    /// Attest ONE topology label for `subject`, signed by `issuer` acting in
+    /// `capacity` — checked against the trust store's pure walk AT SIGNING
+    /// TIME exactly like [`WebAuthContext::build_attestation`], reusing the
+    /// SAME `topology:label` attest predicate
+    /// ([`pillar_topology::ATTEST_ACTION`]) rather than a new signing
+    /// primitive. Records the issued attest into both the trust store (audit
+    /// chain / trust-graph visualization) and the topology registry, which
+    /// re-verifies the chain before recording (declared-vs-attested
+    /// mismatches — see [`WebAuthContext::topology_mismatches`] — surface any
+    /// disagreement with a prior self-declaration).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`TrustError`] — notably
+    /// [`TrustError::CapacityNotHeld`] when `issuer` does not hold the
+    /// declared capacity.
+    pub fn topology_attest(
+        &mut self,
+        issuer: NodeId,
+        capacity: TrustCapacity,
+        authority: Option<TrustCid>,
+        subject: NodeId,
+        label: &TopologyLabel,
+        scope: &str,
+    ) -> Result<TrustCid, TrustError> {
+        let epoch = self.trust.epoch();
+        let attest = Attest {
+            issuer: issuer.clone(),
+            capacity,
+            authority,
+            subject,
+            predicate: Predicate::new(TOPOLOGY_ATTEST_ACTION, label.resource()),
+            scope: scope.to_owned(),
+            epoch,
+            sig: TrustSig::by(issuer),
+        };
+        let cid = self.trust.issue_attest(attest.clone())?;
+        let assignment = TopologyAssignment::Attested {
+            attest: Box::new(attest),
+            cid: cid.clone(),
+        };
+        // The attest was just issued into THIS store under the capacity check
+        // above, so its chain necessarily verifies here.
+        self.topology
+            .attest(&assignment, &self.trust)
+            .expect("a just-issued, capacity-checked attest verifies through the same store");
+        Ok(cid)
+    }
+
+    /// Every declared-vs-attested [`TopologyMismatch`] — the label editor's
+    /// inline "declared X, attested Y" surfacing.
+    #[must_use]
+    pub fn topology_mismatches(&self) -> Vec<TopologyMismatch> {
+        self.topology.mismatches()
+    }
+
+    /// Render the derived tier tree (CONFIG-ordered hierarchy — never
+    /// hardcoded) with every registered node's resolved placement path, live
+    /// health/capacity, and a per-`rollup_tier` capacity rollup.
+    #[must_use]
+    pub fn topology_tree(&self, rollup_tier: &str) -> String {
+        let mut body = String::new();
+        body.push_str(&format!(
+            "TIERS {}\n",
+            self.topology.hierarchy().tiers().join(",")
+        ));
+        let mut values: Vec<(NodeId, u64)> = Vec::new();
+        for (node_str, (health, capacity)) in &self.topology_nodes {
+            let node = NodeId::from(node_str.as_str());
+            let path = self
+                .topology
+                .placement(&node)
+                .path(self.topology.hierarchy())
+                .iter()
+                .map(TopologyLabel::resource)
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!(
+                "NODE {node_str} PATH {path} HEALTH {health} CAPACITY {capacity}\n"
+            ));
+            values.push((node, *capacity));
+        }
+        for (domain, total) in self.topology.rollup(rollup_tier, &values) {
+            let domain = if domain.is_empty() {
+                "(unlabeled)".to_owned()
+            } else {
+                domain
+            };
+            body.push_str(&format!("ROLLUP {rollup_tier} {domain}={total}\n"));
+        }
+        body
+    }
+
+    /// The failure-domain overlay: for each of `nodes`, resolve its value at
+    /// `tier`, then flag a SAME-failure-domain warning when 2+ nodes are
+    /// given but fewer than 2 distinct domains are spanned (a workload's
+    /// replicas landing entirely in one rack). Returns
+    /// `(per-node domain assignment, warn)`.
+    #[must_use]
+    pub fn topology_failure_domain_overlay(
+        &self,
+        nodes: &[NodeId],
+        tier: &str,
+    ) -> (Vec<(NodeId, Option<String>)>, bool) {
+        let assignments: Vec<(NodeId, Option<String>)> = nodes
+            .iter()
+            .map(|n| (n.clone(), self.topology.placement(n).at(tier).map(str::to_owned)))
+            .collect();
+        let domains = self.topology.domains_at(tier, nodes);
+        let warn = nodes.len() >= 2 && domains.len() < 2;
+        (assignments, warn)
+    }
+
+    /// Nodes currently carrying `tier = value` in their RESOLVED placement —
+    /// the facet primitive a workload/telemetry/logs panel filters by.
+    #[must_use]
+    pub fn topology_nodes_at(&self, tier: &str, value: &str) -> Vec<String> {
+        self.topology_nodes
+            .keys()
+            .filter(|n| self.topology.placement(&NodeId::from(n.as_str())).at(tier) == Some(value))
+            .cloned()
+            .collect()
     }
 
     /// The key & offer UI's custody record for `handle`, if any.
@@ -1435,6 +1603,16 @@ fn dispatch_http(
         ("POST", "/portal/sessions/revoke-all") => dispatch_sessions_revoke_all(ctx, request),
         ("POST", "/portal/attestations/build") => dispatch_attestation_build(ctx, request),
         ("GET", "/portal/trust-graph") => dispatch_trust_graph_view(ctx, request),
+        ("GET", p) if p.starts_with("/portal/topology/tree") => dispatch_topology_tree(ctx, request),
+        ("GET", p) if p.starts_with("/portal/topology/mismatches") => {
+            dispatch_topology_mismatches(ctx, request)
+        }
+        ("POST", "/portal/topology/label/declare") => dispatch_topology_label_declare(ctx, request),
+        ("POST", "/portal/topology/label/attest") => dispatch_topology_label_attest(ctx, request),
+        ("GET", p) if p.starts_with("/portal/topology/failure-domain") => {
+            dispatch_topology_failure_domain(ctx, request)
+        }
+        ("GET", p) if p.starts_with("/portal/topology/facet") => dispatch_topology_facet(ctx, request),
         ("POST", "/portal/custody/migrate") => dispatch_custody_migrate(ctx, request),
         ("POST", "/portal/custody/rotate") => dispatch_custody_rotate(ctx, request),
         ("POST", "/portal/custody/seal") => dispatch_custody_seal(ctx, request),
@@ -2039,6 +2217,174 @@ fn dispatch_trust_graph_view(ctx: &WebAuthContext, request: &HttpRequest) -> Htt
     let mut body = String::new();
     for e in ctx.trust_graph_edges() {
         body.push_str(&format!("EDGE {} -> {} LABEL {}\n", e.from.0, e.to.0, e.label));
+    }
+    text_response(200, "OK", body)
+}
+
+/// The topology explorer tree: `GET
+/// /portal/topology/tree?token=<s>[&rollup-tier=<tier>]` (default rollup
+/// tier `rack`). Renders the CONFIG-ordered tier hierarchy, every registered
+/// node's resolved placement path + live health/capacity, and the per-tier
+/// capacity rollup. A pure view — signs nothing.
+fn dispatch_topology_tree(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let rollup_tier = query_value(&request.path, "rollup-tier").unwrap_or("rack");
+    text_response(200, "OK", ctx.topology_tree(rollup_tier))
+}
+
+/// Declared-vs-attested mismatches: `GET
+/// /portal/topology/mismatches?token=<s>`. A pure view — signs nothing.
+fn dispatch_topology_mismatches(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let mut body = String::new();
+    for m in ctx.topology_mismatches() {
+        body.push_str(&format!(
+            "MISMATCH {} tier={} declared={} attested={}\n",
+            m.node.0, m.tier, m.declared, m.attested
+        ));
+    }
+    text_response(200, "OK", body)
+}
+
+/// The label editor's self-declare action: `POST
+/// /portal/topology/label/declare`, body `<token>\n<node>\n<tier>\n<value>`.
+/// Advisory only — records nothing into the trust store. Requires an
+/// admitted session.
+fn dispatch_topology_label_declare(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let node = lines.next().unwrap_or("").trim();
+    let tier = lines.next().unwrap_or("").trim();
+    let value = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if node.is_empty() || tier.is_empty() || value.is_empty() {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    }
+    ctx.topology_declare(NodeId::from(node), vec![TopologyLabel::new(tier, value)]);
+    text_response(200, "OK", "DECLARED".to_owned())
+}
+
+/// The label editor's attest action: `POST /portal/topology/label/attest`,
+/// body
+/// `<token>\n<issuer>\n<capacity-spec>\n<authority-cid-or-empty>\n<subject>\n<tier>\n<value>\n<scope>`
+/// (`capacity-spec` is `self` or `<role>@<scope>`, exactly like the
+/// attestation builder). Emits ONE signed `topology:label` attest event;
+/// refused (403) if `issuer` does not hold the declared capacity.
+fn dispatch_topology_label_attest(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let issuer = lines.next().unwrap_or("").trim();
+    let capacity_spec = lines.next().unwrap_or("").trim();
+    let authority = lines.next().unwrap_or("").trim();
+    let subject = lines.next().unwrap_or("").trim();
+    let tier = lines.next().unwrap_or("").trim();
+    let value = lines.next().unwrap_or("").trim();
+    let scope = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if issuer.is_empty() || subject.is_empty() || tier.is_empty() || value.is_empty() || scope.is_empty()
+    {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    }
+    let capacity = if capacity_spec == "self" {
+        TrustCapacity::SelfCap
+    } else if let Some((role, cap_scope)) = capacity_spec.split_once('@') {
+        TrustCapacity::Role {
+            role: role.to_owned(),
+            scope: cap_scope.to_owned(),
+        }
+    } else {
+        return text_response(400, "Bad Request", "BAD capacity".to_owned());
+    };
+    let authority_cid = if authority.is_empty() {
+        None
+    } else {
+        Some(TrustCid(authority.to_owned()))
+    };
+    let label = TopologyLabel::new(tier, value);
+    match ctx.topology_attest(
+        NodeId::from(issuer),
+        capacity,
+        authority_cid,
+        NodeId::from(subject),
+        &label,
+        scope,
+    ) {
+        Ok(cid) => text_response(200, "OK", format!("ATTESTED CID {}", cid.0)),
+        Err(e) => text_response(403, "Forbidden", format!("DENIED {}", trust_error_reason(&e))),
+    }
+}
+
+/// The failure-domain overlay: `GET
+/// /portal/topology/failure-domain?token=<s>&tier=<tier>&nodes=<a,b,c>`.
+/// Computes each named node's replica spread across `tier` and warns when
+/// 2+ replicas land in the SAME failure domain (e.g. the same rack). A pure
+/// view — signs nothing.
+fn dispatch_topology_failure_domain(
+    ctx: &WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let tier = query_value(&request.path, "tier").unwrap_or("rack");
+    let nodes: Vec<NodeId> = query_value(&request.path, "nodes")
+        .unwrap_or("")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(NodeId::from)
+        .collect();
+    let (assignments, warn) = ctx.topology_failure_domain_overlay(&nodes, tier);
+    let mut body = String::new();
+    for (node, domain) in assignments {
+        body.push_str(&format!(
+            "REPLICA {} {}={}\n",
+            node.0,
+            tier,
+            domain.unwrap_or_else(|| "(unlabeled)".to_owned())
+        ));
+    }
+    body.push_str(if warn {
+        "WARN same-rack\n"
+    } else {
+        "SPREAD-OK\n"
+    });
+    text_response(200, "OK", body)
+}
+
+/// The global topology facet: `GET
+/// /portal/topology/facet?token=<s>&tier=<tier>&value=<value>` — nodes
+/// currently carrying `tier = value` in their resolved placement, the
+/// primitive workload/telemetry/logs panels filter by. A pure view.
+fn dispatch_topology_facet(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let tier = query_value(&request.path, "tier").unwrap_or("");
+    let value = query_value(&request.path, "value").unwrap_or("");
+    if tier.is_empty() || value.is_empty() {
+        return text_response(400, "Bad Request", "MISSING tier-or-value".to_owned());
+    }
+    let mut body = String::new();
+    for n in ctx.topology_nodes_at(tier, value) {
+        body.push_str(&format!("NODE {n}\n"));
     }
     text_response(200, "OK", body)
 }
@@ -3699,5 +4045,187 @@ mod tests {
         assert_eq!(fetched.status, 200, "got: {}", fetched.body);
         assert!(fetched.body.contains("SIGNER "), "signed by its author: {}", fetched.body);
         assert!(fetched.body.contains("workload-grid"), "content preserved: {}", fetched.body);
+    }
+
+    // The topology explorer renders the derived tier tree (config-ordered
+    // hierarchy) with per-node health/capacity, plus a per-tier rollup.
+    #[test]
+    fn topology_explorer_renders_the_tier_tree_with_health_capacity_and_rollup() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        assert_eq!(get(&mut ctx, "/portal/topology/tree?token=nope").status, 401);
+
+        ctx.topology_declare(
+            NodeId::from("node-a"),
+            vec![TopologyLabel::new("rack", "r1"), TopologyLabel::new("zone", "z1")],
+        );
+        ctx.topology_declare(
+            NodeId::from("node-b"),
+            vec![TopologyLabel::new("rack", "r2"), TopologyLabel::new("zone", "z1")],
+        );
+        ctx.topology_register_node("node-a", "ok", 10);
+        ctx.topology_register_node("node-b", "degraded", 20);
+
+        let view = get(
+            &mut ctx,
+            &format!("/portal/topology/tree?token={token}&rollup-tier=rack"),
+        );
+        assert_eq!(view.status, 200, "got: {}", view.body);
+        assert!(view.body.starts_with("TIERS region,zone,site,room,cage,rack,chassis,node"));
+        assert!(
+            view.body.contains("NODE node-a PATH rack=r1,zone=z1 HEALTH ok CAPACITY 10")
+                || view.body.contains("NODE node-a PATH zone=z1,rack=r1 HEALTH ok CAPACITY 10"),
+            "got: {}",
+            view.body
+        );
+        assert!(
+            view.body.contains("HEALTH degraded CAPACITY 20"),
+            "got: {}",
+            view.body
+        );
+        assert!(view.body.contains("ROLLUP rack r1=10\n"), "got: {}", view.body);
+        assert!(view.body.contains("ROLLUP rack r2=20\n"), "got: {}", view.body);
+    }
+
+    // The label editor emits signed label/attestation events — the attested
+    // label verifies through the trust store — and surfaces a
+    // declared-vs-attested mismatch inline.
+    #[test]
+    fn label_editor_attests_a_label_and_surfaces_declared_vs_attested_mismatch() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // The node lies about its own rack.
+        let declared = post(
+            &mut ctx,
+            "/portal/topology/label/declare",
+            &format!("{token}\nnode-7\nrack\nr99"),
+        );
+        assert_eq!(declared.status, 200, "got: {}", declared.body);
+
+        // Unauthorized attest (owner lacks the declared capacity) is refused.
+        let refused = post(
+            &mut ctx,
+            "/portal/topology/label/attest",
+            &format!("{token}\nmallory\ncell-authority@cell-b\n\nnode-7\nrack\nr7\ncell-b"),
+        );
+        assert_eq!(refused.status, 403, "got: {}", refused.body);
+
+        // owner is the trust-store genesis and unconditionally holds every
+        // capacity — a genuine cell-authority attest, signed and verified.
+        let attested = post(
+            &mut ctx,
+            "/portal/topology/label/attest",
+            &format!("{token}\nowner\ncell-authority@cell-b\n\nnode-7\nrack\nr7\ncell-b"),
+        );
+        assert_eq!(attested.status, 200, "got: {}", attested.body);
+        assert!(attested.body.starts_with("ATTESTED CID "), "got: {}", attested.body);
+
+        // The attested label is now the trust-graph's edge too (reuses the
+        // SAME attest primitive, no new signing plane).
+        let graph = get(&mut ctx, &format!("/portal/trust-graph?token={token}"));
+        assert!(
+            graph.body.contains("EDGE owner -> node-7 ")
+                && graph.body.contains("rack=r7"),
+            "got: {}",
+            graph.body
+        );
+
+        // The mismatch view surfaces the declared-vs-attested disagreement.
+        let mismatches = get(&mut ctx, &format!("/portal/topology/mismatches?token={token}"));
+        assert_eq!(mismatches.status, 200, "got: {}", mismatches.body);
+        assert!(
+            mismatches
+                .body
+                .contains("MISMATCH node-7 tier=rack declared=r99 attested=r7"),
+            "got: {}",
+            mismatches.body
+        );
+    }
+
+    // The failure-domain overlay computes replica spread and warns on
+    // same-rack.
+    #[test]
+    fn failure_domain_overlay_computes_spread_and_warns_on_same_rack() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        ctx.topology_declare(NodeId::from("a"), vec![TopologyLabel::new("rack", "r1")]);
+        ctx.topology_declare(NodeId::from("b"), vec![TopologyLabel::new("rack", "r1")]);
+        ctx.topology_declare(NodeId::from("c"), vec![TopologyLabel::new("rack", "r2")]);
+
+        // a, b share a rack: a warning.
+        let warned = get(
+            &mut ctx,
+            &format!("/portal/topology/failure-domain?token={token}&tier=rack&nodes=a,b"),
+        );
+        assert_eq!(warned.status, 200, "got: {}", warned.body);
+        assert!(warned.body.contains("REPLICA a rack=r1"), "got: {}", warned.body);
+        assert!(warned.body.contains("REPLICA b rack=r1"), "got: {}", warned.body);
+        assert!(warned.body.contains("WARN same-rack"), "got: {}", warned.body);
+
+        // a, c span distinct racks: no warning.
+        let ok = get(
+            &mut ctx,
+            &format!("/portal/topology/failure-domain?token={token}&tier=rack&nodes=a,c"),
+        );
+        assert!(ok.body.contains("SPREAD-OK"), "got: {}", ok.body);
+        assert!(!ok.body.contains("WARN"), "got: {}", ok.body);
+    }
+
+    // Workload/telemetry/logs panels expose topology facets that filter by
+    // tier — the shared facet primitive nodes-at(tier, value).
+    #[test]
+    fn topology_facet_filters_nodes_by_tier_value() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        ctx.topology_declare(NodeId::from("a"), vec![TopologyLabel::new("rack", "r1")]);
+        ctx.topology_declare(NodeId::from("b"), vec![TopologyLabel::new("rack", "r1")]);
+        ctx.topology_declare(NodeId::from("c"), vec![TopologyLabel::new("rack", "r2")]);
+        ctx.topology_register_node("a", "ok", 1);
+        ctx.topology_register_node("b", "ok", 1);
+        ctx.topology_register_node("c", "ok", 1);
+
+        let facet = get(
+            &mut ctx,
+            &format!("/portal/topology/facet?token={token}&tier=rack&value=r1"),
+        );
+        assert_eq!(facet.status, 200, "got: {}", facet.body);
+        assert!(facet.body.contains("NODE a\n"), "got: {}", facet.body);
+        assert!(facet.body.contains("NODE b\n"), "got: {}", facet.body);
+        assert!(!facet.body.contains("NODE c\n"), "got: {}", facet.body);
+    }
+
+    // Saved topology dashboards/layouts are signed IPFS+streaming-tip
+    // resources — the topology explorer reuses the SAME `layouts` resource
+    // the resource UI's dashboards persist to (no server-side database).
+    #[test]
+    fn saved_topology_dashboard_is_a_signed_ipfs_streaming_resource() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        let stored = post(
+            &mut ctx,
+            "/portal/layout",
+            &format!("{token}\ntopology-dashboard: {{tier: rack, view: elevation}}"),
+        );
+        assert_eq!(stored.status, 200, "got: {}", stored.body);
+        assert!(stored.body.contains("LAYOUT-CID "), "got: {}", stored.body);
+        assert!(stored.body.contains(" TIP "), "got: {}", stored.body);
+        let cid = stored
+            .body
+            .split_whitespace()
+            .nth(1)
+            .expect("cid token")
+            .to_owned();
+        let fetched = get(&mut ctx, &format!("/portal/layout?token={token}&cid={cid}"));
+        assert_eq!(fetched.status, 200, "got: {}", fetched.body);
+        assert!(
+            fetched.body.contains("topology-dashboard"),
+            "got: {}",
+            fetched.body
+        );
     }
 }
