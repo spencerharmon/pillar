@@ -36,6 +36,7 @@
 pub mod capability;
 pub mod global_identity;
 pub mod login;
+pub mod session_registry;
 
 use std::collections::{HashMap, HashSet};
 
