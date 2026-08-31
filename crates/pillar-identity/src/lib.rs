@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod global_identity;
 pub mod login;
 
 use std::collections::{HashMap, HashSet};
