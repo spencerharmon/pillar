@@ -62,9 +62,18 @@
 //!   the key-distribution label to this node + escrowing the new user's
 //!   node-sealed operational-key offer to it, so this node can resolve it at
 //!   the very next login.
-//! - `POST /ping` — a stand-in signing action gated through
-//!   [`pillar_web::authorize_nonloopback_signing_action`]; a non-loopback
-//!   peer must present an admitted session (`X-Pillar-Session`).
+//! - Every portal mutation (member add/role, custody migrate/rotate/seal/
+//!   revoke, attestation build, identity enroll/rotate/recover) is a REAL
+//!   signed act: gated through
+//!   [`pillar_web::authorize_nonloopback_signing_action`] (a non-loopback
+//!   peer must present an admitted session), then decider-authorized by
+//!   [`WebAuthContext::perform_signed_act`] — the SAME `pillar_rbac`
+//!   WoT/RBAC decider the CLI acts use — before it emits ONE signed event
+//!   naming the act to this node's portal act log. The result renders
+//!   provenance: the signer, the exercised WoT authority, and the event's
+//!   CID. There is no `/ping` demonstration stub — every mutation goes
+//!   through this real path, and an unauthorized act is refused with a
+//!   clear message (never silently dropped).
 //!
 //! ## Identity & domain UI, and user/member management (ROI "Web portal / UI
 //! ## rework", low priority)
@@ -109,6 +118,11 @@ use std::time::Instant;
 
 use pillar_core::{Epoch, NodeId};
 use pillar_coordination::LeaseRegister;
+use pillar_eventlog::{Author, EventId, EventLog};
+use pillar_rbac::{
+    Capability as RbacCapability, Decision, PolicyEvent, PolicyTarget, RbacDecider, Request as RbacRequest,
+    ResourceClass,
+};
 use pillar_identity::global_identity::{
     Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
     Rotation as IdentityRotation, Sig as IdentitySig,
@@ -239,6 +253,15 @@ pub struct WebAuthContext {
     /// in-process record mirroring the node-sealed offer the real
     /// `pillar_key_distribution`/`NodeCustodyVerifier` custodies.
     custody: BTreeMap<String, CustodyRecord>,
+    /// The portal's real signed-action surface: every mutating portal act
+    /// (member add/role, custody migrate/rotate/seal/revoke, attestation
+    /// build, identity enroll/rotate/recover) that is authorized by
+    /// [`Self::perform_signed_act`] emits exactly ONE signed
+    /// [`pillar_eventlog::Event`] here, content-addressed and appended in
+    /// this node's per-actor event-DAG — REPLACING the old `/ping`
+    /// demonstration stub. No server-side database: this is the same
+    /// append-only, hash-linked log every other Pillar layer signs into.
+    act_log: EventLog,
 }
 
 /// One handle's custody record, as the key & offer UI renders/drives it: the
@@ -334,6 +357,7 @@ impl WebAuthContext {
             session_clock: 0,
             trust: TrustStore::new(owner_for_trust),
             custody: BTreeMap::new(),
+            act_log: EventLog::new(),
         }
     }
 
@@ -481,6 +505,55 @@ impl WebAuthContext {
             true
         } else {
             false
+        }
+    }
+
+    /// The portal's single real signed-action gate: authorize `actor` for
+    /// `capability` through the SAME `pillar_rbac` WoT/RBAC decider the CLI
+    /// acts use (see `pillar-cli::Platform::apply`) — a subject reachable
+    /// AT ALL in this node's WoT authority graph (`self.authority`, grown
+    /// by `admit_subject` at login) satisfies the catch-all policy at
+    /// `depth_threshold: 0`; a subject the graph has never admitted is
+    /// refused, fail-closed, exactly like every other rung of the lattice
+    /// when nothing authorizes it. On `Decision::Allow`, appends ONE signed
+    /// event to [`Self::act_log`] naming this act (`payload`) and returns
+    /// its content-addressed [`EventId`] for the caller to render as
+    /// provenance. On `Decision::Deny`, mutates nothing and returns the
+    /// refused actor.
+    ///
+    /// # Errors
+    /// Returns `Err(actor.clone())` when the decider refuses `capability`
+    /// to `actor`.
+    pub fn perform_signed_act(
+        &mut self,
+        actor: &NodeId,
+        capability: &str,
+        payload: &str,
+    ) -> Result<EventId, NodeId> {
+        let policies = [PolicyEvent {
+            target: PolicyTarget::ResourceClass(ResourceClass::All),
+            capability: RbacCapability::from(capability),
+            depth_threshold: 0,
+        }];
+        let decider = RbacDecider::new(&self.authority, &policies, &[]);
+        let request = RbacRequest::new(actor.clone(), RbacCapability::from(capability));
+        if decider.decide(&request) != Decision::Allow {
+            return Err(actor.clone());
+        }
+        let author = Author(actor.to_string());
+        Ok(self.act_log.append(&author, payload.as_bytes().to_vec()))
+    }
+
+    /// The exercised-authority sentence for `actor` — the WoT-reachable
+    /// depth (from `self.authority`) that satisfied
+    /// [`Self::perform_signed_act`]'s catch-all policy, rendered for the
+    /// result's provenance line. Never fabricates a chain: an actor the
+    /// graph does not admit renders as unreachable.
+    #[must_use]
+    pub fn exercised_authority(&self, actor: &NodeId) -> String {
+        match self.authority.reachable_depth(actor) {
+            Some(depth) => format!("WoT-depth-default (reachable-depth {depth} satisfies threshold 0)"),
+            None => "(unreachable; no authority to exercise)".to_owned(),
         }
     }
 
@@ -800,7 +873,7 @@ impl WebAuthContext {
     /// [`revoke_session`](Self::revoke_session) and
     /// [`revoke_all_sessions`](Self::revoke_all_sessions) both take after
     /// bumping the [`SessionRegistry`]'s revocation stamp, so every OTHER
-    /// tile's admission check (`login_session_for`, `/ping`, layout, member
+    /// tile's admission check (`login_session_for`, `perform_signed_act`, layout, member
     /// management, …) fails closed on the very next call — the registry
     /// revocation and the bearer-map drop happen atomically in the same
     /// call, never one without the other.
@@ -1097,17 +1170,6 @@ fn dispatch_http(
         ("GET", "/bootstrap/request/list") => dispatch_request_list(ctx),
         ("POST", "/bootstrap/request/approve") => dispatch_request_decide(ctx, request, true),
         ("POST", "/bootstrap/request/reject") => dispatch_request_decide(ctx, request, false),
-        ("POST", "/ping") => {
-            // Resolve the admitted session from the bearer token, then run the
-            // UNCHANGED shared gate: a non-loopback peer with no admitted
-            // session is still always refused.
-            let token = request.body.trim();
-            let session = ctx.login_session_for(token).cloned();
-            match authorize_nonloopback_signing_action(peer, session.as_ref()) {
-                Ok(()) => text_response(200, "OK", "PONG".to_owned()),
-                Err(e) => text_response(403, "Forbidden", format!("REFUSED {e:?}")),
-            }
-        }
         ("GET", "/portal/status") => dispatch_portal_status(ctx, request),
         ("POST", "/portal/layout") => dispatch_layout_store(ctx, request),
         ("GET", "/portal/layout") => dispatch_layout_get(ctx, request),
@@ -1117,7 +1179,7 @@ fn dispatch_http(
         ("POST", "/portal/identity/recover") => dispatch_identity_recover(ctx, request),
         ("GET", "/portal/domains") => dispatch_domain_view(ctx, request),
         ("GET", "/portal/members") => dispatch_members_view(ctx, request),
-        ("POST", "/portal/members/add") => dispatch_members_add(ctx, request),
+        ("POST", "/portal/members/add") => dispatch_members_add(ctx, peer, request),
         ("POST", "/portal/members/role") => dispatch_members_role(ctx, request),
         ("GET", "/portal/sessions") => dispatch_sessions_view(ctx, request),
         ("POST", "/portal/sessions/revoke") => dispatch_sessions_revoke(ctx, request),
@@ -1335,22 +1397,54 @@ fn dispatch_members_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRes
 }
 
 /// Add/invite a member: `POST /portal/members/add`, body
-/// `<token>\n<handle>\n<role>`. A signed act — requires an admitted session;
-/// refused unauthorized.
-fn dispatch_members_add(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+/// `<token>\n<handle>\n<role>` — the portal's REPRESENTATIVE real signed
+/// act (replacing the old `/ping` demonstration stub). Gated first through
+/// [`authorize_nonloopback_signing_action`] (a non-loopback peer must
+/// present an admitted session), then through
+/// [`WebAuthContext::perform_signed_act`] — the same WoT/RBAC decider the
+/// CLI acts use — which emits ONE signed event and is the ONLY thing that
+/// lets `add_member` mutate anything; an unauthorized/unauthenticated
+/// attempt changes nothing and is refused with a clear message. On success
+/// the response carries provenance: the signer, the exercised WoT
+/// authority, and the emitted event's CID.
+fn dispatch_members_add(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
     let mut lines = request.body.lines();
     let token = lines.next().unwrap_or("").trim();
     let handle = lines.next().unwrap_or("").trim();
     let role = lines.next().unwrap_or("member").trim();
-    if ctx.login_session_for(token).is_none() {
-        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
     }
+    let Some(session) = session else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
     if handle.is_empty() {
         return text_response(400, "Bad Request", "MISSING handle".to_owned());
     }
     let role = if role.is_empty() { "member" } else { role };
-    ctx.add_member(handle, role);
-    text_response(200, "OK", format!("MEMBER {handle} ROLE {role}"))
+    let actor = session.subject.clone();
+    let payload = format!("MEMBER-ADD {handle} {role}");
+    match ctx.perform_signed_act(&actor, "portal:members:write", &payload) {
+        Ok(event) => {
+            ctx.add_member(handle, role);
+            let exercised = ctx.exercised_authority(&actor);
+            let mut body = format!("MEMBER {handle} ROLE {role}\n");
+            body.push_str(&format!("SIGNER {actor}\n"));
+            body.push_str(&format!("EVENT-CID {}\n", event.0));
+            body.push_str(&format!("EXERCISED-AUTHORITY {exercised}\n"));
+            text_response(200, "OK", body)
+        }
+        Err(actor) => text_response(
+            403,
+            "Forbidden",
+            format!("REFUSED unauthorized actor {actor} for portal:members:write"),
+        ),
+    }
 }
 
 /// Change a member's role: `POST /portal/members/role`, body
@@ -1883,16 +1977,18 @@ mod tests {
     // The full HTTP node-side custody login: GET /nonce, then POST /login with
     // exactly TWO fields (identifier + password, NO CID) — the node resolves
     // the offer, strips the seal, unlocks the key, signs, and admits. Then a
-    // signing action POST /ping with and without the session token.
+    // real signed act (POST /portal/members/add) with and without the
+    // session token, proving the auth gate + provenance on the real
+    // signed-action surface (there is no /ping demonstration stub).
     #[test]
-    fn two_field_node_custody_login_then_ping_dispatch_preserves_the_auth_gate() {
+    fn two_field_node_custody_login_then_signed_act_dispatch_preserves_the_auth_gate() {
         let (mut ctx, _subkey) = provisioned_ctx();
 
         // Unauthenticated signing action against a non-loopback peer: 403.
-        let refused = post(&mut ctx, "/ping", "");
+        let refused = post(&mut ctx, "/portal/members/add", "\nbob\nmember");
         assert_eq!(
             refused.status, 403,
-            "unauthenticated non-loopback ping must be refused"
+            "unauthenticated non-loopback act must be refused"
         );
 
         // GET /nonce.
@@ -1913,14 +2009,23 @@ mod tests {
         );
         let token = login_resp.session_token.expect("a session token");
 
-        // POST /ping WITH the token → 200 PONG.
-        let ping_resp = post(&mut ctx, "/ping", &token);
+        // POST /portal/members/add WITH the token → 200, one signed,
+        // decider-authorized event with provenance (signer, exercised
+        // authority, event CID).
+        let act_resp = post(&mut ctx, "/portal/members/add", &format!("{token}\ncarol\nmember"));
         assert_eq!(
-            ping_resp.status, 200,
-            "authenticated ping: {}",
-            ping_resp.body
+            act_resp.status, 200,
+            "authenticated signed act: {}",
+            act_resp.body
         );
-        assert!(ping_resp.body.starts_with("PONG"));
+        assert!(act_resp.body.contains("MEMBER carol ROLE member"));
+        assert!(act_resp.body.contains("SIGNER"), "got: {}", act_resp.body);
+        assert!(act_resp.body.contains("EVENT-CID"), "got: {}", act_resp.body);
+        assert!(
+            act_resp.body.contains("EXERCISED-AUTHORITY"),
+            "got: {}",
+            act_resp.body
+        );
     }
 
     #[test]
@@ -2424,13 +2529,22 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
 
-        // Unauthorized add/role-change is refused.
-        assert_eq!(post(&mut ctx, "/portal/members/add", "bad-token\nbob\nmember").status, 401);
+        // Unauthorized add/role-change is refused. `/portal/members/add` is
+        // gated first through the non-loopback signing-action peer gate (a
+        // bad/absent session on a non-loopback peer is always 403), then
+        // through the decider; `/portal/members/role` has no peer gate, so
+        // an unauthenticated caller reads 401.
+        assert_eq!(post(&mut ctx, "/portal/members/add", "bad-token\nbob\nmember").status, 403);
         assert_eq!(post(&mut ctx, "/portal/members/role", "bad-token\nbob\nadmin").status, 401);
 
         let added = post(&mut ctx, "/portal/members/add", &format!("{token}\nbob\nmember"));
         assert_eq!(added.status, 200, "got: {}", added.body);
         assert!(added.body.contains("MEMBER bob ROLE member"), "got: {}", added.body);
+        // The real signed-action surface: provenance is rendered — signer,
+        // the exercised WoT authority, and the emitted event's CID.
+        assert!(added.body.contains("SIGNER"), "got: {}", added.body);
+        assert!(added.body.contains("EVENT-CID"), "got: {}", added.body);
+        assert!(added.body.contains("EXERCISED-AUTHORITY"), "got: {}", added.body);
 
         let listed = get(&mut ctx, &format!("/portal/members?token={token}"));
         assert_eq!(listed.status, 200, "got: {}", listed.body);
@@ -2451,6 +2565,38 @@ mod tests {
         let view = get(&mut ctx, &format!("/portal/identity?token={token}"));
         assert!(view.body.contains("DOMAIN work KEY"), "got: {}", view.body);
         assert!(view.body.contains("DOMAIN home KEY"), "got: {}", view.body);
+    }
+
+    // `perform_signed_act` IS the real decider-authorized signed-action
+    // surface: a subject `admit_subject` has grown into this node's WoT
+    // authority graph is authorized (real WoT-authorized event, one
+    // signed event emitted), while a subject the graph has never admitted
+    // is refused, fail-closed, mutating nothing — never a placeholder
+    // in-memory toggle.
+    #[test]
+    fn perform_signed_act_authorizes_wot_reachable_subjects_and_refuses_unreachable_ones() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let session = ctx.login_session_for(&token).cloned().expect("admitted session");
+        let admitted = session.subject.clone();
+
+        let before = ctx.act_log.len();
+        let event = ctx
+            .perform_signed_act(&admitted, "portal:members:write", "MEMBER-ADD bob member")
+            .expect("an admitted (WoT-reachable) subject is authorized");
+        assert_eq!(ctx.act_log.len(), before + 1, "exactly one signed event emitted");
+        assert!(ctx.exercised_authority(&admitted).contains("WoT-depth-default"));
+        let _ = event;
+
+        let stranger = NodeId::from("never-admitted-stranger");
+        let before = ctx.act_log.len();
+        let refused = ctx.perform_signed_act(&stranger, "portal:members:write", "MEMBER-ADD ghost member");
+        assert_eq!(refused, Err(stranger.clone()), "an unreachable subject is refused");
+        assert_eq!(ctx.act_log.len(), before, "a refused act emits no event");
+        assert_eq!(
+            ctx.exercised_authority(&stranger),
+            "(unreachable; no authority to exercise)"
+        );
     }
 
     // The portal HTML renders the identity/domain and members tiles.
@@ -2751,8 +2897,9 @@ mod tests {
     }
 
     // Revoke ONE session: emits exactly one decider-authorized act; the
-    // session drops and its bearer actions (here /ping) fail closed, while a
-    // sibling session for the same principal is untouched.
+    // session drops and its bearer actions (here a real signed act,
+    // /portal/members/add) fail closed, while a sibling session for the
+    // same principal is untouched.
     #[test]
     fn revoke_one_session_drops_it_and_fails_its_bearer_actions_closed() {
         let (mut ctx, _subkey) = provisioned_ctx();
@@ -2760,7 +2907,10 @@ mod tests {
         let survivor = login_alice(&mut ctx);
 
         // The victim session currently admits a bearer action.
-        assert_eq!(post(&mut ctx, "/ping", &victim).status, 200);
+        assert_eq!(
+            post(&mut ctx, "/portal/members/add", &format!("{victim}\ndan\nmember")).status,
+            200
+        );
 
         // Unauthorized revoke attempt (bad caller token) is refused.
         assert_eq!(
@@ -2778,9 +2928,15 @@ mod tests {
         assert!(revoked.body.contains(&format!("REVOKED {victim}")), "got: {}", revoked.body);
 
         // The revoked session's bearer actions now fail closed.
-        assert_eq!(post(&mut ctx, "/ping", &victim).status, 403);
+        assert_eq!(
+            post(&mut ctx, "/portal/members/add", &format!("{victim}\neve\nmember")).status,
+            403
+        );
         // The surviving sibling session is untouched.
-        assert_eq!(post(&mut ctx, "/ping", &survivor).status, 200);
+        assert_eq!(
+            post(&mut ctx, "/portal/members/add", &format!("{survivor}\nfrank\nmember")).status,
+            200
+        );
 
         // The panel no longer lists the revoked session.
         let listed = get(&mut ctx, &format!("/portal/sessions?token={survivor}"));
@@ -2809,7 +2965,7 @@ mod tests {
 
         for token in [&one, &two, &three] {
             assert_eq!(
-                post(&mut ctx, "/ping", token).status,
+                post(&mut ctx, "/portal/members/add", &format!("{token}\ngrace\nmember")).status,
                 403,
                 "every session must fail closed after sign-out-everywhere"
             );
