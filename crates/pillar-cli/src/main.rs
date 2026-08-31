@@ -28,6 +28,9 @@ fn usage() -> &'static str {
      \x20 pillar bootstrap node|user --domain <D> [opts]       submit a node/user join request\n\
      \x20 pillar bootstrap request list|approve <id> [--domain D]  review/decide join requests\n\
      \x20 pillar login --domain <D> --user <id> [--password P]    print export PILLAR_DOMAIN/PILLAR_TOKEN\n\
+     \x20 pillar logout | whoami | status           session lifecycle (see pillar_cli::resource::Session)\n\
+     \x20 pillar use|ctx <ls|show|add|rm|rename|current>  local context (see pillar_cli::resource::ContextStore)\n\
+     \x20 pillar <get|describe|apply|create|delete|patch|label|scale|diff|explain> <kind>/<name> [-l sel] [-L cols]  kubectl-parity resource plane (see pillar_cli::resource::ResourcePlane)\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\

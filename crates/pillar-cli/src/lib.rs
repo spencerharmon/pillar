@@ -32,6 +32,7 @@
 pub mod bootstrap;
 pub mod observability_ui;
 pub mod onboard;
+pub mod resource;
 pub mod run;
 pub mod web_serve;
 
