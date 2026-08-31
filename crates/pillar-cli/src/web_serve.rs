@@ -128,6 +128,10 @@ use pillar_bootstrap::{
     RequestError,
 };
 use pillar_wot_authority::{FencedActor, WotAuthority};
+use pillar_trust_artifacts::{
+    parse_quota, Attest, Capacity as TrustCapacity, Cid as TrustCid, GraphEdge, Predicate,
+    Proof as TrustProof, Sig as TrustSig, TrustError, TrustStore,
+};
 
 /// A read-only snapshot of this node's identity/reachability, as the
 /// authenticated portal renders it: [`NodeId`]-derived peer id, the
@@ -221,6 +225,35 @@ pub struct WebAuthContext {
     /// stands in for the wall clock so `issued_at`/`expiry` are deterministic
     /// in tests while still ordering real logins correctly.
     session_clock: u64,
+    /// The trust & attestation UI's substrate (ROI "Web portal / UI rework":
+    /// trust & attestation UI + trust-graph visualization) — every attest
+    /// artifact issued through the attestation builder lives here,
+    /// content-addressed, capacity-checked at signing time by
+    /// `pillar-trust-artifacts`. Anchored at this node's WoT authority root
+    /// (the `owner` `WebAuthContext::new` was constructed with), which
+    /// unconditionally holds every capacity.
+    trust: TrustStore,
+    /// The key & offer UI's substrate (ROI "Web portal / UI rework": custody
+    /// migration, rotation, seal/escrow, revoke) — a signed act per
+    /// operation, keyed by handle. No server-side database: this is an
+    /// in-process record mirroring the node-sealed offer the real
+    /// `pillar_key_distribution`/`NodeCustodyVerifier` custodies.
+    custody: BTreeMap<String, CustodyRecord>,
+}
+
+/// One handle's custody record, as the key & offer UI renders/drives it: the
+/// current holder node, the offer's [`TrustCid`], whether it is currently
+/// sealed (escrowed) to that holder, and a monotonic rotation generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustodyRecord {
+    /// The node currently custodying this handle's operational-key offer.
+    pub holder: NodeId,
+    /// The offer's content address.
+    pub cid: Cid,
+    /// Whether the offer is currently sealed (escrowed) to `holder`.
+    pub sealed: bool,
+    /// Bumped by every `rotate` — the current key-material generation.
+    pub generation: u64,
 }
 
 /// A portal session-management panel's per-session view: `(id, node/domain,
@@ -260,6 +293,7 @@ impl WebAuthContext {
     ) -> Self {
         let origin = origin.into();
         let owner_for_lease = owner.clone();
+        let owner_for_trust = owner.clone();
         let node_for_identity = node.clone();
         let authority = WotAuthority::new(owner, max_depth);
         let mut actor = FencedActor::new();
@@ -298,6 +332,8 @@ impl WebAuthContext {
             members: BTreeMap::new(),
             session_registry: SessionRegistry::new(),
             session_clock: 0,
+            trust: TrustStore::new(owner_for_trust),
+            custody: BTreeMap::new(),
         }
     }
 
@@ -446,6 +482,130 @@ impl WebAuthContext {
         } else {
             false
         }
+    }
+
+    /// The attestation builder — ROI "Web portal / UI rework: trust &
+    /// attestation UI": composes and issues one [`Attest`] artifact,
+    /// signed by `issuer` acting in `capacity` (`self`, or `<role>@<scope>`
+    /// checked against the store's pure walk AT SIGNING TIME —
+    /// [`TrustError::CapacityNotHeld`] if `issuer` does not currently hold
+    /// it), authorizing `subject` to `action` over `resource` within
+    /// `scope`, optionally quantified by `quota` (a budget, never a bare
+    /// boolean — see `pillar_trust_artifacts::Predicate::with_quota`).
+    /// `authority` is the proof-pointer [`TrustCid`] of the prior grant
+    /// `issuer` is exercising (`None` for the genesis/self-capacity case).
+    ///
+    /// On success, renders BOTH the natural-language sentence AND the full
+    /// [`TrustProof`] chain (via [`TrustStore::verify`]) — the builder's
+    /// audit view.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`TrustError`] — notably [`TrustError::CapacityNotHeld`]
+    /// when `issuer` does not (yet, or any longer) hold the declared
+    /// capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_attestation(
+        &mut self,
+        issuer: NodeId,
+        capacity: TrustCapacity,
+        authority: Option<TrustCid>,
+        subject: NodeId,
+        action: &str,
+        resource: &str,
+        quota: Option<u64>,
+        scope: &str,
+    ) -> Result<(TrustCid, TrustProof), TrustError> {
+        let epoch = self.trust.epoch();
+        let mut predicate = Predicate::new(action, resource);
+        if let Some(q) = quota {
+            predicate = predicate.with_quota(q);
+        }
+        let attest = Attest {
+            issuer: issuer.clone(),
+            capacity,
+            authority,
+            subject,
+            predicate,
+            scope: scope.to_owned(),
+            epoch,
+            sig: TrustSig::by(issuer),
+        };
+        let cid = self.trust.issue_attest(attest)?;
+        let proof = self.trust.verify(&cid).map_err(|_| TrustError::CapacityNotHeld {
+            issuer: self.trust.genesis().clone(),
+        })?;
+        Ok((cid, proof))
+    }
+
+    /// The trust-graph visualization — a PURE view (no signing, no
+    /// mutation): every currently-live attest as one edge `issuer ->
+    /// subject`.
+    #[must_use]
+    pub fn trust_graph_edges(&self) -> Vec<GraphEdge> {
+        self.trust.graph_edges()
+    }
+
+    /// Read-only access to the trust store, e.g. to re-render a builder
+    /// result's proof chain.
+    #[must_use]
+    pub fn trust_store(&self) -> &TrustStore {
+        &self.trust
+    }
+
+    /// The key & offer UI's custody record for `handle`, if any.
+    #[must_use]
+    pub fn custody_of(&self, handle: &str) -> Option<&CustodyRecord> {
+        self.custody.get(handle)
+    }
+
+    /// Custody migration — ROI "Web portal / UI rework: key & offer UI": move
+    /// `handle`'s offer to a NEW holder node, replacing its content address.
+    /// A signed act (the caller already checked the presented session is
+    /// admitted); creates the record if `handle` has none yet.
+    pub fn custody_migrate(&mut self, handle: &str, new_holder: NodeId, new_cid: Cid) {
+        let generation = self.custody.get(handle).map_or(0, |r| r.generation);
+        self.custody.insert(
+            handle.to_owned(),
+            CustodyRecord {
+                holder: new_holder,
+                cid: new_cid,
+                sealed: true,
+                generation,
+            },
+        );
+    }
+
+    /// Custody rotation: reseal `handle`'s offer under fresh key material
+    /// (a new content address) to its SAME current holder, bumping the
+    /// generation counter. `false` if `handle` has no custody record yet.
+    pub fn custody_rotate(&mut self, handle: &str, new_cid: Cid) -> bool {
+        if let Some(r) = self.custody.get_mut(handle) {
+            r.cid = new_cid;
+            r.generation += 1;
+            r.sealed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Seal/escrow: mark `handle`'s existing custody record sealed (escrowed)
+    /// to its current holder. `false` if `handle` has no custody record.
+    pub fn custody_seal_escrow(&mut self, handle: &str) -> bool {
+        if let Some(r) = self.custody.get_mut(handle) {
+            r.sealed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Revoke: drop `handle`'s custody record entirely — fail-closed, the
+    /// same handle resolves no offer from this node from this point on.
+    /// `false` if `handle` had no custody record.
+    pub fn custody_revoke(&mut self, handle: &str) -> bool {
+        self.custody.remove(handle).is_some()
     }
 
     /// Chain `subject` to the authority root at `level`, admitting it as
@@ -962,6 +1122,12 @@ fn dispatch_http(
         ("GET", "/portal/sessions") => dispatch_sessions_view(ctx, request),
         ("POST", "/portal/sessions/revoke") => dispatch_sessions_revoke(ctx, request),
         ("POST", "/portal/sessions/revoke-all") => dispatch_sessions_revoke_all(ctx, request),
+        ("POST", "/portal/attestations/build") => dispatch_attestation_build(ctx, request),
+        ("GET", "/portal/trust-graph") => dispatch_trust_graph_view(ctx, request),
+        ("POST", "/portal/custody/migrate") => dispatch_custody_migrate(ctx, request),
+        ("POST", "/portal/custody/rotate") => dispatch_custody_rotate(ctx, request),
+        ("POST", "/portal/custody/seal") => dispatch_custody_seal(ctx, request),
+        ("POST", "/portal/custody/revoke") => dispatch_custody_revoke(ctx, request),
         _ => text_response(404, "Not Found", "not found".to_owned()),
     }
 }
@@ -1271,6 +1437,184 @@ fn dispatch_sessions_revoke_all(ctx: &mut WebAuthContext, request: &HttpRequest)
     let principal = session.subject.to_string();
     ctx.revoke_all_sessions(&principal);
     text_response(200, "OK", "REVOKED-ALL".to_owned())
+}
+
+fn trust_error_reason(e: &TrustError) -> String {
+    match e {
+        TrustError::SignerMismatch => "signer-mismatch".to_owned(),
+        TrustError::CapacityNotHeld { issuer } => format!("capacity-not-held-{}", issuer.0),
+        TrustError::StaleEpoch { attempted, current } => {
+            format!("stale-epoch-{attempted}-vs-{current}")
+        }
+        TrustError::UnknownTarget(cid) => format!("unknown-target-{}", cid.0),
+        TrustError::NotAQuotaPredicate => "not-a-quota-predicate".to_owned(),
+        TrustError::QuotaExceeded { requested, remaining } => {
+            format!("quota-exceeded-{requested}-remaining-{remaining}")
+        }
+    }
+}
+
+/// The attestation builder: `POST /portal/attestations/build`, body
+/// `<token>\n<issuer>\n<capacity>\n<authority-cid-or-empty>\n<subject>\n
+/// <action>\n<resource>\n<quota-spec-or-empty>\n<scope>`, where `capacity`
+/// is `self` or `<role>@<scope>` and `quota-spec` is the `--quota
+/// <resource>=<amount>[m]` budget form (e.g. `cpu=1000m`). Requires an
+/// admitted session. On success renders BOTH the composed sentence AND the
+/// full proof chain; refused ([`TrustError::CapacityNotHeld`]) when `issuer`
+/// does not currently hold the declared capacity.
+fn dispatch_attestation_build(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let issuer = lines.next().unwrap_or("").trim();
+    let capacity_spec = lines.next().unwrap_or("").trim();
+    let authority = lines.next().unwrap_or("").trim();
+    let subject = lines.next().unwrap_or("").trim();
+    let action = lines.next().unwrap_or("").trim();
+    let resource = lines.next().unwrap_or("").trim();
+    let quota_spec = lines.next().unwrap_or("").trim();
+    let scope = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if issuer.is_empty() || subject.is_empty() || action.is_empty() || resource.is_empty() || scope.is_empty()
+    {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    }
+    let capacity = if capacity_spec == "self" {
+        TrustCapacity::SelfCap
+    } else if let Some((role, cap_scope)) = capacity_spec.split_once('@') {
+        TrustCapacity::Role {
+            role: role.to_owned(),
+            scope: cap_scope.to_owned(),
+        }
+    } else {
+        return text_response(400, "Bad Request", "BAD capacity".to_owned());
+    };
+    let authority_cid = if authority.is_empty() {
+        None
+    } else {
+        Some(TrustCid(authority.to_owned()))
+    };
+    let quota = if quota_spec.is_empty() {
+        None
+    } else {
+        parse_quota(quota_spec).map(|(_, amt)| amt)
+    };
+    match ctx.build_attestation(
+        NodeId::from(issuer),
+        capacity,
+        authority_cid,
+        NodeId::from(subject),
+        action,
+        resource,
+        quota,
+        scope,
+    ) {
+        Ok((cid, proof)) => {
+            let mut body = format!("CID {}\n", cid.0);
+            body.push_str(&format!("SENTENCE {}\n", proof.sentence));
+            for c in &proof.chain {
+                body.push_str(&format!("CHAIN {}\n", c.0));
+            }
+            text_response(200, "OK", body)
+        }
+        Err(e) => text_response(403, "Forbidden", format!("DENIED {}", trust_error_reason(&e))),
+    }
+}
+
+/// The trust-graph visualization: `GET /portal/trust-graph?token=...`. A
+/// PURE view — signs and mutates nothing.
+fn dispatch_trust_graph_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let mut body = String::new();
+    for e in ctx.trust_graph_edges() {
+        body.push_str(&format!("EDGE {} -> {} LABEL {}\n", e.from.0, e.to.0, e.label));
+    }
+    text_response(200, "OK", body)
+}
+
+/// Custody migration: `POST /portal/custody/migrate`, body
+/// `<token>\n<handle>\n<new-holder>\n<new-cid>`. A signed act — requires an
+/// admitted session; refused unauthorized.
+fn dispatch_custody_migrate(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    let holder = lines.next().unwrap_or("").trim();
+    let cid = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if handle.is_empty() || holder.is_empty() || cid.is_empty() {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    }
+    ctx.custody_migrate(handle, NodeId::from(holder), Cid::from(cid));
+    text_response(200, "OK", format!("MIGRATED {handle}"))
+}
+
+/// Custody rotation: `POST /portal/custody/rotate`, body
+/// `<token>\n<handle>\n<new-cid>`. A signed act — requires an admitted
+/// session; refused unauthorized, and for a handle with no existing custody
+/// record.
+fn dispatch_custody_rotate(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    let cid = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if handle.is_empty() || cid.is_empty() {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    }
+    if ctx.custody_rotate(handle, Cid::from(cid)) {
+        text_response(200, "OK", format!("ROTATED {handle}"))
+    } else {
+        text_response(404, "Not Found", "DENIED unknown-custody".to_owned())
+    }
+}
+
+/// Seal/escrow: `POST /portal/custody/seal`, body `<token>\n<handle>`. A
+/// signed act — requires an admitted session; refused unauthorized, and for
+/// a handle with no existing custody record.
+fn dispatch_custody_seal(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if handle.is_empty() {
+        return text_response(400, "Bad Request", "MISSING handle".to_owned());
+    }
+    if ctx.custody_seal_escrow(handle) {
+        text_response(200, "OK", format!("SEALED {handle}"))
+    } else {
+        text_response(404, "Not Found", "DENIED unknown-custody".to_owned())
+    }
+}
+
+/// Revoke: `POST /portal/custody/revoke`, body `<token>\n<handle>`. A signed
+/// act — requires an admitted session; refused unauthorized, and for a
+/// handle with no existing custody record.
+fn dispatch_custody_revoke(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if handle.is_empty() {
+        return text_response(400, "Bad Request", "MISSING handle".to_owned());
+    }
+    if ctx.custody_revoke(handle) {
+        text_response(200, "OK", format!("REVOKED {handle}"))
+    } else {
+        text_response(404, "Not Found", "DENIED unknown-custody".to_owned())
+    }
 }
 
 /// Drive one node-side custody login: parse the TWO fields (identifier +
@@ -2470,5 +2814,161 @@ mod tests {
                 "every session must fail closed after sign-out-everywhere"
             );
         }
+    }
+
+    // The attestation builder composes an attestation with capacity
+    // `<role>@<scope>`, subject, predicate (incl. the `--quota cpu=1000m`
+    // budget form), scope — and renders BOTH the natural-language sentence
+    // AND the full proof chain. The genesis identity ("owner") holds every
+    // capacity unconditionally.
+    #[test]
+    fn attestation_builder_composes_capacity_predicate_quota_and_renders_sentence_and_chain() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Unauthorized build is refused.
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/portal/attestations/build",
+                "bad-token\nowner\noperator@cell-b\n\nzoe\nstream:append\ncell-b/streams/*\ncpu=1000m\ncell-b",
+            )
+            .status,
+            401
+        );
+
+        let built = post(
+            &mut ctx,
+            "/portal/attestations/build",
+            &format!(
+                "{token}\nowner\noperator@cell-b\n\nzoe\nstream:append\ncell-b/streams/*\ncpu=1000m\ncell-b"
+            ),
+        );
+        assert_eq!(built.status, 200, "got: {}", built.body);
+        assert!(built.body.starts_with("CID "), "got: {}", built.body);
+        assert!(
+            built.body.contains("SENTENCE owner attests zoe may stream:append cell-b/streams/* as role:operator@cell-b (scope cell-b"),
+            "must render the composed sentence: {}",
+            built.body
+        );
+        assert!(
+            built.body.contains("rooted at genesis owner"),
+            "sentence must render the full proof chain back to genesis: {}",
+            built.body
+        );
+        assert!(built.body.contains("CHAIN "), "must render the CID chain: {}", built.body);
+    }
+
+    // An attestation the signer lacks capacity for is refused
+    // (`TrustError::CapacityNotHeld`), never silently issued.
+    #[test]
+    fn attestation_the_signer_lacks_capacity_for_is_refused() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        let refused = post(
+            &mut ctx,
+            "/portal/attestations/build",
+            &format!(
+                "{token}\nmallory\noperator@cell-b\n\nzoe\nstream:append\ncell-b/streams/*\n\ncell-b"
+            ),
+        );
+        assert_eq!(refused.status, 403, "got: {}", refused.body);
+        assert!(
+            refused.body.contains("capacity-not-held-mallory"),
+            "got: {}",
+            refused.body
+        );
+    }
+
+    // The trust-graph view renders edges — a pure view: no signing, no
+    // mutation of the underlying store.
+    #[test]
+    fn trust_graph_view_renders_edges() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        assert_eq!(get(&mut ctx, "/portal/trust-graph?token=nope").status, 401);
+
+        // Empty before any attestation is issued.
+        let empty = get(&mut ctx, &format!("/portal/trust-graph?token={token}"));
+        assert_eq!(empty.status, 200);
+        assert!(empty.body.trim().is_empty(), "got: {}", empty.body);
+
+        post(
+            &mut ctx,
+            "/portal/attestations/build",
+            &format!(
+                "{token}\nowner\noperator@cell-b\n\nzoe\nstream:append\ncell-b/streams/*\n\ncell-b"
+            ),
+        );
+
+        let view = get(&mut ctx, &format!("/portal/trust-graph?token={token}"));
+        assert_eq!(view.status, 200, "got: {}", view.body);
+        assert!(
+            view.body.contains("EDGE owner -> zoe LABEL"),
+            "got: {}",
+            view.body
+        );
+    }
+
+    // Key & offer UI: custody migration/rotation/seal-escrow/revoke each
+    // drive a signed act (unauthorized refused).
+    #[test]
+    fn key_offer_ui_drives_custody_migration_rotation_seal_escrow_revoke_as_signed_acts() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Unauthorized attempts are refused for every custody act.
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/migrate", "bad\nalice\nnode-2\ncid-2").status,
+            401
+        );
+        assert_eq!(post(&mut ctx, "/portal/custody/rotate", "bad\nalice\ncid-3").status, 401);
+        assert_eq!(post(&mut ctx, "/portal/custody/seal", "bad\nalice").status, 401);
+        assert_eq!(post(&mut ctx, "/portal/custody/revoke", "bad\nalice").status, 401);
+
+        // Rotate/seal on an unknown handle is refused (no custody record yet).
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/rotate", &format!("{token}\nalice\ncid-3")).status,
+            404
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/seal", &format!("{token}\nalice")).status,
+            404
+        );
+
+        // Migrate creates the record as a signed act.
+        let migrated = post(
+            &mut ctx,
+            "/portal/custody/migrate",
+            &format!("{token}\nalice\nnode-2\ncid-2"),
+        );
+        assert_eq!(migrated.status, 200, "got: {}", migrated.body);
+        assert!(migrated.body.contains("MIGRATED alice"), "got: {}", migrated.body);
+        assert_eq!(ctx.custody_of("alice").unwrap().holder, NodeId::from("node-2"));
+
+        // Rotate now succeeds against the existing record.
+        let rotated = post(
+            &mut ctx,
+            "/portal/custody/rotate",
+            &format!("{token}\nalice\ncid-3"),
+        );
+        assert_eq!(rotated.status, 200, "got: {}", rotated.body);
+        assert_eq!(ctx.custody_of("alice").unwrap().generation, 1);
+
+        // Seal/escrow succeeds against the existing record.
+        let sealed = post(&mut ctx, "/portal/custody/seal", &format!("{token}\nalice"));
+        assert_eq!(sealed.status, 200, "got: {}", sealed.body);
+        assert!(ctx.custody_of("alice").unwrap().sealed);
+
+        // Revoke drops the record; a second revoke is refused (already gone).
+        let revoked = post(&mut ctx, "/portal/custody/revoke", &format!("{token}\nalice"));
+        assert_eq!(revoked.status, 200, "got: {}", revoked.body);
+        assert!(ctx.custody_of("alice").is_none());
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/revoke", &format!("{token}\nalice")).status,
+            404
+        );
     }
 }

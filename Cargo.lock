@@ -2223,6 +2223,7 @@ dependencies = [
  "pillar-observability",
  "pillar-rbac",
  "pillar-streamdb",
+ "pillar-trust-artifacts",
  "pillar-web",
  "pillar-wot-authority",
  "tempfile",
