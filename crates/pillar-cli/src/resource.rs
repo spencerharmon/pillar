@@ -876,9 +876,11 @@ mod tests {
         // The SAME get verb reads both kinds.
         assert_eq!(plane.get(WORKLOAD, &Selector::new(), &[]).len(), 1);
         assert_eq!(plane.get(IDENTITY, &Selector::new(), &[]).len(), 1);
-        // And describe surfaces provenance for the identity kind too.
+        // And describe surfaces provenance for the identity kind too — the
+        // signer AND the event CID of the record in force (surface doc §3.2).
         let d = plane.describe(&Address::new(IDENTITY, "alice")).unwrap();
         assert!(d.contains("Signer:"));
+        assert!(d.contains("Event-CID:"), "describe shows the event CID");
         assert!(d.contains(OWNER));
     }
 

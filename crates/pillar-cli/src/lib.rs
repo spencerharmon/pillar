@@ -136,6 +136,11 @@ pub struct Platform {
     /// event — the sequence the view folds over. Derived from the log, never
     /// an authority of its own.
     applied: Vec<ContentHash>,
+    /// The event id (log CID) emitted for each applied manifest, parallel to
+    /// [`Self::applied`]. Lets a `describe` surface the **event CID** of the
+    /// record that put the resource in force — the pillar-specific provenance
+    /// kubectl lacks.
+    applied_events: Vec<EventId>,
 }
 
 impl Platform {
@@ -156,6 +161,7 @@ impl Platform {
             log: EventLog::new(),
             store: BTreeMap::new(),
             applied: Vec::new(),
+            applied_events: Vec::new(),
         }
     }
 
@@ -216,6 +222,7 @@ impl Platform {
 
         self.store.insert(content_hash, envelope);
         self.applied.push(content_hash);
+        self.applied_events.push(event);
 
         Ok(Applied {
             event,
@@ -256,6 +263,25 @@ impl Platform {
     /// NEVER writes back.
     #[must_use]
     pub fn describe(&self, api_version: &str, kind: &str, name: &str) -> Option<String> {
+        self.describe_impl(api_version, kind, name)
+    }
+
+    /// The **event CID** (log id) of the record that last put `key` in force,
+    /// or `None` if no manifest for that key has been applied — the provenance a
+    /// `describe` surfaces alongside the envelope signer. A pure read.
+    #[must_use]
+    pub fn event_cid(&self, key: &ResourceKey) -> Option<EventId> {
+        self.applied
+            .iter()
+            .zip(self.applied_events.iter())
+            .rev()
+            .find_map(|(hash, ev)| {
+                let env = self.store.get(hash)?;
+                (ResourceKey::of(env.body()) == *key).then_some(*ev)
+            })
+    }
+
+    fn describe_impl(&self, api_version: &str, kind: &str, name: &str) -> Option<String> {
         let key = ResourceKey {
             api_version: api_version.to_owned(),
             kind: kind.to_owned(),
@@ -283,6 +309,9 @@ impl Platform {
         out.push_str("Envelope:\n");
         out.push_str(&format!("  Signer:        {}\n", env.signer()));
         out.push_str(&format!("  Content-Hash:  {}\n", env.content_hash().0));
+        if let Some(cid) = self.event_cid(&key) {
+            out.push_str(&format!("  Event-CID:     {}\n", cid.0));
+        }
         out.push_str("  Causal-Parents:");
         if env.causal_parents().is_empty() {
             out.push_str(" (none)\n");
