@@ -18,6 +18,7 @@ trusted. Each document below links to the specification that proves its claims.
 | [consistency-model.md](consistency-model.md) | The CP/AP per-view split and the coordination core (`specs/CoordinationCore.tla`) |
 | [identity.md](identity.md) | The OpenPGP key hierarchy and node-admission handshake (`specs/Registration.tla`) |
 | [plugin-surface.md](plugin-surface.md) | The complete out-of-tree plugin surface and each plugin's interface contract |
+| [cli-surface.md](cli-surface.md) | The single coherent `pillar` CLI: views-vs-acts split, `kind/name` addressing, and the kubectl-parity resource plane |
 | [observability.md](observability.md) | Built-in distributed observability: signal event schema, retention/sampling policy, and RBAC-decider read authority (`specs/Observability.tla`) |
 | [private-pillar.md](private-pillar.md) | Configuring a private network root + owned seeds to run an isolated, app-specific pillar deployment |
 

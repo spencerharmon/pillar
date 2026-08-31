@@ -27,6 +27,45 @@ Every signal is one more entry kind on the same content-addressed event log
 | `profile-sample` | stack/cpu/alloc sample, timestamp | a plain append-only point |
 | `metadata-sample` | a *sampled* reference to a real occurrence (a request, a connection, a config read) plus whatever metadata policy allows | the ONLY kind gated by the sampling policy below — never fabricated, never over-rate |
 
+### The metadata kind: a label-set-over-time signal
+
+The fifth kind, **metadata**, is a distinct signal with **NO numeric value** —
+not found in Prometheus/Loki/Jaeger/pprof. It generalizes the info-metric
+anti-pattern (`node_info`/`*_info`/kube-state-metrics: a metric pinned to a
+constant value purely to carry labels) by making the *payload itself* the label
+set for an entity; the observable of interest is **WHEN the labels change**.
+
+It is timeseries-class like the other four: label-set observations are
+append-only, immutable samples on the same substrate. On top of that history
+(`crates/pillar-observability/src/metadata.rs`) it materializes two derived
+views per entity:
+
+- **current labels** — the label set in effect now (the latest observation),
+  the first-class analog of the info-metric's current value; and
+- **transition history** — every time an entity's labels changed and to what,
+  with the added/removed/changed diff between consecutive distinct
+  observations. A re-observation of identical labels is *not* a transition, so
+  history records genuine change points only.
+
+Metadata is also the **correlation overlay** the other four kinds pivot
+against.
+
+### The shared correlation spine
+
+The five kinds share one correlation model
+(`crates/pillar-observability/src/correlation.rs`) so a metric spike, its logs,
+the trace that caused it, the profile taken during it, and the entity metadata
+in effect all cross-pivot, over two axes every signal stamps:
+
+- a **correlation id** — a trace id or event CID tying signals to one causal
+  thread; and
+- **shared labels** — the common dimensions (domain / cell / node / user /
+  resource + topology tiers).
+
+`CorrelationIndex` answers "every signal of any kind sharing this correlation
+id" and "every signal sharing this label", making a cross-kind join
+O(matches).
+
 Every event carries the same PGP signature and content address as any other
 `streamdb-impl` write; nothing here forks the wire format or the write path.
 

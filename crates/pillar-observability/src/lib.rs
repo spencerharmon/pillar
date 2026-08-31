@@ -37,11 +37,17 @@
 #![forbid(unsafe_code)]
 
 pub mod block;
+pub mod correlation;
+pub mod metadata;
 pub mod query;
 pub mod role;
 pub mod sampling;
 
 pub use block::{Signal, SignalId, SignalKind, TimeseriesBlock, TimeseriesStore, RETENTION_NOTE};
+pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
+pub use metadata::{
+    EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
+};
 pub use query::{Query, ViewCache};
 pub use role::{NodeRole, NodeRoleConfig, RoleError, SignedNodeRole};
 pub use sampling::{Occurrence, SampleError, SamplingPolicy};
@@ -188,6 +194,91 @@ mod tests {
             .read_signal_view(&authority, &n("outsider"), SignalId(3))
             .expect_err("outsider is not authoritative");
         assert!(matches!(err, ActError::NotAuthoritative));
+    }
+
+    /// Each of the five DISTINCT signal kinds ingests into the ONE substrate
+    /// and reads back — metric, log, trace, profile, metadata — with no
+    /// parallel store: every kind is held by the same [`TimeseriesStore`] and
+    /// answered by the same query path.
+    #[test]
+    fn all_five_signal_kinds_ingest_and_read_back_on_one_substrate() {
+        let mut store = TimeseriesStore::new(16, 1000);
+        let m = store.write(SignalKind::Metric, b"cpu 0.9".to_vec(), 0);
+        let l = store.write(SignalKind::Log, b"level=warn msg=hot".to_vec(), 0);
+        let t = store.write(SignalKind::TraceSpan, b"span=1 parent=0".to_vec(), 0);
+        let p = store.write(SignalKind::ProfileSample, b"stack=a;b;c".to_vec(), 0);
+        let d = store.write(SignalKind::MetadataSample, b"entity=n-1 role=worker".to_vec(), 0);
+
+        // All five read back from the single store.
+        for id in [m, l, t, p, d] {
+            assert!(store.contains(id), "kind read-back missing on one substrate");
+        }
+        assert_eq!(store.held_len(), 5);
+
+        // Each kind is independently queryable off the SAME store — no second
+        // store, no second query path.
+        let mut cache = ViewCache::new();
+        for kind in [
+            SignalKind::Metric,
+            SignalKind::Log,
+            SignalKind::TraceSpan,
+            SignalKind::ProfileSample,
+            SignalKind::MetadataSample,
+        ] {
+            let view = cache.materialize(&store, Query::of_kind(kind));
+            assert_eq!(view.len(), 1, "exactly one signal of each kind read back");
+        }
+        // The all-kinds query gathers exactly the five, proving one substrate.
+        assert_eq!(cache.materialize(&store, Query::all()).len(), 5);
+    }
+
+    /// The metadata kind materializes a current-labels view AND a transition
+    /// history, and cross-pivots to the other kinds by a shared correlation id
+    /// and a shared label — the correlation-overlay role of the fifth kind.
+    #[test]
+    fn metadata_view_and_cross_pivot_by_correlation_and_label() {
+        use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
+        use metadata::{EntityId, LabelObservation, LabelSet, MetadataStore};
+        use std::collections::BTreeSet;
+
+        // Metadata: label-set-over-time for an entity.
+        let mut meta = MetadataStore::new();
+        let entity = EntityId("n-1".to_string());
+        let mut set1 = LabelSet::new();
+        set1.insert("role".to_string(), "worker".to_string());
+        meta.ingest(LabelObservation::new(entity.clone(), set1.clone(), 0));
+        let mut set2 = set1.clone();
+        set2.insert("role".to_string(), "drained".to_string());
+        meta.ingest(LabelObservation::new(entity.clone(), set2.clone(), 5));
+
+        assert_eq!(meta.current_labels(&entity), Some(&set2));
+        assert_eq!(meta.transitions(&entity).len(), 2);
+
+        // Cross-pivot: a trace id gathering signals of several kinds, plus a
+        // shared node label gathering metric + metadata.
+        let mut index = CorrelationIndex::new();
+        let trace = CorrelationId("trace-1".to_string());
+        let node = Label::new("node", "n-1");
+        let with_node: BTreeSet<Label> = std::iter::once(node.clone()).collect();
+
+        index.register(
+            SignalId(1),
+            &SignalRef { kind: SignalKind::TraceSpan, correlation: Some(trace.clone()), labels: with_node.clone() },
+        );
+        index.register(
+            SignalId(2),
+            &SignalRef { kind: SignalKind::Metric, correlation: Some(trace.clone()), labels: with_node.clone() },
+        );
+        index.register(
+            SignalId(3),
+            &SignalRef { kind: SignalKind::MetadataSample, correlation: None, labels: with_node.clone() },
+        );
+
+        assert_eq!(index.by_correlation(&trace).len(), 2);
+        assert!(index.kinds_for_correlation(&trace).contains(&SignalKind::TraceSpan));
+        assert!(index.kinds_for_correlation(&trace).contains(&SignalKind::Metric));
+        // Shared label crosses kinds including metadata.
+        assert_eq!(index.by_label(&node).len(), 3);
     }
 
     /// A revoked-then-refreshed reader observes the revocation and (if it lost
