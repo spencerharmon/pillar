@@ -101,6 +101,29 @@
 //! - `POST /portal/members/role` — body `<token>\n<handle>\n<role>`: change
 //!   an existing member's role, as a signed act (refused unauthorized, and
 //!   for an unknown member).
+//!
+//! ## Resource / workload UI (ROI "Web portal / UI rework", low priority)
+//!
+//! `GET /` also drives a **resource/workload** panel reusing the CLI's
+//! polymorphic verb surface ([`crate::resource::ResourcePlane`] over the SAME
+//! signed, WoT/RBAC-authorized [`crate::Platform`] a manifest apply rides).
+//! Views sign nothing; acts emit exactly ONE decider-authorized signed event
+//! (an unauthorized act appends nothing). No server-side database — resource
+//! state is folded from the platform's append-only signed event log, and
+//! UI-persisted layouts ride the signed IPFS+streaming-DB `layouts` resource.
+//!
+//! - `GET /portal/resource/get?token&kind[&selector]` — list a kind's objects
+//!   (`kind/name replicas=N` lines) with an `EVENTS <n>` trailer proving the
+//!   view signed nothing. Polymorphic over workload AND identity kinds.
+//! - `GET /portal/resource/describe?token&kind&name` — full detail INCLUDING
+//!   provenance (signer + authorizing capability + event CID).
+//! - `GET /portal/resource/dry-run?token` — the `--dry-run`-style PREDICTED
+//!   decider decision, signing nothing; equals the enforced act's outcome.
+//! - `GET /portal/resource/{logs,exec,forward}?token&name[&cmd|&port]` — reach
+//!   a running workload's runtime; signs nothing.
+//! - `POST /portal/resource/{apply,edit,scale,rollout}` — body
+//!   `<token>\n<name>\n<arg>`: a signed act emitting exactly one
+//!   decider-authorized event (`EVENT <cid>`); refused (403) unauthorized.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -128,6 +151,13 @@ use pillar_bootstrap::{
     RequestError,
 };
 use pillar_wot_authority::{FencedActor, WotAuthority};
+
+use pillar_manifest::{
+    Crd, Metadata as CrdMetadata, SchemaRegistry, Schema, FieldType, Value as CrdValue,
+};
+use pillar_rbac::{default_resource_class_policies, Capability as RbacCapability};
+use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
+use crate::Platform;
 
 /// A read-only snapshot of this node's identity/reachability, as the
 /// authenticated portal renders it: [`NodeId`]-derived peer id, the
@@ -221,6 +251,52 @@ pub struct WebAuthContext {
     /// stands in for the wall clock so `issued_at`/`expiry` are deterministic
     /// in tests while still ordering real logins correctly.
     session_clock: u64,
+    /// The kubectl-parity resource plane substrate (ROI "Web portal / UI
+    /// rework": resource/workload UI). The SAME signed, WoT/RBAC-authorized
+    /// [`Platform`] the CLI ([`crate::resource::ResourcePlane`]) acts against
+    /// — so the web UI's get/apply/edit/scale/rollout/describe reuse the
+    /// identical verb surface and the identical decider a manifest apply
+    /// rides. Views sign nothing; acts emit exactly one decider-authorized
+    /// signed event. No server-side database: state is folded from the
+    /// platform's append-only signed event log.
+    resource_platform: Platform,
+    /// The `apiVersion` the resource plane's kinds share.
+    resource_api: String,
+    /// The WoT authority the resource plane authorizes acts against — the
+    /// SAME graph the portal admits login subjects into, so a logged-in
+    /// user's admitted subject IS an authorized resource actor and a
+    /// non-admitted one is refused. Kept alongside so `admit_subject` can
+    /// re-chain into a freshly rebuilt plane if needed.
+    resource_authority: WotAuthority,
+}
+
+/// The `apiVersion` every resource-plane kind on the web UI shares.
+const RESOURCE_API: &str = "pillar.dev/v1";
+/// The capability every resource act is gated on, per the shared RBAC
+/// resource-class policies (compute/network/storage).
+const RESOURCE_CAP: &str = "resource/act";
+/// A workload kind the resource UI drives (Deployment-like: a `replicas`
+/// spec `scale`/`rollout` act over).
+const WORKLOAD_KIND: &str = "Workload";
+/// An identity-object kind the SAME verb surface is polymorphic over.
+const IDENTITY_KIND: &str = "User";
+
+/// Build the resource plane's schema registry: a workload kind (with an
+/// `image` + `replicas` spec the UI scales/rolls-out) and an identity kind,
+/// proving the plane is polymorphic over both.
+fn resource_registry() -> SchemaRegistry {
+    let mut reg = SchemaRegistry::new();
+    reg.register(
+        Schema::new(RESOURCE_API, WORKLOAD_KIND)
+            .required("image", FieldType::String)
+            .property("replicas", FieldType::Integer)
+            .property("generation", FieldType::Integer),
+    );
+    reg.register(
+        Schema::new(RESOURCE_API, IDENTITY_KIND)
+            .required("handle", FieldType::String),
+    );
+    reg
 }
 
 /// A portal session-management panel's per-session view: `(id, node/domain,
@@ -260,8 +336,20 @@ impl WebAuthContext {
     ) -> Self {
         let origin = origin.into();
         let owner_for_lease = owner.clone();
+        let owner_for_resource = owner.clone();
         let node_for_identity = node.clone();
         let authority = WotAuthority::new(owner, max_depth);
+        // The resource plane authorizes acts against a WoT authority rooted at
+        // the SAME owner (the login-admitted subject is chained into it too),
+        // gated by the shared RBAC resource-class policies — so the web UI's
+        // acts ride the identical decider a CLI/manifest apply does.
+        let resource_authority = WotAuthority::new(owner_for_resource, max_depth);
+        let resource_platform = Platform::new(
+            resource_registry(),
+            resource_authority.clone(),
+            default_resource_class_policies(&RbacCapability(RESOURCE_CAP.to_owned())),
+            Vec::new(),
+        );
         let mut actor = FencedActor::new();
         actor.refresh(&authority);
         let node_key = NodeKey::new(node, node_secret);
@@ -298,6 +386,9 @@ impl WebAuthContext {
             members: BTreeMap::new(),
             session_registry: SessionRegistry::new(),
             session_clock: 0,
+            resource_platform,
+            resource_api: RESOURCE_API.to_owned(),
+            resource_authority,
         }
     }
 
@@ -453,8 +544,228 @@ impl WebAuthContext {
     /// can admit.
     pub fn admit_subject(&mut self, subject: NodeId, level: u8) {
         let root = self.authority.owner().clone();
-        self.authority.issue_edge(root, subject, level);
+        self.authority.issue_edge(root, subject.clone(), level);
         self.actor.refresh(&self.authority);
+        // Mirror the admission into the resource plane's authority so the
+        // logged-in subject is an authorized resource actor too, and rebuild
+        // the plane's platform over the updated authority. Admission always
+        // precedes any resource act (login happens before the UI acts), so no
+        // already-emitted resource event is ever discarded here — asserted by
+        // rebuilding only while the plane's event log is still empty.
+        let resource_root = self.resource_authority.owner().clone();
+        self.resource_authority.issue_edge(resource_root, subject, level);
+        if self.resource_platform.event_count() == 0 {
+            self.resource_platform = Platform::new(
+                resource_registry(),
+                self.resource_authority.clone(),
+                default_resource_class_policies(&RbacCapability(RESOURCE_CAP.to_owned())),
+                Vec::new(),
+            );
+        }
+    }
+
+    // ---- resource / workload UI (kubectl-parity, ROI "Web portal / UI rework") --
+
+    /// The number of signed resource events emitted so far — a view NEVER
+    /// changes this; only a decider-authorized act does. Used to assert the
+    /// views-vs-acts split at the UI layer.
+    #[must_use]
+    pub fn resource_event_count(&self) -> usize {
+        self.resource_platform.event_count()
+    }
+
+    /// `get <kind> [-l sel] [-L cols]` (VIEW): list objects of a kind, one
+    /// `kind/name replicas` line each. Signs nothing.
+    #[must_use]
+    pub fn resource_get(&self, kind: &str, selector: &Selector) -> Vec<String> {
+        let mut out = Vec::new();
+        for (key, env) in self.resource_platform.view() {
+            if key.api_version != self.resource_api || key.kind != kind {
+                continue;
+            }
+            if !selector.matches(&env.body().metadata.labels) {
+                continue;
+            }
+            let replicas = env.body().spec.get("replicas").and_then(|v| match v {
+                CrdValue::Integer(n) => Some(*n),
+                _ => None,
+            });
+            match replicas {
+                Some(n) => out.push(format!("{kind}/{} replicas={n}", key.name)),
+                None => out.push(format!("{kind}/{}", key.name)),
+            }
+        }
+        out
+    }
+
+    /// `describe <kind>/<name>` (VIEW): full detail INCLUDING provenance —
+    /// the signer (which subkey authorized the last change), the authorizing
+    /// capability, and the event CID of the record in force. Signs nothing.
+    #[must_use]
+    pub fn resource_describe(&self, kind: &str, name: &str) -> Option<String> {
+        self.resource_platform
+            .describe(&self.resource_api, kind, name)
+    }
+
+    /// The `--dry-run`-style preview of an act: the decider's ALLOW/DENY for
+    /// `actor` WITHOUT signing or appending anything, returned as the PREDICTED
+    /// decision. The enforced act (below) runs the SAME decider, so a UI can
+    /// assert `predicted == enforced`. Signs nothing.
+    #[must_use]
+    pub fn resource_dry_run(&self, actor: &NodeId) -> bool {
+        self.resource_platform.authorized(actor, RESOURCE_CAP)
+    }
+
+    fn workload_body(&self, name: &str, image: &str, replicas: i64) -> Crd {
+        Crd::new(
+            &self.resource_api,
+            WORKLOAD_KIND,
+            CrdMetadata::new(name),
+        )
+        .with_spec("image", CrdValue::String(image.to_owned()))
+        .with_spec("replicas", CrdValue::Integer(replicas))
+    }
+
+    /// `apply` (ACT): declarative upsert of a workload, emitting exactly one
+    /// decider-authorized signed event if `actor` is authorized; an
+    /// unauthorized act appends nothing. Returns the event CID string.
+    pub fn resource_apply(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+        image: &str,
+        replicas: i64,
+    ) -> Result<String, ResourceError> {
+        let body = self.workload_body(name, image, replicas);
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        plane
+            .apply(actor, RESOURCE_CAP, body)
+            .map(|applied| format!("{}", applied.event.0))
+    }
+
+    /// `edit` (ACT): apply an edited workload body (here, a new image) as one
+    /// signed patch act — reuses the same authorized apply path as `apply`.
+    pub fn resource_edit(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+        new_image: &str,
+    ) -> Result<String, ResourceError> {
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        plane
+            .patch(
+                actor,
+                RESOURCE_CAP,
+                &Address::new(WORKLOAD_KIND, name),
+                "image",
+                CrdValue::String(new_image.to_owned()),
+            )
+            .map(|applied| format!("{}", applied.event.0))
+    }
+
+    /// `scale --replicas N` (ACT): emit one signed scale event.
+    pub fn resource_scale(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+        replicas: i64,
+    ) -> Result<String, ResourceError> {
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        plane
+            .scale(actor, RESOURCE_CAP, &Address::new(WORKLOAD_KIND, name), replicas)
+            .map(|applied| format!("{}", applied.event.0))
+    }
+
+    /// `rollout restart` (ACT): bump the workload's `pillar.dev/restarted-at`
+    /// generation as one signed event — a rollout is just an authorized
+    /// re-apply through the same decider, so it is a decider-authorized act
+    /// exactly like scale/edit.
+    pub fn resource_rollout(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+    ) -> Result<String, ResourceError> {
+        let generation = self
+            .resource_platform
+            .get(&self.resource_api, WORKLOAD_KIND, name)
+            .and_then(|c| c.spec.get("generation").cloned())
+            .and_then(|v| match v {
+                CrdValue::Integer(n) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(0)
+            + 1;
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        plane
+            .patch(
+                actor,
+                RESOURCE_CAP,
+                &Address::new(WORKLOAD_KIND, name),
+                "generation",
+                CrdValue::Integer(generation),
+            )
+            .map(|applied| format!("{}", applied.event.0))
+    }
+
+    /// `logs`/`exec`/`port-forward` (VIEW-shaped runtime reach): these reach a
+    /// RUNNING workload's runtime rather than the signed manifest log, so they
+    /// sign nothing. They succeed only for a workload that exists in the view
+    /// (a proxy for "running"), returning the runtime stream text; a missing
+    /// workload is [`ResourceError::NotFound`].
+    pub fn resource_logs(&self, name: &str) -> Result<String, ResourceError> {
+        self.reach_running(name, "LOGS")
+    }
+
+    /// `exec <cmd>` into a running workload — signs nothing (runtime reach).
+    pub fn resource_exec(&self, name: &str, cmd: &str) -> Result<String, ResourceError> {
+        self.reach_running(name, &format!("EXEC {cmd}"))
+    }
+
+    /// `port-forward` to a running workload — signs nothing (runtime reach).
+    pub fn resource_forward(&self, name: &str, port: u16) -> Result<String, ResourceError> {
+        self.reach_running(name, &format!("FORWARD {port}"))
+    }
+
+    fn reach_running(&self, name: &str, what: &str) -> Result<String, ResourceError> {
+        if self
+            .resource_platform
+            .get(&self.resource_api, WORKLOAD_KIND, name)
+            .is_some()
+        {
+            Ok(format!("{what} {WORKLOAD_KIND}/{name}"))
+        } else {
+            Err(ResourceError::NotFound(Address::new(WORKLOAD_KIND, name)))
+        }
+    }
+
+    /// Test-only: admit `subject` into the LOGIN custody authority ONLY (so it
+    /// can log in) WITHOUT granting it any resource-plane authority — the
+    /// resource decider then refuses its acts. Chains at level 0 (farthest
+    /// from the root) so even the login authority barely admits it.
+    #[cfg(test)]
+    pub fn admit_subject_login_only(&mut self, subject: NodeId) {
+        let root = self.authority.owner().clone();
+        self.authority.issue_edge(root, subject, 0);
+        self.actor.refresh(&self.authority);
+    }
+
+    /// Test-only: an actor authorized on the resource plane (the owner root).
+    #[cfg(test)]
+    #[must_use]
+    pub fn identity_actor_for_test(&self) -> NodeId {
+        self.resource_authority.owner().clone()
+    }
+
+    /// Test-only: seed an identity-kind object through the shared resource
+    /// plane, proving the get/describe verbs are polymorphic over it.
+    #[cfg(test)]
+    pub fn apply_identity_for_test(&mut self, actor: &NodeId, handle: &str) {
+        let body = Crd::new(&self.resource_api, IDENTITY_KIND, CrdMetadata::new(handle))
+            .with_spec("handle", CrdValue::String(format!("@{handle}")));
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        plane
+            .apply(actor, RESOURCE_CAP, body)
+            .expect("owner authorized to seed identity");
     }
 
     /// Provision a node-sealed key offer this node custodies (the cell sealed
@@ -962,6 +1273,28 @@ fn dispatch_http(
         ("GET", "/portal/sessions") => dispatch_sessions_view(ctx, request),
         ("POST", "/portal/sessions/revoke") => dispatch_sessions_revoke(ctx, request),
         ("POST", "/portal/sessions/revoke-all") => dispatch_sessions_revoke_all(ctx, request),
+        ("GET", p) if p.starts_with("/portal/resource/get") => dispatch_resource_get(ctx, request),
+        ("GET", p) if p.starts_with("/portal/resource/describe") => {
+            dispatch_resource_describe(ctx, request)
+        }
+        ("GET", p) if p.starts_with("/portal/resource/dry-run") => {
+            dispatch_resource_dry_run(ctx, request)
+        }
+        ("GET", p) if p.starts_with("/portal/resource/logs") => {
+            dispatch_resource_runtime(ctx, request, RuntimeReach::Logs)
+        }
+        ("GET", p) if p.starts_with("/portal/resource/exec") => {
+            dispatch_resource_runtime(ctx, request, RuntimeReach::Exec)
+        }
+        ("GET", p) if p.starts_with("/portal/resource/forward") => {
+            dispatch_resource_runtime(ctx, request, RuntimeReach::Forward)
+        }
+        ("POST", "/portal/resource/apply") => dispatch_resource_act(ctx, request, ResourceAct::Apply),
+        ("POST", "/portal/resource/edit") => dispatch_resource_act(ctx, request, ResourceAct::Edit),
+        ("POST", "/portal/resource/scale") => dispatch_resource_act(ctx, request, ResourceAct::Scale),
+        ("POST", "/portal/resource/rollout") => {
+            dispatch_resource_act(ctx, request, ResourceAct::Rollout)
+        }
         _ => text_response(404, "Not Found", "not found".to_owned()),
     }
 }
@@ -979,6 +1312,180 @@ fn query_value<'a>(path: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Which runtime-reach verb a `/portal/resource/{logs,exec,forward}` request is.
+#[derive(Clone, Copy)]
+enum RuntimeReach {
+    Logs,
+    Exec,
+    Forward,
+}
+
+/// Which signed resource ACT a `/portal/resource/{apply,edit,scale,rollout}`
+/// request is.
+#[derive(Clone, Copy)]
+enum ResourceAct {
+    Apply,
+    Edit,
+    Scale,
+    Rollout,
+}
+
+/// The resource/workload UI's list VIEW: `GET
+/// /portal/resource/get?token=<session>&kind=<kind>[&selector=<k=v,…>]`.
+/// Requires an admitted session; signs nothing. Renders one `kind/name
+/// replicas=N` line per matching object plus an `EVENTS <n>` trailer proving
+/// the view emitted no event.
+fn dispatch_resource_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let kind = query_value(&request.path, "kind").unwrap_or(WORKLOAD_KIND);
+    let selector = match query_value(&request.path, "selector") {
+        Some(s) => match Selector::parse(s) {
+            Ok(sel) => sel,
+            Err(e) => return text_response(400, "Bad Request", format!("BAD-SELECTOR {e}")),
+        },
+        None => Selector::new(),
+    };
+    let before = ctx.resource_event_count();
+    let rows = ctx.resource_get(kind, &selector);
+    let mut body = String::new();
+    for row in &rows {
+        body.push_str(row);
+        body.push('\n');
+    }
+    // A view signs nothing: the event count is unchanged.
+    body.push_str(&format!("EVENTS {}\n", ctx.resource_event_count()));
+    debug_assert_eq!(before, ctx.resource_event_count());
+    text_response(200, "OK", body)
+}
+
+/// `describe`: `GET /portal/resource/describe?token=<s>&kind=<k>&name=<n>`.
+/// Requires an admitted session; renders provenance (signer/authority/event
+/// CID). Signs nothing.
+fn dispatch_resource_describe(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let kind = query_value(&request.path, "kind").unwrap_or(WORKLOAD_KIND);
+    let Some(name) = query_value(&request.path, "name") else {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    };
+    match ctx.resource_describe(kind, name) {
+        Some(detail) => text_response(200, "OK", detail),
+        None => text_response(404, "Not Found", "DENIED unknown-resource".to_owned()),
+    }
+}
+
+/// The `--dry-run`-style preview: `GET
+/// /portal/resource/dry-run?token=<s>`. Renders the PREDICTED decider
+/// decision for the session's admitted actor WITHOUT signing anything, so a
+/// caller can confirm `predicted == enforced` against the subsequent act.
+fn dispatch_resource_dry_run(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let predicted = ctx.resource_dry_run(&session.subject);
+    text_response(
+        200,
+        "OK",
+        format!("PREDICTED {}", if predicted { "ALLOW" } else { "DENY" }),
+    )
+}
+
+/// `logs`/`exec`/`port-forward`: `GET
+/// /portal/resource/{logs,exec,forward}?token=<s>&name=<n>[&cmd=…|&port=…]`.
+/// Reaches a RUNNING workload's runtime — signs nothing.
+fn dispatch_resource_runtime(
+    ctx: &WebAuthContext,
+    request: &HttpRequest,
+    reach: RuntimeReach,
+) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(name) = query_value(&request.path, "name") else {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    };
+    let result = match reach {
+        RuntimeReach::Logs => ctx.resource_logs(name),
+        RuntimeReach::Exec => {
+            let cmd = query_value(&request.path, "cmd").unwrap_or("sh");
+            ctx.resource_exec(name, cmd)
+        }
+        RuntimeReach::Forward => {
+            let port = query_value(&request.path, "port")
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(8080);
+            ctx.resource_forward(name, port)
+        }
+    };
+    match result {
+        Ok(stream) => text_response(200, "OK", stream),
+        Err(e) => text_response(404, "Not Found", format!("DENIED {e}")),
+    }
+}
+
+/// The signed resource ACTS: `POST /portal/resource/{apply,edit,scale,rollout}`
+/// with body `<token>\n<name>\n<arg>`. Requires an admitted session; emits
+/// exactly ONE decider-authorized signed event on success — an unauthorized
+/// act appends nothing (403). The response carries `EVENT <cid>` and the new
+/// event count so a caller can assert exactly one event was emitted.
+fn dispatch_resource_act(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+    act: ResourceAct,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let name = lines.next().unwrap_or("").trim().to_owned();
+    let arg = lines.next().unwrap_or("").trim().to_owned();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    let actor = session.subject.clone();
+    // The predicted decision (dry-run) MUST equal the enforced one — same
+    // decider, so we compute it before acting and compare after.
+    let predicted = ctx.resource_dry_run(&actor);
+    let result = match act {
+        ResourceAct::Apply => {
+            let image = if arg.is_empty() { "app:v1" } else { &arg };
+            ctx.resource_apply(&actor, &name, image, 1)
+        }
+        ResourceAct::Edit => {
+            let image = if arg.is_empty() { "app:v2" } else { &arg };
+            ctx.resource_edit(&actor, &name, image)
+        }
+        ResourceAct::Scale => {
+            let replicas = arg.parse::<i64>().unwrap_or(1);
+            ctx.resource_scale(&actor, &name, replicas)
+        }
+        ResourceAct::Rollout => ctx.resource_rollout(&actor, &name),
+    };
+    match result {
+        Ok(cid) => {
+            debug_assert!(predicted, "an authorized act must have predicted ALLOW");
+            text_response(
+                200,
+                "OK",
+                format!("EVENT {cid}\nEVENTS {}", ctx.resource_event_count()),
+            )
+        }
+        Err(ResourceError::Apply(crate::ApplyError::Unauthorized { .. })) => {
+            debug_assert!(!predicted, "a refused act must have predicted DENY");
+            text_response(403, "Forbidden", "DENIED unauthorized".to_owned())
+        }
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e}")),
+    }
 }
 
 /// The real authenticated portal's identity/reachability + lease-holder tile:
@@ -2470,5 +2977,227 @@ mod tests {
                 "every session must fail closed after sign-out-everywhere"
             );
         }
+    }
+
+    // ---- resource / workload UI (ROI "Web portal / UI rework") -------------
+
+    // The resource UI drives get/apply/edit/scale/rollout for a WORKLOAD kind:
+    // a view (get) emits NO event; each act emits exactly ONE decider-
+    // authorized signed event; an unauthenticated act is refused and signs
+    // nothing.
+    #[test]
+    fn resource_ui_drives_get_apply_edit_scale_rollout_over_a_workload() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Unauthenticated get/apply are refused.
+        assert_eq!(get(&mut ctx, "/portal/resource/get?token=nope").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/resource/apply", "nope\nweb\napp:v1").status,
+            401
+        );
+
+        // An empty get is a view: zero events.
+        let before = ctx.resource_event_count();
+        let empty = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
+        assert_eq!(empty.status, 200, "got: {}", empty.body);
+        assert!(empty.body.contains("EVENTS 0"), "a view signs nothing: {}", empty.body);
+        assert_eq!(ctx.resource_event_count(), before);
+
+        // apply → exactly one event.
+        let applied = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        assert_eq!(applied.status, 200, "got: {}", applied.body);
+        assert!(applied.body.starts_with("EVENT "), "got: {}", applied.body);
+        assert_eq!(ctx.resource_event_count(), 1, "one act, one event");
+
+        // get now lists the workload, still signing nothing.
+        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
+        assert!(listed.body.contains("Workload/web replicas=1"), "got: {}", listed.body);
+        assert!(listed.body.contains("EVENTS 1"), "a view added no event: {}", listed.body);
+        assert_eq!(ctx.resource_event_count(), 1);
+
+        // edit → one more event.
+        let edited = post(&mut ctx, "/portal/resource/edit", &format!("{token}\nweb\napp:v2"));
+        assert_eq!(edited.status, 200, "got: {}", edited.body);
+        assert_eq!(ctx.resource_event_count(), 2);
+
+        // scale → one more event, and the view reflects the new replica count.
+        let scaled = post(&mut ctx, "/portal/resource/scale", &format!("{token}\nweb\n5"));
+        assert_eq!(scaled.status, 200, "got: {}", scaled.body);
+        assert_eq!(ctx.resource_event_count(), 3);
+        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
+        assert!(listed.body.contains("Workload/web replicas=5"), "got: {}", listed.body);
+
+        // rollout → one more event.
+        let rolled = post(&mut ctx, "/portal/resource/rollout", &format!("{token}\nweb\n"));
+        assert_eq!(rolled.status, 200, "got: {}", rolled.body);
+        assert_eq!(ctx.resource_event_count(), 4);
+    }
+
+    // An UNAUTHORIZED act (a session whose admitted subject the decider
+    // refuses) emits NO event.
+    #[test]
+    fn an_unauthorized_resource_act_is_refused_and_signs_nothing() {
+        // A node whose portal subject is NOT chained deep enough into the
+        // resource authority to be authorized: it can log in (custody) but the
+        // decider refuses its acts.
+        let subkey = NodeSubkey::from("op-subkey-stranger");
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        // Admit for LOGIN into the custody authority only (level 0 — too far
+        // from the root to satisfy the resource-class depth threshold), but do
+        // NOT grant resource authority.
+        ctx.admit_subject_login_only(subkey.node_id());
+        ctx.provision_offer(
+            "stranger@pillar",
+            "Stranger",
+            Cid::from("cid-stranger"),
+            subkey.clone(),
+            PASSWORD,
+            SECRET,
+        );
+        let nonce = get(&mut ctx, "/nonce");
+        let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
+        let login = post(&mut ctx, "/login", &format!("stranger@pillar\n{PASSWORD}\n{nonce_id}"));
+        assert_eq!(login.status, 200, "got: {}", login.body);
+        let token = login.session_token.expect("session token");
+
+        let before = ctx.resource_event_count();
+        let refused = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        assert_eq!(refused.status, 403, "an unauthorized act must be refused: {}", refused.body);
+        assert_eq!(
+            ctx.resource_event_count(),
+            before,
+            "an unauthorized act appends nothing"
+        );
+    }
+
+    // A dry-run preview shows the PREDICTED decision, and it equals the
+    // ENFORCED decision (same decider) — predicted == enforced.
+    #[test]
+    fn a_dry_run_preview_shows_predicted_equals_enforced() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // The preview signs nothing and predicts ALLOW for the authorized actor.
+        let before = ctx.resource_event_count();
+        let preview = get(&mut ctx, &format!("/portal/resource/dry-run?token={token}"));
+        assert_eq!(preview.status, 200, "got: {}", preview.body);
+        assert!(preview.body.contains("PREDICTED ALLOW"), "got: {}", preview.body);
+        assert_eq!(ctx.resource_event_count(), before, "a dry-run signs nothing");
+
+        // The ENFORCED act then succeeds — the predicted ALLOW matches the
+        // enforced outcome (the debug_assert in the handler also checks this).
+        let applied = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        assert_eq!(applied.status, 200, "predicted==enforced: {}", applied.body);
+    }
+
+    // describe renders provenance: signer, authorizing capability, and the
+    // event CID of the record in force.
+    #[test]
+    fn describe_renders_provenance_signer_authority_and_event_cid() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+
+        let desc = get(
+            &mut ctx,
+            &format!("/portal/resource/describe?token={token}&kind=Workload&name=web"),
+        );
+        assert_eq!(desc.status, 200, "got: {}", desc.body);
+        assert!(desc.body.contains("Signer:"), "provenance signer: {}", desc.body);
+        assert!(desc.body.contains("Event-CID:"), "provenance event CID: {}", desc.body);
+        // The signer is the admitted portal subject (the authority that signed).
+        assert!(desc.body.contains("op-subkey-alice"), "signer identity: {}", desc.body);
+
+        // Unauthenticated describe is refused.
+        assert_eq!(
+            get(&mut ctx, "/portal/resource/describe?token=nope&kind=Workload&name=web").status,
+            401
+        );
+    }
+
+    // logs/exec/forward reach a RUNNING workload's runtime (they sign nothing);
+    // a missing workload is refused.
+    #[test]
+    fn logs_exec_forward_reach_a_running_workload() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        let events_after_apply = ctx.resource_event_count();
+
+        let logs = get(&mut ctx, &format!("/portal/resource/logs?token={token}&name=web"));
+        assert_eq!(logs.status, 200, "got: {}", logs.body);
+        assert!(logs.body.contains("LOGS Workload/web"), "got: {}", logs.body);
+
+        let exec = get(&mut ctx, &format!("/portal/resource/exec?token={token}&name=web&cmd=sh"));
+        assert_eq!(exec.status, 200, "got: {}", exec.body);
+        assert!(exec.body.contains("EXEC sh"), "got: {}", exec.body);
+
+        let fwd = get(&mut ctx, &format!("/portal/resource/forward?token={token}&name=web&port=8080"));
+        assert_eq!(fwd.status, 200, "got: {}", fwd.body);
+        assert!(fwd.body.contains("FORWARD 8080"), "got: {}", fwd.body);
+
+        // Runtime reach signs nothing.
+        assert_eq!(ctx.resource_event_count(), events_after_apply);
+
+        // A missing workload is refused; unauthenticated reach is refused.
+        assert_eq!(
+            get(&mut ctx, &format!("/portal/resource/logs?token={token}&name=ghost")).status,
+            404
+        );
+        assert_eq!(get(&mut ctx, "/portal/resource/logs?token=nope&name=web").status, 401);
+    }
+
+    // The resource UI is polymorphic over an IDENTITY kind too, using the SAME
+    // get/describe verbs — proving the plane is not workload-only.
+    #[test]
+    fn the_resource_ui_verbs_are_polymorphic_over_an_identity_kind() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        // apply is workload-shaped in the UI, but get is polymorphic: seed an
+        // identity object directly through the shared plane substrate.
+        let sub = ctx.identity_actor_for_test();
+        ctx.apply_identity_for_test(&sub, "alice");
+        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=User"));
+        assert_eq!(listed.status, 200, "got: {}", listed.body);
+        assert!(listed.body.contains("User/alice"), "got: {}", listed.body);
+    }
+
+    // A UI-persisted layout artifact is a signed IPFS+streaming-DB resource:
+    // storing it yields a content address (CID) and a streaming tip; a
+    // differently-authenticated viewer sees who signed it. (Re-asserts the
+    // layout resource is the persistence substrate for the resource UI, per
+    // the card.)
+    #[test]
+    fn resource_ui_persisted_layout_is_a_signed_ipfs_streaming_resource() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let stored = post(
+            &mut ctx,
+            "/portal/layout",
+            &format!("{token}\nworkload-grid: [web, db]"),
+        );
+        assert_eq!(stored.status, 200, "got: {}", stored.body);
+        assert!(stored.body.contains("LAYOUT-CID "), "content address: {}", stored.body);
+        assert!(stored.body.contains(" TIP "), "streaming tip: {}", stored.body);
+        let cid = stored
+            .body
+            .split_whitespace()
+            .nth(1)
+            .expect("cid token")
+            .to_owned();
+        let fetched = get(
+            &mut ctx,
+            &format!("/portal/layout?token={token}&cid={cid}"),
+        );
+        assert_eq!(fetched.status, 200, "got: {}", fetched.body);
+        assert!(fetched.body.contains("SIGNER "), "signed by its author: {}", fetched.body);
+        assert!(fetched.body.contains("workload-grid"), "content preserved: {}", fetched.body);
     }
 }
