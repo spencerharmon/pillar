@@ -232,6 +232,20 @@ impl IdentityLog {
             .expect("log always has at least the genesis primary")
     }
 
+    /// The genesis-committed recovery key authorized to sign a rotation when
+    /// the current primary is lost/compromised, if this identity has one —
+    /// used by a "recover" UI action to rotate without the current primary.
+    pub fn recovery_key(&self) -> Option<&KeyId> {
+        self.genesis.recovery.as_ref()
+    }
+
+    /// All domains with a certified subkey, in stable order — the "multi-
+    /// domain view": one global identity across its domains/cells with
+    /// per-domain keys.
+    pub fn domains(&self) -> impl Iterator<Item = (&Domain, &KeyId)> {
+        self.domains.iter().map(|(d, sk)| (d, &sk.key))
+    }
+
     /// The primary key installed at generation `g`, if `g` is installed. Every
     /// historical generation is retained, so a signature attributed to
     /// generation `g` remains resolvable to this identity forever, regardless

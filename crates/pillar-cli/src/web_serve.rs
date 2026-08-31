@@ -65,14 +65,54 @@
 //! - `POST /ping` — a stand-in signing action gated through
 //!   [`pillar_web::authorize_nonloopback_signing_action`]; a non-loopback
 //!   peer must present an admitted session (`X-Pillar-Session`).
+//!
+//! ## Identity & domain UI, and user/member management (ROI "Web portal / UI
+//! ## rework", low priority)
+//!
+//! `GET /` also renders an **identity & domain** tile and a **members** tile
+//! for an admitted session, backed by [`pillar_identity::global_identity::IdentityLog`]
+//! — the same CID-addressed self-certifying log `specs/GlobalIdentity.tla`
+//! models. No server-side database: every mutating action here is a signed
+//! act over that in-process log (or the `layouts` streaming-DB resource);
+//! nothing is persisted to a relational store.
+//!
+//! - `GET /portal/identity` — the identity view: the stable global CID, the
+//!   current primary generation, and every certified per-domain key (the
+//!   "multi-domain view": one global identity across its domains/cells with
+//!   per-domain keys).
+//! - `POST /portal/identity/enroll` — body `<token>\n<domain>`: certify ONE
+//!   per-domain operational subkey for `domain`, signed by the current
+//!   primary.
+//! - `POST /portal/identity/rotate` — body `<token>\n<new-primary>`: rotate
+//!   the primary, signed by the CURRENT primary. The global CID is invariant
+//!   across the rotation (it addresses the genesis, never the current key).
+//! - `POST /portal/identity/recover` — body `<token>`: rotate using the
+//!   genesis-committed recovery key (when the current primary is lost), also
+//!   CID-preserving.
+//! - `GET /portal/domains` — the domain (**naming-only**) grouping view: for
+//!   each domain, the cells it groups. Per `naming-authority-plane-spec` a
+//!   domain here is NAMING-only: this view exposes NO domain-signing /
+//!   granting / coordinating action — it is a read tile only, never a route
+//!   that signs on a domain's behalf (property: a domain signs nothing).
+//! - `GET /portal/members` — list this cell's members and their roles.
+//! - `POST /portal/members/add` — body `<token>\n<handle>\n<role>`: add or
+//!   invite a member with a role, as a signed act (requires an admitted
+//!   session; refused unauthorized).
+//! - `POST /portal/members/role` — body `<token>\n<handle>\n<role>`: change
+//!   an existing member's role, as a signed act (refused unauthorized, and
+//!   for an unknown member).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::time::Instant;
 
 use pillar_core::{Epoch, NodeId};
 use pillar_coordination::LeaseRegister;
+use pillar_identity::global_identity::{
+    Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
+    Rotation as IdentityRotation, Sig as IdentitySig,
+};
 use pillar_identity::NodeSubkey;
 use pillar_streamdb::{OpId, OpLog};
 use pillar_web::key_login::{LoginSession, Origin};
@@ -155,6 +195,17 @@ pub struct WebAuthContext {
     /// content-addressed [`OpId`] is the resource's CID, and
     /// `OpLog::root()` is the resource's streaming tip.
     layouts: OpLog,
+    /// The authenticated session's global identity log — the identity &
+    /// domain UI's substrate (enroll/rotate/recover, per-domain keys).
+    identity_log: IdentityLog,
+    /// A domain (naming-only) grouping: the cells each domain names. Grown
+    /// only by `enroll` (never a domain-signing action) — a domain here is
+    /// purely a naming label over a set of cells, per
+    /// `naming-authority-plane-spec`.
+    domain_cells: BTreeMap<String, Vec<String>>,
+    /// This cell's members and their roles — the user/member management UI's
+    /// substrate. `(handle -> role)`.
+    members: BTreeMap<String, String>,
 }
 
 impl WebAuthContext {
@@ -202,6 +253,12 @@ impl WebAuthContext {
             lease,
             lease_epoch,
             layouts: OpLog::new(),
+            identity_log: IdentityLog::genesis(IdentityGenesis {
+                initial_primary: IdentityKeyId::from("primary:0"),
+                recovery: Some(IdentityKeyId::from("recovery")),
+            }),
+            domain_cells: BTreeMap::new(),
+            members: BTreeMap::new(),
         }
     }
 
@@ -258,6 +315,98 @@ impl WebAuthContext {
     #[must_use]
     pub fn layout_tip(&self) -> u64 {
         self.layouts.root()
+    }
+
+    /// Read-only access to this session's global identity log — the
+    /// identity & domain UI's substrate.
+    #[must_use]
+    pub fn identity_log(&self) -> &IdentityLog {
+        &self.identity_log
+    }
+
+    /// Enroll `domain`: certify ONE per-domain operational subkey, signed by
+    /// the current primary, and register the domain's default cell in the
+    /// naming-only grouping view. Errs exactly as
+    /// [`IdentityLog::certify_domain_subkey`].
+    pub fn identity_enroll(
+        &mut self,
+        domain: &str,
+    ) -> Result<IdentityKeyId, pillar_identity::global_identity::IdentityLogError> {
+        let issuer = self.identity_log.current_primary().clone();
+        let subkey = IdentityKeyId::from(format!("sub:{domain}").as_str());
+        self.identity_log.certify_domain_subkey(
+            IdentityDomain::from(domain),
+            subkey.clone(),
+            &issuer,
+        )?;
+        self.domain_cells
+            .entry(domain.to_owned())
+            .or_default()
+            .push(format!("{domain}-cell-1"));
+        Ok(subkey)
+    }
+
+    /// Rotate the primary to `new_primary`, signed by the CURRENT primary.
+    /// The global CID is unaffected. Returns the newly installed generation.
+    pub fn identity_rotate(
+        &mut self,
+        new_primary: &str,
+    ) -> Result<u64, pillar_identity::global_identity::IdentityLogError> {
+        let signer = self.identity_log.current_primary().clone();
+        self.identity_log.rotate(IdentityRotation {
+            new_primary: IdentityKeyId::from(new_primary),
+            sig: IdentitySig::by(signer),
+        })
+    }
+
+    /// Recover: rotate to a fresh primary using the genesis-committed
+    /// recovery key (never the current primary). Errs
+    /// [`pillar_identity::global_identity::IdentityLogError::UnauthorizedRotation`]
+    /// if this identity has no recovery key.
+    pub fn identity_recover(
+        &mut self,
+    ) -> Result<u64, pillar_identity::global_identity::IdentityLogError> {
+        let recovery = self
+            .identity_log
+            .recovery_key()
+            .cloned()
+            .unwrap_or_else(|| IdentityKeyId::from("no-recovery-configured"));
+        let gen = self.identity_log.head_generation() + 1;
+        self.identity_log.rotate(IdentityRotation {
+            new_primary: IdentityKeyId::from(format!("recovered-primary-{gen}").as_str()),
+            sig: IdentitySig::by(recovery),
+        })
+    }
+
+    /// The domain (naming-only) grouping view: each domain's cells. Read-only
+    /// — never grown by anything but `identity_enroll`, and exposes no
+    /// domain-signing/granting/coordinating action.
+    #[must_use]
+    pub fn domain_cells(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.domain_cells
+    }
+
+    /// This cell's members and their roles.
+    #[must_use]
+    pub fn members(&self) -> &BTreeMap<String, String> {
+        &self.members
+    }
+
+    /// Add or invite a member with `role` — a signed act (the caller already
+    /// checked the presented session is admitted).
+    pub fn add_member(&mut self, handle: &str, role: &str) {
+        self.members.insert(handle.to_owned(), role.to_owned());
+    }
+
+    /// Change an existing member's role — a signed act. `false` if `handle`
+    /// is not a known member (no-op).
+    pub fn set_member_role(&mut self, handle: &str, role: &str) -> bool {
+        if let Some(r) = self.members.get_mut(handle) {
+            *r = role.to_owned();
+            true
+        } else {
+            false
+        }
     }
 
     /// Chain `subject` to the authority root at `level`, admitting it as
@@ -686,6 +835,14 @@ fn dispatch_http(
         ("GET", "/portal/status") => dispatch_portal_status(ctx, request),
         ("POST", "/portal/layout") => dispatch_layout_store(ctx, request),
         ("GET", "/portal/layout") => dispatch_layout_get(ctx, request),
+        ("GET", "/portal/identity") => dispatch_identity_view(ctx, request),
+        ("POST", "/portal/identity/enroll") => dispatch_identity_enroll(ctx, request),
+        ("POST", "/portal/identity/rotate") => dispatch_identity_rotate(ctx, request),
+        ("POST", "/portal/identity/recover") => dispatch_identity_recover(ctx, request),
+        ("GET", "/portal/domains") => dispatch_domain_view(ctx, request),
+        ("GET", "/portal/members") => dispatch_members_view(ctx, request),
+        ("POST", "/portal/members/add") => dispatch_members_add(ctx, request),
+        ("POST", "/portal/members/role") => dispatch_members_role(ctx, request),
         _ => text_response(404, "Not Found", "not found".to_owned()),
     }
 }
@@ -771,6 +928,164 @@ fn dispatch_layout_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRespo
             text_response(200, "OK", format!("SIGNER {signer}\nCONTENT {content}"))
         }
         None => text_response(404, "Not Found", "DENIED unknown-layout".to_owned()),
+    }
+}
+
+/// The identity view: `GET /portal/identity?token=<session>`. Requires an
+/// admitted session; renders the stable global CID, current primary
+/// generation, and every certified per-domain key — the multi-domain view.
+fn dispatch_identity_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let log = ctx.identity_log();
+    let mut body = String::new();
+    body.push_str(&format!("CID {}\n", log.cid().0));
+    body.push_str(&format!("GEN {}\n", log.head_generation()));
+    for (domain, key) in log.domains() {
+        body.push_str(&format!("DOMAIN {} KEY {}\n", domain.0, key.0));
+    }
+    text_response(200, "OK", body)
+}
+
+/// Enroll in a domain: `POST /portal/identity/enroll`, body
+/// `<token>\n<domain>`. Certifies ONE per-domain subkey signed by the current
+/// primary.
+fn dispatch_identity_enroll(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let domain = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if domain.is_empty() {
+        return text_response(400, "Bad Request", "MISSING domain".to_owned());
+    }
+    match ctx.identity_enroll(domain) {
+        Ok(key) => text_response(200, "OK", format!("DOMAIN {domain} KEY {}", key.0)),
+        Err(e) => text_response(409, "Conflict", format!("DENIED {}", identity_reason(&e))),
+    }
+}
+
+/// Rotate the primary: `POST /portal/identity/rotate`, body
+/// `<token>\n<new-primary>`. Signed by the current primary; the CID is
+/// invariant.
+fn dispatch_identity_rotate(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let new_primary = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if new_primary.is_empty() {
+        return text_response(400, "Bad Request", "MISSING new-primary".to_owned());
+    }
+    match ctx.identity_rotate(new_primary) {
+        Ok(gen) => text_response(
+            200,
+            "OK",
+            format!("GEN {gen} CID {}", ctx.identity_log().cid().0),
+        ),
+        Err(e) => text_response(409, "Conflict", format!("DENIED {}", identity_reason(&e))),
+    }
+}
+
+/// Recover: `POST /portal/identity/recover`, body `<token>`. Rotates using
+/// the genesis-committed recovery key; the CID is invariant.
+fn dispatch_identity_recover(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = request.body.lines().next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.identity_recover() {
+        Ok(gen) => text_response(
+            200,
+            "OK",
+            format!("RECOVERED GEN {gen} CID {}", ctx.identity_log().cid().0),
+        ),
+        Err(e) => text_response(409, "Conflict", format!("DENIED {}", identity_reason(&e))),
+    }
+}
+
+fn identity_reason(e: &pillar_identity::global_identity::IdentityLogError) -> String {
+    use pillar_identity::global_identity::IdentityLogError as E;
+    match e {
+        E::UnauthorizedRotation { signer } => format!("unauthorized-rotation-by-{}", signer.0),
+        E::DomainAlreadyCertified(d) => format!("already-certified-{}", d.0),
+        E::DomainNotCertified(d) => format!("not-certified-{}", d.0),
+        E::DomainRevoked(d) => format!("revoked-{}", d.0),
+        E::OfferAlreadySealed(d) => format!("offer-already-sealed-{}", d.0),
+        E::TwoHopCertification { issuer } => format!("two-hop-{}", issuer.0),
+    }
+}
+
+/// The domain (naming-only) grouping view: `GET /portal/domains?token=...`.
+/// Requires an admitted session. Read-only: exposes NO domain-signing /
+/// granting / coordinating action — a domain here groups cells under a name,
+/// and nothing else (property: a domain signs nothing).
+fn dispatch_domain_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let mut body = String::new();
+    for (domain, cells) in ctx.domain_cells() {
+        body.push_str(&format!("DOMAIN {domain} CELLS {}\n", cells.join(",")));
+    }
+    text_response(200, "OK", body)
+}
+
+/// List members: `GET /portal/members?token=...`.
+fn dispatch_members_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let mut body = String::new();
+    for (handle, role) in ctx.members() {
+        body.push_str(&format!("MEMBER {handle} ROLE {role}\n"));
+    }
+    text_response(200, "OK", body)
+}
+
+/// Add/invite a member: `POST /portal/members/add`, body
+/// `<token>\n<handle>\n<role>`. A signed act — requires an admitted session;
+/// refused unauthorized.
+fn dispatch_members_add(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    let role = lines.next().unwrap_or("member").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if handle.is_empty() {
+        return text_response(400, "Bad Request", "MISSING handle".to_owned());
+    }
+    let role = if role.is_empty() { "member" } else { role };
+    ctx.add_member(handle, role);
+    text_response(200, "OK", format!("MEMBER {handle} ROLE {role}"))
+}
+
+/// Change a member's role: `POST /portal/members/role`, body
+/// `<token>\n<handle>\n<role>`. A signed act — refused unauthorized, and for
+/// an unknown member.
+fn dispatch_members_role(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    let role = lines.next().unwrap_or("").trim();
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    if handle.is_empty() || role.is_empty() {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    }
+    if ctx.set_member_role(handle, role) {
+        text_response(200, "OK", format!("MEMBER {handle} ROLE {role}"))
+    } else {
+        text_response(404, "Not Found", "DENIED unknown-member".to_owned())
     }
 }
 
@@ -1508,6 +1823,126 @@ mod tests {
 
     // A UI-persisted layout is a signed, content-addressed resource riding the
     // streaming DB (`pillar-streamdb`) — never a server-side database. Storing
+    // The identity & domain UI: enroll --domain (one per-domain subkey),
+    // shows per-domain keys, rotate-primary preserves the identity CID,
+    // and offers recover — also CID-preserving.
+    #[test]
+    fn identity_ui_enroll_shows_per_domain_keys_rotate_preserves_cid_and_recover_works() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Unauthenticated view/enroll is refused.
+        assert_eq!(get(&mut ctx, "/portal/identity?token=nope").status, 401);
+        assert_eq!(post(&mut ctx, "/portal/identity/enroll", "nope\nwork").status, 401);
+
+        let cid_before = ctx.identity_log().cid().0.clone();
+
+        let enrolled = post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        assert_eq!(enrolled.status, 200, "got: {}", enrolled.body);
+        assert!(enrolled.body.contains("DOMAIN work KEY"), "got: {}", enrolled.body);
+
+        // A second enroll for the SAME domain is refused — one subkey per
+        // domain.
+        let dup = post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        assert_eq!(dup.status, 409, "got: {}", dup.body);
+
+        let view = get(&mut ctx, &format!("/portal/identity?token={token}"));
+        assert_eq!(view.status, 200, "got: {}", view.body);
+        assert!(view.body.contains(&format!("CID {cid_before}")), "got: {}", view.body);
+        assert!(view.body.contains("DOMAIN work KEY"), "must show the per-domain key: {}", view.body);
+
+        // rotate-primary preserves the identity CID.
+        let rotated = post(&mut ctx, "/portal/identity/rotate", &format!("{token}\nprimary-2"));
+        assert_eq!(rotated.status, 200, "got: {}", rotated.body);
+        assert!(rotated.body.contains(&format!("CID {cid_before}")), "got: {}", rotated.body);
+        assert_eq!(ctx.identity_log().cid().0, cid_before);
+        assert_eq!(ctx.identity_log().head_generation(), 1);
+
+        // recover also preserves the CID and installs a fresh primary,
+        // authorized by the genesis recovery key (never the current primary).
+        let recovered = post(&mut ctx, "/portal/identity/recover", token.as_str());
+        assert_eq!(recovered.status, 200, "got: {}", recovered.body);
+        assert!(recovered.body.contains(&format!("CID {cid_before}")), "got: {}", recovered.body);
+        assert_eq!(ctx.identity_log().head_generation(), 2);
+        assert_eq!(ctx.identity_log().cid().0, cid_before);
+    }
+
+    // The domain (naming-only) grouping view: lists cells per domain and
+    // exposes NO domain-signing/granting/coordinating route — a domain here
+    // signs nothing (property, per naming-authority-plane-spec).
+    #[test]
+    fn domain_grouping_view_lists_cells_and_signs_nothing() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+
+        assert_eq!(get(&mut ctx, "/portal/domains?token=nope").status, 401);
+        let view = get(&mut ctx, &format!("/portal/domains?token={token}"));
+        assert_eq!(view.status, 200, "got: {}", view.body);
+        assert!(view.body.contains("DOMAIN work CELLS"), "must list the domain's cells: {}", view.body);
+        assert!(view.body.contains("work-cell-1"), "got: {}", view.body);
+
+        // Property: no domain-signing/granting/coordinating route exists.
+        assert_eq!(post(&mut ctx, "/portal/domains/sign", &format!("{token}\nwork")).status, 404);
+        assert_eq!(post(&mut ctx, "/portal/domains/grant", &format!("{token}\nwork")).status, 404);
+        assert_eq!(post(&mut ctx, "/portal/domains/coordinate", &format!("{token}\nwork")).status, 404);
+    }
+
+    // User/member management: add/invite/role changes are signed acts
+    // (unauthorized refused); the identity view also renders the
+    // multi-domain view (one global identity across its domains/cells).
+    #[test]
+    fn member_management_signed_acts_and_multi_domain_view() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Unauthorized add/role-change is refused.
+        assert_eq!(post(&mut ctx, "/portal/members/add", "bad-token\nbob\nmember").status, 401);
+        assert_eq!(post(&mut ctx, "/portal/members/role", "bad-token\nbob\nadmin").status, 401);
+
+        let added = post(&mut ctx, "/portal/members/add", &format!("{token}\nbob\nmember"));
+        assert_eq!(added.status, 200, "got: {}", added.body);
+        assert!(added.body.contains("MEMBER bob ROLE member"), "got: {}", added.body);
+
+        let listed = get(&mut ctx, &format!("/portal/members?token={token}"));
+        assert_eq!(listed.status, 200, "got: {}", listed.body);
+        assert!(listed.body.contains("MEMBER bob ROLE member"), "got: {}", listed.body);
+
+        let role_changed = post(&mut ctx, "/portal/members/role", &format!("{token}\nbob\nadmin"));
+        assert_eq!(role_changed.status, 200, "got: {}", role_changed.body);
+        assert!(role_changed.body.contains("MEMBER bob ROLE admin"), "got: {}", role_changed.body);
+
+        // Role change on an unknown member is refused.
+        let unknown = post(&mut ctx, "/portal/members/role", &format!("{token}\nghost\nadmin"));
+        assert_eq!(unknown.status, 404, "got: {}", unknown.body);
+
+        // Multi-domain view: one global identity across multiple domains,
+        // each with its own per-domain key.
+        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nhome"));
+        let view = get(&mut ctx, &format!("/portal/identity?token={token}"));
+        assert!(view.body.contains("DOMAIN work KEY"), "got: {}", view.body);
+        assert!(view.body.contains("DOMAIN home KEY"), "got: {}", view.body);
+    }
+
+    // The portal HTML renders the identity/domain and members tiles.
+    #[test]
+    fn portal_renders_identity_domain_and_member_management_ui() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get(&mut ctx, "/");
+        let body = &resp.body;
+        assert!(body.contains("id=\"identity-tile\""), "must render the identity tile");
+        assert!(body.contains("id=\"identity-domain-input\""), "must offer enroll --domain");
+        assert!(body.contains("id=\"identity-rotate-btn\""), "must offer rotate-primary");
+        assert!(body.contains("id=\"identity-recover-btn\""), "must offer recover");
+        assert!(body.contains("id=\"identity-domain-keys\""), "must show per-domain keys");
+        assert!(body.contains("id=\"domain-tile\""), "must render the domain grouping view");
+        assert!(body.contains("id=\"members-tile\""), "must render user/member management");
+        assert!(body.contains("id=\"member-add-form\""), "must offer add/invite");
+    }
+
+    // The UI-persisted layout resource, signed and content-addressed over the
+    // streaming DB (`pillar-streamdb`), applies unchanged: the portal's UI
     // requires an admitted session (the resource is signed by that session's
     // subject); it round-trips by its content-addressed CID and advances the
     // log's streaming tip.
@@ -1515,6 +1950,7 @@ mod tests {
     fn ui_persisted_layout_round_trips_as_a_signed_streaming_db_resource() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
+
 
         // Unauthenticated store is refused.
         let refused = post(&mut ctx, "/portal/layout", "bad-token\n{\"widgets\":[]}");
