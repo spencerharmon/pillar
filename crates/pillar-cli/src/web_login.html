@@ -246,6 +246,121 @@
         <button id="signout-everywhere-btn" class="signout" type="button">Sign out everywhere</button>
         <p class="msg" id="session-msg"></p>
       </div>
+      <div class="tile" id="trust-tile">
+        <h3>Trust &amp; key builders</h3>
+        <p>The trust-graph, the attestation builder, and key/offer custody actions.</p>
+        <button id="trust-graph-refresh-btn" type="button">Refresh trust graph</button>
+        <div id="trust-graph-list"></div>
+        <form id="attestation-build-form">
+          <label>Build an attestation</label>
+          <input id="attest-issuer" type="text" placeholder="issuer" required />
+          <input id="attest-capacity" type="text" placeholder="capacity (self or role@scope)" value="self" />
+          <input id="attest-authority" type="text" placeholder="authority cid (optional)" />
+          <input id="attest-subject" type="text" placeholder="subject" required />
+          <input id="attest-action" type="text" placeholder="action" required />
+          <input id="attest-resource" type="text" placeholder="resource" required />
+          <input id="attest-quota" type="text" placeholder="quota (optional, e.g. cpu=1000m)" />
+          <input id="attest-scope" type="text" placeholder="scope" required />
+          <button id="attest-build-btn" type="submit">Build attestation</button>
+        </form>
+        <div id="attestation-result"></div>
+        <p class="msg" id="attestation-msg"></p>
+        <form id="custody-form">
+          <label>Key / offer custody</label>
+          <input id="custody-handle" type="text" placeholder="handle" required />
+          <input id="custody-cid" type="text" placeholder="new cid (rotate/migrate)" />
+          <input id="custody-holder" type="text" placeholder="new holder (migrate)" />
+          <div class="row">
+            <button id="custody-rotate-btn" type="button">Rotate</button>
+            <button id="custody-seal-btn" type="button">Seal / escrow</button>
+            <button id="custody-migrate-btn" type="button">Migrate</button>
+            <button id="custody-revoke-btn" type="button">Revoke</button>
+          </div>
+        </form>
+        <p class="msg" id="custody-msg"></p>
+      </div>
+      <div class="tile" id="resource-tile">
+        <h3>Resources &amp; workloads</h3>
+        <p>List, apply, edit, scale, and roll out workloads; preview a dry-run and reach runtime.</p>
+        <form id="resource-get-form">
+          <label>List resources</label>
+          <input id="resource-kind" type="text" placeholder="kind" value="Workload" />
+          <input id="resource-selector" type="text" placeholder="selector (optional, k=v,…)" />
+          <button id="resource-get-btn" type="submit">Get</button>
+          <button id="resource-dryrun-btn" type="button">Dry-run</button>
+        </form>
+        <div id="resource-list"></div>
+        <p class="msg" id="resource-dryrun-msg"></p>
+        <form id="resource-apply-form">
+          <label>Apply / edit / scale / roll out a workload</label>
+          <input id="resource-name" type="text" placeholder="name" required />
+          <input id="resource-arg" type="text" placeholder="image (apply/edit) or replicas (scale)" />
+          <div class="row">
+            <button id="resource-apply-btn" type="button">Apply</button>
+            <button id="resource-edit-btn" type="button">Edit</button>
+            <button id="resource-scale-btn" type="button">Scale</button>
+            <button id="resource-rollout-btn" type="button">Roll out</button>
+          </div>
+        </form>
+        <p class="msg" id="resource-act-msg"></p>
+      </div>
+      <div class="tile" id="topology-tile">
+        <h3>Topology explorer</h3>
+        <p>The tier tree with health/capacity, the label editor, and the failure-domain overlay.</p>
+        <button id="topology-tree-refresh-btn" type="button">Refresh tree</button>
+        <button id="topology-mismatches-btn" type="button">Show mismatches</button>
+        <pre id="topology-tree"></pre>
+        <div id="topology-mismatches"></div>
+        <form id="topology-attest-form">
+          <label>Attest a topology label</label>
+          <input id="topology-issuer" type="text" placeholder="issuer" required />
+          <input id="topology-capacity" type="text" placeholder="capacity (self or role@scope)" value="self" />
+          <input id="topology-authority" type="text" placeholder="authority cid (optional)" />
+          <input id="topology-subject" type="text" placeholder="subject (node)" required />
+          <input id="topology-tier" type="text" placeholder="tier" required />
+          <input id="topology-value" type="text" placeholder="value" required />
+          <input id="topology-scope" type="text" placeholder="scope" required />
+          <div class="row">
+            <button id="topology-declare-btn" type="button">Declare</button>
+            <button id="topology-attest-btn" type="submit">Attest</button>
+          </div>
+        </form>
+        <p class="msg" id="topology-label-msg"></p>
+        <form id="topology-fd-form">
+          <label>Failure-domain spread overlay</label>
+          <input id="topology-fd-tier" type="text" placeholder="tier" value="rack" />
+          <input id="topology-fd-nodes" type="text" placeholder="nodes (a,b,c)" />
+          <button id="topology-fd-btn" type="submit">Compute spread</button>
+        </form>
+        <div id="topology-fd-list"></div>
+      </div>
+      <div class="tile" id="observability-tile">
+        <h3>Observability</h3>
+        <p>Explore and query metrics/logs/traces/profiles/metadata; save a dashboard.</p>
+        <form id="obs-explore-form">
+          <label>Explore / query signals</label>
+          <select id="obs-kind">
+            <option value="metric">metric</option>
+            <option value="log">log</option>
+            <option value="trace">trace</option>
+            <option value="profile">profile</option>
+            <option value="metadata">metadata</option>
+          </select>
+          <input id="obs-filter" type="text" placeholder="filter (optional)" />
+          <div class="row">
+            <button id="obs-explore-btn" type="button">Explore</button>
+            <button id="obs-query-btn" type="submit">Query</button>
+          </div>
+        </form>
+        <div id="obs-list"></div>
+        <form id="obs-dashboard-form">
+          <label>Save a dashboard</label>
+          <input id="obs-dashboard-name" type="text" placeholder="name" required />
+          <input id="obs-dashboard-spec" type="text" placeholder="spec" required />
+          <button id="obs-dashboard-btn" type="submit">Save dashboard</button>
+        </form>
+        <p class="msg" id="obs-dashboard-msg"></p>
+      </div>
       <button id="signout" class="signout" type="button">Sign out</button>
     </section>
   </main>
@@ -473,6 +588,258 @@
     });
   }
 
+  // --- Trust & key builders panel: the trust-graph visualization, the
+  // attestation builder (capacity-checked signed artifact + full proof
+  // chain), and key/offer custody actions (rotate/seal/migrate/revoke),
+  // each a signed act through the admitted session. ---
+  function renderLines(el, text, cls) {
+    el.innerHTML = text
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => '<p class="' + cls + '">' + l + "</p>")
+      .join("");
+  }
+
+  async function refreshTrustGraph() {
+    if (!sessionToken) return;
+    try {
+      const resp = await fetch("/portal/trust-graph?token=" + encodeURIComponent(sessionToken));
+      if (!resp.ok) return;
+      renderLines($("trust-graph-list"), await resp.text(), "trust-edge");
+    } catch (_) { /* best-effort */ }
+  }
+
+  if ($("trust-graph-refresh-btn")) {
+    $("trust-graph-refresh-btn").addEventListener("click", () => refreshTrustGraph());
+  }
+
+  if ($("attestation-build-form")) {
+    $("attestation-build-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      // Body per dispatch_attestation_build: token, issuer, capacity,
+      // authority-cid-or-empty, subject, action, resource, quota-or-empty,
+      // scope — one field per line.
+      const body = [
+        sessionToken,
+        $("attest-issuer").value.trim(),
+        $("attest-capacity").value.trim() || "self",
+        $("attest-authority").value.trim(),
+        $("attest-subject").value.trim(),
+        $("attest-action").value.trim(),
+        $("attest-resource").value.trim(),
+        $("attest-quota").value.trim(),
+        $("attest-scope").value.trim(),
+      ].join("\n");
+      await withPending($("attest-build-btn"), async () => {
+        const resp = await fetch("/portal/attestations/build", { method: "POST", body });
+        const text = await resp.text();
+        if (resp.ok) renderLines($("attestation-result"), text, "attest-line");
+        setMsg("attestation-msg", resp.ok ? "Attestation built." : text, resp.ok ? "ok" : "err");
+      });
+    });
+  }
+
+  async function custodyAct(btn, path, body) {
+    await withPending(btn, async () => {
+      const resp = await fetch(path, { method: "POST", body });
+      const text = await resp.text();
+      setMsg("custody-msg", text, resp.ok ? "ok" : "err");
+    });
+  }
+  if ($("custody-rotate-btn")) {
+    $("custody-rotate-btn").addEventListener("click", () =>
+      custodyAct($("custody-rotate-btn"), "/portal/custody/rotate",
+        sessionToken + "\n" + $("custody-handle").value.trim() + "\n" + $("custody-cid").value.trim()));
+  }
+  if ($("custody-seal-btn")) {
+    $("custody-seal-btn").addEventListener("click", () =>
+      custodyAct($("custody-seal-btn"), "/portal/custody/seal",
+        sessionToken + "\n" + $("custody-handle").value.trim()));
+  }
+  if ($("custody-migrate-btn")) {
+    $("custody-migrate-btn").addEventListener("click", () =>
+      custodyAct($("custody-migrate-btn"), "/portal/custody/migrate",
+        sessionToken + "\n" + $("custody-handle").value.trim() + "\n" +
+        $("custody-holder").value.trim() + "\n" + $("custody-cid").value.trim()));
+  }
+  if ($("custody-revoke-btn")) {
+    $("custody-revoke-btn").addEventListener("click", () =>
+      custodyAct($("custody-revoke-btn"), "/portal/custody/revoke",
+        sessionToken + "\n" + $("custody-handle").value.trim()));
+  }
+
+  // --- Resource / workload panel: list (get), dry-run preview
+  // (predicted==enforced), and the signed apply/edit/scale/rollout acts,
+  // reusing the same signed decider a CLI/manifest apply rides. ---
+  async function refreshResources() {
+    if (!sessionToken) return;
+    const kind = $("resource-kind").value.trim() || "Workload";
+    const selector = $("resource-selector").value.trim();
+    let url = "/portal/resource/get?token=" + encodeURIComponent(sessionToken) +
+      "&kind=" + encodeURIComponent(kind);
+    if (selector) url += "&selector=" + encodeURIComponent(selector);
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) { setMsg("resource-act-msg", await resp.text(), "err"); return; }
+      renderLines($("resource-list"), await resp.text(), "resource-row");
+    } catch (_) { /* best-effort */ }
+  }
+  if ($("resource-get-form")) {
+    $("resource-get-form").addEventListener("submit", (ev) => { ev.preventDefault(); refreshResources(); });
+  }
+  if ($("resource-dryrun-btn")) {
+    $("resource-dryrun-btn").addEventListener("click", async () => {
+      await withPending($("resource-dryrun-btn"), async () => {
+        const resp = await fetch("/portal/resource/dry-run?token=" + encodeURIComponent(sessionToken));
+        const text = await resp.text();
+        setMsg("resource-dryrun-msg", text, resp.ok ? "ok" : "err");
+      });
+    });
+  }
+  async function resourceAct(btn, path) {
+    const name = $("resource-name").value.trim();
+    const arg = $("resource-arg").value.trim();
+    await withPending(btn, async () => {
+      const resp = await fetch(path, { method: "POST", body: sessionToken + "\n" + name + "\n" + arg });
+      const text = await resp.text();
+      setMsg("resource-act-msg", text, resp.ok ? "ok" : "err");
+      if (resp.ok) refreshResources();
+    });
+  }
+  if ($("resource-apply-btn")) {
+    $("resource-apply-btn").addEventListener("click", () => resourceAct($("resource-apply-btn"), "/portal/resource/apply"));
+  }
+  if ($("resource-edit-btn")) {
+    $("resource-edit-btn").addEventListener("click", () => resourceAct($("resource-edit-btn"), "/portal/resource/edit"));
+  }
+  if ($("resource-scale-btn")) {
+    $("resource-scale-btn").addEventListener("click", () => resourceAct($("resource-scale-btn"), "/portal/resource/scale"));
+  }
+  if ($("resource-rollout-btn")) {
+    $("resource-rollout-btn").addEventListener("click", () => resourceAct($("resource-rollout-btn"), "/portal/resource/rollout"));
+  }
+
+  // --- Topology explorer panel: the tier tree with health/capacity/rollup,
+  // the declared-vs-attested mismatches, the label editor (declare advisory /
+  // attest a signed label), and the failure-domain spread overlay. ---
+  async function refreshTopologyTree() {
+    if (!sessionToken) return;
+    try {
+      const resp = await fetch("/portal/topology/tree?token=" + encodeURIComponent(sessionToken));
+      if (!resp.ok) return;
+      $("topology-tree").textContent = await resp.text();
+    } catch (_) { /* best-effort */ }
+  }
+  if ($("topology-tree-refresh-btn")) {
+    $("topology-tree-refresh-btn").addEventListener("click", () => refreshTopologyTree());
+  }
+  if ($("topology-mismatches-btn")) {
+    $("topology-mismatches-btn").addEventListener("click", async () => {
+      try {
+        const resp = await fetch("/portal/topology/mismatches?token=" + encodeURIComponent(sessionToken));
+        if (!resp.ok) return;
+        const text = (await resp.text()).trim();
+        renderLines($("topology-mismatches"), text || "No mismatches.", "topology-mismatch");
+      } catch (_) { /* best-effort */ }
+    });
+  }
+  if ($("topology-declare-btn")) {
+    $("topology-declare-btn").addEventListener("click", async () => {
+      const body = [sessionToken, $("topology-subject").value.trim(),
+        $("topology-tier").value.trim(), $("topology-value").value.trim()].join("\n");
+      await withPending($("topology-declare-btn"), async () => {
+        const resp = await fetch("/portal/topology/label/declare", { method: "POST", body });
+        const text = await resp.text();
+        setMsg("topology-label-msg", text, resp.ok ? "ok" : "err");
+        if (resp.ok) refreshTopologyTree();
+      });
+    });
+  }
+  if ($("topology-attest-form")) {
+    $("topology-attest-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      // Body per dispatch_topology_label_attest: token, issuer, capacity,
+      // authority-cid-or-empty, subject, tier, value, scope.
+      const body = [
+        sessionToken,
+        $("topology-issuer").value.trim(),
+        $("topology-capacity").value.trim() || "self",
+        $("topology-authority").value.trim(),
+        $("topology-subject").value.trim(),
+        $("topology-tier").value.trim(),
+        $("topology-value").value.trim(),
+        $("topology-scope").value.trim(),
+      ].join("\n");
+      await withPending($("topology-attest-btn"), async () => {
+        const resp = await fetch("/portal/topology/label/attest", { method: "POST", body });
+        const text = await resp.text();
+        setMsg("topology-label-msg", text, resp.ok ? "ok" : "err");
+        if (resp.ok) refreshTopologyTree();
+      });
+    });
+  }
+  if ($("topology-fd-form")) {
+    $("topology-fd-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const tier = $("topology-fd-tier").value.trim() || "rack";
+      const nodes = $("topology-fd-nodes").value.trim();
+      const url = "/portal/topology/failure-domain?token=" + encodeURIComponent(sessionToken) +
+        "&tier=" + encodeURIComponent(tier) + "&nodes=" + encodeURIComponent(nodes);
+      await withPending($("topology-fd-btn"), async () => {
+        const resp = await fetch(url);
+        if (resp.ok) renderLines($("topology-fd-list"), await resp.text(), "topology-fd-row");
+      });
+    });
+  }
+
+  // --- Observability panel: explore/query the five signal kinds
+  // (metric/log/trace/profile/metadata) over the shared substrate, and save a
+  // dashboard as a signed streaming-DB resource. Explore/query sign nothing;
+  // the dashboard save is a signed act. ---
+  async function obsExplore() {
+    if (!sessionToken) return;
+    const kind = $("obs-kind").value;
+    try {
+      const resp = await fetch("/portal/obs/explore?token=" + encodeURIComponent(sessionToken) +
+        "&kind=" + encodeURIComponent(kind));
+      if (!resp.ok) return;
+      renderLines($("obs-list"), await resp.text(), "obs-row");
+    } catch (_) { /* best-effort */ }
+  }
+  async function obsQuery() {
+    if (!sessionToken) return;
+    const kind = $("obs-kind").value;
+    const filter = $("obs-filter").value.trim();
+    let url = "/portal/obs/query?token=" + encodeURIComponent(sessionToken) +
+      "&kind=" + encodeURIComponent(kind);
+    if (filter) url += "&filter=" + encodeURIComponent(filter);
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      renderLines($("obs-list"), await resp.text(), "obs-row");
+    } catch (_) { /* best-effort */ }
+  }
+  if ($("obs-explore-btn")) {
+    $("obs-explore-btn").addEventListener("click", () => obsExplore());
+  }
+  if ($("obs-explore-form")) {
+    $("obs-explore-form").addEventListener("submit", (ev) => { ev.preventDefault(); obsQuery(); });
+  }
+  if ($("obs-dashboard-form")) {
+    $("obs-dashboard-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const name = $("obs-dashboard-name").value.trim();
+      const spec = $("obs-dashboard-spec").value.trim();
+      // Body per dispatch_obs_dashboard: "<token>\n<name>: <spec>".
+      const body = sessionToken + "\n" + name + ": " + spec;
+      await withPending($("obs-dashboard-btn"), async () => {
+        const resp = await fetch("/portal/obs/dashboard", { method: "POST", body });
+        const text = await resp.text();
+        setMsg("obs-dashboard-msg", text, resp.ok ? "ok" : "err");
+      });
+    });
+  }
+
   // --- Pending/disabled state for a mutating control whose signed event is in
   // flight. The button shows pending + is disabled (no double-submit) for the
   // duration of `action`, and re-enables on the result (success OR failure). ---
@@ -593,6 +960,10 @@
     refreshDomains();
     refreshMembers();
     refreshSessions();
+    refreshTrustGraph();
+    refreshResources();
+    refreshTopologyTree();
+    obsExplore();
   }
 
   // --- Node identity / peers / lease holder, from the real node state. ---

@@ -177,6 +177,8 @@ use pillar_topology::{
     Assignment as TopologyAssignment, Label as TopologyLabel, Mismatch as TopologyMismatch,
     TierHierarchy, Topology as TopologyRegistry, ATTEST_ACTION as TOPOLOGY_ATTEST_ACTION,
 };
+use pillar_observability::SignalKind;
+use crate::observability_ui::ObservabilityBuilders;
 use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
 use crate::Platform;
 
@@ -325,6 +327,14 @@ pub struct WebAuthContext {
     /// alongside each node's resolved placement path, and rolls up per tier.
     /// `node-id -> (health, capacity)`.
     topology_nodes: BTreeMap<String, (String, u64)>,
+    /// The observability UI's substrate (ROI P3 addendum "Web portal / UI
+    /// rework": observability explore/query/dashboard) — the five-kind
+    /// (metric/log/trace/profile/metadata) explore+query builders layered over
+    /// [`pillar_observability`], plus the signed streaming-DB resource logs the
+    /// saved-query/dashboard builders persist to. Views (explore/query) sign
+    /// nothing; a dashboard SAVE is ONE signed, content-addressed streaming-DB
+    /// resource event — no server-side database, exactly like `layouts`.
+    observability: ObservabilityBuilders,
 }
 
 /// One handle's custody record, as the key & offer UI renders/drives it: the
@@ -467,6 +477,7 @@ impl WebAuthContext {
             resource_authority,
             topology: TopologyRegistry::new(TierHierarchy::default()),
             topology_nodes: BTreeMap::new(),
+            observability: ObservabilityBuilders::new(),
         }
     }
 
@@ -523,6 +534,83 @@ impl WebAuthContext {
     #[must_use]
     pub fn layout_tip(&self) -> u64 {
         self.layouts.root()
+    }
+
+    /// The observability explore builder for `kind`, rendered as one
+    /// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` line per held signal of
+    /// that kind. A pure read — signs nothing.
+    pub fn observability_explore(&mut self, kind: SignalKind) -> String {
+        let mut body = String::new();
+        for r in self.observability.explore(kind) {
+            body.push_str(&format!(
+                "SIGNAL {} KIND {} PAYLOAD {}\n",
+                r.id.0,
+                signal_kind_tag(kind),
+                r.payload
+            ));
+        }
+        body
+    }
+
+    /// The observability per-kind query builder: metric/log/trace substring
+    /// query, profile `top`, or metadata entity query, rendered as text. A
+    /// pure read — signs nothing.
+    pub fn observability_query(&mut self, kind: SignalKind, filter: Option<&str>) -> String {
+        let mut body = String::new();
+        match kind {
+            SignalKind::MetadataSample => {
+                for (entity, view) in self.observability.metadata_query(filter) {
+                    let labels = view
+                        .current
+                        .map(|ls| {
+                            ls.iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    body.push_str(&format!("ENTITY {} LABELS {}\n", entity.0, labels));
+                }
+            }
+            _ => {
+                let records = match kind {
+                    SignalKind::Metric => self.observability.metric_query(filter),
+                    SignalKind::Log => self.observability.log_query(filter),
+                    SignalKind::TraceSpan => self.observability.trace_search(filter),
+                    // Profile has no substring query; `top <n>` is its query
+                    // verb — an optional numeric `filter` picks `n`.
+                    SignalKind::ProfileSample => {
+                        let n = filter.and_then(|f| f.parse::<usize>().ok()).unwrap_or(20);
+                        self.observability.profile_top(n)
+                    }
+                    SignalKind::MetadataSample => unreachable!("handled above"),
+                };
+                for r in records {
+                    body.push_str(&format!(
+                        "SIGNAL {} KIND {} PAYLOAD {}\n",
+                        r.id.0,
+                        signal_kind_tag(kind),
+                        r.payload
+                    ));
+                }
+            }
+        }
+        body
+    }
+
+    /// Persist a named observability dashboard as ONE signed, content-addressed
+    /// streaming-DB resource (the SAME no-server-side-database pattern
+    /// [`Self::store_layout`] uses for UI layouts): returns the resource's CID
+    /// and the dashboard log's new streaming tip. The portal only ever calls
+    /// this for an admitted session (`signer` is that session's handle).
+    pub fn save_observability_dashboard(
+        &mut self,
+        signer: &str,
+        name: &str,
+        spec: &str,
+    ) -> (u64, u64) {
+        let cid = self.observability.create_dashboard(signer, name, spec);
+        (cid, self.observability.dashboard_tip())
     }
 
     /// Read-only access to this session's global identity log — the
@@ -1700,6 +1788,9 @@ fn dispatch_http(
         ("POST", "/portal/resource/rollout") => {
             dispatch_resource_act(ctx, request, ResourceAct::Rollout)
         }
+        ("GET", p) if p.starts_with("/portal/obs/explore") => dispatch_obs_explore(ctx, request),
+        ("GET", p) if p.starts_with("/portal/obs/query") => dispatch_obs_query(ctx, request),
+        ("POST", "/portal/obs/dashboard") => dispatch_obs_dashboard(ctx, request),
         _ => text_response(404, "Not Found", "not found".to_owned()),
     }
 }
@@ -1717,6 +1808,30 @@ fn query_value<'a>(path: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Map a `kind=<...>` query-param token to its [`SignalKind`], for the
+/// observability explore/query endpoints.
+fn parse_signal_kind(s: &str) -> Option<SignalKind> {
+    match s {
+        "metric" => Some(SignalKind::Metric),
+        "log" => Some(SignalKind::Log),
+        "trace" => Some(SignalKind::TraceSpan),
+        "profile" => Some(SignalKind::ProfileSample),
+        "metadata" => Some(SignalKind::MetadataSample),
+        _ => None,
+    }
+}
+
+/// The stable text tag for a [`SignalKind`] the observability views render.
+fn signal_kind_tag(kind: SignalKind) -> &'static str {
+    match kind {
+        SignalKind::Metric => "metric",
+        SignalKind::Log => "log",
+        SignalKind::TraceSpan => "trace",
+        SignalKind::ProfileSample => "profile",
+        SignalKind::MetadataSample => "metadata",
+    }
 }
 
 /// Which runtime-reach verb a `/portal/resource/{logs,exec,forward}` request is.
@@ -2312,6 +2427,66 @@ fn dispatch_trust_graph_view(ctx: &WebAuthContext, request: &HttpRequest) -> Htt
         body.push_str(&format!("EDGE {} -> {} LABEL {}\n", e.from.0, e.to.0, e.label));
     }
     text_response(200, "OK", body)
+}
+
+/// The observability explore view: `GET
+/// /portal/obs/explore?token=<s>&kind=metric|log|trace|profile|metadata`.
+/// Requires an admitted session (an unauthenticated request is refused, like
+/// every other read endpoint). Renders every held signal of `kind` as a
+/// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` line. A pure view — signs
+/// nothing.
+fn dispatch_obs_explore(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(kind) = parse_signal_kind(query_value(&request.path, "kind").unwrap_or("metric"))
+    else {
+        return text_response(400, "Bad Request", "BAD kind".to_owned());
+    };
+    text_response(200, "OK", ctx.observability_explore(kind))
+}
+
+/// The observability per-kind query view: `GET
+/// /portal/obs/query?token=<s>&kind=<k>[&filter=<f>]`. Requires an admitted
+/// session. `filter` is a plain substring match (metric/log/trace) or an
+/// entity-id prefix (metadata); for `profile` an optional numeric `filter`
+/// picks the `top <n>` sample count. A pure view — signs nothing.
+fn dispatch_obs_query(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(kind) = parse_signal_kind(query_value(&request.path, "kind").unwrap_or("metric"))
+    else {
+        return text_response(400, "Bad Request", "BAD kind".to_owned());
+    };
+    let filter = query_value(&request.path, "filter").filter(|f| !f.is_empty());
+    text_response(200, "OK", ctx.observability_query(kind, filter))
+}
+
+/// Save an observability dashboard: `POST /portal/obs/dashboard`, body
+/// `<token>\n<name>: <spec>`. Requires an admitted session. Persists the
+/// dashboard as ONE signed, content-addressed streaming-DB resource (the SAME
+/// no-server-side-database path the UI-layout store uses), returning its CID
+/// and the dashboard log's new streaming tip — `OBS-DASHBOARD-CID <cid> TIP
+/// <tip>`.
+fn dispatch_obs_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let rest = lines.collect::<Vec<_>>().join("\n");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let Some((name, spec)) = rest.split_once(": ") else {
+        return text_response(400, "Bad Request", "MISSING name-spec".to_owned());
+    };
+    let (name, spec) = (name.trim(), spec.trim());
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    let (cid, tip) = ctx.save_observability_dashboard(&session.subject.to_string(), name, spec);
+    text_response(200, "OK", format!("OBS-DASHBOARD-CID {cid} TIP {tip}"))
 }
 
 /// The topology explorer tree: `GET
@@ -4381,6 +4556,126 @@ mod tests {
             fetched.body.contains("topology-dashboard"),
             "got: {}",
             fetched.body
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-feature UI CONFIRMATION suite (one test per banked `ui-*` task).
+    //
+    // These assert the SURFACE the operator actually sees: the served `/`
+    // page (web_login.html, the client SPA) must WIRE each banked feature's
+    // endpoint(s) and render its controls. An endpoint that exists but is
+    // never fetched by the SPA is invisible to the user, so asserting the
+    // dispatch handler alone is not enough -- each test asserts the served
+    // page itself calls the feature's `/portal/*` endpoint. Not fakeable
+    // with a dead <div>: the fetch URL means the panel is really wired.
+    // ---------------------------------------------------------------------
+
+    // Assert the served "/" page contains every one of `needles`.
+    fn assert_ui_wires(feature: &str, needles: &[&str]) {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let page = get(&mut ctx, "/").body;
+        for n in needles {
+            assert!(
+                page.contains(n),
+                "the served portal UI is missing the {feature} feature: \
+                 web_login.html does not contain `{n}` -- the endpoint may \
+                 exist server-side but the SPA never surfaces it"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_confirms_request_inbox_panel() {
+        assert_ui_wires(
+            "request-inbox",
+            &["/bootstrap/request/list", "inbox-approve", "inbox-reject"],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_identity_panel() {
+        assert_ui_wires(
+            "identity",
+            &[
+                "/portal/identity",
+                "/portal/identity/enroll",
+                "/portal/identity/rotate",
+                "/portal/identity/recover",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_domain_panel() {
+        assert_ui_wires("domain", &["/portal/domains"]);
+    }
+
+    #[test]
+    fn ui_confirms_member_management_panel() {
+        assert_ui_wires(
+            "member-management",
+            &["/portal/members", "/portal/members/add"],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_session_management_panel() {
+        assert_ui_wires(
+            "session-management",
+            &[
+                "/portal/sessions",
+                "/portal/sessions/revoke",
+                "/portal/sessions/revoke-all",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_trust_and_key_builder_panel() {
+        assert_ui_wires(
+            "trust-and-key-builders",
+            &[
+                "/portal/trust-graph",
+                "/portal/attestations/build",
+                "/portal/custody/rotate",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_resource_workload_panel() {
+        assert_ui_wires(
+            "resource-workload",
+            &[
+                "/portal/resource/get",
+                "/portal/resource/apply",
+                "/portal/resource/dry-run",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_topology_explorer_panel() {
+        assert_ui_wires(
+            "topology-explorer",
+            &[
+                "/portal/topology/tree",
+                "/portal/topology/label/attest",
+                "/portal/topology/failure-domain",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_observability_panel() {
+        assert_ui_wires(
+            "observability",
+            &[
+                "/portal/obs/explore",
+                "/portal/obs/query",
+                "/portal/obs/dashboard",
+            ],
         );
     }
 }
