@@ -32,6 +32,7 @@ use std::fmt;
 
 use pillar_streamdb::content_address;
 
+pub mod bgp_lb;
 pub mod ingress;
 
 /// The content-address of a manifest body — the same 64-bit content address
