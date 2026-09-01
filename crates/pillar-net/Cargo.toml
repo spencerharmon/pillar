@@ -28,6 +28,8 @@ libp2p = { version = "0.56", features = [
 ] }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-eventlog = { path = "../pillar-eventlog" }
+pillar-core = { path = "../pillar-core" }
+pillar-ipam = { path = "../pillar-ipam" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -43,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # which is exactly the "overlay never a bootstrap dep of the substrate"
 # invariant this task requires.
 pillar-streamdb = { path = "../pillar-streamdb" }
+# Dev-only: builds a TopologyScopedIpam fixture for the pillar-UDP reply-set
+# determinism test. Not a runtime dep (pillar-ipam is; topology comes through it).
+pillar-topology = { path = "../pillar-topology" }
 
 [lints]
 workspace = true

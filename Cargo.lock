@@ -2307,8 +2307,11 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "libp2p",
+ "pillar-core",
  "pillar-eventlog",
+ "pillar-ipam",
  "pillar-streamdb",
+ "pillar-topology",
  "serde",
  "sha3",
  "tokio",

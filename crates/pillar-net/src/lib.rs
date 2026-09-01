@@ -32,6 +32,8 @@ use libp2p::{
     tcp, upnp, yamux, PeerId, Swarm, Transport,
 };
 
+pub mod pillar_udp;
+
 pub mod blob;
 pub use blob::{
     build_blob_swarm, BlobBehaviour, BlobBehaviourEvent, BlobDigest, BlobRequest, BlobResponse,
