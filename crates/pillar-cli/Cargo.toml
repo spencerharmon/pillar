@@ -20,6 +20,7 @@ pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-rbac = { path = "../pillar-rbac" }
 pillar-identity = { path = "../pillar-identity" }
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+pillar-topology = { path = "../pillar-topology" }
 pillar-key-distribution = { path = "../pillar-key-distribution" }
 pillar-web = { path = "../pillar-web" }
 pillar-net = { path = "../pillar-net" }
@@ -27,7 +28,6 @@ pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-controller = { path = "../pillar-controller" }
 pillar-coordination = { path = "../pillar-coordination" }
 pillar-observability = { path = "../pillar-observability" }
-pillar-topology = { path = "../pillar-topology" }
 pillar-cells = { path = "../pillar-cells" }
 libp2p = { version = "0.56", features = ["ed25519"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

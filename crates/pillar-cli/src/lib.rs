@@ -38,6 +38,7 @@ pub mod resource;
 pub mod run;
 pub mod session_cli;
 pub mod stream_cli;
+pub mod topology_cli;
 pub mod web_serve;
 
 use std::collections::BTreeMap;
