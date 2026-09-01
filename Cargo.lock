@@ -2298,7 +2298,10 @@ dependencies = [
 name = "pillar-manifest"
 version = "0.0.0"
 dependencies = [
+ "pillar-core",
  "pillar-streamdb",
+ "pillar-topology",
+ "pillar-trust-artifacts",
 ]
 
 [[package]]

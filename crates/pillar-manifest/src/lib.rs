@@ -32,6 +32,8 @@ use std::fmt;
 
 use pillar_streamdb::content_address;
 
+pub mod ingress;
+
 /// The content-address of a manifest body — the same 64-bit content address
 /// [`pillar_streamdb`] derives for every other Pillar artifact. Two nodes
 /// holding the same CRD body necessarily agree on its [`ContentHash`].

@@ -9,6 +9,9 @@ description = "Signed intent manifests: a CRD-compatible body inside a pillar-na
 
 [dependencies]
 pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-core = { path = "../pillar-core" }
+pillar-topology = { path = "../pillar-topology" }
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 
 [lints]
 workspace = true
