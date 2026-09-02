@@ -49,6 +49,12 @@ pillar-streamdb = { path = "../pillar-streamdb" }
 # Dev-only: builds a TopologyScopedIpam fixture for the pillar-UDP reply-set
 # determinism test. Not a runtime dep (pillar-ipam is; topology comes through it).
 pillar-topology = { path = "../pillar-topology" }
+# Dev-only: the distributed-lb-acceptance test composes the ingress/LB
+# manifest model (Route/Frontend/derive_routing_table) and the WoT trust
+# artifacts gating Route attachment. Neither is a runtime dep of the
+# transport substrate itself.
+pillar-manifest = { path = "../pillar-manifest" }
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 
 [lints]
 workspace = true
