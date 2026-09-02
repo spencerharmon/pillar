@@ -36,6 +36,12 @@ use libp2p::{
 
 pub mod pillar_udp;
 
+pub mod pillar_udp_transport;
+pub use pillar_udp_transport::{
+    is_pillar_udp_addr, pillar_udp_multiaddr, pillar_udp_socket_addr, PillarUdpStream,
+    PillarUdpTransport, PILLAR_UDP_SUFFIX,
+};
+
 pub mod blob;
 pub use blob::{
     build_blob_swarm, BlobBehaviour, BlobBehaviourEvent, BlobDigest, BlobRequest, BlobResponse,
@@ -188,6 +194,7 @@ pub fn build_event_swarm_with_root(
                 yamux::Config::default,
             )?
             .with_quic()
+            .with_other_transport(pillar_udp_boxed_transport)?
             .with_behaviour(|key| {
                 let peer_id = key.public().to_peer_id();
                 EventBehaviour {
@@ -228,6 +235,23 @@ fn pnet_tcp_transport(
     let pnet_config = PnetConfig::new(psk);
     tcp::tokio::Transport::new(tcp::Config::default())
         .and_then(move |socket, _| pnet_config.handshake(socket))
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(keypair).expect("static noise config is valid"))
+        .multiplex(yamux::Config::default())
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
+        .boxed()
+}
+
+/// Builds the pillar-UDP libp2p transport, upgraded (Noise-authenticated,
+/// yamux-multiplexed) exactly like the TCP/QUIC legs, so a node that calls
+/// [`build_event_swarm`] binds/advertises/dials `…/udp/<port>/p-pillar`
+/// addresses as an ADDITIONAL registered transport. This is the live wiring
+/// deferred by `pillar-udp-transport-impl`: the raw datagram substrate now
+/// composes with the [`pillar_udp`] mechanics module in a running swarm.
+fn pillar_udp_boxed_transport(
+    keypair: &Keypair,
+) -> libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)> {
+    PillarUdpTransport::new(keypair.clone())
         .upgrade(Version::V1Lazy)
         .authenticate(noise::Config::new(keypair).expect("static noise config is valid"))
         .multiplex(yamux::Config::default())
