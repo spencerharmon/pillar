@@ -416,6 +416,15 @@ impl ContentStore {
         self.held.contains_key(cid)
     }
 
+    /// Read-only local lookup of a held segment, with no backfill and no
+    /// mutation — the shape a [`SegmentSource`] peer exposes to answer a
+    /// remote fetch (as opposed to [`Self::get`], which is the requesting
+    /// side's local-or-backfill resolve).
+    #[must_use]
+    pub fn get_local(&self, cid: &Cid) -> Option<SignedSegment> {
+        self.held.get(cid).cloned()
+    }
+
     /// Mark a held segment durable (pinned — never garbage-collected).
     ///
     /// # Errors

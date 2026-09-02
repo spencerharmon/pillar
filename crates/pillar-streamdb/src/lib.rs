@@ -31,6 +31,9 @@ pub use store::{
     Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, StoreError, Visibility,
 };
 
+mod ipfs_persist;
+pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};
+
 /// A content address: the identity of an [`Op`], derived purely from its
 /// payload bytes via a **collision-resistant cryptographic** hash.
 ///
