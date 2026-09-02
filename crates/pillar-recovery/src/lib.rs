@@ -196,7 +196,7 @@ impl SwarmBackup {
     /// The content address of the stored ciphertext.
     #[must_use]
     pub fn digest(&self) -> BlobDigest {
-        self.digest
+        self.digest.clone()
     }
 
     /// Whether `node` is within the federation-restricted seal.
@@ -221,7 +221,7 @@ pub fn store_backup(
     }
     let digest = store.insert(blob.to_bytes());
     Ok(SwarmBackup {
-        digest,
+        digest: digest.clone(),
         sealed: SealedArtifact::new(digest, sealed_to),
     })
 }
@@ -239,7 +239,7 @@ pub fn fetch_backup(
         return Err(RecoveryError::NotSealedToRequester);
     }
     let bytes = store
-        .get(swarm.digest)
+        .get(&swarm.digest)
         .ok_or(RecoveryError::ArtifactNotFound)?;
     BackupBlob::from_bytes(bytes).ok_or(RecoveryError::ArtifactNotFound)
 }

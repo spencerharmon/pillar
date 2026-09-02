@@ -40,7 +40,7 @@ pub struct SignedNodeRole {
     role: NodeRole,
     /// A content tag binding `(node, role)` — the stand-in for the detached
     /// signature the node produces over its declaration.
-    sig_tag: u64,
+    sig_tag: pillar_streamdb::OpId,
 }
 
 impl SignedNodeRole {
@@ -75,10 +75,11 @@ impl SignedNodeRole {
     }
 }
 
-fn role_sig_tag(node: &NodeId, role: NodeRole) -> u64 {
-    // A deterministic binding of (node, role); NOT cryptographic — it stands
-    // in for the detached signature so a mismatched/tampered declaration is
-    // rejected structurally before the authority check.
+fn role_sig_tag(node: &NodeId, role: NodeRole) -> pillar_streamdb::OpId {
+    // A deterministic binding of (node, role) via the SAME real cryptographic
+    // content-addressing (SHA2-256 multihash) the streaming store uses, so a
+    // mismatched/tampered declaration is rejected structurally before the
+    // authority check.
     let mut bytes = node.0.clone().into_bytes();
     bytes.push(b'|');
     bytes.push(match role {
@@ -86,7 +87,7 @@ fn role_sig_tag(node: &NodeId, role: NodeRole) -> u64 {
         NodeRole::Serve => 2,
         NodeRole::SubscribeAndServe => 3,
     });
-    pillar_streamdb::content_address(&bytes)
+    pillar_streamdb::OpId(pillar_streamdb::content_address(&bytes))
 }
 
 /// Why a signed role declaration was refused.

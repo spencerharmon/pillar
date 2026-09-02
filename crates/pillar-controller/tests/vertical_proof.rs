@@ -120,7 +120,7 @@ async fn vertical_proof_runs_declared_workload_over_libp2p() {
     let spec = WorkloadSpec::new(
         "singleton-web",
         controller.node(),
-        digest,
+        digest.clone(),
         SideEffect::Exclusive,
     );
     let mut stream = Stream::new();

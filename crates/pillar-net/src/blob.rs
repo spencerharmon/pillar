@@ -28,22 +28,53 @@ use serde::{Deserialize, Serialize};
 pub const BLOB_PROTOCOL_NAME: &str = "/pillar/blob/1.0.0";
 
 /// The content address of a blob: a pure function of its bytes, computed with
-/// the streamdb content-addressing function so blob identities are canonical
-/// across every Pillar layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BlobDigest(pub u64);
+/// the streamdb content-addressing function (a real SHA2-256 multihash) so
+/// blob identities are canonical AND collision-resistant across every Pillar
+/// layer — an adversary cannot forge a distinct blob sharing a digest.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BlobDigest(pub pillar_streamdb::OpId);
 
 impl BlobDigest {
+    /// The raw multihash bytes of this digest.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
     /// Derive the digest of `bytes` via the shared content-addressing function.
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
-        BlobDigest(content_address(bytes))
+        BlobDigest(pillar_streamdb::OpId(content_address(bytes)))
     }
 
     /// Whether `bytes` actually hash to this digest.
     #[must_use]
     pub fn verifies(&self, bytes: &[u8]) -> bool {
         BlobDigest::of(bytes) == *self
+    }
+}
+
+impl PartialOrd for BlobDigest {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BlobDigest {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+impl Serialize for BlobDigest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.as_bytes().to_vec().serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for BlobDigest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(d)?;
+        Ok(BlobDigest(pillar_streamdb::OpId(
+            pillar_crypto::ContentId::from_bytes(bytes),
+        )))
     }
 }
 
@@ -82,20 +113,20 @@ impl BlobStore {
     pub fn insert(&mut self, bytes: impl Into<Vec<u8>>) -> BlobDigest {
         let bytes = bytes.into();
         let digest = BlobDigest::of(&bytes);
-        self.blobs.insert(digest, bytes);
+        self.blobs.insert(digest.clone(), bytes);
         digest
     }
 
     /// Fetch a blob's bytes by digest, if present.
     #[must_use]
-    pub fn get(&self, digest: BlobDigest) -> Option<&[u8]> {
-        self.blobs.get(&digest).map(Vec::as_slice)
+    pub fn get(&self, digest: &BlobDigest) -> Option<&[u8]> {
+        self.blobs.get(digest).map(Vec::as_slice)
     }
 
     /// Whether the store holds the given digest.
     #[must_use]
-    pub fn contains(&self, digest: BlobDigest) -> bool {
-        self.blobs.contains_key(&digest)
+    pub fn contains(&self, digest: &BlobDigest) -> bool {
+        self.blobs.contains_key(digest)
     }
 
     /// Number of distinct blobs held.
@@ -114,7 +145,7 @@ impl BlobStore {
     #[must_use]
     pub fn answer(&self, request: &BlobRequest) -> BlobResponse {
         BlobResponse {
-            bytes: self.get(request.digest).map(<[u8]>::to_vec),
+            bytes: self.get(&request.digest).map(<[u8]>::to_vec),
         }
     }
 }
@@ -186,7 +217,7 @@ mod tests {
         // Same bytes -> same digest (pure function), and it uses the shared
         // streamdb content-addressing.
         assert_eq!(digest, BlobDigest::of(&bytes));
-        assert_eq!(digest.0, content_address(&bytes));
+        assert_eq!(digest.0, pillar_streamdb::OpId(content_address(&bytes)));
         assert!(digest.verifies(&bytes));
         // Different bytes must not verify against the digest.
         assert!(!digest.verifies(b"tampered-bytes"));
@@ -196,12 +227,12 @@ mod tests {
     fn store_keys_by_content_address() {
         let mut store = BlobStore::new();
         let digest = store.insert(b"layer".to_vec());
-        assert!(store.contains(digest));
-        assert_eq!(store.get(digest), Some(&b"layer"[..]));
-        assert!(digest.verifies(store.get(digest).unwrap()));
+        assert!(store.contains(&digest));
+        assert_eq!(store.get(&digest), Some(&b"layer"[..]));
+        assert!(digest.verifies(store.get(&digest).unwrap()));
         // A digest we never inserted is absent, and answering yields None.
         let absent = BlobDigest::of(b"not-here");
-        assert!(!store.contains(absent));
+        assert!(!store.contains(&absent));
         assert_eq!(store.answer(&BlobRequest { digest: absent }).bytes, None);
     }
 
@@ -272,10 +303,12 @@ mod tests {
                     SwarmEvent::ConnectionEstablished { peer_id, .. }
                         if peer_id == provider_peer_id =>
                     {
-                        fetcher
-                            .behaviour_mut()
-                            .blob
-                            .send_request(&provider_peer_id, BlobRequest { digest });
+                        fetcher.behaviour_mut().blob.send_request(
+                            &provider_peer_id,
+                            BlobRequest {
+                                digest: digest.clone(),
+                            },
+                        );
                     }
                     SwarmEvent::Behaviour(BlobBehaviourEvent::Blob(
                         request_response::Event::Message {

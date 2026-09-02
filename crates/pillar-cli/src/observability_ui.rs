@@ -196,7 +196,7 @@ impl ObservabilityBuilders {
         labels: BTreeSet<Label>,
     ) {
         self.correlation.register(
-            id,
+            id.clone(),
             &pillar_observability::SignalRef {
                 kind: self
                     .store
@@ -228,7 +228,7 @@ impl ObservabilityBuilders {
             .filter_map(|raw| {
                 self.store
                     .held_signals()
-                    .find(|s| s.id().0 == raw)
+                    .find(|s| s.id() == raw)
                     .map(|s| ExploreRecord {
                         id: s.id(),
                         kind: s.kind(),
@@ -353,10 +353,10 @@ impl ObservabilityBuilders {
     // -- trace: get / search / graph --
 
     /// `obs trace get <id>` — the one trace-span record with this id.
-    pub fn trace_get(&mut self, id: SignalId) -> Option<ExploreRecord> {
+    pub fn trace_get(&mut self, id: &SignalId) -> Option<ExploreRecord> {
         self.explore(SignalKind::TraceSpan)
             .into_iter()
-            .find(|r| r.id == id)
+            .find(|r| &r.id == id)
     }
 
     /// `obs trace search [filter]` — every trace-span record whose payload
@@ -377,16 +377,16 @@ impl ObservabilityBuilders {
     // -- profile: get / flame / top --
 
     /// `obs profile get <id>` — the one profile-sample record with this id.
-    pub fn profile_get(&mut self, id: SignalId) -> Option<ExploreRecord> {
+    pub fn profile_get(&mut self, id: &SignalId) -> Option<ExploreRecord> {
         self.explore(SignalKind::ProfileSample)
             .into_iter()
-            .find(|r| r.id == id)
+            .find(|r| &r.id == id)
     }
 
     /// `obs profile flame <id>` — the profile sample's stack frames, split on
     /// `;` (the collapsed-stack convention `perf`/`pprof` flamegraphs share),
     /// outermost frame first.
-    pub fn profile_flame(&mut self, id: SignalId) -> Option<Vec<String>> {
+    pub fn profile_flame(&mut self, id: &SignalId) -> Option<Vec<String>> {
         self.profile_get(id)
             .map(|r| r.payload.split(';').map(str::to_owned).collect())
     }
@@ -485,7 +485,7 @@ impl ObservabilityBuilders {
 
     /// The streaming tip (Merkle root) of the saved-query resource log.
     #[must_use]
-    pub fn query_tip(&self) -> u64 {
+    pub fn query_tip(&self) -> pillar_streamdb::MerkleRoot {
         self.queries.root()
     }
 
@@ -515,26 +515,32 @@ impl ObservabilityBuilders {
     /// Create a new dashboard, returning its dashboard id (used for every
     /// subsequent update/delete/get on this same dashboard). ONE signed
     /// resource event.
-    pub fn create_dashboard(&mut self, signer: &str, name: &str, content: &str) -> u64 {
+    pub fn create_dashboard(&mut self, signer: &str, name: &str, content: &str) -> OpId {
         // The dashboard id is the content-address of its FIRST (create) event
         // — a stable, content-addressed identity for the dashboard's whole
         // lifetime, exactly like a layout/query resource's CID.
         let probe = format!("probe\n{signer}\n{name}\n{content}");
-        let id = pillar_streamdb::content_address(probe.as_bytes());
-        self.append_dashboard_event(id, DashboardOp::Create, signer, name, content);
+        let id = OpId(pillar_streamdb::content_address(probe.as_bytes()));
+        self.append_dashboard_event(&id, DashboardOp::Create, signer, name, content);
         id
     }
 
     /// Update an existing dashboard's name/content. ONE signed resource event;
     /// the dashboard's CURRENT state (per [`Self::get_dashboard`]) becomes this
     /// mutation.
-    pub fn update_dashboard(&mut self, dashboard_id: u64, signer: &str, name: &str, content: &str) {
+    pub fn update_dashboard(
+        &mut self,
+        dashboard_id: &OpId,
+        signer: &str,
+        name: &str,
+        content: &str,
+    ) {
         self.append_dashboard_event(dashboard_id, DashboardOp::Update, signer, name, content);
     }
 
     /// Delete a dashboard. ONE signed tombstone resource event; after this,
     /// [`Self::get_dashboard`] resolves `None` for this id.
-    pub fn delete_dashboard(&mut self, dashboard_id: u64, signer: &str) {
+    pub fn delete_dashboard(&mut self, dashboard_id: &OpId, signer: &str) {
         self.append_dashboard_event(dashboard_id, DashboardOp::Delete, signer, "", "");
     }
 
@@ -543,7 +549,7 @@ impl ObservabilityBuilders {
     /// unambiguously regardless of the log's content-address iteration order.
     fn append_dashboard_event(
         &mut self,
-        dashboard_id: u64,
+        dashboard_id: &OpId,
         op: DashboardOp,
         signer: &str,
         name: &str,
@@ -552,7 +558,8 @@ impl ObservabilityBuilders {
         let seq = self.next_dashboard_seq;
         self.next_dashboard_seq += 1;
         let payload = format!(
-            "{seq}\n{dashboard_id}\n{}\n{signer}\n{name}\n{content}",
+            "{seq}\n{}\n{}\n{signer}\n{name}\n{content}",
+            dashboard_id.to_hex(),
             op.tag()
         );
         self.dashboards.append(payload.into_bytes());
@@ -562,7 +569,7 @@ impl ObservabilityBuilders {
     /// assigned-sequence order to the latest one — `None` if it was never
     /// created, or its latest event is a delete tombstone.
     #[must_use]
-    pub fn get_dashboard(&self, dashboard_id: u64) -> Option<DashboardView> {
+    pub fn get_dashboard(&self, dashboard_id: &OpId) -> Option<DashboardView> {
         let mut latest: Option<(u64, DashboardOp, String, String, String)> = None;
         for op in self.dashboards.order() {
             let text = String::from_utf8_lossy(op.payload()).into_owned();
@@ -574,10 +581,10 @@ impl ObservabilityBuilders {
                 continue;
             };
             let Some(id_raw) = lines.next() else { continue };
-            let Ok(id) = id_raw.parse::<u64>() else {
+            let Some(id) = OpId::from_hex(id_raw) else {
                 continue;
             };
-            if id != dashboard_id {
+            if &id != dashboard_id {
                 continue;
             }
             let Some(op_tag) = lines.next() else { continue };
@@ -605,7 +612,7 @@ impl ObservabilityBuilders {
 
     /// The streaming tip (Merkle root) of the dashboard resource log.
     #[must_use]
-    pub fn dashboard_tip(&self) -> u64 {
+    pub fn dashboard_tip(&self) -> pillar_streamdb::MerkleRoot {
         self.dashboards.root()
     }
 }
@@ -702,7 +709,7 @@ mod tests {
         assert_eq!(loaded.signer, "alice");
         assert_eq!(loaded.name, "hot-cpu");
         assert_eq!(loaded.spec, "kind=metric name=cpu>0.9");
-        assert!(b.query_tip() != 0 || true); // tip advanced deterministically; sanity only
+        assert!(!b.query_tip().as_bytes().is_empty()); // tip advanced deterministically; sanity only
     }
 
     /// The dashboard builder CRUDs a dashboard.
@@ -710,17 +717,17 @@ mod tests {
     fn dashboard_builder_cruds_a_dashboard() {
         let mut b = ObservabilityBuilders::new();
         let id = b.create_dashboard("alice", "ops", "layout-v1");
-        let view = b.get_dashboard(id).expect("dashboard exists after create");
+        let view = b.get_dashboard(&id).expect("dashboard exists after create");
         assert_eq!(view.name, "ops");
         assert_eq!(view.content, "layout-v1");
 
-        b.update_dashboard(id, "alice", "ops", "layout-v2");
-        let updated = b.get_dashboard(id).expect("dashboard exists after update");
+        b.update_dashboard(&id, "alice", "ops", "layout-v2");
+        let updated = b.get_dashboard(&id).expect("dashboard exists after update");
         assert_eq!(updated.content, "layout-v2");
 
-        b.delete_dashboard(id, "alice");
+        b.delete_dashboard(&id, "alice");
         assert!(
-            b.get_dashboard(id).is_none(),
+            b.get_dashboard(&id).is_none(),
             "deleted dashboard resolves to None"
         );
     }
@@ -748,7 +755,7 @@ mod tests {
             "streaming tip advanced on create"
         );
         let tip_after_create = b.dashboard_tip();
-        b.update_dashboard(id, "alice", "d", "c2");
+        b.update_dashboard(&id, "alice", "d", "c2");
         assert_ne!(
             b.dashboard_tip(),
             tip_after_create,
@@ -839,9 +846,12 @@ mod tests {
         let mut b = ObservabilityBuilders::new();
         let trace = CorrelationId("trace-1".to_string());
         let span = b.ingest(SignalKind::TraceSpan, b"span=root".to_vec(), 0);
-        b.register_correlation(span, Some(trace.clone()), BTreeSet::new());
+        b.register_correlation(span.clone(), Some(trace.clone()), BTreeSet::new());
 
-        assert_eq!(b.trace_get(span).expect("span exists").payload, "span=root");
+        assert_eq!(
+            b.trace_get(&span).expect("span exists").payload,
+            "span=root"
+        );
         assert_eq!(b.trace_search(Some("root")).len(), 1);
         let graph = b.trace_graph(&trace);
         assert!(graph.signals.contains(&span));
@@ -854,8 +864,8 @@ mod tests {
         let mut b = ObservabilityBuilders::new();
         let id = b.ingest(SignalKind::ProfileSample, b"main;work;sleep".to_vec(), 0);
 
-        assert!(b.profile_get(id).is_some());
-        let flame = b.profile_flame(id).expect("sample exists");
+        assert!(b.profile_get(&id).is_some());
+        let flame = b.profile_flame(&id).expect("sample exists");
         assert_eq!(flame, vec!["main", "work", "sleep"]);
         assert_eq!(b.profile_top(5).len(), 1);
     }

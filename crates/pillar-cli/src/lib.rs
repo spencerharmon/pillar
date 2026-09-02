@@ -237,7 +237,7 @@ impl Platform {
 
         self.store.insert(content_hash.clone(), envelope);
         self.applied.push(content_hash.clone());
-        self.applied_events.push(event);
+        self.applied_events.push(event.clone());
 
         Ok(Applied {
             event,
@@ -329,7 +329,7 @@ impl Platform {
             .rev()
             .find_map(|(hash, ev)| {
                 let env = self.store.get(hash)?;
-                (ResourceKey::of(env.body()) == *key).then_some(*ev)
+                (ResourceKey::of(env.body()) == *key).then_some(ev.clone())
             })
     }
 
@@ -800,7 +800,7 @@ mod tests {
 
     // The log is private; expose a tiny read helper just for the test.
     fn p_get_event(p: &Platform, id: EventId) -> pillar_eventlog::Event {
-        p.log.get(id).expect("event exists").clone()
+        p.log.get(&id).expect("event exists").clone()
     }
 
     #[test]

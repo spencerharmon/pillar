@@ -46,10 +46,40 @@ pub enum SignalKind {
 }
 
 /// A signal's content-addressed identity — its `EventId` in the spec, derived
-/// purely from its payload bytes via the SAME content-addressing the op-log
-/// uses, so two nodes holding the same signal agree on its id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SignalId(pub u64);
+/// purely from its payload bytes via the SAME real cryptographic
+/// content-addressing (SHA2-256 multihash) the op-log uses, so two nodes
+/// holding the same signal agree on its id and no adversary can forge a
+/// distinct payload sharing it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SignalId(pub pillar_streamdb::OpId);
+
+impl SignalId {
+    /// The raw multihash bytes of this content address.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// A deterministic test-only content address derived from a numeric seed —
+    /// a real SHA2-256 multihash of the seed bytes, so tests get distinct,
+    /// stable ids without hand-constructing a placeholder integer id.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_test_seed(seed: u64) -> Self {
+        SignalId(pillar_streamdb::OpId(content_address(&seed.to_le_bytes())))
+    }
+}
+
+impl PartialOrd for SignalId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SignalId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
 
 /// A single observability signal event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +103,7 @@ impl Signal {
         retention_window: u64,
     ) -> Self {
         let payload = payload.into();
-        let id = SignalId(content_address(&payload));
+        let id = SignalId(pillar_streamdb::OpId(content_address(&payload)));
         Signal {
             id,
             kind,
@@ -85,7 +115,7 @@ impl Signal {
     /// The signal's content address.
     #[must_use]
     pub fn id(&self) -> SignalId {
-        self.id
+        self.id.clone()
     }
 
     /// The signal's kind.
@@ -165,8 +195,8 @@ impl TimeseriesBlock {
 
     /// Whether the block holds `id`.
     #[must_use]
-    pub fn contains(&self, id: SignalId) -> bool {
-        self.signals.contains_key(&id)
+    pub fn contains(&self, id: &SignalId) -> bool {
+        self.signals.contains_key(id)
     }
 
     /// The maximum retention deadline over every event in this block — the
@@ -198,7 +228,7 @@ impl TimeseriesBlock {
             return false;
         }
         self.latest_expiry = self.latest_expiry.max(signal.expiry);
-        self.signals.entry(signal.id).or_insert(signal);
+        self.signals.entry(signal.id.clone()).or_insert(signal);
         if self.signals.len() >= self.capacity {
             self.sealed = true;
         }
@@ -274,9 +304,9 @@ impl TimeseriesStore {
         write_tick: u64,
     ) -> SignalId {
         let signal = Signal::new(kind, payload, write_tick, self.retention_window);
-        let id = signal.id;
+        let id = signal.id.clone();
         let expiry = signal.expiry;
-        self.written.entry(id).or_insert(expiry);
+        self.written.entry(id.clone()).or_insert(expiry);
         if !self.open.admit(signal.clone()) {
             // Current block was sealed/full: retire it and open a fresh one.
             let full = std::mem::replace(&mut self.open, TimeseriesBlock::new(self.block_capacity));
@@ -291,14 +321,14 @@ impl TimeseriesStore {
 
     /// Whether `id` is currently materialized (held in some block).
     #[must_use]
-    pub fn contains(&self, id: SignalId) -> bool {
+    pub fn contains(&self, id: &SignalId) -> bool {
         self.open.contains(id) || self.sealed.iter().any(|b| b.contains(id))
     }
 
     /// Whether `id` was ever written into this store (grow-only ghost).
     #[must_use]
-    pub fn was_written(&self, id: SignalId) -> bool {
-        self.written.contains_key(&id)
+    pub fn was_written(&self, id: &SignalId) -> bool {
+        self.written.contains_key(id)
     }
 
     /// Total signals currently held across every block.
@@ -339,8 +369,8 @@ impl TimeseriesStore {
     /// The retention deadline set for a written signal, if any (the spec's
     /// `expiry[e]`).
     #[must_use]
-    pub fn expiry_of(&self, id: SignalId) -> Option<u64> {
-        self.written.get(&id).copied()
+    pub fn expiry_of(&self, id: &SignalId) -> Option<u64> {
+        self.written.get(id).copied()
     }
 }
 
@@ -370,10 +400,10 @@ mod tests {
         let a = store.write(SignalKind::Log, b"a".to_vec(), 0);
         let b = store.write(SignalKind::Log, b"b".to_vec(), 1);
         for id in store.held_ids() {
-            assert!(store.was_written(id));
+            assert!(store.was_written(&id));
         }
-        assert!(store.was_written(a));
-        assert!(store.was_written(b));
+        assert!(store.was_written(&a));
+        assert!(store.was_written(&b));
     }
 
     /// `Compact` guard: a sealed block is NOT droppable before the clock has
@@ -385,11 +415,11 @@ mod tests {
         let id = store.write(SignalKind::Metric, b"x".to_vec(), 0);
         store.write(SignalKind::Metric, b"open".to_vec(), 0); // opens fresh block
         assert_eq!(store.sealed_block_count(), 1);
-        assert_eq!(store.expiry_of(id), Some(10));
+        assert_eq!(store.expiry_of(&id), Some(10));
 
         // Before expiry (tick 9 < 10): nothing dropped, event still present.
         assert_eq!(store.compact(9), 0);
-        assert!(store.contains(id));
+        assert!(store.contains(&id));
     }
 
     /// `NoLossBeforeExpiry` corollary: once (and only once) the clock passes a
@@ -400,15 +430,15 @@ mod tests {
         let mut store = TimeseriesStore::new(1, 10);
         let id = store.write(SignalKind::Metric, b"x".to_vec(), 0);
         store.write(SignalKind::Metric, b"open".to_vec(), 0);
-        assert!(store.contains(id));
+        assert!(store.contains(&id));
 
         // At tick 10 (>= expiry 10) the sealed block is compactable.
         let dropped = store.compact(10);
         assert_eq!(dropped, 1);
-        assert!(!store.contains(id));
+        assert!(!store.contains(&id));
         // But it was still genuinely written — retention drops, never rewrites
         // history.
-        assert!(store.was_written(id));
+        assert!(store.was_written(&id));
     }
 
     /// The open block is never compacted — its events may not have expired and
@@ -419,7 +449,7 @@ mod tests {
         let id = store.write(SignalKind::Log, b"live".to_vec(), 0);
         // Far past the retention window, but the block never sealed.
         assert_eq!(store.compact(1000), 0);
-        assert!(store.contains(id));
+        assert!(store.contains(&id));
     }
 
     /// Retention is implemented; resampling is explicitly deferred — the note

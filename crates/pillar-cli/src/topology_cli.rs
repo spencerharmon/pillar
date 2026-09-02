@@ -514,7 +514,7 @@ mod tests {
 
         // The emitted events are authentic (signed by the actor).
         let tip = cli.log.tip(&Author("op".to_owned())).expect("has a tip");
-        let ev = cli.log.get(tip).expect("event exists");
+        let ev = cli.log.get(&tip).expect("event exists");
         assert!(ev.is_authentic());
         assert_eq!(ev.content().author().0, "op");
 

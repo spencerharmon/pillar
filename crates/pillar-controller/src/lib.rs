@@ -327,7 +327,7 @@ impl WorkloadSpec {
     /// The content address of the OCI image to run.
     #[must_use]
     pub fn image(&self) -> BlobDigest {
-        self.image
+        self.image.clone()
     }
 
     /// The workload's side-effect class.
@@ -347,7 +347,10 @@ impl WorkloadSpec {
         };
         format!(
             "{}\n{}\n{}\n{}",
-            self.name, self.target_node.0, self.image.0, effect
+            self.name,
+            self.target_node.0,
+            blobdigest_to_hex(&self.image),
+            effect
         )
         .into_bytes()
     }
@@ -365,9 +368,7 @@ impl WorkloadSpec {
         let target = lines.next().ok_or(SpecDecodeError::MissingField)?;
         let image = lines.next().ok_or(SpecDecodeError::MissingField)?;
         let effect = lines.next().ok_or(SpecDecodeError::MissingField)?;
-        let image = image
-            .parse::<u64>()
-            .map_err(|_| SpecDecodeError::InvalidDigest)?;
+        let image = blobdigest_from_hex(image).ok_or(SpecDecodeError::InvalidDigest)?;
         let effect = match effect {
             "exclusive" => SideEffect::Exclusive,
             "convergent" => SideEffect::Convergent,
@@ -376,10 +377,40 @@ impl WorkloadSpec {
         Ok(WorkloadSpec {
             name: name.to_owned(),
             target_node: NodeId(target.to_owned()),
-            image: BlobDigest(image),
+            image,
             effect,
         })
     }
+}
+
+/// Hex-encode a [`BlobDigest`]'s multihash bytes for the canonical wire form.
+fn blobdigest_to_hex(d: &BlobDigest) -> String {
+    let mut s = String::with_capacity(d.as_bytes().len() * 2);
+    for b in d.as_bytes() {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode a hex-encoded multihash back into a [`BlobDigest`]. Returns `None`
+/// on any non-hex / odd-length input.
+fn blobdigest_from_hex(s: &str) -> Option<BlobDigest> {
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    let raw = s.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let hi = (raw[i] as char).to_digit(16)?;
+        let lo = (raw[i + 1] as char).to_digit(16)?;
+        bytes.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(BlobDigest(pillar_streamdb::OpId(
+        pillar_crypto::ContentId::from_bytes(bytes),
+    )))
 }
 
 /// A [`WorkloadSpec::decode`] failure.
@@ -561,7 +592,7 @@ impl AdmittedFetch {
     /// over the substrate.
     #[must_use]
     pub fn digest(&self) -> BlobDigest {
-        self.0.spec().image
+        self.0.spec().image.clone()
     }
 
     /// The node the workload will run on.
@@ -584,7 +615,7 @@ impl AdmittedFetch {
     /// to the authorized digest.
     pub fn run(self, image_bytes: Vec<u8>) -> Result<RunningWorkload, ReconcileError> {
         let actual = BlobDigest::of(&image_bytes);
-        let expected = self.0.spec().image;
+        let expected = self.0.spec().image.clone();
         if actual != expected {
             return Err(ReconcileError::ImageDigestMismatch { expected, actual });
         }
@@ -629,7 +660,7 @@ impl RunningWorkload {
     /// The content address of the image it is running.
     #[must_use]
     pub fn image(&self) -> BlobDigest {
-        self.image
+        self.image.clone()
     }
 
     /// The verified image bytes it is running.
@@ -741,7 +772,12 @@ mod tests {
         let lease = lease_held_by(&controller.node(), epoch);
 
         let digest = BlobDigest::of(IMAGE);
-        let spec = WorkloadSpec::new("web", controller.node(), digest, SideEffect::Exclusive);
+        let spec = WorkloadSpec::new(
+            "web",
+            controller.node(),
+            digest.clone(),
+            SideEffect::Exclusive,
+        );
 
         let mut stream = Stream::new(); // strict by default
         declare(&mut stream, &spec);
@@ -756,7 +792,7 @@ mod tests {
         // for the integration test's real libp2p fetch) and run it.
         let mut store = BlobStore::new();
         store.insert(IMAGE.to_vec());
-        let bytes = store.get(admitted.digest()).unwrap().to_vec();
+        let bytes = store.get(&admitted.digest()).unwrap().to_vec();
 
         let running = admitted.run(bytes).expect("verified image runs");
         assert_eq!(running.node(), &controller.node());
@@ -879,7 +915,12 @@ mod tests {
         let lease = LeaseRegister::new(3); // nobody holds anything
 
         let digest = BlobDigest::of(IMAGE);
-        let spec = WorkloadSpec::new("replica", controller.node(), digest, SideEffect::Convergent);
+        let spec = WorkloadSpec::new(
+            "replica",
+            controller.node(),
+            digest.clone(),
+            SideEffect::Convergent,
+        );
         let relaxed = Stream::with_policy(pillar_core::ViewPolicy::Relaxed);
         let admitted = controller
             .authorize_fetch(&identity, &caps, &lease, epoch, &relaxed.view(), &spec)

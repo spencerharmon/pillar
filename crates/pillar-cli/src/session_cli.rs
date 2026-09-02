@@ -412,7 +412,7 @@ mod tests {
         let event = cli.revoke("alice", "alice", "s1").unwrap();
         // Exactly one signed event, authored by the caller, and it verifies.
         assert_eq!(cli.log().len(), 1);
-        let signed = cli.log().get(event).unwrap();
+        let signed = cli.log().get(&event).unwrap();
         assert!(signed.is_authentic(), "the revocation event is signed");
         assert_eq!(signed.content().author(), &Author("alice".into()));
 
@@ -439,7 +439,7 @@ mod tests {
 
         // One signed event; a single epoch bump for the whole atomic sweep.
         assert_eq!(cli.log().len(), 1);
-        assert!(cli.log().get(event).unwrap().is_authentic());
+        assert!(cli.log().get(&event).unwrap().is_authentic());
         assert_eq!(
             cli.registry().rev_epoch(),
             epoch_before + 1,
@@ -502,7 +502,7 @@ mod tests {
         let event = cli.revoke("mallory", "bob", "s1").unwrap();
         assert_eq!(cli.log().len(), 1);
         assert_eq!(
-            cli.log().get(event).unwrap().content().author(),
+            cli.log().get(&event).unwrap().content().author(),
             &Author("mallory".into())
         );
         view.refresh(cli.registry());

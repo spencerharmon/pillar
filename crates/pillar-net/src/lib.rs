@@ -959,7 +959,7 @@ mod tests {
         // merge, no overlay-specific transport involved.
         let mut receiver_log = OpLog::new();
         receiver_log.merge(&publisher_log);
-        assert!(receiver_log.contains(op_id));
+        assert!(receiver_log.contains(&op_id));
 
         // The receiver reads the op back out of its materialized order and
         // decodes it to the identical mesh peer record.

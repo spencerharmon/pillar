@@ -2624,6 +2624,7 @@ dependencies = [
  "libp2p",
  "pillar-coordination",
  "pillar-core",
+ "pillar-crypto",
  "pillar-identity",
  "pillar-net",
  "pillar-streamdb",
@@ -2733,6 +2734,7 @@ dependencies = [
  "pillar-core",
  "pillar-streamdb",
  "pillar-wot-authority",
+ "sha2",
 ]
 
 [[package]]
@@ -2773,6 +2775,7 @@ version = "0.0.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
+ "sha2",
 ]
 
 [[package]]

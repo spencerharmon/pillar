@@ -146,13 +146,13 @@ mod tests {
         log
     }
 
-    fn ids(log: &EventLog) -> BTreeSet<u64> {
+    fn ids(log: &EventLog) -> BTreeSet<pillar_eventlog::EventId> {
         let mut out = BTreeSet::new();
         for a in ["alice", "bob"] {
             let author = author(a);
             let mut seq = 0;
             while let Some(ev) = log.event_at(&author, seq) {
-                out.insert(ev.id().0);
+                out.insert(ev.id());
                 seq += 1;
             }
         }

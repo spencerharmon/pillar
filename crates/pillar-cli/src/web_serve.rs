@@ -521,11 +521,11 @@ impl WebAuthContext {
     /// Resolve a previously stored layout by its CID, returning
     /// `(signer, content)`.
     #[must_use]
-    pub fn get_layout(&self, id: OpId) -> Option<(String, String)> {
+    pub fn get_layout(&self, id: &OpId) -> Option<(String, String)> {
         self.layouts
             .order()
             .into_iter()
-            .find(|op| op.id() == id)
+            .find(|op| &op.id() == id)
             .and_then(|op| {
                 let text = String::from_utf8_lossy(op.payload());
                 let mut lines = text.splitn(2, '\n');
@@ -537,7 +537,7 @@ impl WebAuthContext {
 
     /// The streaming tip (Merkle root) of the layout resource log.
     #[must_use]
-    pub fn layout_tip(&self) -> u64 {
+    pub fn layout_tip(&self) -> pillar_streamdb::MerkleRoot {
         self.layouts.root()
     }
 
@@ -613,7 +613,7 @@ impl WebAuthContext {
         signer: &str,
         name: &str,
         spec: &str,
-    ) -> (u64, u64) {
+    ) -> (OpId, pillar_streamdb::MerkleRoot) {
         let cid = self.observability.create_dashboard(signer, name, spec);
         (cid, self.observability.dashboard_tip())
     }
@@ -2076,7 +2076,7 @@ fn dispatch_layout_store(ctx: &mut WebAuthContext, request: &HttpRequest) -> Htt
     text_response(
         200,
         "OK",
-        format!("LAYOUT-CID {} TIP {}", cid.0, ctx.layout_tip()),
+        format!("LAYOUT-CID {} TIP {}", cid, ctx.layout_tip()),
     )
 }
 
@@ -2092,10 +2092,10 @@ fn dispatch_layout_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRespo
     let Some(cid_raw) = query_value(&request.path, "cid") else {
         return text_response(400, "Bad Request", "MISSING cid".to_owned());
     };
-    let Ok(cid) = cid_raw.parse::<u64>() else {
+    let Some(cid) = OpId::from_hex(cid_raw) else {
         return text_response(400, "Bad Request", "BAD cid".to_owned());
     };
-    match ctx.get_layout(OpId(cid)) {
+    match ctx.get_layout(&cid) {
         Some((signer, content)) => {
             text_response(200, "OK", format!("SIGNER {signer}\nCONTENT {content}"))
         }
@@ -3966,13 +3966,7 @@ mod tests {
             "got: {}",
             stored.body
         );
-        let cid: u64 = stored
-            .body
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let cid: String = stored.body.split_whitespace().nth(1).unwrap().to_owned();
         // The streaming tip (Merkle root) advanced once the op was appended.
         assert_ne!(ctx.layout_tip(), tip_before);
 

@@ -626,7 +626,7 @@ impl SealedArtifact {
     /// The content-addressed digest of the sealed ciphertext.
     #[must_use]
     pub fn digest(&self) -> BlobDigest {
-        self.digest
+        self.digest.clone()
     }
 
     /// Whether `node` is currently entitled to fetch and unseal this
@@ -1106,7 +1106,7 @@ mod tests {
     #[test]
     fn sealed_artifact_tracks_digest_and_seal_target() {
         let digest = BlobDigest::of(b"ciphertext-bytes");
-        let sealed = SealedArtifact::new(digest, nodes(&["node-1"]));
+        let sealed = SealedArtifact::new(digest.clone(), nodes(&["node-1"]));
         assert_eq!(sealed.digest(), digest);
         assert!(sealed.is_sealed_to(&NodeId::from("node-1")));
         assert!(!sealed.is_sealed_to(&NodeId::from("node-2")));

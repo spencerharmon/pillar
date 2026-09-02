@@ -61,9 +61,17 @@ fn ops_dir(root: &Path) -> PathBuf {
     root.join("ops")
 }
 
-/// The content-addressed filename of an op: its address as fixed-width hex.
-fn op_filename(id: OpId) -> String {
-    format!("{:016x}", id.0)
+/// The content-addressed filename of an op: its multihash content address as
+/// lowercase hex. The address is a real SHA2-256 multihash (see
+/// [`content_address`]), so the filename is a collision-resistant name — an
+/// adversary cannot craft a distinct payload that lands under the same file.
+fn op_filename(id: &OpId) -> String {
+    let mut s = String::with_capacity(id.as_bytes().len() * 2);
+    for b in id.as_bytes() {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 impl PersistentStream {
@@ -143,11 +151,12 @@ impl PersistentStream {
             })?;
             let addr = content_address(&bytes);
             let expected = entry.file_name().to_string_lossy().into_owned();
-            if op_filename(OpId(addr)) != expected {
+            let actual_id = OpId(addr);
+            if op_filename(&actual_id) != expected {
                 return Err(PersistError::Corrupt {
                     path,
                     expected,
-                    actual: op_filename(OpId(addr)),
+                    actual: op_filename(&actual_id),
                 });
             }
             // Re-appending is idempotent on the CRDT set; policy is not checked
@@ -212,7 +221,7 @@ impl PersistentStream {
     /// Returns [`PersistError::Io`] if any newly merged op cannot be persisted.
     pub fn merge_persistent(&mut self, other: &Stream) -> Result<(), PersistError> {
         for op in other.log().order() {
-            if !self.stream.log().contains(op.id()) {
+            if !self.stream.log().contains(&op.id()) {
                 self.persist_op(op.id(), op.payload())?;
             }
         }
@@ -233,12 +242,12 @@ impl PersistentStream {
     /// partial file under a content address it does not hash to.
     fn persist_op(&self, id: OpId, payload: &[u8]) -> Result<(), PersistError> {
         let ops = ops_dir(&self.root_dir);
-        let final_path = ops.join(op_filename(id));
+        let final_path = ops.join(op_filename(&id));
         // Idempotent: an identical op already persisted needs no rewrite.
         if final_path.exists() {
             return Ok(());
         }
-        let tmp_path = ops.join(format!("{}.tmp", op_filename(id)));
+        let tmp_path = ops.join(format!("{}.tmp", op_filename(&id)));
         fs::write(&tmp_path, payload).map_err(|source| PersistError::Io {
             path: tmp_path.clone(),
             source,
@@ -353,7 +362,7 @@ mod tests {
 
         let reopened = PersistentStream::open(&root).unwrap();
         for id in &ids {
-            assert!(reopened.stream().log().contains(*id));
+            assert!(reopened.stream().log().contains(id));
         }
         assert_eq!(reopened.stream().log().len(), 3);
         assert_eq!(
@@ -383,11 +392,11 @@ mod tests {
             .append(b"payload".to_vec(), SideEffect::Exclusive)
             .unwrap();
 
-        let path = ops_dir(&root).join(op_filename(id));
+        let path = ops_dir(&root).join(op_filename(&id));
         assert!(path.is_file(), "op stored under its content-addressed name");
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes, b"payload");
-        assert_eq!(content_address(&bytes), id.0);
+        assert_eq!(OpId(content_address(&bytes)), id);
 
         fs::remove_dir_all(&root).ok();
     }
@@ -439,8 +448,11 @@ mod tests {
             let mut db = PersistentStream::open(&root).unwrap();
             db.append(b"good".to_vec(), SideEffect::Exclusive).unwrap();
         }
-        // Plant a file named for one address but holding different bytes.
-        let bogus = ops_dir(&root).join(op_filename(OpId(0xdead_beef)));
+        // Plant a file named for one content address but holding different
+        // bytes (bytes that hash to a DIFFERENT address), so its name cannot
+        // match its own content.
+        let wrong_name_id = OpId(content_address(b"some-other-op"));
+        let bogus = ops_dir(&root).join(op_filename(&wrong_name_id));
         fs::write(&bogus, b"not-matching-bytes").unwrap();
 
         let err = PersistentStream::open(&root).unwrap_err();
