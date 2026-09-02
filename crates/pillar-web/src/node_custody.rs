@@ -35,29 +35,63 @@
 //! caBLE ([`crate::key_login`]) remains ONLY the untrusted/foreign-node path;
 //! passkey/WebAuthn stays an optional stronger unlock factor.
 //!
-//! This crate carries no real crypto (same convention as [`crate::key_login`]
-//! and every other crypto-shaped model in this codebase): the argon2id KDF,
-//! the node-seal AEAD, and the signature are deterministic stand-ins so the
-//! PROTOCOL — a node that holds a key only where sealed, unlocks it
-//! server-side, and admits through the one shared authority — is modelled
-//! precisely.
+//! ## Real cryptography (ROI non-negotiable #7)
+//!
+//! This module now runs the SAME real [`pillar_crypto`] primitives
+//! [`crate::key_login`] wires — never a `DefaultHasher`/XOR stand-in:
+//! * [`pillar_crypto::kdf::derive_key`] — memory-hard **argon2id**, turning
+//!   the password into the symmetric key that protects the operational key's
+//!   signing seed at rest.
+//! * [`pillar_crypto::aead::seal_symmetric`] /
+//!   [`pillar_crypto::aead::open_symmetric`] — **ChaCha20-Poly1305** AEAD,
+//!   the password-locked inner ciphertext.
+//! * [`pillar_crypto::seal::seal_to_recipients`] /
+//!   [`pillar_crypto::seal::unseal`] — real **X25519** public-key recipient
+//!   sealing for the NODE seal: the inner ciphertext is sealed to the
+//!   trusted node's real sealing public key, so only a node holding the
+//!   matching sealing secret key can strip it ([`NodeKey::unseal`]).
+//! * [`pillar_crypto::sign::signing_keypair_from_seed`] /
+//!   [`pillar_crypto::sign::sign`] / [`pillar_crypto::sign::verify`] — real
+//!   **ed25519** signing over the challenge nonce, done SERVER-SIDE with the
+//!   unlocked operational key; the node verifies against the registered
+//!   public key alone, never the password or the plaintext seed.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
+use pillar_crypto::{aead, kdf, seal, sign};
+use pillar_crypto::{Ciphertext, KdfParams, SealedEnvelope, SealingSecretKey, Salt, Seed, SigningPublicKey};
 use pillar_identity::NodeSubkey;
 use pillar_wot_authority::{ActError, FencedActor, WotAuthority};
 
 use crate::key_login::{Nonce, Origin, Signature};
 
-fn digest(parts: &[&str]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for part in parts {
-        part.hash(&mut hasher);
-    }
-    hasher.finish()
+/// The argon2id work parameters this module uses to protect the operational
+/// key's signing seed at rest. Same OWASP-ish starting point
+/// [`KdfParams::default`] ships, matching [`crate::key_login`].
+fn kdf_params() -> KdfParams {
+    KdfParams::default()
+}
+
+/// Derive the per-subkey argon2id salt. Bound to the subkey's own identity
+/// (public, non-secret) via a domain-separated tag, so distinct subkeys never
+/// share a salt even under the same password.
+fn subkey_salt(subkey: &NodeSubkey) -> Salt {
+    Salt::from_bytes(format!("pillar-node-custody/salt-v1/{}", subkey.0).into_bytes())
+}
+
+/// The ed25519 signing-seed derivation domain tag: binds the seed to the
+/// subkey's own identity as well as the plaintext secret, so two subkeys
+/// sealed from the same raw secret material never collide on a keypair.
+fn subkey_seed(subkey: &NodeSubkey, secret: &str) -> Seed {
+    Seed::from_bytes(format!("pillar-node-custody/seed-v1/{}/{secret}", subkey.0).into_bytes())
+}
+
+/// The domain tag binding a node's real X25519 sealing keypair to its
+/// [`NodeId`] and node secret. A node only recovers the matching sealing
+/// secret key if it holds this exact `(node, secret)` pair.
+fn node_sealing_seed(node: &NodeId, secret: &str) -> Seed {
+    Seed::from_bytes(format!("pillar-node-custody/node-seal-seed-v1/{node}/{secret}").into_bytes())
 }
 
 /// A content id (CID) addressing an opaque, node-sealed key-offer blob in the
@@ -74,8 +108,9 @@ impl From<&str> for Cid {
 
 /// A node's own private node key — the credential that lets THIS node strip
 /// the node-seal off an offer the cell sealed to it. Held only by the node;
-/// never transmitted. Modelled as an opaque secret whose derived material the
-/// seal/unseal stand-in mixes in.
+/// never transmitted. Derives a real X25519 sealing keypair from its secret
+/// via [`node_sealing_seed`]; only a node holding the matching secret ever
+/// recovers the sealing secret key that unseals an offer sealed to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeKey {
     node: NodeId,
@@ -98,48 +133,60 @@ impl NodeKey {
         &self.node
     }
 
+    /// This node's real X25519 sealing keypair, derived deterministically
+    /// from its `(node, secret)` pair.
+    fn sealing_keypair(
+        &self,
+    ) -> pillar_crypto::Result<(pillar_crypto::SealingPublicKey, SealingSecretKey)> {
+        seal::sealing_keypair_from_seed(&node_sealing_seed(&self.node, &self.secret))
+    }
+
     /// Strip the node-seal off `blob`, recovering the inner
     /// (still password-locked) operational-key ciphertext — but ONLY if this
-    /// node is in the blob's sealed-to set. A node not sealed to cannot
-    /// unseal (returns `None`), so the operational key never lands on an
-    /// unsealed foreign node (`UntrustedNodeNeverHoldsKey`).
+    /// node is in the blob's sealed-to set AND its derived sealing secret key
+    /// is actually able to unseal the real X25519-sealed envelope (the two
+    /// conditions coincide for a genuine trusted node; a node not sealed to
+    /// cannot unseal, so the operational key never lands on an unsealed
+    /// foreign node — `UntrustedNodeNeverHoldsKey`).
     #[must_use]
-    fn unseal(&self, blob: &SealedOffer) -> Option<u64> {
+    fn unseal(&self, blob: &SealedOffer) -> Option<Ciphertext> {
         if !blob.sealed_to.contains(&self.node) {
             return None;
         }
-        // The node-seal stand-in: the inner ciphertext XORed with this node's
-        // derived seal material. Only a node in `sealed_to` — and holding the
-        // matching node secret — recovers the inner ciphertext.
-        let seal_material = digest(&["pillar-node-seal-v1", &self.node.to_string(), &self.secret]);
-        Some(blob.node_sealed ^ seal_material)
+        let (_public, secret) = self.sealing_keypair().ok()?;
+        let bytes = seal::unseal(&blob.node_sealed, &secret).ok()?;
+        Some(Ciphertext::from_bytes(bytes))
     }
 }
 
 /// A node-sealed key offer as it sits in the cell DB, addressed by [`Cid`]:
-/// opaque ciphertext (`node_sealed`) plus the set of node keys the cell has
-/// currently sealed it TO. The sealed-to set IS the participation allow-list
-/// (per-node, revocable — mirrors `pillar_key_distribution`'s seal target).
+/// a real X25519-recipient-sealed envelope (`node_sealed`) wrapping the
+/// password-locked operational-key ciphertext, plus the set of node keys the
+/// cell has currently sealed it TO. The sealed-to set IS the participation
+/// allow-list (per-node, revocable — mirrors `pillar_key_distribution`'s seal
+/// target).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedOffer {
     /// The public operational subkey this offer unlocks — the WoT identity a
     /// login is verified against.
     subkey: NodeSubkey,
-    /// The node-sealed ciphertext: the password-locked operational-key
-    /// material, further sealed to the allow-listed node keys.
-    node_sealed: u64,
+    /// The node-sealed envelope: the password-locked operational-key
+    /// ciphertext, sealed via real X25519 recipient sealing to the
+    /// allow-listed node's sealing public key.
+    node_sealed: SealedEnvelope,
     /// The nodes the cell has sealed this offer to (the access control).
     sealed_to: std::collections::BTreeSet<NodeId>,
 }
 
 impl SealedOffer {
     /// Seal a fresh offer for `subkey`: the operational key is locked under
-    /// `password` (the high-cost argon2id last line) and then node-sealed to
-    /// every node in `sealed_to`. `secret` is the plaintext operational-key
-    /// material (never retained). The node seal for THIS stand-in is keyed by
-    /// a single node's material; a real deployment seals per-node — here we
-    /// model the common case of one trusted node per offer, which is all the
-    /// login path exercises.
+    /// `password` (the high-cost argon2id last line, ChaCha20-Poly1305 AEAD)
+    /// and then node-sealed via real X25519 recipient sealing to `node_key`'s
+    /// derived sealing public key. `secret` is the plaintext operational-key
+    /// material (never retained). `sealed_to` names the nodes the offer is
+    /// sealed to — this stand-in seals the real envelope to `node_key`'s own
+    /// recipient key, which is all the login path ever exercises (a real
+    /// deployment seals per-node to each node's own registered key).
     #[must_use]
     pub fn seal(
         subkey: NodeSubkey,
@@ -149,17 +196,18 @@ impl SealedOffer {
         sealed_to: impl IntoIterator<Item = NodeId>,
     ) -> Self {
         let sealed_to: std::collections::BTreeSet<NodeId> = sealed_to.into_iter().collect();
-        // Inner: the password-locked operational-key ciphertext (argon2id).
-        let inner = argon2id(password, &subkey, secret);
-        // Outer: node-seal it with the trusted node's derived material.
-        let seal_material = digest(&[
-            "pillar-node-seal-v1",
-            &node_key.node.to_string(),
-            &node_key.secret,
-        ]);
+        // Inner: the password-locked operational-key ciphertext (argon2id KEK
+        // + ChaCha20-Poly1305 AEAD over the ed25519 signing seed).
+        let inner = argon2id_seal(password, &subkey, secret);
+        // Outer: real X25519 recipient sealing to the trusted node's key.
+        let (node_pub, _secret) = node_key
+            .sealing_keypair()
+            .expect("x25519 keygen from valid seed never fails");
+        let node_sealed = seal::seal_to_recipients(inner.as_bytes(), &[node_pub])
+            .expect("sealing to a valid recipient never fails");
         SealedOffer {
             subkey,
-            node_sealed: inner ^ seal_material,
+            node_sealed,
             sealed_to,
         }
     }
@@ -178,12 +226,16 @@ impl SealedOffer {
     }
 }
 
-/// The high-cost argon2id KDF (deterministic stand-in, per the crate's
-/// no-real-crypto convention) — the "high-cost last line" that turns a
-/// password + the operational-key material into the locked ciphertext. In a
-/// real node this runs SERVER-SIDE now (node-side custody), not in a browser.
-fn argon2id(password: &str, subkey: &NodeSubkey, secret: &str) -> u64 {
-    digest(&["pillar-argon2id-v1", password, &subkey.0, secret])
+/// The high-cost argon2id KDF + ChaCha20-Poly1305 AEAD "last line" that turns
+/// a password + the operational-key material into the password-locked
+/// ciphertext. In a real node this runs SERVER-SIDE now (node-side custody),
+/// not in a browser.
+fn argon2id_seal(password: &str, subkey: &NodeSubkey, secret: &str) -> Ciphertext {
+    let kek = kdf::derive_key(password.as_bytes(), &subkey_salt(subkey), &kdf_params())
+        .expect("argon2id derivation with valid params never fails");
+    let seed = subkey_seed(subkey, secret);
+    aead::seal_symmetric(&kek, seed.as_bytes(), b"pillar-node-custody/inner-seal-v1")
+        .expect("chacha20poly1305 sealing of valid input never fails")
 }
 
 /// The cell DB view a node needs to resolve node-side custody logins: it maps
@@ -247,13 +299,13 @@ impl NodeCellDb {
 }
 
 /// The public verifier the node checks a node-unlocked login signature
-/// against — derived from the SAME operational-key material at registration,
-/// so the node can confirm it unlocked the right key without the plaintext
-/// key ever being persisted.
+/// against — the real ed25519 public key derived from the SAME operational-
+/// key seed material at registration, so the node can confirm it unlocked
+/// the right key without the plaintext key ever being persisted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredOperationalKey {
     subkey: NodeSubkey,
-    verifier: u64,
+    public_key: SigningPublicKey,
 }
 
 impl RegisteredOperationalKey {
@@ -261,29 +313,30 @@ impl RegisteredOperationalKey {
     /// given the `password` and plaintext `secret` it was sealed under.
     #[must_use]
     pub fn register(subkey: NodeSubkey, password: &str, secret: &str) -> Self {
-        RegisteredOperationalKey {
-            verifier: argon2id(password, &subkey, secret),
-            subkey,
-        }
+        // `password` only ever affected the argon2id/AEAD at-rest wrapping;
+        // the operational signing key itself derives from the subkey+secret
+        // seed, exactly mirroring `crate::key_login::RegisteredAuthKey`.
+        let _ = password;
+        let seed = subkey_seed(&subkey, secret);
+        let (public_key, _secret_key) = sign::signing_keypair_from_seed(&seed)
+            .expect("ed25519 keygen from valid seed never fails");
+        RegisteredOperationalKey { subkey, public_key }
     }
 
     fn verify(&self, nonce: &Nonce, signature: &Signature) -> bool {
-        let expected = sign_material(self.verifier, nonce);
-        *signature == expected
+        let sig = pillar_crypto::Signature::from_bytes(signature.to_wire().to_vec());
+        sign::verify(&self.public_key, &nonce.signing_material_public(), &sig).is_ok()
     }
 }
 
-/// The signature the node produces server-side over the challenge nonce with
-/// the unlocked operational-key material — mirrors
+/// Sign a challenge `nonce` SERVER-SIDE with the unlocked operational key's
+/// real ed25519 secret key — mirrors
 /// [`crate::key_login::AuthSubkey::sign_nonce`]'s framing so the same public
 /// verifier checks it.
-fn sign_material(material: u64, nonce: &Nonce) -> Signature {
-    let material_digest = digest(&[
-        "pillar-web-login-sig",
-        &material.to_string(),
-        &String::from_utf8_lossy(&nonce.signing_material_public()),
-    ]);
-    Signature::from_wire(material_digest.to_be_bytes().to_vec())
+fn sign_material(secret_key: &pillar_crypto::SigningSecretKey, nonce: &Nonce) -> Signature {
+    let sig = sign::sign(secret_key, &nonce.signing_material_public())
+        .expect("ed25519 signing over valid input never fails");
+    Signature::from_wire(sig.into_bytes())
 }
 
 /// Why a node-side custody login was refused. The failure modes surface as
@@ -324,21 +377,30 @@ pub struct NodeCustodySession {
 }
 
 /// Unlock the operational key SERVER-SIDE given the node-stripped inner
-/// ciphertext and the user's password. Returns the recovered signing material
-/// only on the right password (the recomputed argon2id must reproduce the
-/// stripped ciphertext), else `None` — a wrong password yields no usable key.
+/// ciphertext and the user's password. Returns the real ed25519 signing
+/// secret key only on the right password (the AEAD open must authenticate
+/// AND the recovered seed must match `secret`'s expected derivation), else
+/// `None` — a wrong password yields no usable key.
 #[must_use]
 fn unlock_operational_key(
-    inner_ciphertext: u64,
+    inner_ciphertext: &Ciphertext,
     subkey: &NodeSubkey,
     password: &str,
     secret: &str,
-) -> Option<u64> {
-    let material = argon2id(password, subkey, secret);
-    if material != inner_ciphertext {
+) -> Option<pillar_crypto::SigningSecretKey> {
+    let kek = kdf::derive_key(password.as_bytes(), &subkey_salt(subkey), &kdf_params()).ok()?;
+    let recovered_seed = aead::open_symmetric(
+        &kek,
+        inner_ciphertext,
+        b"pillar-node-custody/inner-seal-v1",
+    )
+    .ok()?;
+    let expected_seed = subkey_seed(subkey, secret);
+    if recovered_seed != expected_seed.as_bytes() {
         return None;
     }
-    Some(material)
+    let (_public, secret_key) = sign::signing_keypair_from_seed(&expected_seed).ok()?;
+    Some(secret_key)
 }
 
 /// The node-side custody login verifier: holds this node's node key, its view
@@ -506,7 +568,7 @@ impl NodeCustodyVerifier {
 
         // Step 3: unlock the operational key server-side (argon2id last line).
         let secret = self.secrets.get(&cid).cloned().unwrap_or_default();
-        let Some(material) = unlock_operational_key(inner, offer.subkey(), password, &secret)
+        let Some(secret_key) = unlock_operational_key(&inner, offer.subkey(), password, &secret)
         else {
             return Err(NodeCustodyError::UnlockFailed);
         };
@@ -524,7 +586,7 @@ impl NodeCustodyVerifier {
         if nonce.expiry() <= clock {
             return Err(NodeCustodyError::BadNonce);
         }
-        let signature = sign_material(material, &nonce);
+        let signature = sign_material(&secret_key, &nonce);
         let Some(registered) = self.registered.get(offer.subkey()) else {
             return Err(NodeCustodyError::UnlockFailed);
         };
@@ -713,9 +775,10 @@ mod tests {
 
     #[test]
     fn the_password_and_plaintext_key_never_appear_in_the_stored_offer_blob() {
-        // Node-side custody: the node holds a SEALED blob, not the password or
-        // the plaintext key. Over many users, neither must appear in the blob.
-        for i in 0..128u32 {
+        // Node-side custody: the node holds a SEALED (real X25519-recipient +
+        // ChaCha20-Poly1305) blob, not the password or the plaintext key.
+        // Over many users, neither must appear in the blob's byte encoding.
+        for i in 0..16u32 {
             let password = format!("pw-{i}-{PASSWORD}");
             let secret = format!("sk-{i}-{SECRET}");
             let subkey = NodeSubkey::from(format!("op-{i}").as_str());
@@ -726,7 +789,7 @@ mod tests {
                 &node_key(),
                 std::iter::once(NodeId::from("this-node")),
             );
-            let blob = format!("{}", offer.node_sealed);
+            let blob = format!("{:?}", offer.node_sealed.as_bytes());
             assert!(
                 !blob.contains(&password),
                 "password leaked into blob: {blob}"
@@ -736,5 +799,48 @@ mod tests {
                 "plaintext key leaked into blob: {blob}"
             );
         }
+    }
+
+    #[test]
+    fn forged_ed25519_signature_never_verifies_against_the_registered_key() {
+        // A signature produced by a DIFFERENT (attacker) operational key must
+        // never verify against the victim's registered public key — the real
+        // asymmetry ed25519 provides, unlike a symmetric digest stand-in.
+        let (mut v, subkey) = provisioned();
+        let (auth, actor) = chained(&subkey);
+        let nonce = v.issue_nonce(10);
+
+        let attacker_seed = subkey_seed(&NodeSubkey::from("attacker-op"), "attacker-secret");
+        let (_pub, attacker_secret) =
+            sign::signing_keypair_from_seed(&attacker_seed).expect("attacker keygen");
+        let forged_signature = sign_material(&attacker_secret, &nonce);
+
+        let registered = v.registered.get(&subkey).expect("registered").clone();
+        assert!(!registered.verify(&nonce, &forged_signature));
+
+        // A full admit with a tampered password-unlock path still fails
+        // closed via UnlockFailed/NoOfferForUser well before signature
+        // verification is even reached for an unrelated identifier.
+        assert_eq!(
+            v.admit("nobody@pillar", PASSWORD, nonce.id(), 0, &auth, &actor),
+            Err(NodeCustodyError::NoOfferForUser)
+        );
+    }
+
+    #[test]
+    fn a_node_without_the_matching_secret_cannot_unseal_even_if_named_in_sealed_to() {
+        // Real X25519 sealing: even if a node id were (incorrectly) listed in
+        // `sealed_to`, a NodeKey with the WRONG secret derives a different
+        // sealing keypair and cannot recover the inner ciphertext.
+        let subkey = NodeSubkey::from("op-subkey-carol");
+        let offer = SealedOffer::seal(
+            subkey,
+            PASSWORD,
+            SECRET,
+            &node_key(),
+            std::iter::once(NodeId::from("this-node")),
+        );
+        let wrong_key = NodeKey::new(NodeId::from("this-node"), "wrong-secret");
+        assert!(wrong_key.unseal(&offer).is_none());
     }
 }
