@@ -49,7 +49,17 @@
           # `ci` workflow owns fmt/clippy/test.
           doCheck = false;
 
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          # pillar-cli pulls in pillar-crypto transitively (via pillar-core and
+          # friends), whose hardware custody backends link native libraries:
+          #   * tpm2-tss      — TpmCustody via tss-esapi (+ tss-esapi-sys bindgen)
+          #   * hidapi/libusb — PasskeyCustody via ctap-hid-fido2
+          #   * libclang      — bindgen build scripts (tss-esapi-sys, cryptoki-sys)
+          # so the reproducible build needs them even though no hardware is
+          # exercised at build time (only linked).
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.clang ];
+          buildInputs = [ pkgs.tpm2-tss pkgs.hidapi pkgs.libusb1 ];
+
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           meta = {
             description = "pillar node run entrypoint";
