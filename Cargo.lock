@@ -2598,6 +2598,7 @@ dependencies = [
  "pillar-controller",
  "pillar-coordination",
  "pillar-core",
+ "pillar-crypto",
  "pillar-eventlog",
  "pillar-identity",
  "pillar-key-distribution",

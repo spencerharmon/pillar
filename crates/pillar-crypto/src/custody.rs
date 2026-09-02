@@ -2,8 +2,17 @@
 //!
 //! A node unseals offers with its **sealing secret key** ([`crate::seal`]). How
 //! that secret is protected at rest is a pluggable custody backend. The full
-//! set of popular hardware security modules is compiled in by default (max
-//! support); the operator selects one at runtime via the [`Custody`] enum:
+//! set of popular hardware security modules is available; the operator selects
+//! one at runtime via the [`Custody`] enum:
+//!
+//! The hardware backends (TPM / passkey / PKCS#11) are behind the crate's
+//! `tpm` / `passkey` / `pkcs11` Cargo features (all folded into `hsm`) so the
+//! everyday build skips their bindgen crates and native libraries. They are
+//! **off by default but on in every shipped node**: the deploy build runs
+//! `cargo build -p pillar-cli --features hsm`, so a deployed node carries all
+//! of them. When a backend's feature is not compiled in, its
+//! [`load_sealing_secret`](NodeCustody::load_sealing_secret) fails closed with
+//! [`CryptoError::Backend`] rather than silently returning a bogus secret.
 //!
 //! * [`UnencryptedCustody`] — plaintext on disk (operator-approved for node
 //!   keys).
@@ -33,7 +42,9 @@
 //! are compiled by CI and validated by the operator against real hardware.
 
 use crate::error::{CryptoError, Result};
-use crate::types::{Ciphertext, CustodyKind, KdfParams, Salt, SealingSecretKey, SymmetricKey};
+#[cfg(any(test, feature = "passkey"))]
+use crate::types::SymmetricKey;
+use crate::types::{Ciphertext, CustodyKind, KdfParams, Salt, SealingSecretKey};
 
 /// AEAD associated-data domain separator for custody-wrapped node secrets.
 const CUSTODY_AAD: &[u8] = b"pillar-node-custody-v1";
@@ -42,6 +53,7 @@ const CUSTODY_AAD: &[u8] = b"pillar-node-custody-v1";
 /// hardware-released secret (e.g. a FIDO2 `hmac-secret` output) into a
 /// key-encryption key bound to a purpose, so the same device secret can never
 /// be reused verbatim across domains.
+#[cfg(any(test, feature = "passkey"))]
 fn hkdf32(domain: &[u8], salt: &[u8], ikm: &[u8]) -> [u8; 32] {
     use hkdf::Hkdf;
     use sha2::Sha256;
@@ -57,6 +69,7 @@ fn hkdf32(domain: &[u8], salt: &[u8], ikm: &[u8]) -> [u8; 32] {
 /// key released by a hardware backend. Pure — this is the CI-testable half of
 /// the passkey / HSM flows. A wrong KEK fails the AEAD tag and returns an error
 /// (fail-closed), never a bogus secret.
+#[cfg(any(test, feature = "passkey"))]
 fn unwrap_with_kek(kek: [u8; 32], wrapped: &Ciphertext) -> Result<SealingSecretKey> {
     let key = SymmetricKey::from_bytes(kek.to_vec());
     let secret = crate::aead::open_symmetric(&key, wrapped, CUSTODY_AAD)?;
@@ -65,6 +78,7 @@ fn unwrap_with_kek(kek: [u8; 32], wrapped: &Ciphertext) -> Result<SealingSecretK
 
 /// Map a hardware/library error into a crate error without leaking the concrete
 /// dependency type into the public surface.
+#[cfg(any(feature = "tpm", feature = "passkey", feature = "pkcs11"))]
 fn backend_err(context: &str, e: impl core::fmt::Display) -> CryptoError {
     CryptoError::Backend(format!("{context}: {e}"))
 }
@@ -167,45 +181,56 @@ impl NodeCustody for TpmCustody {
             ));
         }
 
-        use std::str::FromStr;
-        use tss_esapi::handles::{PersistentTpmHandle, TpmHandle};
-        use tss_esapi::structures::{Auth, Private, Public};
-        use tss_esapi::traits::UnMarshall;
-        use tss_esapi::{Context, TctiNameConf};
+        #[cfg(not(feature = "tpm"))]
+        {
+            Err(CryptoError::Backend(
+                "tpm: TPM custody support was not compiled in (build with the \"tpm\" feature)"
+                    .into(),
+            ))
+        }
 
-        let tcti = if self.tcti.is_empty() {
-            TctiNameConf::from_environment_variable()
-                .map_err(|e| backend_err("tpm: tcti from env", e))?
-        } else {
-            TctiNameConf::from_str(&self.tcti).map_err(|e| backend_err("tpm: tcti", e))?
-        };
-        let mut ctx = Context::new(tcti).map_err(|e| backend_err("tpm: context", e))?;
+        #[cfg(feature = "tpm")]
+        {
+            use std::str::FromStr;
+            use tss_esapi::handles::{PersistentTpmHandle, TpmHandle};
+            use tss_esapi::structures::{Auth, Private, Public};
+            use tss_esapi::traits::UnMarshall;
+            use tss_esapi::{Context, TctiNameConf};
 
-        let persistent = PersistentTpmHandle::new(self.parent_handle)
-            .map_err(|e| backend_err("tpm: parent handle", e))?;
-        let parent_object = ctx
-            .tr_from_tpm_public(TpmHandle::Persistent(persistent))
-            .map_err(|e| backend_err("tpm: resolve parent", e))?;
+            let tcti = if self.tcti.is_empty() {
+                TctiNameConf::from_environment_variable()
+                    .map_err(|e| backend_err("tpm: tcti from env", e))?
+            } else {
+                TctiNameConf::from_str(&self.tcti).map_err(|e| backend_err("tpm: tcti", e))?
+            };
+            let mut ctx = Context::new(tcti).map_err(|e| backend_err("tpm: context", e))?;
 
-        let public = Public::unmarshall(&self.sealed_public)
-            .map_err(|e| backend_err("tpm: unmarshall public", e))?;
-        let private = Private::try_from(self.sealed_private.clone())
-            .map_err(|e| backend_err("tpm: private", e))?;
-        let auth = self.auth.clone();
+            let persistent = PersistentTpmHandle::new(self.parent_handle)
+                .map_err(|e| backend_err("tpm: parent handle", e))?;
+            let parent_object = ctx
+                .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+                .map_err(|e| backend_err("tpm: resolve parent", e))?;
 
-        let secret: Vec<u8> = ctx
-            .execute_with_nullauth_session(|ctx| {
-                let object = ctx.load(parent_object.into(), private.clone(), public.clone())?;
-                if !auth.is_empty() {
-                    let auth_value = Auth::try_from(auth.clone())?;
-                    ctx.tr_set_auth(object.into(), auth_value)?;
-                }
-                let sensitive = ctx.unseal(object.into())?;
-                Ok::<Vec<u8>, tss_esapi::Error>(sensitive.value().to_vec())
-            })
-            .map_err(|e| backend_err("tpm: unseal", e))?;
+            let public = Public::unmarshall(&self.sealed_public)
+                .map_err(|e| backend_err("tpm: unmarshall public", e))?;
+            let private = Private::try_from(self.sealed_private.clone())
+                .map_err(|e| backend_err("tpm: private", e))?;
+            let auth = self.auth.clone();
 
-        Ok(SealingSecretKey::from_bytes(secret))
+            let secret: Vec<u8> = ctx
+                .execute_with_nullauth_session(|ctx| {
+                    let object = ctx.load(parent_object.into(), private.clone(), public.clone())?;
+                    if !auth.is_empty() {
+                        let auth_value = Auth::try_from(auth.clone())?;
+                        ctx.tr_set_auth(object.into(), auth_value)?;
+                    }
+                    let sensitive = ctx.unseal(object.into())?;
+                    Ok::<Vec<u8>, tss_esapi::Error>(sensitive.value().to_vec())
+                })
+                .map_err(|e| backend_err("tpm: unseal", e))?;
+
+            Ok(SealingSecretKey::from_bytes(secret))
+        }
     }
 }
 
@@ -238,45 +263,58 @@ impl NodeCustody for PasskeyCustody {
             return Err(CryptoError::Backend("passkey: no credential id".into()));
         }
 
-        use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Extension;
-        use ctap_hid_fido2::fidokey::GetAssertionArgsBuilder;
-        use ctap_hid_fido2::{Cfg, FidoKeyHidFactory};
+        #[cfg(not(feature = "passkey"))]
+        {
+            Err(CryptoError::Backend(
+                "passkey: FIDO2 custody support was not compiled in (build with the \"passkey\" \
+                 feature)"
+                    .into(),
+            ))
+        }
 
-        let device = FidoKeyHidFactory::create(&Cfg::init())
-            .map_err(|e| backend_err("passkey: open authenticator", e))?;
+        #[cfg(feature = "passkey")]
+        {
+            use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Extension;
+            use ctap_hid_fido2::fidokey::GetAssertionArgsBuilder;
+            use ctap_hid_fido2::{Cfg, FidoKeyHidFactory};
 
-        // The assertion challenge only needs to be present; we consume the
-        // hmac-secret output, not the signature, so a domain-bound deterministic
-        // challenge avoids pulling in an RNG while staying credential-specific.
-        let challenge = hkdf32(
-            b"pillar-crypto/custody/passkey/challenge-v1",
-            &self.credential_id,
-            &self.prf_salt,
-        );
+            let device = FidoKeyHidFactory::create(&Cfg::init())
+                .map_err(|e| backend_err("passkey: open authenticator", e))?;
 
-        let args = GetAssertionArgsBuilder::new(&self.rp_id, &challenge)
-            .credential_id(&self.credential_id)
-            .extensions(&[Extension::HmacSecret(Some(self.prf_salt))])
-            .build();
-        let assertions = device
-            .get_assertion_with_args(&args)
-            .map_err(|e| backend_err("passkey: get assertion", e))?;
+            // The assertion challenge only needs to be present; we consume the
+            // hmac-secret output, not the signature, so a domain-bound
+            // deterministic challenge avoids pulling in an RNG while staying
+            // credential-specific.
+            let challenge = hkdf32(
+                b"pillar-crypto/custody/passkey/challenge-v1",
+                &self.credential_id,
+                &self.prf_salt,
+            );
 
-        let output = assertions
-            .iter()
-            .flat_map(|a| a.extensions.iter())
-            .find_map(|e| match e {
-                Extension::HmacSecret(Some(o)) => Some(*o),
-                _ => None,
-            })
-            .ok_or_else(|| CryptoError::Backend("passkey: no hmac-secret output".into()))?;
+            let args = GetAssertionArgsBuilder::new(&self.rp_id, &challenge)
+                .credential_id(&self.credential_id)
+                .extensions(&[Extension::HmacSecret(Some(self.prf_salt))])
+                .build();
+            let assertions = device
+                .get_assertion_with_args(&args)
+                .map_err(|e| backend_err("passkey: get assertion", e))?;
 
-        let kek = hkdf32(
-            b"pillar-crypto/custody/passkey/kek-v1",
-            &self.prf_salt,
-            &output,
-        );
-        unwrap_with_kek(kek, &self.wrapped)
+            let output = assertions
+                .iter()
+                .flat_map(|a| a.extensions.iter())
+                .find_map(|e| match e {
+                    Extension::HmacSecret(Some(o)) => Some(*o),
+                    _ => None,
+                })
+                .ok_or_else(|| CryptoError::Backend("passkey: no hmac-secret output".into()))?;
+
+            let kek = hkdf32(
+                b"pillar-crypto/custody/passkey/kek-v1",
+                &self.prf_salt,
+                &output,
+            );
+            unwrap_with_kek(kek, &self.wrapped)
+        }
     }
 }
 
@@ -324,76 +362,88 @@ impl NodeCustody for Pkcs11Custody {
             return Err(CryptoError::Backend("pkcs11: empty wrapped secret".into()));
         }
 
-        use cryptoki::context::{CInitializeArgs, Pkcs11};
-        use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource};
-        use cryptoki::mechanism::{Mechanism, MechanismType};
-        use cryptoki::object::Attribute;
-        use cryptoki::session::UserType;
-        use cryptoki::types::AuthPin;
+        #[cfg(not(feature = "pkcs11"))]
+        {
+            Err(CryptoError::Backend(
+                "pkcs11: PKCS#11 custody support was not compiled in (build with the \"pkcs11\" \
+                 feature)"
+                    .into(),
+            ))
+        }
 
-        let pkcs11 =
-            Pkcs11::new(&self.module_path).map_err(|e| backend_err("pkcs11: load module", e))?;
-        pkcs11
-            .initialize(CInitializeArgs::OsThreads)
-            .map_err(|e| backend_err("pkcs11: initialize", e))?;
+        #[cfg(feature = "pkcs11")]
+        {
+            use cryptoki::context::{CInitializeArgs, Pkcs11};
+            use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource};
+            use cryptoki::mechanism::{Mechanism, MechanismType};
+            use cryptoki::object::Attribute;
+            use cryptoki::session::UserType;
+            use cryptoki::types::AuthPin;
 
-        let slots = pkcs11
-            .get_slots_with_token()
-            .map_err(|e| backend_err("pkcs11: slots", e))?;
-        let slot = match &self.token_label {
-            None => *slots
-                .first()
-                .ok_or_else(|| CryptoError::Backend("pkcs11: no token present".into()))?,
-            Some(label) => {
-                let mut found = None;
-                for s in slots {
-                    if let Ok(info) = pkcs11.get_token_info(s) {
-                        if info.label().trim_end() == label {
-                            found = Some(s);
-                            break;
+            let pkcs11 = Pkcs11::new(&self.module_path)
+                .map_err(|e| backend_err("pkcs11: load module", e))?;
+            pkcs11
+                .initialize(CInitializeArgs::OsThreads)
+                .map_err(|e| backend_err("pkcs11: initialize", e))?;
+
+            let slots = pkcs11
+                .get_slots_with_token()
+                .map_err(|e| backend_err("pkcs11: slots", e))?;
+            let slot = match &self.token_label {
+                None => *slots
+                    .first()
+                    .ok_or_else(|| CryptoError::Backend("pkcs11: no token present".into()))?,
+                Some(label) => {
+                    let mut found = None;
+                    for s in slots {
+                        if let Ok(info) = pkcs11.get_token_info(s) {
+                            if info.label().trim_end() == label {
+                                found = Some(s);
+                                break;
+                            }
                         }
                     }
+                    found.ok_or_else(|| {
+                        CryptoError::Backend(format!("pkcs11: no token labelled {label:?}"))
+                    })?
                 }
-                found.ok_or_else(|| {
-                    CryptoError::Backend(format!("pkcs11: no token labelled {label:?}"))
-                })?
-            }
-        };
+            };
 
-        let session = pkcs11
-            .open_ro_session(slot)
-            .map_err(|e| backend_err("pkcs11: open session", e))?;
-        let pin = AuthPin::new(
-            String::from_utf8(self.pin.clone())
-                .map_err(|e| backend_err("pkcs11: pin encoding", e))?,
-        );
-        session
-            .login(UserType::User, Some(&pin))
-            .map_err(|e| backend_err("pkcs11: login", e))?;
+            let session = pkcs11
+                .open_ro_session(slot)
+                .map_err(|e| backend_err("pkcs11: open session", e))?;
+            let pin = AuthPin::new(
+                String::from_utf8(self.pin.clone())
+                    .map_err(|e| backend_err("pkcs11: pin encoding", e))?,
+            );
+            session
+                .login(UserType::User, Some(&pin))
+                .map_err(|e| backend_err("pkcs11: login", e))?;
 
-        let key = session
-            .find_objects(&[
-                Attribute::Label(self.key_label.clone()),
-                Attribute::Decrypt(true),
-            ])
-            .map_err(|e| backend_err("pkcs11: find key", e))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| CryptoError::Backend("pkcs11: decrypting key not found".into()))?;
+            let key = session
+                .find_objects(&[
+                    Attribute::Label(self.key_label.clone()),
+                    Attribute::Decrypt(true),
+                ])
+                .map_err(|e| backend_err("pkcs11: find key", e))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| CryptoError::Backend("pkcs11: decrypting key not found".into()))?;
 
-        let mechanism = match self.mechanism {
-            Pkcs11Mechanism::RsaOaepSha256 => Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
-                MechanismType::SHA256,
-                PkcsMgfType::MGF1_SHA256,
-                PkcsOaepSource::empty(),
-            )),
-            Pkcs11Mechanism::RsaPkcs1v15 => Mechanism::RsaPkcs,
-        };
+            let mechanism = match self.mechanism {
+                Pkcs11Mechanism::RsaOaepSha256 => Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
+                    MechanismType::SHA256,
+                    PkcsMgfType::MGF1_SHA256,
+                    PkcsOaepSource::empty(),
+                )),
+                Pkcs11Mechanism::RsaPkcs1v15 => Mechanism::RsaPkcs,
+            };
 
-        let secret = session
-            .decrypt(&mechanism, key, &self.wrapped)
-            .map_err(|e| backend_err("pkcs11: decrypt", e))?;
-        Ok(SealingSecretKey::from_bytes(secret))
+            let secret = session
+                .decrypt(&mechanism, key, &self.wrapped)
+                .map_err(|e| backend_err("pkcs11: decrypt", e))?;
+            Ok(SealingSecretKey::from_bytes(secret))
+        }
     }
 }
 

@@ -43,14 +43,18 @@
             lockFile = ./Cargo.lock;
           };
 
-          # Only the pillar-cli `pillar` binary is shipped in the image.
-          cargoBuildFlags = [ "-p" "pillar-cli" "--bin" "pillar" ];
+          # The shipped `pillar` binary (pillar-cli) enables the `hsm` feature so
+          # a deployed node carries EVERY popular hardware custody backend
+          # (TPM / passkey / PKCS#11). The feature is off in the everyday build
+          # (`cargo test --all`, local dev) so that common path skips the bindgen
+          # crates and native libs below; the deployed node opts in here.
+          cargoBuildFlags = [ "-p" "pillar-cli" "--bin" "pillar" "--features" "hsm" ];
           # Workspace-wide test run is out of scope for the image build; CI's
           # `ci` workflow owns fmt/clippy/test.
           doCheck = false;
 
-          # pillar-cli pulls in pillar-crypto transitively (via pillar-core and
-          # friends), whose hardware custody backends link native libraries:
+          # The `hsm` feature (above) links native libraries for the hardware
+          # custody backends in pillar-crypto:
           #   * tpm2-tss      — TpmCustody via tss-esapi (+ tss-esapi-sys bindgen)
           #   * hidapi/libusb — PasskeyCustody via ctap-hid-fido2
           #   * libclang      — bindgen build scripts (tss-esapi-sys, cryptoki-sys)

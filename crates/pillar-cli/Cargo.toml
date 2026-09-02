@@ -29,11 +29,20 @@ pillar-controller = { path = "../pillar-controller" }
 pillar-coordination = { path = "../pillar-coordination" }
 pillar-observability = { path = "../pillar-observability" }
 pillar-cells = { path = "../pillar-cells" }
+pillar-crypto = { path = "../pillar-crypto", default-features = false }
 libp2p = { version = "0.56", features = ["ed25519"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Default keeps the everyday `cargo build -p pillar-cli` / `cargo test --all`
+# fast — no HSM bindgen crates or native libs. The deployed node turns them on:
+# the flake builds `-p pillar-cli --features hsm`, so every shipped `pillar`
+# binary carries every popular hardware custody backend.
+default = []
+hsm = ["pillar-crypto/hsm"]
 
 [dev-dependencies]
 tempfile = "3"
