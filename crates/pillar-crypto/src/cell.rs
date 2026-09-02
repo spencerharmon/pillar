@@ -12,7 +12,7 @@
 //! principal, cell A seals to cell B's [`PrincipalPublic::sealing`] with the
 //! shared [`crate::seal`] operation.
 
-use crate::error::{CryptoError, Result};
+use crate::error::Result;
 use crate::types::{Ciphertext, SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed, SymmetricKey};
 
 /// The symmetric group key of a cell. Encrypts the cell's database records and
@@ -34,8 +34,11 @@ impl CellGroupKey {
 /// Derive a fresh cell group key from seed material (real generation may use a
 /// CSPRNG; a rotation derives a new one).
 pub fn group_key_from_seed(seed: &Seed) -> Result<CellGroupKey> {
-    let _ = seed;
-    Err(CryptoError::NotImplemented("cell::group_key_from_seed"))
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pillar-crypto/cell/group-key/seed-v1");
+    h.update(seed.as_bytes());
+    Ok(CellGroupKey(SymmetricKey::from_bytes(h.finalize().to_vec())))
 }
 
 /// Encrypt a streaming-database record or a broadcast message under the cell
@@ -44,14 +47,12 @@ pub fn group_key_from_seed(seed: &Seed) -> Result<CellGroupKey> {
 /// Contract: [`cell_decrypt`] with the same group key and aad recovers it; a
 /// different group key cannot.
 pub fn cell_encrypt(group: &CellGroupKey, plaintext: &[u8], aad: &[u8]) -> Result<Ciphertext> {
-    let _ = (group, plaintext, aad);
-    Err(CryptoError::NotImplemented("cell::cell_encrypt"))
+    crate::aead::seal_symmetric(&group.0, plaintext, aad)
 }
 
 /// Decrypt a record/broadcast produced by [`cell_encrypt`].
 pub fn cell_decrypt(group: &CellGroupKey, ciphertext: &Ciphertext, aad: &[u8]) -> Result<Vec<u8>> {
-    let _ = (group, ciphertext, aad);
-    Err(CryptoError::NotImplemented("cell::cell_decrypt"))
+    crate::aead::open_symmetric(&group.0, ciphertext, aad)
 }
 
 /// Seal the cell group key to a set of member recipients (node and/or user
@@ -62,8 +63,7 @@ pub fn distribute_group_key(
     group: &CellGroupKey,
     recipients: &[SealingPublicKey],
 ) -> Result<SealedEnvelope> {
-    let _ = (group, recipients);
-    Err(CryptoError::NotImplemented("cell::distribute_group_key"))
+    crate::seal::seal_to_recipients(group.0.as_bytes(), recipients)
 }
 
 /// Recover the cell group key from a sealed distribution using a recipient's
@@ -72,8 +72,8 @@ pub fn recover_group_key(
     sealed: &SealedEnvelope,
     recipient_secret: &SealingSecretKey,
 ) -> Result<CellGroupKey> {
-    let _ = (sealed, recipient_secret);
-    Err(CryptoError::NotImplemented("cell::recover_group_key"))
+    let key = crate::seal::unseal(sealed, recipient_secret)?;
+    Ok(CellGroupKey(SymmetricKey::from_bytes(key)))
 }
 
 #[cfg(test)]

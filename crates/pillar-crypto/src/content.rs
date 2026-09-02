@@ -5,16 +5,29 @@
 //! content address, it is a checksum. The output is opaque multihash bytes so
 //! the digest algorithm (sha256, blake3, …) can change without a format break.
 
-use crate::error::{CryptoError, Result};
+use crate::error::Result;
 use crate::types::ContentId;
+
+/// Multicodec code for SHA2-256 (per the multihash table).
+const SHA2_256_CODE: u8 = 0x12;
+const SHA2_256_LEN: u8 = 32;
 
 /// Compute the content address of `bytes`.
 ///
 /// Contract: deterministic; distinct inputs yield distinct addresses (collision
 /// resistance); a single-bit change flips the address; at least 32 bytes wide.
+///
+/// The output is a self-describing multihash: `<code><len><digest>`, so the
+/// digest algorithm can change (sha256 -> blake3, …) without a format break at
+/// the call site. Today it wraps a real SHA2-256 (256-bit, collision-resistant).
 pub fn content_address(bytes: &[u8]) -> Result<ContentId> {
-    let _ = bytes;
-    Err(CryptoError::NotImplemented("content::content_address"))
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = Vec::with_capacity(2 + digest.len());
+    out.push(SHA2_256_CODE);
+    out.push(SHA2_256_LEN);
+    out.extend_from_slice(&digest);
+    Ok(ContentId::from_bytes(out))
 }
 
 #[cfg(test)]

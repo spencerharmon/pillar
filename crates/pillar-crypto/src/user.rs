@@ -16,7 +16,9 @@
 //!   ACROSS cells identically, since sealing is independent of cell membership.
 
 use crate::cell::CellGroupKey;
-use crate::error::{CryptoError, Result};
+use crate::error::Result;
+#[cfg(test)]
+use crate::error::CryptoError;
 use crate::principal::PrincipalPublic;
 use crate::types::{
     Ciphertext, CellId, SealedEnvelope, SealingSecretKey, Signature, SigningPublicKey,
@@ -41,6 +43,20 @@ pub struct SignedDirectMessage {
     pub signature: Signature,
 }
 
+/// Build the canonical message a subkey certificate signs: a domain-separated
+/// binding of the subkey's public material to the cell it is valid in.
+fn subkey_cert_message(subkey: &PrincipalPublic, cell: &CellId) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(b"pillar-crypto/user/subkey-cert-v1");
+    m.extend_from_slice(&(subkey.signing.as_bytes().len() as u32).to_be_bytes());
+    m.extend_from_slice(subkey.signing.as_bytes());
+    m.extend_from_slice(&(subkey.sealing.as_bytes().len() as u32).to_be_bytes());
+    m.extend_from_slice(subkey.sealing.as_bytes());
+    m.extend_from_slice(&(cell.as_bytes().len() as u32).to_be_bytes());
+    m.extend_from_slice(cell.as_bytes());
+    m
+}
+
 /// Certify a per-cell subkey under the user's master signing key: the master
 /// signs the subkey's public material bound to `cell`.
 ///
@@ -51,8 +67,8 @@ pub fn certify_subkey(
     subkey: &PrincipalPublic,
     cell: &CellId,
 ) -> Result<Signature> {
-    let _ = (master_signing_secret, subkey, cell);
-    Err(CryptoError::NotImplemented("user::certify_subkey"))
+    let msg = subkey_cert_message(subkey, cell);
+    crate::sign::sign(master_signing_secret, &msg)
 }
 
 /// Verify a subkey certificate against the user's master public key.
@@ -67,8 +83,8 @@ pub fn verify_subkey(
     cell: &CellId,
     cert: &Signature,
 ) -> Result<()> {
-    let _ = (master_signing_public, subkey, cell, cert);
-    Err(CryptoError::NotImplemented("user::verify_subkey"))
+    let msg = subkey_cert_message(subkey, cell);
+    crate::sign::verify(master_signing_public, &msg, cert)
 }
 
 /// Sign `plaintext` with the sender's (subkey) signing secret and encrypt it
@@ -78,8 +94,13 @@ pub fn signed_cell_message(
     group: &CellGroupKey,
     plaintext: &[u8],
 ) -> Result<SignedCellMessage> {
-    let _ = (sender_signing_secret, group, plaintext);
-    Err(CryptoError::NotImplemented("user::signed_cell_message"))
+    let signature = crate::sign::sign(sender_signing_secret, plaintext)?;
+    let ciphertext =
+        crate::cell::cell_encrypt(group, plaintext, b"pillar-crypto/user/cell-message-v1")?;
+    Ok(SignedCellMessage {
+        ciphertext,
+        signature,
+    })
 }
 
 /// Decrypt a cell message under the group key and verify the sender's signature
@@ -89,8 +110,13 @@ pub fn open_signed_cell_message(
     sender_signing_public: &SigningPublicKey,
     message: &SignedCellMessage,
 ) -> Result<Vec<u8>> {
-    let _ = (group, sender_signing_public, message);
-    Err(CryptoError::NotImplemented("user::open_signed_cell_message"))
+    let plaintext = crate::cell::cell_decrypt(
+        group,
+        &message.ciphertext,
+        b"pillar-crypto/user/cell-message-v1",
+    )?;
+    crate::sign::verify(sender_signing_public, &plaintext, &message.signature)?;
+    Ok(plaintext)
 }
 
 /// Seal a direct message to `recipient` (any principal — another user, in the
@@ -100,8 +126,13 @@ pub fn seal_message_to_user(
     recipient: &PrincipalPublic,
     plaintext: &[u8],
 ) -> Result<SignedDirectMessage> {
-    let _ = (sender_signing_secret, recipient, plaintext);
-    Err(CryptoError::NotImplemented("user::seal_message_to_user"))
+    let signature = crate::sign::sign(sender_signing_secret, plaintext)?;
+    let envelope =
+        crate::seal::seal_to_recipients(plaintext, std::slice::from_ref(&recipient.sealing))?;
+    Ok(SignedDirectMessage {
+        envelope,
+        signature,
+    })
 }
 
 /// Unseal a direct message with the recipient's sealing secret and verify the
@@ -114,8 +145,9 @@ pub fn open_message_from_user(
     sender_signing_public: &SigningPublicKey,
     message: &SignedDirectMessage,
 ) -> Result<Vec<u8>> {
-    let _ = (recipient_sealing_secret, sender_signing_public, message);
-    Err(CryptoError::NotImplemented("user::open_message_from_user"))
+    let plaintext = crate::seal::unseal(&message.envelope, recipient_sealing_secret)?;
+    crate::sign::verify(sender_signing_public, &plaintext, &message.signature)?;
+    Ok(plaintext)
 }
 
 #[cfg(test)]

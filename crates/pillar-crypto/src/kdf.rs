@@ -13,8 +13,36 @@ use crate::types::{KdfParams, Salt, SymmetricKey};
 /// Contract: deterministic in `(password, salt, params)`, sensitive to each
 /// input, memory-hard, and at least `params.output_len` bytes wide.
 pub fn derive_key(password: &[u8], salt: &Salt, params: &KdfParams) -> Result<SymmetricKey> {
-    let _ = (password, salt, params);
-    Err(CryptoError::NotImplemented("kdf::derive_key"))
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    if params.output_len == 0 {
+        return Err(CryptoError::InvalidLength);
+    }
+    // Argon2 requires a salt of at least 8 bytes. The advisory `Salt` newtype is
+    // arbitrary-length caller input, so bind it into a fixed-width, KDF-safe salt
+    // via a domain-separated SHA-256 rather than rejecting short salts.
+    let bound_salt = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"pillar-crypto/kdf/argon2id/salt-v1");
+        h.update(salt.as_bytes());
+        h.finalize()
+    };
+
+    let a2params = Params::new(
+        params.mem_kib,
+        params.iterations,
+        params.parallelism,
+        Some(params.output_len),
+    )
+    .map_err(|_| CryptoError::InvalidLength)?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, a2params);
+
+    let mut out = vec![0u8; params.output_len];
+    argon
+        .hash_password_into(password, bound_salt.as_slice(), &mut out)
+        .map_err(|_| CryptoError::InvalidLength)?;
+    Ok(SymmetricKey::from_bytes(out))
 }
 
 #[cfg(test)]

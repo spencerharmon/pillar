@@ -8,20 +8,47 @@
 use crate::error::{CryptoError, Result};
 use crate::types::{Seed, Signature, SigningPublicKey, SigningSecretKey};
 
+/// Derive a 32-byte ed25519 secret scalar seed from arbitrary seed material via
+/// a domain-separated SHA-256 (independent of the sealing derivation).
+pub(crate) fn ed25519_secret_bytes(seed: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pillar-crypto/sign/ed25519/seed-v1");
+    h.update(seed);
+    let d = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
+    out
+}
+
 /// Derive a signing keypair deterministically from `seed`.
 ///
 /// Contract: deterministic in `seed`; distinct seeds yield distinct keypairs.
 /// (Reproducible generation; real key generation may draw the seed from an OS
 /// CSPRNG.)
 pub fn signing_keypair_from_seed(seed: &Seed) -> Result<(SigningPublicKey, SigningSecretKey)> {
-    let _ = seed;
-    Err(CryptoError::NotImplemented("sign::signing_keypair_from_seed"))
+    use ed25519_dalek::SigningKey;
+
+    let sk_bytes = ed25519_secret_bytes(seed.as_bytes());
+    let signing = SigningKey::from_bytes(&sk_bytes);
+    let verifying = signing.verifying_key();
+    Ok((
+        SigningPublicKey::from_bytes(verifying.to_bytes().to_vec()),
+        SigningSecretKey::from_bytes(sk_bytes.to_vec()),
+    ))
 }
 
 /// Sign `message` with `secret`.
 pub fn sign(secret: &SigningSecretKey, message: &[u8]) -> Result<Signature> {
-    let _ = (secret, message);
-    Err(CryptoError::NotImplemented("sign::sign"))
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let sk_bytes: [u8; 32] = secret
+        .as_bytes()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let signing = SigningKey::from_bytes(&sk_bytes);
+    let sig = signing.sign(message);
+    Ok(Signature::from_bytes(sig.to_bytes().to_vec()))
 }
 
 /// Verify `signature` over `message` against `public`.
@@ -29,8 +56,22 @@ pub fn sign(secret: &SigningSecretKey, message: &[u8]) -> Result<Signature> {
 /// Contract: `Ok(())` only for a signature produced by the matching secret over
 /// exactly this message; [`CryptoError::VerificationFailed`] otherwise.
 pub fn verify(public: &SigningPublicKey, message: &[u8], signature: &Signature) -> Result<()> {
-    let _ = (public, message, signature);
-    Err(CryptoError::NotImplemented("sign::verify"))
+    use ed25519_dalek::{Verifier, VerifyingKey};
+
+    let pk_bytes: [u8; 32] = public
+        .as_bytes()
+        .try_into()
+        .map_err(|_| CryptoError::VerificationFailed)?;
+    let verifying =
+        VerifyingKey::from_bytes(&pk_bytes).map_err(|_| CryptoError::VerificationFailed)?;
+    let sig_bytes: [u8; 64] = signature
+        .as_bytes()
+        .try_into()
+        .map_err(|_| CryptoError::VerificationFailed)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    verifying
+        .verify(message, &sig)
+        .map_err(|_| CryptoError::VerificationFailed)
 }
 
 #[cfg(test)]

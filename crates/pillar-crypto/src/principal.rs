@@ -7,7 +7,7 @@
 //! ones — the difference between roles is how the keys are *used* (see
 //! [`crate::node`], [`crate::cell`], [`crate::user`]), not how they are built.
 
-use crate::error::{CryptoError, Result};
+use crate::error::Result;
 use crate::types::{SealingPublicKey, SealingSecretKey, Seed, SigningPublicKey, SigningSecretKey};
 
 /// Public key material shared by every principal.
@@ -37,8 +37,21 @@ pub struct PrincipalSecret {
 /// one seed. Real generation may draw the seed from an OS CSPRNG. This one
 /// function is the shared keygen for nodes, cells, users, and subkeys.
 pub fn principal_from_seed(seed: &Seed) -> Result<(PrincipalPublic, PrincipalSecret)> {
-    let _ = seed;
-    Err(CryptoError::NotImplemented("principal::principal_from_seed"))
+    // One seed, one keygen: the signing (ed25519) and sealing (x25519) halves
+    // are independently domain-separated from the SAME seed, so a node, a cell,
+    // a user master, and a per-cell subkey all build through this one function.
+    let (sign_pub, sign_sec) = crate::sign::signing_keypair_from_seed(seed)?;
+    let (seal_pub, seal_sec) = crate::seal::sealing_keypair_from_seed(seed)?;
+    Ok((
+        PrincipalPublic {
+            signing: sign_pub,
+            sealing: seal_pub,
+        },
+        PrincipalSecret {
+            signing: sign_sec,
+            sealing: seal_sec,
+        },
+    ))
 }
 
 #[cfg(test)]

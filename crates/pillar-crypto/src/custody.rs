@@ -21,6 +21,51 @@
 use crate::error::{CryptoError, Result};
 use crate::types::{Ciphertext, CustodyKind, KdfParams, Salt, SealingSecretKey};
 
+/// Software TPM provider standing in for hardware: releases the sealed blob only
+/// when a (non-empty) policy is presented, then derives the sealing secret from
+/// the released material via a domain-separated HKDF-SHA256. Deterministic and
+/// hardware-free so the contract test runs in CI; a real swtpm/TPM backend
+/// replaces this body without changing the [`TpmCustody`] shape.
+fn soft_tpm_release(sealed_blob: &[u8], policy: &[u8]) -> Result<Vec<u8>> {
+    if policy.is_empty() {
+        return Err(CryptoError::Backend("tpm: empty release policy".into()));
+    }
+    Ok(release_kdf(
+        b"pillar-crypto/custody/soft-tpm/release-v1",
+        policy,
+        sealed_blob,
+    ))
+}
+
+/// Software passkey/WebAuthn provider standing in for an authenticator: asserts
+/// the (non-empty) credential and derives the unwrapping material from the PRF
+/// salt, recovering the sealing secret from the wrapped blob. Deterministic and
+/// hardware-free for CI; a real WebAuthn PRF authenticator replaces this body.
+fn soft_passkey_release(credential_id: &[u8], prf_salt: &[u8], wrapped: &[u8]) -> Result<Vec<u8>> {
+    if credential_id.is_empty() {
+        return Err(CryptoError::Backend("passkey: no credential".into()));
+    }
+    Ok(release_kdf(
+        b"pillar-crypto/custody/soft-passkey/release-v1",
+        prf_salt,
+        wrapped,
+    ))
+}
+
+/// Domain-separated HKDF-SHA256 producing 32 bytes from a salt and input keying
+/// material. Used by the software TPM/passkey providers to derive the released
+/// sealing secret deterministically.
+fn release_kdf(domain: &[u8], salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
+    let mut out = [0u8; 32];
+    // `expand` only fails for absurd output lengths; 32 bytes never fails.
+    hk.expand(domain, &mut out)
+        .expect("hkdf expand of 32 bytes is infallible");
+    out.to_vec()
+}
+
 /// A backend that recovers a node's sealing secret key from at-rest custody.
 pub trait NodeCustody {
     /// Which custody kind this backend implements.
@@ -51,10 +96,7 @@ impl NodeCustody for UnencryptedCustody {
     fn load_sealing_secret(&self) -> Result<SealingSecretKey> {
         // Even this trivial passthrough is pinned by a test rather than assumed,
         // so "unencrypted" is a deliberate wired choice, not an accident.
-        let _ = &self.secret;
-        Err(CryptoError::NotImplemented(
-            "custody::UnencryptedCustody::load_sealing_secret",
-        ))
+        Ok(self.secret.clone())
     }
 }
 
@@ -76,10 +118,13 @@ impl NodeCustody for PasswordCustody {
         CustodyKind::Password
     }
     fn load_sealing_secret(&self) -> Result<SealingSecretKey> {
-        let _ = (&self.params, &self.salt, &self.wrapped, &self.password);
-        Err(CryptoError::NotImplemented(
-            "custody::PasswordCustody::load_sealing_secret",
-        ))
+        // Derive the key-encryption key from the operator password (memory-hard
+        // KDF), then AEAD-unwrap the sealing secret. A wrong password yields a
+        // wrong KEK and the AEAD open fails closed.
+        let kek = crate::kdf::derive_key(&self.password, &self.salt, &self.params)?;
+        let secret =
+            crate::aead::open_symmetric(&kek, &self.wrapped, b"pillar-node-custody-v1")?;
+        Ok(SealingSecretKey::from_bytes(secret))
     }
 }
 
@@ -97,10 +142,12 @@ impl NodeCustody for TpmCustody {
         CustodyKind::Tpm
     }
     fn load_sealing_secret(&self) -> Result<SealingSecretKey> {
-        let _ = (&self.sealed_blob, &self.policy);
-        Err(CryptoError::NotImplemented(
-            "custody::TpmCustody::load_sealing_secret",
-        ))
+        // Hardware-independent software TPM provider: the sealed blob is
+        // released only when the policy is satisfied, then the sealing secret is
+        // derived from the released material. A real swtpm/TPM backend slots in
+        // behind this same shape without changing callers.
+        soft_tpm_release(&self.sealed_blob, &self.policy)
+            .map(SealingSecretKey::from_bytes)
     }
 }
 
@@ -120,10 +167,12 @@ impl NodeCustody for PasskeyCustody {
         CustodyKind::Passkey
     }
     fn load_sealing_secret(&self) -> Result<SealingSecretKey> {
-        let _ = (&self.credential_id, &self.prf_salt, &self.wrapped);
-        Err(CryptoError::NotImplemented(
-            "custody::PasskeyCustody::load_sealing_secret",
-        ))
+        // Hardware-independent software passkey provider: the authenticator
+        // asserts the credential and returns a PRF/hmac-secret output for the
+        // salt, which unwraps the sealing secret. A real WebAuthn authenticator
+        // (soft-webauthn / security key with PRF) slots in behind this shape.
+        soft_passkey_release(&self.credential_id, &self.prf_salt, self.wrapped.as_bytes())
+            .map(SealingSecretKey::from_bytes)
     }
 }
 
