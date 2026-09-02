@@ -2677,6 +2677,7 @@ version = "0.0.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
+ "rand_core 0.6.4",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ description = "OpenPGP key-type hierarchy, node admission, and the cold-root/op-
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lints]
 workspace = true
