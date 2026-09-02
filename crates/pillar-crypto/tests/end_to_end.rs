@@ -118,6 +118,21 @@ fn user_subkeys_across_cells_validate_one_another() {
         verify_subkey(&master_pub.signing, &sub_b, &cell_b, &cert_b),
         Ok(())
     );
+
+    // A forged cert is rejected: an attacker's master signature over the real
+    // subkey/cell does not verify against the genuine master public key.
+    let (_forger_pub, forger_sec) = principal_from_seed(&seed("mallory-master")).expect("forger");
+    let forged = certify_subkey(&forger_sec.signing, &sub_a, &cell_a).expect("forged cert");
+    assert!(
+        verify_subkey(&master_pub.signing, &sub_a, &cell_a, &forged).is_err(),
+        "a cert not produced by the genuine master is rejected"
+    );
+
+    // A genuine cert does not verify for the wrong cell (cell binding holds).
+    assert!(
+        verify_subkey(&master_pub.signing, &sub_a, &cell_b, &cert_a).is_err(),
+        "a cert is bound to its cell and rejected against another cell"
+    );
 }
 
 /// Cell-to-cell messaging: a cell is a principal, so cell A seals to cell B.
