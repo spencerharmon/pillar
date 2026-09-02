@@ -603,13 +603,18 @@ mod tests {
     fn log_from_cid_skips_up_to_and_including_that_op() {
         let mut cli = StreamCli::new();
         cli.create("s", None, ViewPolicy::Strict).unwrap();
-        let id1 = cli
-            .append("s", b"a".to_vec(), SideEffect::Convergent)
+        cli.append("s", b"a".to_vec(), SideEffect::Convergent)
             .unwrap();
-        let _id2 = cli
-            .append("s", b"b".to_vec(), SideEffect::Convergent)
+        cli.append("s", b"b".to_vec(), SideEffect::Convergent)
             .unwrap();
-        let after = cli.log("s", Some(id1)).unwrap();
+        // The materialized order is by content address, which is a pure but
+        // otherwise arbitrary function of the payload bytes — not insertion
+        // order. Skip through whichever op the real content-addressing sorts
+        // first, and assert exactly the other op remains.
+        let full = cli.log("s", None).unwrap();
+        assert_eq!(full.len(), 2);
+        let first_id = full[0].id();
+        let after = cli.log("s", Some(first_id)).unwrap();
         assert_eq!(after.len(), 1);
     }
 

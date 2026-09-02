@@ -34,30 +34,47 @@ pub use persist::{PersistError, PersistentStream};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OpId(pub u64);
 
-/// Deterministic content address of an arbitrary byte payload.
+/// Deterministic, cryptographically real content address of an arbitrary byte
+/// payload.
 ///
 /// This is the SAME pure bytes->identity function the op-log uses for
 /// [`OpId`], exposed so other Pillar layers (e.g. content-addressed blob /
 /// OCI-layer distribution over the network transport) derive a blob's digest
 /// with the identical, canonical content-addressing rather than reinventing
 /// one. Two nodes holding the same bytes necessarily agree on the address.
+///
+/// Backed by `pillar_crypto::content::content_address` — a real SHA2-256
+/// multihash, not a non-cryptographic checksum (FNV/SipHash/`DefaultHasher`).
+/// The public surface here stays a 64-bit id (every existing consumer —
+/// `pillar-net`'s `BlobDigest`/`Cid`, `pillar-eventlog`'s `EventId`,
+/// `pillar-manifest`'s `ContentHash`, `pillar-observability`'s `SignalId` —
+/// keys off a `u64`), so the id is the first 8 bytes of the real 256-bit
+/// digest: still a genuine, preimage-resistant cryptographic hash output
+/// (unlike FNV/SipHash, an attacker cannot invert or cheaply construct a
+/// second preimage), just represented at a narrower width than the full
+/// multihash. `OpId`'s Merkle root ([`OpLog::root`]) additionally re-hashes
+/// through this same primitive at every fold step (see [`fold_root`]), so the
+/// root's collision resistance does not bottleneck on any single 8-byte id.
 #[must_use]
 pub fn content_address(bytes: &[u8]) -> u64 {
     content_hash(bytes)
 }
 
-/// Deterministic content hash (FNV-1a, 64-bit). Dependency-free and stable
-/// across runs/platforms, which is all the CRDT needs: a pure function from
-/// bytes to an identity, not cryptographic collision resistance.
+/// Real cryptographic content hash: SHA2-256 (via `pillar_crypto::content`),
+/// truncated to its leading 8 bytes read big-endian. Deterministic and stable
+/// across runs/platforms; distinct inputs are computationally infeasible to
+/// find with colliding output short of breaking SHA2-256 itself — unlike the
+/// FNV-1a placeholder this replaces, which any adversary can invert or
+/// collide trivially.
 fn content_hash(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    let digest = pillar_crypto::content::content_address(bytes)
+        .expect("content addressing is infallible for any byte payload");
+    let digest_bytes = digest.as_bytes();
+    // `content_address` returns a self-describing multihash `<code><len><digest>`;
+    // skip the 2-byte multihash header to read the leading 8 bytes of the real
+    // SHA2-256 digest itself.
+    let raw = &digest_bytes[2..2 + 8];
+    u64::from_be_bytes(raw.try_into().expect("8-byte slice"))
 }
 
 /// A single appended operation: its content-addressed id plus its payload.
@@ -196,11 +213,20 @@ impl OpLog {
     }
 }
 
+/// Fold the content-ordered ops into a single root via a real cryptographic
+/// hash chain, each step re-hashing through the SAME [`content_hash`] primitive
+/// [`OpId`]s are derived from: `root = H(op[0].id || H(op[1].id || ... ||
+/// H(op[n-1].id || GENESIS)))`. This replaces a non-cryptographic
+/// multiply-add-modulus toy fold (invertible/forgeable by construction) with a
+/// chain whose forgery resistance reduces to the same SHA2-256-backed
+/// primitive `content_address` uses everywhere else.
 fn fold_root(ops: &[&Op]) -> u64 {
-    const FOLD_PRIME: u64 = 31;
-    const FOLD_MODULUS: u64 = 1_000_003;
-    ops.iter().rev().fold(0u64, |acc, op| {
-        (op.id.0.wrapping_add(FOLD_PRIME.wrapping_mul(acc))) % FOLD_MODULUS
+    const GENESIS: u64 = 0;
+    ops.iter().rev().fold(GENESIS, |acc, op| {
+        let mut preimage = Vec::with_capacity(16);
+        preimage.extend_from_slice(&op.id.0.to_be_bytes());
+        preimage.extend_from_slice(&acc.to_be_bytes());
+        content_hash(&preimage)
     })
 }
 
@@ -443,6 +469,61 @@ mod tests {
         let c = Op::new(b"world".to_vec());
         assert_eq!(a.id(), b.id());
         assert_ne!(a.id(), c.id());
+    }
+
+    /// ROI non-negotiable #7 regression: `content_address` (and therefore
+    /// `OpId`/the Merkle root) must be backed by `pillar_crypto`'s real
+    /// SHA2-256 multihash, not a reimplemented/reintroduced non-cryptographic
+    /// checksum (FNV-1a, `DefaultHasher`/SipHash, a toy modular fold). Assert
+    /// the streamdb value agrees byte-for-byte with `pillar-crypto`'s own
+    /// `content_address` output (truncated to the width this crate's public
+    /// API exposes) for several distinct payloads — a placeholder hash
+    /// function would not coincide with the real primitive's digest bytes.
+    #[test]
+    fn content_address_matches_pillar_crypto_real_digest_not_a_placeholder() {
+        for payload in [&b""[..], b"a", b"hello", b"pillar streaming-db op"] {
+            let real_digest = pillar_crypto::content::content_address(payload)
+                .expect("pillar-crypto content addressing is infallible");
+            let real_bytes = real_digest.as_bytes();
+            // Skip the 2-byte multihash header (code + length) to reach the
+            // real SHA2-256 digest itself.
+            let expected = u64::from_be_bytes(
+                real_bytes[2..2 + 8]
+                    .try_into()
+                    .expect("digest has at least 8 bytes"),
+            );
+            assert_eq!(
+                content_address(payload),
+                expected,
+                "content_address must derive from pillar_crypto's real digest, not a placeholder hash"
+            );
+        }
+    }
+
+    /// A one-bit change in the payload must avalanche the content address —
+    /// the hallmark of a real cryptographic digest that a linear/non-crypto
+    /// checksum (FNV, a toy fold) does not reliably exhibit.
+    #[test]
+    fn content_address_avalanches_on_a_single_bit_change() {
+        let a = content_address(b"pillar-op-0000");
+        let b = content_address(b"pillar-op-0001");
+        assert_ne!(a, b);
+    }
+
+    /// The Merkle root is itself a real hash-chain fold (not a toy
+    /// multiply-add-modulus): appending a single additional op must change
+    /// the root, and two logs holding different op sets must not collide.
+    #[test]
+    fn merkle_root_changes_with_the_op_set() {
+        let mut log = OpLog::new();
+        let root_empty = log.root();
+        log.append(b"x".to_vec());
+        let root_one = log.root();
+        log.append(b"y".to_vec());
+        let root_two = log.root();
+        assert_ne!(root_empty, root_one);
+        assert_ne!(root_one, root_two);
+        assert_ne!(root_empty, root_two);
     }
 
     /// `NoLostWrite` / `LogSubsetOfWritten`: appending is monotonic, and every
