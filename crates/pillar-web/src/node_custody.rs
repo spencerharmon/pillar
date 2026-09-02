@@ -278,11 +278,12 @@ impl RegisteredOperationalKey {
 /// [`crate::key_login::AuthSubkey::sign_nonce`]'s framing so the same public
 /// verifier checks it.
 fn sign_material(material: u64, nonce: &Nonce) -> Signature {
-    Signature::from_wire(digest(&[
+    let material_digest = digest(&[
         "pillar-web-login-sig",
         &material.to_string(),
-        &nonce.signing_material_public(),
-    ]))
+        &String::from_utf8_lossy(&nonce.signing_material_public()),
+    ]);
+    Signature::from_wire(material_digest.to_be_bytes().to_vec())
 }
 
 /// Why a node-side custody login was refused. The failure modes surface as

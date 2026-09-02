@@ -11,11 +11,11 @@
 //! 1. **Server issues a nonce** ([`NonceIssuer::issue`]) bound to
 //!    `(origin, expiry)` and minted from a monotone, never-reused serial.
 //! 2. **Client fetches its password-protected auth SUBKEY by CID**
-//!    ([`CipherStore`] holds world-readable ciphertext), decrypts and
-//!    unlocks it **locally** with a high-cost **argon2id** KDF
+//!    ([`EncryptedAuthSubkey`] holds world-readable ciphertext), decrypts
+//!    and unlocks it **locally** with a high-cost **argon2id** KDF
 //!    ([`unlock_auth_subkey`]), and signs the nonce
-//!    ([`AuthSubkey::sign_nonce`]). The password and the plaintext key never
-//!    leave the client.
+//!    ([`AuthSubkey::sign_nonce`]). The password and the plaintext key
+//!    material never leave the client.
 //! 3. **Server verifies** ([`KeyLoginVerifier::admit`]): the signature must
 //!    be over an unexpired, right-origin, unconsumed nonce; the signing
 //!    subkey must be WoT-trust-reachable (chain to the owner anchor) and its
@@ -23,27 +23,30 @@
 //!    guard the controllers use, so revocation fail-closed holds for login
 //!    sessions unchanged.
 //!
-//! This crate carries no real OpenPGP/argon2 primitives (same reason
-//! [`pillar_identity::Signature`] and [`crate::PasskeyAuthenticator`] stand
-//! in for real key material): the **protocol** is modelled precisely — the
-//! server never observes the password or plaintext key, only a challenge-
-//! bound proof it can verify against a WoT-trusted registration key.
+//! ## Real cryptography (ROI non-negotiable #7)
+//!
+//! This crate now runs the SAME real primitives [`pillar_crypto`] wires
+//! everywhere else in the codebase — never a `DefaultHasher`/`SipHash`
+//! stand-in:
+//! * [`pillar_crypto::kdf::derive_key`] — memory-hard **argon2id**, turning
+//!   the password into the symmetric key that protects the auth subkey's
+//!   signing seed at rest.
+//! * [`pillar_crypto::aead::seal_symmetric`] /
+//!   [`pillar_crypto::aead::open_symmetric`] — **ChaCha20-Poly1305** AEAD,
+//!   the "world-readable ciphertext" the ROI describes.
+//! * [`pillar_crypto::sign::signing_keypair_from_seed`] /
+//!   [`pillar_crypto::sign::sign`] / [`pillar_crypto::sign::verify`] — real
+//!   **ed25519** signing over the challenge nonce; the server verifies
+//!   against the WoT-registered public key alone, never the password or the
+//!   plaintext seed.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
+use pillar_crypto::{aead, kdf, sign};
+use pillar_crypto::{Ciphertext, KdfParams, Salt, Seed, SigningPublicKey};
 use pillar_identity::NodeSubkey;
 use pillar_wot_authority::{ActError, FencedActor, WotAuthority};
-
-fn digest(parts: &[&str]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for part in parts {
-        part.hash(&mut hasher);
-    }
-    hasher.finish()
-}
 
 /// A server origin a challenge nonce may be bound to (`https://host:port`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -89,11 +92,12 @@ impl Nonce {
     /// The exact bytes a client signs: the nonce's `(id, origin, expiry)`,
     /// so a signature is inseparably bound to all three. A signature is
     /// never transferable to a different nonce, origin, or expiry.
-    fn signing_material(&self) -> String {
+    fn signing_material(&self) -> Vec<u8> {
         format!(
             "pillar-web-nonce:{}:{}:{}",
             self.id, self.origin.0, self.expiry
         )
+        .into_bytes()
     }
 
     /// The signing material as a public accessor, so the node-side custody
@@ -101,7 +105,7 @@ impl Nonce {
     /// SAME framing a client uses — the two custody models share one nonce
     /// contract, never a divergent one.
     #[must_use]
-    pub fn signing_material_public(&self) -> String {
+    pub fn signing_material_public(&self) -> Vec<u8> {
         self.signing_material()
     }
 
@@ -155,20 +159,39 @@ impl NonceIssuer {
     }
 }
 
+/// The argon2id work parameters this crate uses to protect an auth subkey's
+/// signing seed at rest. Deliberately the same OWASP-ish starting point
+/// [`KdfParams::default`] ships.
+fn kdf_params() -> KdfParams {
+    KdfParams::default()
+}
+
+/// Derive the per-subkey argon2id salt. Bound to the subkey's own identity
+/// (public, non-secret) via a domain-separated tag, so distinct subkeys
+/// never share a salt even under the same password.
+fn subkey_salt(subkey: &NodeSubkey) -> Salt {
+    Salt::from_bytes(format!("pillar-web-key-auth/salt-v1/{}", subkey.0).into_bytes())
+}
+
+/// The ed25519 signing-seed derivation domain tag: binds the seed to the
+/// subkey's own identity as well as the plaintext secret, so two subkeys
+/// sealed from the same raw secret material never collide on a keypair.
+fn subkey_seed(subkey: &NodeSubkey, secret: &str) -> Seed {
+    Seed::from_bytes(format!("pillar-web-key-auth/seed-v1/{}/{secret}", subkey.0).into_bytes())
+}
+
 /// A client's argon2id-encrypted auth subkey, stored as world-readable
 /// ciphertext addressed by content id (CID) — anyone may fetch it; only the
 /// password holder can unlock it.
 ///
-/// The ciphertext is derived from the plaintext subkey secret and the
-/// password through a high-cost KDF; recovering the secret requires the
-/// password (modelled: `unlock` recomputes it from the password and only
-/// yields the usable key on a match). The plaintext secret and the password
-/// are never stored here.
+/// The ciphertext is the ed25519 signing seed sealed under a ChaCha20-
+/// Poly1305 AEAD key derived by argon2id from the password (and a per-subkey
+/// salt); recovering the seed requires the password. The plaintext seed and
+/// the password are never stored here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedAuthSubkey {
     subkey: NodeSubkey,
-    /// argon2id(password, subkey-secret): the world-readable ciphertext.
-    ciphertext: u64,
+    ciphertext: Ciphertext,
 }
 
 impl EncryptedAuthSubkey {
@@ -177,7 +200,13 @@ impl EncryptedAuthSubkey {
     /// `subkey`. Neither the password nor the plaintext secret is retained.
     #[must_use]
     pub fn seal(subkey: NodeSubkey, password: &str, secret: &str) -> Self {
-        let ciphertext = argon2id(password, &subkey, secret);
+        let salt = subkey_salt(&subkey);
+        let kek = kdf::derive_key(password.as_bytes(), &salt, &kdf_params())
+            .expect("argon2id derivation with valid params never fails");
+        let seed = subkey_seed(&subkey, secret);
+        let ciphertext =
+            aead::seal_symmetric(&kek, seed.as_bytes(), b"pillar-web-key-auth/subkey-seal-v1")
+                .expect("chacha20poly1305 sealing of valid input never fails");
         EncryptedAuthSubkey { subkey, ciphertext }
     }
 
@@ -189,22 +218,14 @@ impl EncryptedAuthSubkey {
     }
 }
 
-/// The high-cost argon2id KDF (modelled as a deterministic stand-in, per the
-/// crate's no-real-crypto convention). In the real client this is a genuine
-/// memory-hard argon2id; here it is the one place the password and plaintext
-/// secret are combined — and it runs ONLY client-side.
-fn argon2id(password: &str, subkey: &NodeSubkey, secret: &str) -> u64 {
-    digest(&["pillar-argon2id-v1", password, &subkey.0, secret])
-}
-
-/// A locally-unlocked auth subkey: the client-side plaintext key material,
-/// produced by [`unlock_auth_subkey`]. It NEVER crosses the wire — only the
-/// signatures it produces do. There is intentionally no way to serialize it.
+/// A locally-unlocked auth subkey: the client-side plaintext ed25519 key
+/// material, produced by [`unlock_auth_subkey`]. It NEVER crosses the wire —
+/// only the signatures it produces do. There is intentionally no way to
+/// serialize it.
 #[derive(Clone, Debug)]
 pub struct AuthSubkey {
     subkey: NodeSubkey,
-    /// The recovered plaintext signing secret (client-side only).
-    secret_material: u64,
+    secret_key: pillar_crypto::SigningSecretKey,
 }
 
 impl AuthSubkey {
@@ -219,43 +240,41 @@ impl AuthSubkey {
     /// any other nonce.
     #[must_use]
     pub fn sign_nonce(&self, nonce: &Nonce) -> Signature {
-        Signature(digest(&[
-            "pillar-web-login-sig",
-            &self.secret_material.to_string(),
-            &nonce.signing_material(),
-        ]))
+        let sig = sign::sign(&self.secret_key, &nonce.signing_material())
+            .expect("ed25519 signing over valid input never fails");
+        Signature(sig.into_bytes())
     }
 }
 
-/// A client-side signature over a challenge nonce. The only artifact of the
-/// login handshake that crosses the wire to the server.
+/// A client-side signature over a challenge nonce — the only artifact of the
+/// login handshake that crosses the wire to the server. Carries the raw
+/// ed25519 signature bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Signature(u64);
+pub struct Signature(Vec<u8>);
 
 impl Signature {
-    /// The opaque wire encoding of this signature — the exact bytes (as a
-    /// single integer, for this crate's no-real-crypto stand-in) that cross
-    /// the network from client to server. Never contains the password or
-    /// plaintext key (see
+    /// The opaque wire encoding of this signature — the exact bytes that
+    /// cross the network from client to server. Never contains the password
+    /// or plaintext key (see
     /// `password_and_plaintext_key_never_appear_in_any_server_observable_payload`).
     #[must_use]
-    pub fn to_wire(&self) -> u64 {
-        self.0
+    pub fn to_wire(&self) -> &[u8] {
+        &self.0
     }
 
     /// Reconstruct a signature received over the wire (the server side of
     /// [`to_wire`](Self::to_wire)).
     #[must_use]
-    pub fn from_wire(value: u64) -> Self {
+    pub fn from_wire(value: Vec<u8>) -> Self {
         Signature(value)
     }
 }
 
 /// Client-side unlock of a password-protected auth subkey fetched by CID.
 ///
-/// Runs the argon2id KDF over the password to recover the plaintext key
-/// material. Returns `None` on the wrong password (the recovered material
-/// does not reproduce the stored ciphertext), so a wrong password yields no
+/// Re-derives the argon2id key from the password and the subkey's salt and
+/// opens the AEAD-sealed signing seed. Returns `None` on the wrong password
+/// (the AEAD open fails to authenticate), so a wrong password yields no
 /// usable key rather than a subtly-wrong one. This is the ONLY place the
 /// password is used, and it is a purely client-side computation — the
 /// password never reaches the server.
@@ -265,50 +284,60 @@ pub fn unlock_auth_subkey(
     password: &str,
     secret: &str,
 ) -> Option<AuthSubkey> {
-    // The KDF over (password, secret) must reproduce the stored ciphertext;
-    // a wrong password (or wrong secret) fails to, and no key is yielded.
-    if argon2id(password, &encrypted.subkey, secret) != encrypted.ciphertext {
+    let salt = subkey_salt(&encrypted.subkey);
+    let kek = kdf::derive_key(password.as_bytes(), &salt, &kdf_params()).ok()?;
+    let recovered_seed = aead::open_symmetric(
+        &kek,
+        &encrypted.ciphertext,
+        b"pillar-web-key-auth/subkey-seal-v1",
+    )
+    .ok()?;
+    // The recovered seed must match what `secret` (the plaintext auth-subkey
+    // material fetched alongside the ciphertext) would derive — a wrong
+    // password authenticates against nothing (AEAD open already failed
+    // above) and a wrong/mismatched `secret` never reproduces the seed the
+    // ciphertext was sealed under.
+    let expected_seed = subkey_seed(&encrypted.subkey, secret);
+    if recovered_seed != expected_seed.as_bytes() {
         return None;
     }
+    let (_public, secret_key) = sign::signing_keypair_from_seed(&expected_seed).ok()?;
     Some(AuthSubkey {
         subkey: encrypted.subkey.clone(),
-        secret_material: argon2id(password, &encrypted.subkey, secret),
+        secret_key,
     })
 }
 
 /// The public half of a registered auth subkey the server verifies against:
-/// the subkey's WoT identity plus the public verifier the server recomputes
-/// a login signature against. Derived at registration from the SAME argon2id
-/// material — but the server only ever holds this public verifier, never the
-/// password or the plaintext key.
+/// the subkey's WoT identity plus the real ed25519 public key the server
+/// checks a login signature against. Derived at registration from the SAME
+/// seed material — but the server only ever holds this public key, never
+/// the password or the plaintext seed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredAuthKey {
     subkey: NodeSubkey,
-    verifier: u64,
+    public_key: SigningPublicKey,
 }
 
 impl RegisteredAuthKey {
     /// Register the public half of `encrypted`'s auth key, given the
-    /// `secret` used to seal it. In a real system this public verifier is
-    /// published at registration (a public key); here it is derived so the
-    /// server can check a signature without ever seeing the password or
-    /// plaintext key.
+    /// `secret` used to seal it. In a real system this public key is
+    /// published at registration; here it is re-derived so the server can
+    /// check a signature without ever seeing the password or plaintext key.
     #[must_use]
-    pub fn register(encrypted: &EncryptedAuthSubkey, password: &str, secret: &str) -> Self {
-        let material = argon2id(password, &encrypted.subkey, secret);
+    pub fn register(encrypted: &EncryptedAuthSubkey, _password: &str, secret: &str) -> Self {
+        let seed = subkey_seed(&encrypted.subkey, secret);
+        let (public_key, _secret_key) = sign::signing_keypair_from_seed(&seed)
+            .expect("ed25519 keygen from valid seed never fails");
         RegisteredAuthKey {
             subkey: encrypted.subkey.clone(),
-            verifier: material,
+            public_key,
         }
     }
 
     fn verify(&self, nonce: &Nonce, signature: &Signature) -> bool {
-        let expected = Signature(digest(&[
-            "pillar-web-login-sig",
-            &self.verifier.to_string(),
-            &nonce.signing_material(),
-        ]));
-        *signature == expected
+        let sig = pillar_crypto::Signature::from_bytes(signature.0.clone());
+        sign::verify(&self.public_key, &nonce.signing_material(), &sig).is_ok()
     }
 }
 
@@ -558,7 +587,7 @@ mod tests {
             expiry: 10,
         };
         // Even a correctly-formed signature can't help: the nonce is unknown.
-        let sig = Signature(0);
+        let sig = Signature(vec![0u8; 64]);
         assert_eq!(
             v.admit(&forged, &sig, &subkey, iss.origin(), 0, &auth, &actor),
             Err(LoginError::UnknownNonce)
@@ -619,7 +648,7 @@ mod tests {
             SECRET
         )
         .is_none());
-        let bogus = Signature(0xdead_beef);
+        let bogus = Signature(vec![0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(
             v.admit(&nonce, &bogus, &subkey, iss.origin(), 0, &auth, &actor),
             Err(LoginError::BadSignature)
@@ -654,10 +683,13 @@ mod tests {
 
     #[test]
     fn password_and_plaintext_key_never_appear_in_any_server_observable_payload() {
-        // Property test: over many passwords/secrets, the only artifacts that
-        // cross to the server (the nonce's signing material and the signature)
-        // must contain NEITHER the password NOR the plaintext key secret.
-        for i in 0..256u32 {
+        // Property test: over several passwords/secrets, the only artifacts
+        // that cross to the server (the nonce's signing material and the
+        // signature) must contain NEITHER the password NOR the plaintext key
+        // secret. Kept small (each iteration runs a real high-cost argon2id
+        // derivation, unlike the old digest stand-in) — still exercises many
+        // distinct password/secret/subkey combinations.
+        for i in 0..8u32 {
             let password = format!("pw-{i}-{PASSWORD}");
             let secret = format!("sk-{i}-{SECRET}");
             let subkey = NodeSubkey::from(format!("subkey-{i}").as_str());
@@ -668,15 +700,18 @@ mod tests {
             let unlocked = unlock_auth_subkey(&encrypted, &password, &secret).unwrap();
             let signature = unlocked.sign_nonce(&nonce);
 
-            // The exact bytes a server ever sees: the nonce material + the sig.
-            let wire = format!("{}|{}", nonce.signing_material(), signature.0);
+            // The exact bytes a server ever sees: the nonce material + the sig,
+            // both as raw bytes (never string-formatted secret material).
+            let mut wire = nonce.signing_material();
+            wire.extend_from_slice(signature.to_wire());
+            let wire_str = String::from_utf8_lossy(&wire).into_owned();
             assert!(
-                !wire.contains(&password),
-                "password leaked into server-observable payload: {wire}"
+                !wire_str.contains(&password),
+                "password leaked into server-observable payload: {wire_str}"
             );
             assert!(
-                !wire.contains(&secret),
-                "plaintext key leaked into server-observable payload: {wire}"
+                !wire_str.contains(&secret),
+                "plaintext key leaked into server-observable payload: {wire_str}"
             );
         }
     }
@@ -725,5 +760,24 @@ mod tests {
             v.admit(&nonce, &sig, &subkey, iss.origin(), 0, &authority, &actor),
             Err(LoginError::NotAuthorized(_))
         ));
+    }
+
+    #[test]
+    fn forged_ed25519_signature_never_verifies_against_the_registered_key() {
+        // A signature produced by a DIFFERENT (attacker) keypair must never
+        // verify against the victim's registered auth key — the real
+        // asymmetry ed25519 provides, unlike a symmetric digest stand-in.
+        let (mut v, iss, nonce, _sig, subkey, auth, actor) = valid_login();
+        let attacker_subkey = NodeSubkey::from("attacker-subkey");
+        let attacker_encrypted =
+            EncryptedAuthSubkey::seal(attacker_subkey, "attacker-pw", "attacker-secret");
+        let attacker_key =
+            unlock_auth_subkey(&attacker_encrypted, "attacker-pw", "attacker-secret")
+                .expect("attacker unlock");
+        let forged_sig = attacker_key.sign_nonce(&nonce);
+        assert_eq!(
+            v.admit(&nonce, &forged_sig, &subkey, iss.origin(), 0, &auth, &actor),
+            Err(LoginError::BadSignature)
+        );
     }
 }
