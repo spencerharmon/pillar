@@ -17,6 +17,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
 | `Registration.tla` | `AdmissionRequiresAuthorizedChain`, `NoAmbientAuthority`, `TypeOK` | `crates/pillar-identity` (PGP key hierarchy: USER_PRIMARY -> NODE_SUBKEY + REGISTRATION; node-join handshake) | ROI P1 identity/PGP |
 | `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
+| `StreamdbIpfsStore.tla` | `ContentAddressCorrect`, `HeadSequenceMonotonic`, `HeadSignedByOwner`, `AnchorsOnlyToDHT`, `PinnedSubsetOfStore`, `StoreSubsetOfWritten`, `BackfillReconverges` (`<>[]`), `TypeOK` | durable content-object store surface the streaming DB rides (IPFS/libp2p plugin, pillar's private swarm OFF the public DHT): put/get by CID, pin, provide public anchors to the DHT, IPNS-format signed/seq-numbered/TTL mutable head scoped by visibility class; refines `StreamingDB.tla` | ROI P1 durable streaming-DB persistence (2026-08-31 audit correction) |
 | `EventDAG.tla` | `UniquePerAuthorSeq`, `NoGaps`, `PrevLinkIntegrity`, `ParentsCrossAuthorAndExist`, `CausalMonotone`, `TypeOK` | event order & integrity substrate (PGP-signed events in a hash-linked Merkle DAG: per-author linear chain + cross-author causal partial order + content-addressed dedup) | ROI P1 event order & integrity |
 | `IPAM.tla` | `NoDoubleAllocation`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-ipam` (IPv4/IPv6 allocation from a delegated pool) | ROI P3 distributed-authority |
 | `WoTAuthority.tla` | `NoActionAfterRevocation`, `FailClosedUnderStaleView`, `TypeOK`, `CaughtUpBounded` | Web-of-Trust authority & RBAC (`wot-authority-impl`, `rbac-decider`): owner-anchored bounded-depth tsig reachability, 3 revocation kinds, revoke-before-act | ROI P1 WoT authority |
@@ -60,6 +61,23 @@ pinned release into `./.tools/` (the path CI uses).
   — weak fairness is insufficient because an adversarial partition leaves a
   deliverable gossip step enabled only intermittently. TLC is run with
   `-deadlock` (quiescence at the semilattice top is an expected idle state).
+- `StreamdbIpfsStore` models the DURABLE content-object store surface the
+  streaming DB rides — the IPFS/libp2p plugin's own surface (non-negotiable #5:
+  the plugin OWNS content-addressing; the streaming DB never re-implements it on
+  local disk). Per the 2026-08-31 audit ROI correction the durable store MUST be
+  IPFS on pillar's private libp2p swarm, OFF the public DHT — not a hand-rolled
+  local-fs store. It refines `StreamingDB.tla` (adds the durable content-object +
+  IPNS-format mutable-head layer beneath the AP op-log) and proves: content
+  addressing is collision-free/deterministic (`ContentAddressCorrect`), a
+  published head's sequence only advances (`HeadSequenceMonotonic`) and is signed
+  by its owner (`HeadSignedByOwner`), ONLY public anchor objects ever reach the
+  DHT while cell/sealed heads travel the private swarm's pubsub
+  (`AnchorsOnlyToDHT`), and a missing-but-reachable segment is eventually
+  backfilled under a lossy link (`BackfillReconverges`, `<>[]`, under **strong**
+  per-pair fairness of backfill + healing, the same discipline as `StreamingDB`/
+  `AntiEntropy`). `-deadlock`: saturation (every object put/held, heads at
+  `MaxSeq`) is expected quiescence, not a fault. Spec only — the plugin's real
+  implementation is a refinement of this machine-checked contract.
 - `EventDAG` is **safety-only** (`-deadlock`): a state where every author's
   chain has saturated is expected quiescence, not a fault (the `ReBroadcast`
   self-loop also keeps the model deadlock-free). It ADOPTS the git / CT / SSB /
