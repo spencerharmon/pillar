@@ -227,24 +227,17 @@ impl Platform {
         // preview's verdict can never diverge from what this apply enforces.
         self.preview(actor, capability, &body)?;
 
-        let envelope = Envelope::import(
-            body,
-            actor.0.clone(),
-            causal_parents,
-            capability_scope,
-        );
+        let envelope = Envelope::import(body, actor.0.clone(), causal_parents, capability_scope);
         let content_hash = envelope.content_hash();
 
         // Emit exactly one signed event; its payload names the sealed
         // manifest by content-hash — the view resolves it from the store.
         let author = Author(actor.0.clone());
-        let event = self
-            .log
-            .append(&author, content_hash.as_bytes().to_vec());
+        let event = self.log.append(&author, content_hash.as_bytes().to_vec());
 
         self.store.insert(content_hash.clone(), envelope);
         self.applied.push(content_hash.clone());
-        self.applied_events.push(event);
+        self.applied_events.push(event.clone());
 
         Ok(Applied {
             event,
@@ -336,7 +329,7 @@ impl Platform {
             .rev()
             .find_map(|(hash, ev)| {
                 let env = self.store.get(hash)?;
-                (ResourceKey::of(env.body()) == *key).then_some(*ev)
+                (ResourceKey::of(env.body()) == *key).then_some(ev.clone())
             })
     }
 
@@ -807,7 +800,7 @@ mod tests {
 
     // The log is private; expose a tiny read helper just for the test.
     fn p_get_event(p: &Platform, id: EventId) -> pillar_eventlog::Event {
-        p.log.get(id).expect("event exists").clone()
+        p.log.get(&id).expect("event exists").clone()
     }
 
     #[test]
@@ -876,7 +869,8 @@ mod tests {
     }
 
     #[test]
-    fn describe_exercised_authority_reflects_an_explicit_grant_and_never_fabricates_with_no_scope() {
+    fn describe_exercised_authority_reflects_an_explicit_grant_and_never_fabricates_with_no_scope()
+    {
         let owner = NodeId::from(OWNER);
         // An explicit ALLOW grant is the rung actually exercised here.
         let grants = vec![ExplicitGrant {
@@ -890,14 +884,21 @@ mod tests {
             default_resource_class_policies(&RbacCapability(CAP.to_owned())),
             grants,
         );
-        p.apply(&owner, CAP, route_crd("granted"), [], [ManifestCapability::from(CAP)])
-            .unwrap();
+        p.apply(
+            &owner,
+            CAP,
+            route_crd("granted"),
+            [],
+            [ManifestCapability::from(CAP)],
+        )
+        .unwrap();
         let described = p.describe(API, KIND, "granted").unwrap();
         assert!(described.contains("Exercised-Authority: explicit grant (allow)"));
 
         // An envelope applied with NO capability-scope has nothing to
         // explain — describe says so plainly rather than guessing a rung.
-        p.apply(&owner, CAP, route_crd("scopeless"), [], []).unwrap();
+        p.apply(&owner, CAP, route_crd("scopeless"), [], [])
+            .unwrap();
         let described = p.describe(API, KIND, "scopeless").unwrap();
         assert!(described.contains("Exercised-Authority: (no capability-scope"));
     }

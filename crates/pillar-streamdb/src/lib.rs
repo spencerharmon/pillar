@@ -27,37 +27,100 @@ mod persist;
 pub use persist::{PersistError, PersistentStream};
 
 /// A content address: the identity of an [`Op`], derived purely from its
-/// payload bytes.
+/// payload bytes via a **collision-resistant cryptographic** hash.
 ///
 /// Mirrors `Ops \subseteq Nat` in the spec, where an op's id IS its content
-/// address — two ops with the same id necessarily have the same content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OpId(pub u64);
+/// address — two ops with the same id necessarily have the same content. Here
+/// that identity is a real SHA2-256 multihash (see [`content_address`]), not a
+/// checksum: a non-cryptographic hash (FNV, SipHash, `DefaultHasher`) is *not*
+/// a content address, because an adversary can forge a distinct payload sharing
+/// the same address and thereby impersonate an op across gossip. The underlying
+/// bytes are the self-describing multihash produced by
+/// [`pillar_crypto::content::content_address`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OpId(pub pillar_crypto::ContentId);
 
-/// Deterministic content address of an arbitrary byte payload.
+impl OpId {
+    /// The raw multihash bytes of this content address.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// The content address as lowercase hex of its multihash bytes — the
+    /// canonical string form used in URLs, wire encodings, and logs.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        let mut s = String::with_capacity(self.as_bytes().len() * 2);
+        for b in self.as_bytes() {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    /// Parse a content address from its lowercase-hex string form (the inverse
+    /// of [`OpId::to_hex`]). Returns `None` for any non-hex / odd-length input.
+    #[must_use]
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.is_empty() || s.len() % 2 != 0 {
+            return None;
+        }
+        let raw = s.as_bytes();
+        let mut bytes = Vec::with_capacity(s.len() / 2);
+        let mut i = 0;
+        while i < raw.len() {
+            let hi = (raw[i] as char).to_digit(16)?;
+            let lo = (raw[i + 1] as char).to_digit(16)?;
+            bytes.push(((hi << 4) | lo) as u8);
+            i += 2;
+        }
+        Some(OpId(pillar_crypto::ContentId::from_bytes(bytes)))
+    }
+}
+
+impl fmt::Display for OpId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+// `ContentId` is an opaque byte container that is `Eq + Hash` but deliberately
+// not `Ord` (the crypto layer treats it as opaque). The op-log keys a
+// `BTreeMap` on the content address to get a deterministic, content-derived
+// per-partition order (`Order`/`SortSet` in the spec), so we impose a total
+// order here by lexicographic comparison of the multihash bytes — a pure
+// function of content, identical on every node.
+impl PartialOrd for OpId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OpId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_bytes().cmp(other.0.as_bytes())
+    }
+}
+
+/// Deterministic, collision-resistant content address of an arbitrary byte
+/// payload.
 ///
 /// This is the SAME pure bytes->identity function the op-log uses for
 /// [`OpId`], exposed so other Pillar layers (e.g. content-addressed blob /
 /// OCI-layer distribution over the network transport) derive a blob's digest
 /// with the identical, canonical content-addressing rather than reinventing
-/// one. Two nodes holding the same bytes necessarily agree on the address.
+/// one. Two nodes holding the same bytes necessarily agree on the address, and
+/// — because it delegates to [`pillar_crypto::content::content_address`] (a
+/// real SHA2-256 multihash) — no adversary can construct a distinct payload
+/// sharing the address.
 #[must_use]
-pub fn content_address(bytes: &[u8]) -> u64 {
-    content_hash(bytes)
-}
-
-/// Deterministic content hash (FNV-1a, 64-bit). Dependency-free and stable
-/// across runs/platforms, which is all the CRDT needs: a pure function from
-/// bytes to an identity, not cryptographic collision resistance.
-fn content_hash(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+pub fn content_address(bytes: &[u8]) -> pillar_crypto::ContentId {
+    // The crypto content-addressing function is infallible for an in-memory
+    // byte slice (it computes a SHA2-256 digest); surface any error as a panic
+    // rather than threading a `Result` through the CRDT identity, since a
+    // failure here would mean the crypto primitive itself is broken.
+    pillar_crypto::content::content_address(bytes)
+        .expect("SHA2-256 content addressing is infallible for an in-memory payload")
 }
 
 /// A single appended operation: its content-addressed id plus its payload.
@@ -71,14 +134,14 @@ impl Op {
     /// Build an op from its payload, deriving its content-addressed id.
     #[must_use]
     pub fn new(payload: Vec<u8>) -> Self {
-        let id = OpId(content_hash(&payload));
+        let id = OpId(content_address(&payload));
         Op { id, payload }
     }
 
     /// The op's content address.
     #[must_use]
     pub fn id(&self) -> OpId {
-        self.id
+        self.id.clone()
     }
 
     /// The op's raw payload.
@@ -113,15 +176,15 @@ impl OpLog {
     /// simply no-ops rather than being disallowed, since the log is a set).
     pub fn append(&mut self, payload: impl Into<Vec<u8>>) -> OpId {
         let op = Op::new(payload.into());
-        let id = op.id;
-        self.ops.entry(id).or_insert(op);
+        let id = op.id.clone();
+        self.ops.entry(id.clone()).or_insert(op);
         id
     }
 
     /// Whether this log already holds `id`.
     #[must_use]
-    pub fn contains(&self, id: OpId) -> bool {
-        self.ops.contains_key(&id)
+    pub fn contains(&self, id: &OpId) -> bool {
+        self.ops.contains_key(id)
     }
 
     /// Number of ops held.
@@ -141,7 +204,7 @@ impl OpLog {
     /// source repeatedly, or in any order, converges to the same set.
     pub fn merge(&mut self, other: &OpLog) {
         for (id, op) in &other.ops {
-            self.ops.entry(*id).or_insert_with(|| op.clone());
+            self.ops.entry(id.clone()).or_insert_with(|| op.clone());
         }
     }
 
@@ -155,15 +218,19 @@ impl OpLog {
 
     /// The set of content addresses currently held.
     pub fn ids(&self) -> impl Iterator<Item = OpId> + '_ {
-        self.ops.keys().copied()
+        self.ops.keys().cloned()
     }
 
-    /// The Merkle root: a hash-chain fold over the content-ordered ops.
-    /// Deterministic in the op set alone (the order is itself derived from
-    /// content) — `Root`/`FoldRoot` in the spec. Two nodes holding the same
-    /// set always compute the same root, regardless of gossip path.
+    /// The Merkle root: a **cryptographic** hash-chain fold over the
+    /// content-ordered ops. Deterministic in the op set alone (the order is
+    /// itself derived from each op's content address) — `Root`/`FoldRoot` in
+    /// the spec. Two nodes holding the same set always compute the same root,
+    /// regardless of gossip path, and — because each fold step is a real
+    /// SHA2-256 over `(accumulator || op-address)` — the root is a
+    /// collision-resistant commitment to the exact set, not a reversible/
+    /// forgeable arithmetic mix.
     #[must_use]
-    pub fn root(&self) -> u64 {
+    pub fn root(&self) -> MerkleRoot {
         fold_root(&self.order())
     }
 
@@ -190,18 +257,68 @@ impl OpLog {
             ops: snapshot.ops.clone(),
         };
         for op in tail {
-            log.ops.entry(op.id).or_insert_with(|| op.clone());
+            log.ops.entry(op.id.clone()).or_insert_with(|| op.clone());
         }
         log
     }
 }
 
-fn fold_root(ops: &[&Op]) -> u64 {
-    const FOLD_PRIME: u64 = 31;
-    const FOLD_MODULUS: u64 = 1_000_003;
-    ops.iter().rev().fold(0u64, |acc, op| {
-        (op.id.0.wrapping_add(FOLD_PRIME.wrapping_mul(acc))) % FOLD_MODULUS
-    })
+/// A cryptographic Merkle root: a collision-resistant commitment to an op
+/// *set*, produced by [`OpLog::root`].
+///
+/// The bytes are a real SHA2-256 digest of the content-ordered op addresses,
+/// so two roots are equal iff (with cryptographic confidence) the two logs hold
+/// the same op set. A `u64` arithmetic fold (the previous FNV/modular-mix
+/// placeholder) could not offer this: distinct sets collide trivially under a
+/// 64-bit non-cryptographic mix.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MerkleRoot(Vec<u8>);
+
+impl MerkleRoot {
+    /// The raw digest bytes of this Merkle root.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The Merkle root as lowercase hex — its canonical string form.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        let mut s = String::with_capacity(self.0.len() * 2);
+        for b in &self.0 {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+}
+
+impl fmt::Display for MerkleRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+/// Fold the content-ordered ops into a cryptographic Merkle root.
+///
+/// The fold is a hash chain: starting from the SHA2-256 of a fixed domain-
+/// separation tag, each op folds in as `H(accumulator || op-content-address)`.
+/// Because the ops are already in content-derived order and each address is
+/// itself a collision-resistant hash of the op's bytes, the resulting root is a
+/// deterministic, collision-resistant commitment to the op *set* — identical on
+/// every node holding that set, and infeasible to forge a colliding set for.
+fn fold_root(ops: &[&Op]) -> MerkleRoot {
+    use sha2::{Digest, Sha256};
+    // Domain separation so a streamdb Merkle root can never be confused with a
+    // bare content address of the same bytes.
+    let mut acc: Vec<u8> = Sha256::digest(b"pillar-streamdb-merkle-root-v1").to_vec();
+    for op in ops {
+        let mut hasher = Sha256::new();
+        hasher.update(&acc);
+        hasher.update(op.id.as_bytes());
+        acc = hasher.finalize().to_vec();
+    }
+    MerkleRoot(acc)
 }
 
 /// A content-addressed compaction of an [`OpLog`] at a point in time.
@@ -211,15 +328,15 @@ fn fold_root(ops: &[&Op]) -> u64 {
 /// reconstructs the identical op set a continuously-gossiped peer would hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
-    root: u64,
+    root: MerkleRoot,
     ops: BTreeMap<OpId, Op>,
 }
 
 impl Snapshot {
     /// The Merkle root this snapshot was taken at.
     #[must_use]
-    pub fn root(&self) -> u64 {
-        self.root
+    pub fn root(&self) -> MerkleRoot {
+        self.root.clone()
     }
 
     /// Number of ops summarized by this snapshot.
@@ -381,7 +498,7 @@ impl View<'_> {
 
     /// The view's Merkle root, delegating to the underlying log.
     #[must_use]
-    pub fn root(&self) -> u64 {
+    pub fn root(&self) -> MerkleRoot {
         self.log.root()
     }
 }
@@ -434,6 +551,65 @@ impl std::error::Error for PolicyViolation {}
 mod tests {
     use super::*;
 
+    /// ROI non-negotiable #7 (real cryptography only): the content address is a
+    /// REAL collision-resistant cryptographic multihash, NOT a 64-bit checksum.
+    /// This test pins the two properties a placeholder (FNV/SipHash/`DefaultHasher`
+    /// u64) could never satisfy, so a regression back to a checksum id fails here:
+    ///   * the address is a self-describing SHA2-256 multihash: `0x12 0x20`
+    ///     (code=sha2-256, len=32) followed by the 32-byte digest — 34 bytes,
+    ///     far wider than any 8-byte checksum;
+    ///   * it is byte-for-byte the SAME address `pillar_crypto::content::content_address`
+    ///     computes (no private/second hash), tying the CRDT identity to the audited
+    ///     real-crypto crate.
+    #[test]
+    fn content_address_is_a_real_cryptographic_multihash_not_a_checksum() {
+        let payload = b"pillar streamdb op".to_vec();
+        let id = OpId(content_address(&payload));
+        // 34-byte sha2-256 multihash, not a <=8-byte checksum.
+        assert_eq!(
+            id.as_bytes().len(),
+            34,
+            "must be a 256-bit multihash, not a u64 checksum"
+        );
+        assert!(id.as_bytes().len() >= 32);
+        assert_eq!(id.as_bytes()[0], 0x12, "multicodec sha2-256");
+        assert_eq!(id.as_bytes()[1], 0x20, "digest length 32 bytes");
+        // Exactly the crypto crate's real content address — no second/private hash.
+        let expected =
+            pillar_crypto::content::content_address(&payload).expect("real content address");
+        assert_eq!(
+            id.0, expected,
+            "streamdb reuses the audited real-crypto content address"
+        );
+        // Avalanche: a one-byte change flips the address.
+        let mut flipped = payload.clone();
+        flipped[0] ^= 0x01;
+        assert_ne!(id, OpId(content_address(&flipped)));
+    }
+
+    /// The Merkle root is a real cryptographic (SHA2-256) commitment, not a
+    /// 64-bit arithmetic fold: 32 bytes wide, and it changes when the op SET
+    /// changes (collision-resistant over the set).
+    #[test]
+    fn merkle_root_is_a_real_cryptographic_commitment() {
+        let mut a = OpLog::new();
+        a.append(b"x".to_vec());
+        a.append(b"y".to_vec());
+        let mut b = a.clone();
+        b.append(b"z".to_vec());
+        assert_eq!(
+            a.root().as_bytes().len(),
+            32,
+            "sha2-256 digest, not a u64 fold"
+        );
+        assert_ne!(a.root(), b.root(), "root commits to the op set");
+        // Deterministic over the set regardless of append order.
+        let mut a2 = OpLog::new();
+        a2.append(b"y".to_vec());
+        a2.append(b"x".to_vec());
+        assert_eq!(a.root(), a2.root());
+    }
+
     /// `DeterministicMerkleRoot` precursor: the content address is a pure
     /// function of the payload bytes alone.
     #[test]
@@ -452,11 +628,11 @@ mod tests {
         let mut log = OpLog::new();
         let before: Vec<OpId> = log.ids().collect();
         let id1 = log.append(b"a".to_vec());
-        assert!(before.iter().all(|id| log.contains(*id)));
-        assert!(log.contains(id1));
+        assert!(before.iter().all(|id| log.contains(id)));
+        assert!(log.contains(&id1));
         let id2 = log.append(b"b".to_vec());
-        assert!(log.contains(id1));
-        assert!(log.contains(id2));
+        assert!(log.contains(&id1));
+        assert!(log.contains(&id2));
         assert_eq!(log.len(), 2);
     }
 
@@ -490,7 +666,7 @@ mod tests {
         merged_ba.merge(&a);
 
         // Monotonic: everything `a` held before merging is still held after.
-        assert!(a_before_ids.iter().all(|id| merged_ab.contains(*id)));
+        assert!(a_before_ids.iter().all(|id| merged_ab.contains(id)));
 
         // Commutative: merging a into b or b into a converges to the same set.
         assert_eq!(

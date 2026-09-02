@@ -40,14 +40,31 @@ use pillar_streamdb::content_address;
 ///
 /// This is exactly [`pillar_streamdb::content_address`], so a CID computed here
 /// equals the CID the streaming DB / blob store computes for the same bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Cid(pub u64);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Cid(pub pillar_streamdb::OpId);
 
 impl Cid {
+    /// The raw multihash bytes of this CID.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
     /// Compute the CID of a message's bytes (canonical across all layers).
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
-        Cid(content_address(bytes))
+        Cid(pillar_streamdb::OpId(content_address(bytes)))
+    }
+}
+
+impl PartialOrd for Cid {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Cid {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
     }
 }
 
@@ -116,14 +133,14 @@ impl DedupProcessor {
     /// `false` for every later copy of the same CID, so the message is
     /// processed exactly once regardless of how many redundant / forwarded
     /// copies arrive.
-    pub fn process(&mut self, cid: Cid) -> bool {
-        self.seen.insert(cid)
+    pub fn process(&mut self, cid: &Cid) -> bool {
+        self.seen.insert(cid.clone())
     }
 
     /// Whether this CID has already been processed.
     #[must_use]
-    pub fn has_seen(&self, cid: Cid) -> bool {
-        self.seen.contains(&cid)
+    pub fn has_seen(&self, cid: &Cid) -> bool {
+        self.seen.contains(cid)
     }
 }
 
@@ -156,11 +173,17 @@ impl ExclusiveRouter {
     /// and the (sorted) membership view. Returns `None` only if the membership
     /// set is empty.
     #[must_use]
-    pub fn lease_holder(&self, cid: Cid) -> Option<&NodeId> {
+    pub fn lease_holder(&self, cid: &Cid) -> Option<&NodeId> {
         if self.members.is_empty() {
             return None;
         }
-        let idx = (cid.0 as usize) % self.members.len();
+        // Derive a stable index from the leading bytes of the (cryptographic)
+        // content address — a pure function of the CID, identical on every node.
+        let mut acc: u64 = 0;
+        for &b in cid.as_bytes().iter().take(8) {
+            acc = (acc << 8) | u64::from(b);
+        }
+        let idx = (acc as usize) % self.members.len();
         self.members.get(idx)
     }
 
@@ -172,7 +195,7 @@ impl ExclusiveRouter {
     /// - [`SideEffect::Convergent`]: admitted for ANY member (opportunistic
     ///   multi-node pickup is legal for idempotent messages).
     #[must_use]
-    pub fn admits(&self, effect: SideEffect, cid: Cid, candidate: &NodeId) -> bool {
+    pub fn admits(&self, effect: SideEffect, cid: &Cid, candidate: &NodeId) -> bool {
         match effect {
             SideEffect::Exclusive => self.lease_holder(cid) == Some(candidate),
             SideEffect::Convergent => self.members.iter().any(|m| m == candidate),
@@ -196,7 +219,7 @@ impl ExclusiveRouter {
 #[must_use]
 pub fn reply_node_set(
     ipam: &TopologyScopedIpam,
-    _cid: Cid,
+    _cid: &Cid,
     k: usize,
     want_v6: bool,
     preference: Option<&BTreeMap<String, u64>>,
@@ -229,11 +252,11 @@ impl ForwardGate {
     /// exhausted and the CID not seen before), and `None` when forwarding must
     /// stop — either the TTL reached zero or the CID was already forwarded
     /// (loop). A returned `Some` records the CID so any later loop copy stops.
-    pub fn forward(&mut self, cid: Cid, ttl: u32) -> Option<u32> {
+    pub fn forward(&mut self, cid: &Cid, ttl: u32) -> Option<u32> {
         if ttl == 0 {
             return None;
         }
-        if !self.seen.insert(cid) {
+        if !self.seen.insert(cid.clone()) {
             // Already forwarded this CID: a loop — terminate.
             return None;
         }
@@ -406,11 +429,7 @@ pub fn encode(message: &[u8], k: usize, m: usize) -> Result<Vec<Shard>, ShardErr
 /// Returns [`ShardError::Empty`] if `k == 0`, [`ShardError::MissingLength`] if
 /// `orig_len` is zero, or [`ShardError::InsufficientShards`] if fewer than `k`
 /// data positions can be recovered from the verified shards.
-pub fn reconstruct(
-    shards: &[Shard],
-    k: usize,
-    orig_len: usize,
-) -> Result<Vec<u8>, ShardError> {
+pub fn reconstruct(shards: &[Shard], k: usize, orig_len: usize) -> Result<Vec<u8>, ShardError> {
     if k == 0 {
         return Err(ShardError::Empty);
     }
@@ -520,12 +539,15 @@ mod tests {
         // 3 redundant copies (3 reply nodes) + 1 forwarded copy = 4 arrivals.
         let mut processed = 0;
         for _ in 0..4 {
-            if dedup.process(cid) {
+            if dedup.process(&cid) {
                 processed += 1;
             }
         }
-        assert_eq!(processed, 1, "message processed exactly once across 4 copies");
-        assert!(dedup.has_seen(cid));
+        assert_eq!(
+            processed, 1,
+            "message processed exactly once across 4 copies"
+        );
+        assert!(dedup.has_seen(&cid));
     }
 
     // --- exclusive-message single-lease-holder routing (TLA: ExclusiveSingleHolder) ---
@@ -535,11 +557,11 @@ mod tests {
         let members = [n("a"), n("b"), n("c"), n("d")];
         let router = ExclusiveRouter::new(members.clone());
         let cid = Cid::of(b"claim-the-dns-name");
-        let holder = router.lease_holder(cid).cloned().unwrap();
+        let holder = router.lease_holder(&cid).cloned().unwrap();
 
         let mut admitted = 0;
         for m in &members {
-            if router.admits(SideEffect::Exclusive, cid, m) {
+            if router.admits(SideEffect::Exclusive, &cid, m) {
                 admitted += 1;
                 assert_eq!(*m, holder, "only the lease holder is admitted");
             }
@@ -554,12 +576,12 @@ mod tests {
         let cid = Cid::of(b"an idempotent replica advert");
         for m in &members {
             assert!(
-                router.admits(SideEffect::Convergent, cid, m),
+                router.admits(SideEffect::Convergent, &cid, m),
                 "any member may pick up an idempotent message"
             );
         }
         // A non-member is never admitted.
-        assert!(!router.admits(SideEffect::Convergent, cid, &n("stranger")));
+        assert!(!router.admits(SideEffect::Convergent, &cid, &n("stranger")));
     }
 
     // --- identical independently-computed reply-node sets (TLA: DeterministicReplySet) ---
@@ -570,9 +592,12 @@ mod tests {
         let ipam_b = two_region_ipam();
         let cid = Cid::of(b"a request needing 3 dispersed replies");
 
-        let set_a = reply_node_set(&ipam_a, cid, 3, false, None);
-        let set_b = reply_node_set(&ipam_b, cid, 3, false, None);
-        assert_eq!(set_a, set_b, "two independent computations agree bit-for-bit");
+        let set_a = reply_node_set(&ipam_a, &cid, 3, false, None);
+        let set_b = reply_node_set(&ipam_b, &cid, 3, false, None);
+        assert_eq!(
+            set_a, set_b,
+            "two independent computations agree bit-for-bit"
+        );
         // K=3 over 2 bound sites spans both distinct regions (west + east).
         assert_eq!(set_a.len(), 2, "one address per distinct failure domain");
         assert!(set_a.iter().any(|a| a.to_string().starts_with("10.1")));
@@ -586,9 +611,9 @@ mod tests {
         let cid = Cid::of(b"a forwarded message in a loop");
         let mut gate = ForwardGate::new();
         // First arrival forwards with plenty of TTL.
-        assert_eq!(gate.forward(cid, 8), Some(7));
+        assert_eq!(gate.forward(&cid, 8), Some(7));
         // An injected loop copy of the SAME cid is refused even with TTL left.
-        assert_eq!(gate.forward(cid, 8), None, "dedup breaks the loop pre-TTL");
+        assert_eq!(gate.forward(&cid, 8), None, "dedup breaks the loop pre-TTL");
     }
 
     #[test]
@@ -599,7 +624,7 @@ mod tests {
         // Each hop is a DISTINCT cid so only the TTL bounds the chain.
         loop {
             let cid = Cid::of(format!("hop-{hops}").as_bytes());
-            match gate.forward(cid, ttl) {
+            match gate.forward(&cid, ttl) {
                 Some(next) => {
                     ttl = next;
                     hops += 1;
@@ -617,7 +642,10 @@ mod tests {
         let mut gate = AntiAmplificationGate::new(3);
         // Client not yet validated: no reply commits, budget is zero.
         assert_eq!(gate.budget(), 0);
-        assert!(!gate.try_commit_reply(false), "unvalidated client gets no reply");
+        assert!(
+            !gate.try_commit_reply(false),
+            "unvalidated client gets no reply"
+        );
         // Even claiming validated=true, with zero validated requests the budget
         // is zero so nothing commits.
         assert!(!gate.try_commit_reply(true));
@@ -636,7 +664,10 @@ mod tests {
                 committed += 1;
             }
         }
-        assert_eq!(committed, 6, "replies bounded to factor * validated requests");
+        assert_eq!(
+            committed, 6,
+            "replies bounded to factor * validated requests"
+        );
     }
 
     // --- K+M shard reconstruction with bad-CID rejection (TLA: ReconstructOrReject) ---
@@ -650,10 +681,16 @@ mod tests {
         // Corrupt one data shard's bytes WITHOUT updating its CID: it must be
         // rejected on verify, and reconstruction falls back to a parity shard.
         shards[1].bytes[0] ^= 0xFF;
-        assert!(!shards[1].verify(), "corrupted shard fails CID verification");
+        assert!(
+            !shards[1].verify(),
+            "corrupted shard fails CID verification"
+        );
 
         let recovered = reconstruct(&shards, k, message.len()).unwrap();
-        assert_eq!(recovered, message, "reconstructed from surviving+parity shards");
+        assert_eq!(
+            recovered, message,
+            "reconstructed from surviving+parity shards"
+        );
     }
 
     #[test]

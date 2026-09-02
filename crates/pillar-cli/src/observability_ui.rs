@@ -196,7 +196,7 @@ impl ObservabilityBuilders {
         labels: BTreeSet<Label>,
     ) {
         self.correlation.register(
-            id,
+            id.clone(),
             &pillar_observability::SignalRef {
                 kind: self
                     .store
@@ -212,9 +212,10 @@ impl ObservabilityBuilders {
 
     /// Ingest a metadata label-set observation for `entity` at `tick`.
     pub fn observe_metadata(&mut self, entity: EntityId, labels: LabelSet, tick: u64) {
-        self.metadata.ingest(pillar_observability::LabelObservation::new(
-            entity, labels, tick,
-        ));
+        self.metadata
+            .ingest(pillar_observability::LabelObservation::new(
+                entity, labels, tick,
+            ));
     }
 
     // -------------------------- Explore/query builder -----------------------
@@ -227,7 +228,7 @@ impl ObservabilityBuilders {
             .filter_map(|raw| {
                 self.store
                     .held_signals()
-                    .find(|s| s.id().0 == raw)
+                    .find(|s| s.id() == raw)
                     .map(|s| ExploreRecord {
                         id: s.id(),
                         kind: s.kind(),
@@ -263,7 +264,10 @@ impl ObservabilityBuilders {
     fn filtered(records: Vec<ExploreRecord>, filter: Option<&str>) -> Vec<ExploreRecord> {
         match filter {
             None => records,
-            Some(f) => records.into_iter().filter(|r| r.payload.contains(f)).collect(),
+            Some(f) => records
+                .into_iter()
+                .filter(|r| r.payload.contains(f))
+                .collect(),
         }
     }
 
@@ -349,8 +353,10 @@ impl ObservabilityBuilders {
     // -- trace: get / search / graph --
 
     /// `obs trace get <id>` — the one trace-span record with this id.
-    pub fn trace_get(&mut self, id: SignalId) -> Option<ExploreRecord> {
-        self.explore(SignalKind::TraceSpan).into_iter().find(|r| r.id == id)
+    pub fn trace_get(&mut self, id: &SignalId) -> Option<ExploreRecord> {
+        self.explore(SignalKind::TraceSpan)
+            .into_iter()
+            .find(|r| &r.id == id)
     }
 
     /// `obs trace search [filter]` — every trace-span record whose payload
@@ -371,14 +377,16 @@ impl ObservabilityBuilders {
     // -- profile: get / flame / top --
 
     /// `obs profile get <id>` — the one profile-sample record with this id.
-    pub fn profile_get(&mut self, id: SignalId) -> Option<ExploreRecord> {
-        self.explore(SignalKind::ProfileSample).into_iter().find(|r| r.id == id)
+    pub fn profile_get(&mut self, id: &SignalId) -> Option<ExploreRecord> {
+        self.explore(SignalKind::ProfileSample)
+            .into_iter()
+            .find(|r| &r.id == id)
     }
 
     /// `obs profile flame <id>` — the profile sample's stack frames, split on
     /// `;` (the collapsed-stack convention `perf`/`pprof` flamegraphs share),
     /// outermost frame first.
-    pub fn profile_flame(&mut self, id: SignalId) -> Option<Vec<String>> {
+    pub fn profile_flame(&mut self, id: &SignalId) -> Option<Vec<String>> {
         self.profile_get(id)
             .map(|r| r.payload.split(';').map(str::to_owned).collect())
     }
@@ -439,7 +447,12 @@ impl ObservabilityBuilders {
         let signals = self.correlation.by_label(label);
         let kinds = signals
             .iter()
-            .filter_map(|id| self.store.held_signals().find(|s| s.id() == *id).map(|s| s.kind()))
+            .filter_map(|id| {
+                self.store
+                    .held_signals()
+                    .find(|s| s.id() == *id)
+                    .map(|s| s.kind())
+            })
             .collect();
         LabelPivot { signals, kinds }
     }
@@ -456,19 +469,23 @@ impl ObservabilityBuilders {
     /// Reload a previously saved query by its CID.
     #[must_use]
     pub fn load_query(&self, id: OpId) -> Option<SavedQuery> {
-        self.queries.order().into_iter().find(|op| op.id() == id).and_then(|op| {
-            let text = String::from_utf8_lossy(op.payload()).into_owned();
-            let mut lines = text.splitn(3, '\n');
-            let signer = lines.next()?.to_owned();
-            let name = lines.next()?.to_owned();
-            let spec = lines.next().unwrap_or("").to_owned();
-            Some(SavedQuery { signer, name, spec })
-        })
+        self.queries
+            .order()
+            .into_iter()
+            .find(|op| op.id() == id)
+            .and_then(|op| {
+                let text = String::from_utf8_lossy(op.payload()).into_owned();
+                let mut lines = text.splitn(3, '\n');
+                let signer = lines.next()?.to_owned();
+                let name = lines.next()?.to_owned();
+                let spec = lines.next().unwrap_or("").to_owned();
+                Some(SavedQuery { signer, name, spec })
+            })
     }
 
     /// The streaming tip (Merkle root) of the saved-query resource log.
     #[must_use]
-    pub fn query_tip(&self) -> u64 {
+    pub fn query_tip(&self) -> pillar_streamdb::MerkleRoot {
         self.queries.root()
     }
 
@@ -498,26 +515,32 @@ impl ObservabilityBuilders {
     /// Create a new dashboard, returning its dashboard id (used for every
     /// subsequent update/delete/get on this same dashboard). ONE signed
     /// resource event.
-    pub fn create_dashboard(&mut self, signer: &str, name: &str, content: &str) -> u64 {
+    pub fn create_dashboard(&mut self, signer: &str, name: &str, content: &str) -> OpId {
         // The dashboard id is the content-address of its FIRST (create) event
         // — a stable, content-addressed identity for the dashboard's whole
         // lifetime, exactly like a layout/query resource's CID.
         let probe = format!("probe\n{signer}\n{name}\n{content}");
-        let id = pillar_streamdb::content_address(probe.as_bytes());
-        self.append_dashboard_event(id, DashboardOp::Create, signer, name, content);
+        let id = OpId(pillar_streamdb::content_address(probe.as_bytes()));
+        self.append_dashboard_event(&id, DashboardOp::Create, signer, name, content);
         id
     }
 
     /// Update an existing dashboard's name/content. ONE signed resource event;
     /// the dashboard's CURRENT state (per [`Self::get_dashboard`]) becomes this
     /// mutation.
-    pub fn update_dashboard(&mut self, dashboard_id: u64, signer: &str, name: &str, content: &str) {
+    pub fn update_dashboard(
+        &mut self,
+        dashboard_id: &OpId,
+        signer: &str,
+        name: &str,
+        content: &str,
+    ) {
         self.append_dashboard_event(dashboard_id, DashboardOp::Update, signer, name, content);
     }
 
     /// Delete a dashboard. ONE signed tombstone resource event; after this,
     /// [`Self::get_dashboard`] resolves `None` for this id.
-    pub fn delete_dashboard(&mut self, dashboard_id: u64, signer: &str) {
+    pub fn delete_dashboard(&mut self, dashboard_id: &OpId, signer: &str) {
         self.append_dashboard_event(dashboard_id, DashboardOp::Delete, signer, "", "");
     }
 
@@ -526,7 +549,7 @@ impl ObservabilityBuilders {
     /// unambiguously regardless of the log's content-address iteration order.
     fn append_dashboard_event(
         &mut self,
-        dashboard_id: u64,
+        dashboard_id: &OpId,
         op: DashboardOp,
         signer: &str,
         name: &str,
@@ -534,7 +557,11 @@ impl ObservabilityBuilders {
     ) {
         let seq = self.next_dashboard_seq;
         self.next_dashboard_seq += 1;
-        let payload = format!("{seq}\n{dashboard_id}\n{}\n{signer}\n{name}\n{content}", op.tag());
+        let payload = format!(
+            "{seq}\n{}\n{}\n{signer}\n{name}\n{content}",
+            dashboard_id.to_hex(),
+            op.tag()
+        );
         self.dashboards.append(payload.into_bytes());
     }
 
@@ -542,16 +569,22 @@ impl ObservabilityBuilders {
     /// assigned-sequence order to the latest one — `None` if it was never
     /// created, or its latest event is a delete tombstone.
     #[must_use]
-    pub fn get_dashboard(&self, dashboard_id: u64) -> Option<DashboardView> {
+    pub fn get_dashboard(&self, dashboard_id: &OpId) -> Option<DashboardView> {
         let mut latest: Option<(u64, DashboardOp, String, String, String)> = None;
         for op in self.dashboards.order() {
             let text = String::from_utf8_lossy(op.payload()).into_owned();
             let mut lines = text.splitn(6, '\n');
-            let Some(seq_raw) = lines.next() else { continue };
-            let Ok(seq) = seq_raw.parse::<u64>() else { continue };
+            let Some(seq_raw) = lines.next() else {
+                continue;
+            };
+            let Ok(seq) = seq_raw.parse::<u64>() else {
+                continue;
+            };
             let Some(id_raw) = lines.next() else { continue };
-            let Ok(id) = id_raw.parse::<u64>() else { continue };
-            if id != dashboard_id {
+            let Some(id) = OpId::from_hex(id_raw) else {
+                continue;
+            };
+            if &id != dashboard_id {
                 continue;
             }
             let Some(op_tag) = lines.next() else { continue };
@@ -568,14 +601,18 @@ impl ObservabilityBuilders {
         match latest {
             Some((_, DashboardOp::Delete, ..)) | None => None,
             Some((_, DashboardOp::Create | DashboardOp::Update, signer, name, content)) => {
-                Some(DashboardView { signer, name, content })
+                Some(DashboardView {
+                    signer,
+                    name,
+                    content,
+                })
             }
         }
     }
 
     /// The streaming tip (Merkle root) of the dashboard resource log.
     #[must_use]
-    pub fn dashboard_tip(&self) -> u64 {
+    pub fn dashboard_tip(&self) -> pillar_streamdb::MerkleRoot {
         self.dashboards.root()
     }
 }
@@ -593,7 +630,10 @@ mod tests {
     use std::iter::once;
 
     fn labels(pairs: &[(&str, &str)]) -> LabelSet {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// An explore/query builder exists for each of the five kinds and returns
@@ -669,7 +709,7 @@ mod tests {
         assert_eq!(loaded.signer, "alice");
         assert_eq!(loaded.name, "hot-cpu");
         assert_eq!(loaded.spec, "kind=metric name=cpu>0.9");
-        assert!(b.query_tip() != 0 || true); // tip advanced deterministically; sanity only
+        assert!(!b.query_tip().as_bytes().is_empty()); // tip advanced deterministically; sanity only
     }
 
     /// The dashboard builder CRUDs a dashboard.
@@ -677,16 +717,19 @@ mod tests {
     fn dashboard_builder_cruds_a_dashboard() {
         let mut b = ObservabilityBuilders::new();
         let id = b.create_dashboard("alice", "ops", "layout-v1");
-        let view = b.get_dashboard(id).expect("dashboard exists after create");
+        let view = b.get_dashboard(&id).expect("dashboard exists after create");
         assert_eq!(view.name, "ops");
         assert_eq!(view.content, "layout-v1");
 
-        b.update_dashboard(id, "alice", "ops", "layout-v2");
-        let updated = b.get_dashboard(id).expect("dashboard exists after update");
+        b.update_dashboard(&id, "alice", "ops", "layout-v2");
+        let updated = b.get_dashboard(&id).expect("dashboard exists after update");
         assert_eq!(updated.content, "layout-v2");
 
-        b.delete_dashboard(id, "alice");
-        assert!(b.get_dashboard(id).is_none(), "deleted dashboard resolves to None");
+        b.delete_dashboard(&id, "alice");
+        assert!(
+            b.get_dashboard(&id).is_none(),
+            "deleted dashboard resolves to None"
+        );
     }
 
     /// Every persisted artifact (saved query, dashboard mutation) is a signed
@@ -699,14 +742,25 @@ mod tests {
         let tip_before = b.query_tip();
         let cid = b.save_query("alice", "q", "spec");
         assert_ne!(b.query_tip(), tip_before, "streaming tip advanced on save");
-        assert!(b.load_query(cid).is_some(), "resolves by content address, not a DB row");
+        assert!(
+            b.load_query(cid).is_some(),
+            "resolves by content address, not a DB row"
+        );
 
         let dash_tip_before = b.dashboard_tip();
         let id = b.create_dashboard("alice", "d", "c");
-        assert_ne!(b.dashboard_tip(), dash_tip_before, "streaming tip advanced on create");
+        assert_ne!(
+            b.dashboard_tip(),
+            dash_tip_before,
+            "streaming tip advanced on create"
+        );
         let tip_after_create = b.dashboard_tip();
-        b.update_dashboard(id, "alice", "d", "c2");
-        assert_ne!(b.dashboard_tip(), tip_after_create, "streaming tip advanced on update");
+        b.update_dashboard(&id, "alice", "d", "c2");
+        assert_ne!(
+            b.dashboard_tip(),
+            tip_after_create,
+            "streaming tip advanced on update"
+        );
     }
 
     /// Read/explore surfaces sign nothing; a save emits one signed resource
@@ -727,12 +781,24 @@ mod tests {
         let _ = b.metadata_view(&entity);
         let _ = b.pivot_by_label(&Label::new("node", "n-1"));
 
-        assert_eq!(b.query_tip(), before_query_tip, "explore/read signed nothing");
-        assert_eq!(b.dashboard_tip(), before_dash_tip, "explore/read signed nothing");
+        assert_eq!(
+            b.query_tip(),
+            before_query_tip,
+            "explore/read signed nothing"
+        );
+        assert_eq!(
+            b.dashboard_tip(),
+            before_dash_tip,
+            "explore/read signed nothing"
+        );
 
         // Exactly one save call -> exactly one new signed event.
         b.save_query("alice", "q", "spec");
-        assert_eq!(b.queries.order().len(), 1, "one save == one signed resource event");
+        assert_eq!(
+            b.queries.order().len(),
+            1,
+            "one save == one signed resource event"
+        );
     }
 
     /// `obs metric {query,series,tail,top,retention}`: each verb reads the
@@ -780,9 +846,12 @@ mod tests {
         let mut b = ObservabilityBuilders::new();
         let trace = CorrelationId("trace-1".to_string());
         let span = b.ingest(SignalKind::TraceSpan, b"span=root".to_vec(), 0);
-        b.register_correlation(span, Some(trace.clone()), BTreeSet::new());
+        b.register_correlation(span.clone(), Some(trace.clone()), BTreeSet::new());
 
-        assert_eq!(b.trace_get(span).expect("span exists").payload, "span=root");
+        assert_eq!(
+            b.trace_get(&span).expect("span exists").payload,
+            "span=root"
+        );
         assert_eq!(b.trace_search(Some("root")).len(), 1);
         let graph = b.trace_graph(&trace);
         assert!(graph.signals.contains(&span));
@@ -795,8 +864,8 @@ mod tests {
         let mut b = ObservabilityBuilders::new();
         let id = b.ingest(SignalKind::ProfileSample, b"main;work;sleep".to_vec(), 0);
 
-        assert!(b.profile_get(id).is_some());
-        let flame = b.profile_flame(id).expect("sample exists");
+        assert!(b.profile_get(&id).is_some());
+        let flame = b.profile_flame(&id).expect("sample exists");
         assert_eq!(flame, vec!["main", "work", "sleep"]);
         assert_eq!(b.profile_top(5).len(), 1);
     }
@@ -814,7 +883,10 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, entity);
 
-        assert_eq!(b.metadata_current(&entity), Some(labels(&[("role", "drained")])));
+        assert_eq!(
+            b.metadata_current(&entity),
+            Some(labels(&[("role", "drained")]))
+        );
         assert_eq!(b.metadata_history(&entity).len(), 2);
         assert_eq!(b.metadata_series(&entity), b.metadata_history(&entity));
     }
@@ -832,6 +904,10 @@ mod tests {
         let results = b.run_saved_query(cid).expect("saved query runs");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].payload, "cpu 0.9");
-        assert_eq!(b.query_tip(), before_tip, "running a saved query signs nothing");
+        assert_eq!(
+            b.query_tip(),
+            before_tip,
+            "running a saved query signs nothing"
+        );
     }
 }

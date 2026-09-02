@@ -150,10 +150,10 @@ mod tests {
         reader.refresh(&authority);
 
         let snap = reader
-            .read_signal_view(&authority, &n("owner"), SignalId(7))
+            .read_signal_view(&authority, &n("owner"), SignalId::from_test_seed(7))
             .expect("owner is authoritative and fresh");
         assert_eq!(snap.reader, n("owner"));
-        assert_eq!(snap.signal, SignalId(7));
+        assert_eq!(snap.signal, SignalId::from_test_seed(7));
         assert!(authority.is_authoritative(&snap.reader));
         assert_eq!(snap.watermark, authority.rev_count());
     }
@@ -172,7 +172,7 @@ mod tests {
         assert!(reader.watermark() < authority.rev_count());
 
         let err = reader
-            .read_signal_view(&authority, &n("owner"), SignalId(1))
+            .read_signal_view(&authority, &n("owner"), SignalId::from_test_seed(1))
             .expect_err("stale view must fail closed");
         match err {
             ActError::StaleView { local, current } => {
@@ -191,7 +191,7 @@ mod tests {
         reader.refresh(&authority);
 
         let err = reader
-            .read_signal_view(&authority, &n("outsider"), SignalId(3))
+            .read_signal_view(&authority, &n("outsider"), SignalId::from_test_seed(3))
             .expect_err("outsider is not authoritative");
         assert!(matches!(err, ActError::NotAuthoritative));
     }
@@ -207,11 +207,18 @@ mod tests {
         let l = store.write(SignalKind::Log, b"level=warn msg=hot".to_vec(), 0);
         let t = store.write(SignalKind::TraceSpan, b"span=1 parent=0".to_vec(), 0);
         let p = store.write(SignalKind::ProfileSample, b"stack=a;b;c".to_vec(), 0);
-        let d = store.write(SignalKind::MetadataSample, b"entity=n-1 role=worker".to_vec(), 0);
+        let d = store.write(
+            SignalKind::MetadataSample,
+            b"entity=n-1 role=worker".to_vec(),
+            0,
+        );
 
         // All five read back from the single store.
         for id in [m, l, t, p, d] {
-            assert!(store.contains(id), "kind read-back missing on one substrate");
+            assert!(
+                store.contains(&id),
+                "kind read-back missing on one substrate"
+            );
         }
         assert_eq!(store.held_len(), 5);
 
@@ -262,21 +269,37 @@ mod tests {
         let with_node: BTreeSet<Label> = std::iter::once(node.clone()).collect();
 
         index.register(
-            SignalId(1),
-            &SignalRef { kind: SignalKind::TraceSpan, correlation: Some(trace.clone()), labels: with_node.clone() },
+            SignalId::from_test_seed(1),
+            &SignalRef {
+                kind: SignalKind::TraceSpan,
+                correlation: Some(trace.clone()),
+                labels: with_node.clone(),
+            },
         );
         index.register(
-            SignalId(2),
-            &SignalRef { kind: SignalKind::Metric, correlation: Some(trace.clone()), labels: with_node.clone() },
+            SignalId::from_test_seed(2),
+            &SignalRef {
+                kind: SignalKind::Metric,
+                correlation: Some(trace.clone()),
+                labels: with_node.clone(),
+            },
         );
         index.register(
-            SignalId(3),
-            &SignalRef { kind: SignalKind::MetadataSample, correlation: None, labels: with_node.clone() },
+            SignalId::from_test_seed(3),
+            &SignalRef {
+                kind: SignalKind::MetadataSample,
+                correlation: None,
+                labels: with_node.clone(),
+            },
         );
 
         assert_eq!(index.by_correlation(&trace).len(), 2);
-        assert!(index.kinds_for_correlation(&trace).contains(&SignalKind::TraceSpan));
-        assert!(index.kinds_for_correlation(&trace).contains(&SignalKind::Metric));
+        assert!(index
+            .kinds_for_correlation(&trace)
+            .contains(&SignalKind::TraceSpan));
+        assert!(index
+            .kinds_for_correlation(&trace)
+            .contains(&SignalKind::Metric));
         // Shared label crosses kinds including metadata.
         assert_eq!(index.by_label(&node).len(), 3);
     }
@@ -291,13 +314,13 @@ mod tests {
         let mut reader = SignalReader::new();
         reader.refresh(&authority);
         assert!(reader
-            .read_signal_view(&authority, &n("alice"), SignalId(9))
+            .read_signal_view(&authority, &n("alice"), SignalId::from_test_seed(9))
             .is_ok());
 
         authority.revoke_grant(n("alice"));
         reader.refresh(&authority);
         assert!(matches!(
-            reader.read_signal_view(&authority, &n("alice"), SignalId(9)),
+            reader.read_signal_view(&authority, &n("alice"), SignalId::from_test_seed(9)),
             Err(ActError::NotAuthoritative)
         ));
     }

@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::block::{Signal, SignalKind, TimeseriesStore};
+use crate::block::{Signal, SignalId, SignalKind, TimeseriesStore};
 
 /// A raw query over held signals: filter by kind (or all kinds).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -50,18 +50,19 @@ impl Query {
 /// function of that set (order-independent, matching the op-log's Merkle
 /// root), used as the cache key so an unchanged set answers from cache.
 #[must_use]
-fn held_root(store: &TimeseriesStore) -> u64 {
-    // Order-independent fold over held ids (XOR of a mixed hash) — a pure
-    // function of the SET, never the append/gossip path.
-    let mut acc: u64 = 0;
+fn held_root(store: &TimeseriesStore) -> Vec<u8> {
+    // Order-independent fold over held ids: a cryptographic hash of each id's
+    // multihash bytes, combined by XOR — a pure function of the SET, never the
+    // append/gossip path.
+    use sha2::{Digest, Sha256};
+    let mut acc = [0u8; 32];
     for id in store.held_ids() {
-        let mut x = id.0;
-        x ^= x >> 33;
-        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        x ^= x >> 33;
-        acc ^= x;
+        let h = Sha256::digest(id.as_bytes());
+        for (a, b) in acc.iter_mut().zip(h.iter()) {
+            *a ^= *b;
+        }
     }
-    acc
+    acc.to_vec()
 }
 
 /// A materialized-view cache for raw queries, keyed on `(query, held-set
@@ -70,7 +71,7 @@ fn held_root(store: &TimeseriesStore) -> u64 {
 /// verbatim rather than recomputed.
 #[derive(Clone, Debug, Default)]
 pub struct ViewCache {
-    entries: HashMap<(Query, u64), Vec<u64>>,
+    entries: HashMap<(Query, Vec<u8>), Vec<SignalId>>,
     hits: u64,
     misses: u64,
 }
@@ -101,7 +102,7 @@ impl ViewCache {
     /// deterministic materialized view). On a cache miss the view is computed
     /// and stored keyed on the current held-set root; on a hit the cached view
     /// is returned without recomputation.
-    pub fn materialize(&mut self, store: &TimeseriesStore, query: Query) -> Vec<u64> {
+    pub fn materialize(&mut self, store: &TimeseriesStore, query: Query) -> Vec<SignalId> {
         let root = held_root(store);
         let key = (query, root);
         if let Some(view) = self.entries.get(&key) {
@@ -109,10 +110,10 @@ impl ViewCache {
             return view.clone();
         }
         self.misses += 1;
-        let mut ids: Vec<u64> = store
+        let mut ids: Vec<SignalId> = store
             .held_signals()
             .filter(|s| query.matches(s))
-            .map(|s| s.id().0)
+            .map(|s| s.id())
             .collect();
         ids.sort_unstable();
         self.entries.insert(key, ids.clone());

@@ -90,7 +90,7 @@ pub fn verify_ops(candidates: &[ClaimedOp]) -> Result<(), TamperedOp> {
         let actual = OpId(content_address(&c.payload));
         if actual != c.claimed_id {
             return Err(TamperedOp {
-                claimed_id: c.claimed_id,
+                claimed_id: c.claimed_id.clone(),
                 actual_id: actual,
             });
         }
@@ -189,11 +189,7 @@ impl StreamCli {
     /// [`TamperedOp`] wrapped as [`StreamCliError::Policy`]-adjacent is
     /// surfaced directly via the `Err` variant's [`TamperedOp`] (see return
     /// type) so a caller can report exactly which entry was mangled.
-    pub fn sync(
-        &mut self,
-        name: &str,
-        candidates: &[ClaimedOp],
-    ) -> Result<usize, SyncError> {
+    pub fn sync(&mut self, name: &str, candidates: &[ClaimedOp]) -> Result<usize, SyncError> {
         let entry = self
             .streams
             .get_mut(name)
@@ -244,7 +240,7 @@ impl StreamCli {
     ///
     /// # Errors
     /// [`StreamCliError::NoSuchStream`].
-    pub fn tip(&self, name: &str) -> Result<u64, StreamCliError> {
+    pub fn tip(&self, name: &str) -> Result<pillar_streamdb::MerkleRoot, StreamCliError> {
         Ok(self.entry(name)?.stream.log().root())
     }
 
@@ -281,15 +277,15 @@ impl StreamCli {
     ///
     /// # Errors
     /// [`StreamCliError::NoSuchStream`] / [`StreamCliError::NoSuchOp`].
-    pub fn get(&self, name: &str, cid: OpId) -> Result<&[u8], StreamCliError> {
+    pub fn get(&self, name: &str, cid: &OpId) -> Result<&[u8], StreamCliError> {
         self.entry(name)?
             .stream
             .log()
             .order()
             .into_iter()
-            .find(|op| op.id() == cid)
+            .find(|op| &op.id() == cid)
             .map(Op::payload)
-            .ok_or(StreamCliError::NoSuchOp(cid))
+            .ok_or_else(|| StreamCliError::NoSuchOp(cid.clone()))
     }
 
     /// `pillar stream head <name>` — the most-recently-content-ordered op
@@ -390,7 +386,7 @@ pub struct StreamDescription {
     /// Number of ops currently held.
     pub len: usize,
     /// The current Merkle root ("head CID").
-    pub head: u64,
+    pub head: pillar_streamdb::MerkleRoot,
 }
 
 /// Why `pillar stream sync` refused a batch.
@@ -463,7 +459,7 @@ mod tests {
         for _ in 0..5 {
             let _ = cli.log("s", None).unwrap();
             let _ = cli.tip("s").unwrap();
-            let _ = cli.get("s", id).unwrap();
+            let _ = cli.get("s", &id).unwrap();
             let _ = cli.head("s").unwrap();
         }
 
@@ -473,7 +469,7 @@ mod tests {
             len_before,
             "views never append an op"
         );
-        assert_eq!(cli.get("s", id).unwrap(), b"payload");
+        assert_eq!(cli.get("s", &id).unwrap(), b"payload");
         assert_eq!(cli.head("s").unwrap().unwrap().id(), id);
     }
 
@@ -482,8 +478,10 @@ mod tests {
         let mut cli = StreamCli::new();
         cli.create("s", None, ViewPolicy::Strict).unwrap();
         assert_eq!(
-            cli.get("s", OpId(999)),
-            Err(StreamCliError::NoSuchOp(OpId(999)))
+            cli.get("s", &OpId(content_address(b"nonexistent-op"))),
+            Err(StreamCliError::NoSuchOp(OpId(content_address(
+                b"nonexistent-op"
+            ))))
         );
     }
 
@@ -509,8 +507,8 @@ mod tests {
     fn verify_ops_detects_a_tampered_event() {
         let honest = ClaimedOp::honest(b"original payload".to_vec());
         let tampered = ClaimedOp {
-            claimed_id: honest.claimed_id, // stale address...
-            payload: b"mutated payload".to_vec(), // ...for DIFFERENT bytes
+            claimed_id: honest.claimed_id.clone(), // stale address...
+            payload: b"mutated payload".to_vec(),  // ...for DIFFERENT bytes
         };
 
         let err = verify_ops(&[honest.clone(), tampered.clone()]).unwrap_err();
@@ -534,7 +532,7 @@ mod tests {
 
         let honest = ClaimedOp::honest(b"good op".to_vec());
         let tampered = ClaimedOp {
-            claimed_id: OpId(42),
+            claimed_id: OpId(content_address(b"stale-claim")),
             payload: b"bad op".to_vec(),
         };
 
@@ -594,7 +592,10 @@ mod tests {
         cli.create("s", None, ViewPolicy::Strict).unwrap();
         cli.subscribe("s", "watcher-1").unwrap();
         cli.subscribe("s", "watcher-2").unwrap();
-        assert_eq!(cli.subscribers("s").unwrap(), vec!["watcher-1", "watcher-2"]);
+        assert_eq!(
+            cli.subscribers("s").unwrap(),
+            vec!["watcher-1", "watcher-2"]
+        );
         cli.unsubscribe("s", "watcher-1").unwrap();
         assert_eq!(cli.subscribers("s").unwrap(), vec!["watcher-2"]);
     }
@@ -603,13 +604,15 @@ mod tests {
     fn log_from_cid_skips_up_to_and_including_that_op() {
         let mut cli = StreamCli::new();
         cli.create("s", None, ViewPolicy::Strict).unwrap();
-        let id1 = cli
-            .append("s", b"a".to_vec(), SideEffect::Convergent)
+        cli.append("s", b"a".to_vec(), SideEffect::Convergent)
             .unwrap();
-        let _id2 = cli
-            .append("s", b"b".to_vec(), SideEffect::Convergent)
+        cli.append("s", b"b".to_vec(), SideEffect::Convergent)
             .unwrap();
-        let after = cli.log("s", Some(id1)).unwrap();
+        // The materialized order is by (cryptographic) content address, not
+        // append order; take the FIRST op in that order and confirm `log
+        // --from` skips up-to-and-including it, leaving exactly the tail.
+        let first = cli.log("s", None).unwrap()[0].id();
+        let after = cli.log("s", Some(first)).unwrap();
         assert_eq!(after.len(), 1);
     }
 

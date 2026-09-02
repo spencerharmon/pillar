@@ -30,9 +30,7 @@ use std::collections::BTreeMap;
 
 use pillar_core::NodeId;
 use pillar_eventlog::{Author, EventId, EventLog};
-use pillar_topology::{
-    Assignment, Label, Mismatch, TierError, TierHierarchy, Topology,
-};
+use pillar_topology::{Assignment, Label, Mismatch, TierError, TierHierarchy, Topology};
 use pillar_trust_artifacts::{Cid as TrustCid, TrustStore};
 
 /// One rendered line of the derived tier nesting for `pillar topology tree`:
@@ -262,8 +260,7 @@ impl TopologyCli {
                     continue;
                 }
             }
-            let mut values: Vec<String> =
-                self.topo.domains_at(tier, nodes).into_iter().collect();
+            let mut values: Vec<String> = self.topo.domains_at(tier, nodes).into_iter().collect();
             values.sort();
             for value in values {
                 rows.push(TreeRow {
@@ -304,13 +301,7 @@ impl TopologyCli {
     /// `pillar node place <node> --under <tier>/<value> --as <signer>` — an
     /// ACT: place `node` under one failure domain (a single self-declared
     /// label), emitting one signed event.
-    pub fn node_place(
-        &mut self,
-        signer: &NodeId,
-        node: &NodeId,
-        tier: &str,
-        value: &str,
-    ) {
+    pub fn node_place(&mut self, signer: &NodeId, node: &NodeId, tier: &str, value: &str) {
         self.node_label(signer, node, &[Label::new(tier, value)]);
     }
 
@@ -319,13 +310,7 @@ impl TopologyCli {
     /// emitting one signed event. Semantically identical to a re-`place`; the
     /// verb records operator intent (a move, not an initial placement) in the
     /// signed event payload.
-    pub fn node_move(
-        &mut self,
-        signer: &NodeId,
-        node: &NodeId,
-        tier: &str,
-        value: &str,
-    ) {
+    pub fn node_move(&mut self, signer: &NodeId, node: &NodeId, tier: &str, value: &str) {
         self.topo.declare(node.clone(), &[Label::new(tier, value)]);
         self.emit(signer, format!("node move {} to {tier}={value}", node.0));
     }
@@ -529,7 +514,7 @@ mod tests {
 
         // The emitted events are authentic (signed by the actor).
         let tip = cli.log.tip(&Author("op".to_owned())).expect("has a tip");
-        let ev = cli.log.get(tip).expect("event exists");
+        let ev = cli.log.get(&tip).expect("event exists");
         assert!(ev.is_authentic());
         assert_eq!(ev.content().author().0, "op");
 
@@ -569,7 +554,12 @@ mod tests {
         let mut cli = TopologyCli::new(hierarchy());
         cli.tiers_set(
             &signer,
-            vec!["region".to_owned(), "zone".to_owned(), "rack".to_owned(), "node".to_owned()],
+            vec![
+                "region".to_owned(),
+                "zone".to_owned(),
+                "rack".to_owned(),
+                "node".to_owned(),
+            ],
         )
         .unwrap();
         assert_eq!(cli.event_count(), 1);

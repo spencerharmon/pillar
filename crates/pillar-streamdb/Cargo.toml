@@ -10,6 +10,7 @@ description = "Content-addressed op-log CRDT + materialized view + snapshot/comp
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
+sha2 = "0.10"
 
 [lints]
 workspace = true

@@ -57,8 +57,49 @@ pub struct Author(pub String);
 /// content. Mirrors `Id(a, n)` in the spec, whose `UniquePerAuthorSeq`
 /// theorem makes the content address a faithful surrogate for a
 /// collision-resistant hash of the full event content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct EventId(pub u64);
+///
+/// Backed by a real cryptographic content address (SHA2-256 multihash) via
+/// [`pillar_streamdb::content_address`] — NOT a 64-bit checksum. A
+/// non-cryptographic id would let an adversary forge a distinct event content
+/// sharing an [`EventId`], collapsing the `UniquePerAuthorSeq` guarantee.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EventId(pub pillar_streamdb::OpId);
+
+impl EventId {
+    /// The raw multihash bytes of this content address.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl Serialize for EventId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.as_bytes().to_vec().serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for EventId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(d)?;
+        Ok(EventId(pillar_streamdb::OpId(
+            pillar_crypto::ContentId::from_bytes(bytes),
+        )))
+    }
+}
+
+// `EventId` keys `BTreeMap`/`BTreeSet`, so it needs a total order. `OpId`
+// (hence `ContentId`) is opaque and not `Ord`; order lexicographically by the
+// multihash bytes — a pure, content-derived, node-independent order.
+impl PartialOrd for EventId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for EventId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
 
 /// The signed content of an event: author, per-author sequence number, the
 /// `prev` hash-link (the same-author chain edge; `None` for a genesis event),
@@ -93,7 +134,7 @@ impl EventContent {
     /// `None` for a genesis (`seq == 0`) event.
     #[must_use]
     pub fn prev(&self) -> Option<EventId> {
-        self.prev
+        self.prev.clone()
     }
 
     /// The set of cross-author `parents` hash-links (observed tips of other
@@ -113,8 +154,8 @@ impl EventContent {
     /// cross-author parent. These are exactly the happens-before edges.
     fn links(&self) -> BTreeSet<EventId> {
         let mut links = self.parents.clone();
-        if let Some(p) = self.prev {
-            links.insert(p);
+        if let Some(p) = &self.prev {
+            links.insert(p.clone());
         }
         links
     }
@@ -127,25 +168,26 @@ impl EventContent {
         b.extend_from_slice(&(self.author.0.len() as u64).to_le_bytes());
         b.extend_from_slice(self.author.0.as_bytes());
         b.extend_from_slice(&self.seq.to_le_bytes());
-        match self.prev {
+        match &self.prev {
             Some(p) => {
                 b.push(1);
-                b.extend_from_slice(&p.0.to_le_bytes());
+                b.extend_from_slice(p.as_bytes());
             }
             None => b.push(0),
         }
         b.extend_from_slice(&(self.parents.len() as u64).to_le_bytes());
         // BTreeSet iterates in sorted order — canonical regardless of insert order.
         for p in &self.parents {
-            b.extend_from_slice(&p.0.to_le_bytes());
+            b.extend_from_slice(p.as_bytes());
         }
         b.extend_from_slice(&self.payload);
         b
     }
 
-    /// The content digest — the raw 64-bit content address of this content.
-    fn digest(&self) -> u64 {
-        content_address(&self.canonical_bytes())
+    /// The content digest — the raw cryptographic content address (SHA2-256
+    /// multihash bytes) of this content.
+    fn digest(&self) -> pillar_streamdb::OpId {
+        pillar_streamdb::OpId(content_address(&self.canonical_bytes()))
     }
 
     /// The content-addressed identity of this event.
@@ -167,7 +209,7 @@ impl EventContent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     author: Author,
-    signed_digest: u64,
+    signed_digest: EventId,
 }
 
 impl Signature {
@@ -177,7 +219,7 @@ impl Signature {
     pub fn sign(author: &Author, content: &EventContent) -> Self {
         Signature {
             author: author.clone(),
-            signed_digest: content.digest(),
+            signed_digest: EventId(content.digest()),
         }
     }
 
@@ -187,7 +229,7 @@ impl Signature {
     /// fails this check.
     #[must_use]
     pub fn verifies(&self, content: &EventContent) -> bool {
-        self.author == content.author && self.signed_digest == content.digest()
+        self.author == content.author && self.signed_digest.0 == content.digest()
     }
 
     /// The author who issued this signature.
@@ -293,20 +335,20 @@ impl EventLog {
 
     /// Whether the log already holds `id`.
     #[must_use]
-    pub fn contains(&self, id: EventId) -> bool {
-        self.events.contains_key(&id)
+    pub fn contains(&self, id: &EventId) -> bool {
+        self.events.contains_key(id)
     }
 
     /// Borrow a held event by id.
     #[must_use]
-    pub fn get(&self, id: EventId) -> Option<&Event> {
-        self.events.get(&id)
+    pub fn get(&self, id: &EventId) -> Option<&Event> {
+        self.events.get(id)
     }
 
     /// The current tip (latest event id) of `author`, if it has published.
     #[must_use]
     pub fn tip(&self, author: &Author) -> Option<EventId> {
-        self.tip.get(author).copied()
+        self.tip.get(author).cloned()
     }
 
     /// Author `author` appends `payload` as its next event, building the
@@ -320,12 +362,12 @@ impl EventLog {
     /// construction and it never fails.
     pub fn append(&mut self, author: &Author, payload: impl Into<Vec<u8>>) -> EventId {
         let seq = self.height.get(author).copied().unwrap_or(0);
-        let prev = self.tip.get(author).copied();
+        let prev = self.tip.get(author).cloned();
         let parents: BTreeSet<EventId> = self
             .tip
             .iter()
             .filter(|(a, _)| *a != author)
-            .map(|(_, id)| *id)
+            .map(|(_, id)| id.clone())
             .collect();
         let content = EventContent {
             author: author.clone(),
@@ -377,7 +419,7 @@ impl EventLog {
         let seq = event.content.seq;
 
         // Same-author chain link + gap detection.
-        match event.content.prev {
+        match &event.content.prev {
             None => {
                 if seq != 0 {
                     return Err(EventError::MalformedChainLink);
@@ -396,11 +438,11 @@ impl EventLog {
                 // The prev link must be exactly the (author, seq-1)
                 // predecessor, which must be present — this is both gap
                 // detection and prev-link integrity.
-                let expected = self.tip.get(&author).copied();
+                let expected = self.tip.get(&author);
                 if expected != Some(prev_id) {
                     return Err(EventError::GapOrBrokenPrev);
                 }
-                match self.events.get(&prev_id) {
+                match self.events.get(prev_id) {
                     Some(p) if p.content.author == author && p.content.seq == seq - 1 => {}
                     _ => return Err(EventError::GapOrBrokenPrev),
                 }
@@ -420,9 +462,9 @@ impl EventLog {
         // record the event and advance the author's chain.
         self.store.append(event.content.canonical_bytes());
         self.height.insert(author.clone(), seq + 1);
-        self.tip.insert(author.clone(), id);
-        self.by_seq.insert((author, seq), id);
-        self.events.insert(id, event);
+        self.tip.insert(author.clone(), id.clone());
+        self.by_seq.insert((author, seq), id.clone());
+        self.events.insert(id.clone(), event);
         Ok(id)
     }
 
@@ -430,14 +472,14 @@ impl EventLog {
     /// `parents` hash-links backward (the transitive happens-before predecessor
     /// set). `id` itself is not included.
     #[must_use]
-    pub fn ancestors(&self, id: EventId) -> BTreeSet<EventId> {
+    pub fn ancestors(&self, id: &EventId) -> BTreeSet<EventId> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<EventId> = Vec::new();
-        if let Some(ev) = self.events.get(&id) {
+        if let Some(ev) = self.events.get(id) {
             stack.extend(ev.content.links());
         }
         while let Some(cur) = stack.pop() {
-            if !seen.insert(cur) {
+            if !seen.insert(cur.clone()) {
                 continue;
             }
             if let Some(ev) = self.events.get(&cur) {
@@ -452,8 +494,8 @@ impl EventLog {
     /// hash-links, and (per `CausalMonotone`) is a strict partial order —
     /// irreflexive, asymmetric, and transitive — so the DAG is acyclic.
     #[must_use]
-    pub fn happens_before(&self, a: EventId, b: EventId) -> bool {
-        self.ancestors(b).contains(&a)
+    pub fn happens_before(&self, a: &EventId, b: &EventId) -> bool {
+        self.ancestors(b).contains(a)
     }
 }
 
@@ -474,7 +516,7 @@ mod tests {
         let mut log = EventLog::new();
 
         let g = log.append(&alice, b"genesis".to_vec());
-        let e1 = log.get(g).unwrap().clone();
+        let e1 = log.get(&g).unwrap().clone();
         assert_eq!(log.len(), 1);
 
         // Re-broadcasting the very same event is idempotent.
@@ -496,7 +538,7 @@ mod tests {
         };
         assert_eq!(
             dup_content.id(),
-            g,
+            g.clone(),
             "identical content must share the content id"
         );
 
@@ -505,7 +547,7 @@ mod tests {
             payload: b"different".to_vec(),
             ..dup_content
         };
-        assert_ne!(other.id(), g);
+        assert_ne!(other.id(), g.clone());
     }
 
     /// `NoGaps`: an event at `seq n > 0` is refused unless its `n-1`
@@ -521,7 +563,7 @@ mod tests {
         let content = EventContent {
             author: alice.clone(),
             seq: 2,
-            prev: Some(g),
+            prev: Some(g.clone()),
             parents: BTreeSet::new(),
             payload: b"seq2".to_vec(),
         };
@@ -536,7 +578,7 @@ mod tests {
         let c2 = EventContent {
             author: alice.clone(),
             seq: 2,
-            prev: Some(s1),
+            prev: Some(s1.clone()),
             parents: BTreeSet::new(),
             payload: b"seq2".to_vec(),
         };
@@ -560,8 +602,8 @@ mod tests {
 
         // Take the genuine seq-1 event, then rewrite its prev link to point at
         // itself (history tampering) while keeping the original signature.
-        let mut tampered = log.get(s1).unwrap().clone();
-        tampered.content.prev = Some(s1);
+        let mut tampered = log.get(&s1).unwrap().clone();
+        tampered.content.prev = Some(s1.clone());
 
         assert!(
             !tampered.is_authentic(),
@@ -570,7 +612,7 @@ mod tests {
 
         // A fresh log that has seq0 must still reject the tampered seq1.
         let mut log2 = EventLog::new();
-        log2.ingest(log.get(g).unwrap().clone()).unwrap();
+        log2.ingest(log.get(&g).unwrap().clone()).unwrap();
         assert_eq!(log2.ingest(tampered), Err(EventError::TamperedSignature));
     }
 
@@ -587,8 +629,8 @@ mod tests {
         let content = EventContent {
             author: alice.clone(),
             seq: 1,
-            prev: Some(g),
-            parents: BTreeSet::from([g]),
+            prev: Some(g.clone()),
+            parents: BTreeSet::from([g.clone()]),
             payload: b"seq1".to_vec(),
         };
         let signature = Signature::sign(&alice, &content);
@@ -601,8 +643,10 @@ mod tests {
         let content = EventContent {
             author: alice.clone(),
             seq: 1,
-            prev: Some(g),
-            parents: BTreeSet::from([EventId(0xdead_beef)]),
+            prev: Some(g.clone()),
+            parents: BTreeSet::from([EventId(pillar_streamdb::OpId(
+                pillar_crypto::content::content_address(b"absent-parent").unwrap(),
+            ))]),
             payload: b"seq1".to_vec(),
         };
         let signature = Signature::sign(&alice, &content);
@@ -629,13 +673,13 @@ mod tests {
         let a1 = log.append(&alice, b"a1".to_vec()); // prev a0, parents {b0}
 
         // Sanity: the cross-author edges were actually built.
-        assert!(log.get(b0).unwrap().content.parents().contains(&a0));
-        assert!(log.get(a1).unwrap().content.parents().contains(&b0));
+        assert!(log.get(&b0).unwrap().content.parents().contains(&a0));
+        assert!(log.get(&a1).unwrap().content.parents().contains(&b0));
 
-        let all = [a0, b0, a1];
+        let all = [a0.clone(), b0.clone(), a1.clone()];
 
         // Irreflexive: nothing happens-before itself.
-        for &x in &all {
+        for x in &all {
             assert!(
                 !log.happens_before(x, x),
                 "happens-before must be irreflexive"
@@ -643,13 +687,13 @@ mod tests {
         }
 
         // Known edges of the causal order.
-        assert!(log.happens_before(a0, b0));
-        assert!(log.happens_before(b0, a1));
-        assert!(log.happens_before(a0, a1)); // transitive: a0 -> b0 -> a1
+        assert!(log.happens_before(&a0, &b0));
+        assert!(log.happens_before(&b0, &a1));
+        assert!(log.happens_before(&a0, &a1)); // transitive: a0 -> b0 -> a1
 
         // Asymmetric: no pair is ordered both ways.
-        for &x in &all {
-            for &y in &all {
+        for x in &all {
+            for y in &all {
                 if log.happens_before(x, y) {
                     assert!(
                         !log.happens_before(y, x),
@@ -660,9 +704,9 @@ mod tests {
         }
 
         // Transitive over the whole set.
-        for &x in &all {
-            for &y in &all {
-                for &z in &all {
+        for x in &all {
+            for y in &all {
+                for z in &all {
                     if log.happens_before(x, y) && log.happens_before(y, z) {
                         assert!(
                             log.happens_before(x, z),

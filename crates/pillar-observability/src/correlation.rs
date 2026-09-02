@@ -82,18 +82,18 @@ impl CorrelationIndex {
     /// Register `signal` on the spine under its correlation id (if any) and
     /// every shared label it stamps. Idempotent per signal id.
     pub fn register(&mut self, signal: SignalId, spine: &SignalRef) {
-        self.kinds.insert(signal, spine.kind);
+        self.kinds.insert(signal.clone(), spine.kind);
         if let Some(cid) = &spine.correlation {
             self.by_correlation
                 .entry(cid.clone())
                 .or_default()
-                .insert(signal);
+                .insert(signal.clone());
         }
         for label in &spine.labels {
             self.by_label
                 .entry(label.clone())
                 .or_default()
-                .insert(signal);
+                .insert(signal.clone());
         }
     }
 
@@ -142,7 +142,7 @@ mod tests {
         let trace = CorrelationId("trace-abc".to_string());
 
         index.register(
-            SignalId(1),
+            SignalId::from_test_seed(1),
             &SignalRef {
                 kind: SignalKind::TraceSpan,
                 correlation: Some(trace.clone()),
@@ -150,7 +150,7 @@ mod tests {
             },
         );
         index.register(
-            SignalId(2),
+            SignalId::from_test_seed(2),
             &SignalRef {
                 kind: SignalKind::Log,
                 correlation: Some(trace.clone()),
@@ -158,7 +158,7 @@ mod tests {
             },
         );
         index.register(
-            SignalId(3),
+            SignalId::from_test_seed(3),
             &SignalRef {
                 kind: SignalKind::ProfileSample,
                 correlation: Some(trace.clone()),
@@ -167,7 +167,7 @@ mod tests {
         );
         // An unrelated metric on a different trace is NOT gathered.
         index.register(
-            SignalId(4),
+            SignalId::from_test_seed(4),
             &SignalRef {
                 kind: SignalKind::Metric,
                 correlation: Some(CorrelationId("trace-other".to_string())),
@@ -177,10 +177,10 @@ mod tests {
 
         let gathered = index.by_correlation(&trace);
         assert_eq!(gathered.len(), 3);
-        assert!(gathered.contains(&SignalId(1)));
-        assert!(gathered.contains(&SignalId(2)));
-        assert!(gathered.contains(&SignalId(3)));
-        assert!(!gathered.contains(&SignalId(4)));
+        assert!(gathered.contains(&SignalId::from_test_seed(1)));
+        assert!(gathered.contains(&SignalId::from_test_seed(2)));
+        assert!(gathered.contains(&SignalId::from_test_seed(3)));
+        assert!(!gathered.contains(&SignalId::from_test_seed(4)));
 
         // The pivot genuinely crosses kinds.
         let kinds = index.kinds_for_correlation(&trace);
@@ -198,7 +198,7 @@ mod tests {
         let node = Label::new("node", "n-7");
 
         index.register(
-            SignalId(10),
+            SignalId::from_test_seed(10),
             &SignalRef {
                 kind: SignalKind::Metric,
                 correlation: None,
@@ -206,7 +206,7 @@ mod tests {
             },
         );
         index.register(
-            SignalId(11),
+            SignalId::from_test_seed(11),
             &SignalRef {
                 kind: SignalKind::MetadataSample,
                 correlation: None,
@@ -214,7 +214,7 @@ mod tests {
             },
         );
         index.register(
-            SignalId(12),
+            SignalId::from_test_seed(12),
             &SignalRef {
                 kind: SignalKind::Log,
                 correlation: None,
@@ -224,9 +224,9 @@ mod tests {
 
         let gathered = index.by_label(&node);
         assert_eq!(gathered.len(), 2);
-        assert!(gathered.contains(&SignalId(10)));
-        assert!(gathered.contains(&SignalId(11)));
-        assert!(!gathered.contains(&SignalId(12)));
+        assert!(gathered.contains(&SignalId::from_test_seed(10)));
+        assert!(gathered.contains(&SignalId::from_test_seed(11)));
+        assert!(!gathered.contains(&SignalId::from_test_seed(12)));
     }
 
     /// A signal with no correlation id is still pivotable by its shared labels
@@ -235,7 +235,7 @@ mod tests {
     fn labels_pivot_independently_of_correlation_id() {
         let mut index = CorrelationIndex::new();
         index.register(
-            SignalId(1),
+            SignalId::from_test_seed(1),
             &SignalRef {
                 kind: SignalKind::Metric,
                 correlation: None,

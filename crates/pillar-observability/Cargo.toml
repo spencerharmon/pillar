@@ -11,6 +11,7 @@ description = "Built-in distributed observability riding the streaming DB: confi
 pillar-core = { path = "../pillar-core" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
+sha2 = "0.10"
 
 [lints]
 workspace = true

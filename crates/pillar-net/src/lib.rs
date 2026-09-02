@@ -25,7 +25,9 @@
 
 use libp2p::{
     core::{muxing::StreamMuxerBox, upgrade::Version},
-    dcutr, gossipsub, identify, identity::Keypair, kad, noise,
+    dcutr, gossipsub, identify,
+    identity::Keypair,
+    kad, noise,
     pnet::{PnetConfig, PreSharedKey},
     relay,
     swarm::behaviour::toggle::Toggle,
@@ -338,9 +340,7 @@ impl std::error::Error for SeedAddrMissingPeerId {}
 /// is what Kademlia keys its routing table on, and dialing an address with no
 /// known peer id cannot populate the DHT. Returns [`SeedAddrMissingPeerId`] when
 /// the `/p2p` component is absent.
-pub fn parse_seed_multiaddr(
-    addr: libp2p::Multiaddr,
-) -> Result<SeedPeer, SeedAddrMissingPeerId> {
+pub fn parse_seed_multiaddr(addr: libp2p::Multiaddr) -> Result<SeedPeer, SeedAddrMissingPeerId> {
     use libp2p::multiaddr::Protocol;
     let rendered = addr.to_string();
     // The peer id lives in the LAST /p2p component; strip it off to get the
@@ -366,10 +366,7 @@ pub fn parse_seed_multiaddr(
 /// is a no-op, so this only calls `bootstrap()` when at least one seed was
 /// added; the caller can treat a zero return as "no seeds configured — this is
 /// itself a seed/first node".
-pub fn seed_event_dht(
-    swarm: &mut Swarm<EventBehaviour>,
-    seeds: &[SeedPeer],
-) -> usize {
+pub fn seed_event_dht(swarm: &mut Swarm<EventBehaviour>, seeds: &[SeedPeer]) -> usize {
     for seed in seeds {
         swarm
             .behaviour_mut()
@@ -962,7 +959,7 @@ mod tests {
         // merge, no overlay-specific transport involved.
         let mut receiver_log = OpLog::new();
         receiver_log.merge(&publisher_log);
-        assert!(receiver_log.contains(op_id));
+        assert!(receiver_log.contains(&op_id));
 
         // The receiver reads the op back out of its materialized order and
         // decodes it to the identical mesh peer record.
@@ -1185,10 +1182,8 @@ mod tests {
         let root_a = PrivateSwarmKey::from_root_secret("network-alpha");
         let root_b = PrivateSwarmKey::from_root_secret("network-beta");
 
-        let mut a =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root_a).unwrap();
-        let mut b =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root_b).unwrap();
+        let mut a = build_event_swarm_with_root(Keypair::generate_ed25519(), root_a).unwrap();
+        let mut b = build_event_swarm_with_root(Keypair::generate_ed25519(), root_b).unwrap();
         let b_peer_id = *b.local_peer_id();
 
         let b_addr = listen_and_get_addr(&mut b).await;
@@ -1244,8 +1239,7 @@ mod tests {
             }
         });
 
-        let mut joiner =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root).unwrap();
+        let mut joiner = build_event_swarm_with_root(Keypair::generate_ed25519(), root).unwrap();
         let seeds = vec![parse_seed_multiaddr(seed_multiaddr).unwrap()];
         let added = seed_event_dht(&mut joiner, &seeds);
         assert_eq!(added, 1, "one seed configured");
