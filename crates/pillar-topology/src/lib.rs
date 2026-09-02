@@ -450,7 +450,11 @@ impl Topology {
     /// authority chain must verify (non-revoked, terminating at genesis). A
     /// label naming a tier outside the hierarchy, a wrong action, or a broken
     /// chain is refused.
-    pub fn attest(&mut self, assignment: &Assignment, store: &TrustStore) -> Result<(), TopologyError> {
+    pub fn attest(
+        &mut self,
+        assignment: &Assignment,
+        store: &TrustStore,
+    ) -> Result<(), TopologyError> {
         let Assignment::Attested { attest, cid } = assignment else {
             return Err(TopologyError::NotAttested);
         };
@@ -458,7 +462,9 @@ impl Topology {
             return Err(TopologyError::WrongAction(attest.predicate.action.clone()));
         }
         let Some(label) = Label::from_resource(&attest.predicate.resource) else {
-            return Err(TopologyError::MalformedLabel(attest.predicate.resource.clone()));
+            return Err(TopologyError::MalformedLabel(
+                attest.predicate.resource.clone(),
+            ));
         };
         if self.hierarchy.rank(&label.tier).is_none() {
             return Err(TopologyError::UnknownTier(label.tier));
@@ -532,7 +538,9 @@ impl Topology {
                 }
             }
         }
-        out.sort_by(|a, b| (a.node.0.as_str(), a.tier.as_str()).cmp(&(b.node.0.as_str(), b.tier.as_str())));
+        out.sort_by(|a, b| {
+            (a.node.0.as_str(), a.tier.as_str()).cmp(&(b.node.0.as_str(), b.tier.as_str()))
+        });
         out
     }
 
@@ -597,9 +605,7 @@ impl Topology {
         }
         let domains = self.domains_at(tier, members);
         // Every member must carry a label at the tier AND span ≥2 domains.
-        let all_labeled = members
-            .iter()
-            .all(|n| self.placement(n).at(tier).is_some());
+        let all_labeled = members.iter().all(|n| self.placement(n).at(tier).is_some());
         all_labeled && domains.len() >= 2
     }
 
@@ -697,7 +703,10 @@ mod tests {
         assert!(h.nests("rack", "pdu"));
         assert!(h.nests("pdu", "node"));
         // Duplicate / unknown anchor refused.
-        assert_eq!(h.insert_after("rack", "pdu"), Err(TierError::DuplicateTier("pdu".to_owned())));
+        assert_eq!(
+            h.insert_after("rack", "pdu"),
+            Err(TierError::DuplicateTier("pdu".to_owned()))
+        );
         assert_eq!(
             h.insert_after("nope", "switch"),
             Err(TierError::UnknownTier("nope".to_owned()))
@@ -749,7 +758,8 @@ mod tests {
         let assignment = attest_label(&mut store, &auth, &node, &label);
 
         assert!(topo.verify_attested(&assignment, &store));
-        topo.attest(&assignment, &store).expect("verifies + recorded");
+        topo.attest(&assignment, &store)
+            .expect("verifies + recorded");
         assert_eq!(topo.attested_placement(&node).at("rack"), Some("r7"));
     }
 
@@ -810,10 +820,22 @@ mod tests {
 
     fn labeled_topo() -> Topology {
         let mut topo = Topology::new(TierHierarchy::default());
-        topo.declare(n("a"), &[Label::new("rack", "r1"), Label::new("zone", "z1")]);
-        topo.declare(n("b"), &[Label::new("rack", "r1"), Label::new("zone", "z1")]);
-        topo.declare(n("c"), &[Label::new("rack", "r2"), Label::new("zone", "z1")]);
-        topo.declare(n("d"), &[Label::new("rack", "r3"), Label::new("zone", "z2")]);
+        topo.declare(
+            n("a"),
+            &[Label::new("rack", "r1"), Label::new("zone", "z1")],
+        );
+        topo.declare(
+            n("b"),
+            &[Label::new("rack", "r1"), Label::new("zone", "z1")],
+        );
+        topo.declare(
+            n("c"),
+            &[Label::new("rack", "r2"), Label::new("zone", "z1")],
+        );
+        topo.declare(
+            n("d"),
+            &[Label::new("rack", "r3"), Label::new("zone", "z2")],
+        );
         topo
     }
 
@@ -898,7 +920,12 @@ mod tests {
         // Anti-affinity: no two chosen share the tier value.
         let domains: BTreeSet<_> = chosen
             .iter()
-            .map(|nd| topo.placement(nd).at(policy.anti_affinity_tier.as_deref().unwrap()).unwrap().to_owned())
+            .map(|nd| {
+                topo.placement(nd)
+                    .at(policy.anti_affinity_tier.as_deref().unwrap())
+                    .unwrap()
+                    .to_owned()
+            })
             .collect();
         assert_eq!(domains.len(), chosen.len());
         // Quorum over the referenced tier must span >1 domain.

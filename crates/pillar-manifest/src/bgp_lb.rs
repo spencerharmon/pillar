@@ -288,10 +288,7 @@ mod tests {
                 .with_peer(Peer::new("n2", "site-a")),
         );
         let ad = plugin
-            .elect_advertiser(
-                &fe(),
-                &health(&[("n1", false), ("n2", true), ("n3", true)]),
-            )
+            .elect_advertiser(&fe(), &health(&[("n1", false), ("n2", true), ("n3", true)]))
             .expect("fails over");
         assert_eq!(ad.node, "n2", "failover stays within site-a");
     }
@@ -314,8 +311,7 @@ mod tests {
     #[test]
     fn no_healthy_same_site_peer_means_no_advertisement() {
         let plugin = BgpLbPlugin::new(
-            BgpLbConfig::enabled("site-a", Some(Asn(64512)))
-                .with_peer(Peer::new("n1", "site-a")),
+            BgpLbConfig::enabled("site-a", Some(Asn(64512))).with_peer(Peer::new("n1", "site-a")),
         );
         assert_eq!(
             plugin.elect_advertiser(&fe(), &health(&[("n1", false)])),
@@ -328,8 +324,7 @@ mod tests {
     #[test]
     fn a_configured_user_asn_is_honored() {
         let plugin = BgpLbPlugin::new(
-            BgpLbConfig::enabled("site-a", Some(Asn(65001)))
-                .with_peer(Peer::new("n1", "site-a")),
+            BgpLbConfig::enabled("site-a", Some(Asn(65001))).with_peer(Peer::new("n1", "site-a")),
         );
         let ad = plugin
             .elect_advertiser(&fe(), &health(&[("n1", true)]))

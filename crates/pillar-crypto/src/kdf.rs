@@ -57,7 +57,10 @@ mod tests {
 
         let k1 = derive_key(password, &salt, &params).expect("derive must succeed");
         let k2 = derive_key(password, &salt, &params).expect("derive must succeed");
-        assert_eq!(k1, k2, "same (password, salt, params) must yield the same key");
+        assert_eq!(
+            k1, k2,
+            "same (password, salt, params) must yield the same key"
+        );
         assert!(
             k1.len() >= params.output_len,
             "key must be at least output_len bytes"
@@ -65,10 +68,16 @@ mod tests {
 
         let wrong_pw = derive_key(b"Correct Horse Battery Staple", &salt, &params)
             .expect("derive must succeed");
-        assert_ne!(k1, wrong_pw, "a different password must yield a different key");
+        assert_ne!(
+            k1, wrong_pw,
+            "a different password must yield a different key"
+        );
 
         let salt2 = Salt::from_bytes(b"pillar-fixed-per-user-salt-0002".to_vec());
         let other_salt = derive_key(password, &salt2, &params).expect("derive must succeed");
-        assert_ne!(k1, other_salt, "a different salt must yield a different key");
+        assert_ne!(
+            k1, other_salt,
+            "a different salt must yield a different key"
+        );
     }
 }

@@ -29,8 +29,8 @@
 //! server never observes the password or plaintext key, only a challenge-
 //! bound proof it can verify against a WoT-trusted registration key.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
@@ -90,7 +90,10 @@ impl Nonce {
     /// so a signature is inseparably bound to all three. A signature is
     /// never transferable to a different nonce, origin, or expiry.
     fn signing_material(&self) -> String {
-        format!("pillar-web-nonce:{}:{}:{}", self.id, self.origin.0, self.expiry)
+        format!(
+            "pillar-web-nonce:{}:{}:{}",
+            self.id, self.origin.0, self.expiry
+        )
     }
 
     /// The signing material as a public accessor, so the node-side custody
@@ -257,7 +260,11 @@ impl Signature {
 /// password is used, and it is a purely client-side computation — the
 /// password never reaches the server.
 #[must_use]
-pub fn unlock_auth_subkey(encrypted: &EncryptedAuthSubkey, password: &str, secret: &str) -> Option<AuthSubkey> {
+pub fn unlock_auth_subkey(
+    encrypted: &EncryptedAuthSubkey,
+    password: &str,
+    secret: &str,
+) -> Option<AuthSubkey> {
     // The KDF over (password, secret) must reproduce the stored ciphertext;
     // a wrong password (or wrong secret) fails to, and no key is yielded.
     if argon2id(password, &encrypted.subkey, secret) != encrypted.ciphertext {
@@ -444,7 +451,10 @@ impl KeyLoginVerifier {
 /// there is no parallel gate, so this flag never changes the admit/deny
 /// outcome, it only records how the subkey's material was unlocked.
 #[must_use]
-pub fn is_passkey_attested(passkey_subkeys: &std::collections::HashSet<NodeSubkey>, subkey: &NodeSubkey) -> bool {
+pub fn is_passkey_attested(
+    passkey_subkeys: &std::collections::HashSet<NodeSubkey>,
+    subkey: &NodeSubkey,
+) -> bool {
     passkey_subkeys.contains(subkey)
 }
 
@@ -699,7 +709,9 @@ mod tests {
         let mut iss = NonceIssuer::new(GOOD_ORIGIN);
         let nonce = iss.issue(10);
         v.track_issued(nonce.clone());
-        let sig = unlock_auth_subkey(&encrypted, PASSWORD, SECRET).unwrap().sign_nonce(&nonce);
+        let sig = unlock_auth_subkey(&encrypted, PASSWORD, SECRET)
+            .unwrap()
+            .sign_nonce(&nonce);
 
         let authority = WotAuthority::new(NodeId::from("owner"), 4); // subkey unreachable
         let mut actor = FencedActor::new();

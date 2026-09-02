@@ -118,7 +118,9 @@ impl WotAuthority {
         self.edges.iter().filter(move |(signer, subject, _)| {
             !self.revoked_keys.contains(signer)
                 && !self.revoked_keys.contains(subject)
-                && !self.revoked_edges.contains(&(signer.clone(), subject.clone()))
+                && !self
+                    .revoked_edges
+                    .contains(&(signer.clone(), subject.clone()))
         })
     }
 
@@ -184,7 +186,12 @@ impl WotAuthority {
     /// `owner`). Same budget-composition/bounded-fixpoint rule as
     /// [`reachable_depth`](Self::reachable_depth), just rooted anywhere.
     #[must_use]
-    pub fn reachable_depth_from(&self, root: &NodeId, root_budget: u8, node: &NodeId) -> Option<u8> {
+    pub fn reachable_depth_from(
+        &self,
+        root: &NodeId,
+        root_budget: u8,
+        node: &NodeId,
+    ) -> Option<u8> {
         if node == root {
             return if self.revoked_keys.contains(root) {
                 None
@@ -276,7 +283,10 @@ impl WotAuthority {
     /// The full set of currently-authoritative subjects (used to snapshot
     /// "who was authoritative at act time" for [`FencedActor::act`]).
     #[must_use]
-    pub fn authoritative_set(&self, candidates: impl IntoIterator<Item = NodeId>) -> HashSet<NodeId> {
+    pub fn authoritative_set(
+        &self,
+        candidates: impl IntoIterator<Item = NodeId>,
+    ) -> HashSet<NodeId> {
         candidates
             .into_iter()
             .filter(|c| self.is_authoritative(c))
@@ -367,7 +377,11 @@ impl FencedActor {
     /// global one (fail-closed — the guard disables `Act` entirely rather
     /// than accepting a possibly-outdated grant); [`ActError::NotAuthoritative`]
     /// if the view is fresh but `subject` is not authoritative.
-    pub fn act(&self, authority: &WotAuthority, subject: &NodeId) -> Result<ActedSnapshot, ActError> {
+    pub fn act(
+        &self,
+        authority: &WotAuthority,
+        subject: &NodeId,
+    ) -> Result<ActedSnapshot, ActError> {
         let current = authority.rev_count();
         if self.watermark != current {
             return Err(ActError::StaleView {

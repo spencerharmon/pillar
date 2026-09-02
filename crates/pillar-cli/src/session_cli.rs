@@ -261,13 +261,13 @@ impl SessionCli {
                 target: target.to_owned(),
             });
         }
-        let session = self
-            .registry
-            .show(target, id)
-            .ok_or_else(|| SessionCliError::NoSuchSession {
-                principal: target.to_owned(),
-                id: id.to_owned(),
-            })?;
+        let session =
+            self.registry
+                .show(target, id)
+                .ok_or_else(|| SessionCliError::NoSuchSession {
+                    principal: target.to_owned(),
+                    id: id.to_owned(),
+                })?;
         Ok(SessionRow::project(session, now, current))
     }
 

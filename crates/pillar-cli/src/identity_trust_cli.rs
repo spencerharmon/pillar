@@ -161,7 +161,11 @@ impl IdentityCli {
     /// `pillar identity link --domain <domain> --alias <alias>` — an ACT:
     /// opt-in pairwise/unlinkable mode for `domain`, binding a domain-local
     /// alias distinct from the global CID.
-    pub fn link(&mut self, domain: &Domain, alias: impl Into<String>) -> Result<(), IdentityCliError> {
+    pub fn link(
+        &mut self,
+        domain: &Domain,
+        alias: impl Into<String>,
+    ) -> Result<(), IdentityCliError> {
         self.log
             .enroll_pairwise(domain, alias)
             .map_err(IdentityCliError::from)
@@ -206,9 +210,11 @@ impl IdentityCli {
             .log
             .recovery_key()
             .cloned()
-            .ok_or(IdentityCliError::Log(IdentityLogError::UnauthorizedRotation {
-                signer: new_primary.clone(),
-            }))?;
+            .ok_or(IdentityCliError::Log(
+                IdentityLogError::UnauthorizedRotation {
+                    signer: new_primary.clone(),
+                },
+            ))?;
         self.rotate_primary(new_primary, recovery)
     }
 }
@@ -406,7 +412,7 @@ impl UserCli {
         };
         as_explicit_grants(store)
             .into_iter()
-            .filter(|g| &g.subject == &record.identity)
+            .filter(|g| g.subject == record.identity)
             .map(|g| TrustCid(format!("grant:{}:{}", g.subject.0, g.capability.0)))
             .collect()
     }
@@ -507,11 +513,17 @@ impl KeyCli {
     /// crate models no key material).
     #[must_use]
     pub fn fingerprint(&self, id: &IdentityKeyId) -> Option<String> {
-        self.keys.get(id).map(|_| format!("fp:{:x}", crc32(id.0.as_bytes())))
+        self.keys
+            .get(id)
+            .map(|_| format!("fp:{:x}", crc32(id.0.as_bytes())))
     }
 
     /// `pillar key label <id> <label>` — an ACT.
-    pub fn label(&mut self, id: &IdentityKeyId, label: impl Into<String>) -> Result<(), KeyCliError> {
+    pub fn label(
+        &mut self,
+        id: &IdentityKeyId,
+        label: impl Into<String>,
+    ) -> Result<(), KeyCliError> {
         self.record_mut(id)?.label = Some(label.into());
         Ok(())
     }
@@ -693,12 +705,18 @@ impl OfferCli {
         cell: CellId,
         artifact: ArtifactId,
     ) -> Result<(), OfferCliError> {
-        self.ledger.offer(user, cell, artifact).map_err(OfferCliError::from)
+        self.ledger
+            .offer(user, cell, artifact)
+            .map_err(OfferCliError::from)
     }
 
     /// `pillar offer escrow <artifact-kind> <artifact-id>` — an ACT: store
     /// the server-held envelope for an operational artifact.
-    pub fn escrow(&mut self, artifact: ArtifactId, kind: ArtifactKind) -> Result<(), OfferCliError> {
+    pub fn escrow(
+        &mut self,
+        artifact: ArtifactId,
+        kind: ArtifactKind,
+    ) -> Result<(), OfferCliError> {
         let artifact = Artifact::new(artifact, kind);
         self.escrow.store(&artifact).map_err(OfferCliError::from)
     }
@@ -715,7 +733,9 @@ impl OfferCli {
     /// `pillar offer revoke <record>` — an ACT: withdraw the offer,
     /// fail-closed (clears admission and seal immediately).
     pub fn revoke(&mut self, record: &RecordKey) -> Result<(), OfferCliError> {
-        self.ledger.revoke_offer(record).map_err(OfferCliError::from)
+        self.ledger
+            .revoke_offer(record)
+            .map_err(OfferCliError::from)
     }
 
     /// `pillar offer status <record>` — a VIEW.
@@ -850,7 +870,8 @@ impl GrantCli {
 
     /// `pillar grant add <right> --to <user> [--allow|--deny]` — an ACT.
     pub fn add(&mut self, subject: NodeId, capability: Capability, effect: GrantEffect) {
-        self.grants.retain(|g| !(g.subject == subject && g.capability == capability));
+        self.grants
+            .retain(|g| !(g.subject == subject && g.capability == capability));
         self.grants.push(ExplicitGrant {
             subject,
             capability,
@@ -869,7 +890,12 @@ impl GrantCli {
     /// asks the SAME [`RbacDecider`] every act routes through — never a
     /// private/duplicated auth path.
     #[must_use]
-    pub fn check(&self, authority: &WotAuthority, subject: &NodeId, capability: &Capability) -> Decision {
+    pub fn check(
+        &self,
+        authority: &WotAuthority,
+        subject: &NodeId,
+        capability: &Capability,
+    ) -> Decision {
         let decider = RbacDecider::new(authority, &[], &self.grants);
         decider.decide(&Request::new(subject.clone(), capability.clone()))
     }
@@ -919,7 +945,9 @@ impl CapsCli {
         let decider = RbacDecider::new(authority, &[], grants);
         candidates
             .iter()
-            .filter(|c| decider.decide(&Request::new(subject.clone(), (*c).clone())) == Decision::Allow)
+            .filter(|c| {
+                decider.decide(&Request::new(subject.clone(), (*c).clone())) == Decision::Allow
+            })
             .cloned()
             .collect()
     }
@@ -958,7 +986,11 @@ impl RevokeCli {
     /// specific attest artifact by content address, bumping the store's
     /// epoch by one so any attest signed at the prior epoch is immediately
     /// stale for future issuance.
-    pub fn attest(store: &mut TrustStore, target: TrustCid, signer: NodeId) -> Result<(), TrustError> {
+    pub fn attest(
+        store: &mut TrustStore,
+        target: TrustCid,
+        signer: NodeId,
+    ) -> Result<(), TrustError> {
         store.revoke(&Revoke {
             target,
             sig: TrustSig::by(signer),
@@ -977,7 +1009,6 @@ pub struct AuditCli;
 
 impl AuditCli {
     /// Render the audit result for `cid`.
-    #[must_use]
     pub fn audit(store: &TrustStore, cid: &TrustCid) -> Result<Proof, VerifyError> {
         store.verify(cid)
     }
@@ -1007,14 +1038,21 @@ mod tests {
         cli.enroll(domain("example.com"), kid("subkey-a")).unwrap();
 
         let summary = cli.show();
-        assert_eq!(summary.domains, vec![(domain("example.com"), kid("subkey-a"))]);
+        assert_eq!(
+            summary.domains,
+            vec![(domain("example.com"), kid("subkey-a"))]
+        );
 
         // A second enroll on the SAME domain is refused (exactly one subkey
         // per domain) — one hop, never a chain.
-        let err = cli.enroll(domain("example.com"), kid("subkey-b")).unwrap_err();
+        let err = cli
+            .enroll(domain("example.com"), kid("subkey-b"))
+            .unwrap_err();
         assert_eq!(
             err,
-            IdentityCliError::Log(IdentityLogError::DomainAlreadyCertified(domain("example.com")))
+            IdentityCliError::Log(IdentityLogError::DomainAlreadyCertified(domain(
+                "example.com"
+            )))
         );
     }
 
@@ -1023,7 +1061,8 @@ mod tests {
         let mut cli = IdentityCli::new(kid("primary-0"), None);
         let cid_before = cli.show().cid;
 
-        cli.rotate_primary(kid("primary-1"), kid("primary-0")).unwrap();
+        cli.rotate_primary(kid("primary-1"), kid("primary-0"))
+            .unwrap();
 
         let after = cli.show();
         assert_eq!(after.cid, cid_before, "identity CID must survive rotation");
@@ -1034,7 +1073,9 @@ mod tests {
     #[test]
     fn rotate_primary_refuses_an_unauthorized_signer() {
         let mut cli = IdentityCli::new(kid("primary-0"), None);
-        let err = cli.rotate_primary(kid("primary-1"), kid("attacker")).unwrap_err();
+        let err = cli
+            .rotate_primary(kid("primary-1"), kid("attacker"))
+            .unwrap_err();
         assert_eq!(
             err,
             IdentityCliError::Log(IdentityLogError::UnauthorizedRotation {
@@ -1061,7 +1102,10 @@ mod tests {
         let mut cli = IdentityCli::new(kid("primary-0"), None);
         cli.enroll(domain("example.com"), kid("subkey-a")).unwrap();
         cli.link(&domain("example.com"), "alias-1").unwrap();
-        assert_eq!(cli.log.pairwise_alias(&domain("example.com")), Some("alias-1"));
+        assert_eq!(
+            cli.log.pairwise_alias(&domain("example.com")),
+            Some("alias-1")
+        );
 
         cli.unlink(&domain("example.com"));
         assert!(cli.log.is_revoked(&domain("example.com")));
@@ -1090,13 +1134,25 @@ mod tests {
 
         let mut cli = UserCli::new();
         let err = cli
-            .add(&decider_deny, &nid("stranger"), "alice", nid("id-alice"), "example.com")
+            .add(
+                &decider_deny,
+                &nid("stranger"),
+                "alice",
+                nid("id-alice"),
+                "example.com",
+            )
             .unwrap_err();
         assert!(matches!(err, UserCliError::Unauthorized { .. }));
         assert!(cli.show("alice").is_none());
 
-        cli.add(&decider_allow, &nid("op"), "alice", nid("id-alice"), "example.com")
-            .unwrap();
+        cli.add(
+            &decider_allow,
+            &nid("op"),
+            "alice",
+            nid("id-alice"),
+            "example.com",
+        )
+        .unwrap();
         assert!(cli.show("alice").is_some());
     }
 
@@ -1110,8 +1166,14 @@ mod tests {
         }];
         let decider = RbacDecider::new(&authority, &[], &grants);
         let mut cli = UserCli::new();
-        cli.add(&decider, &nid("op"), "alice", nid("id-alice"), "example.com")
-            .unwrap();
+        cli.add(
+            &decider,
+            &nid("op"),
+            "alice",
+            nid("id-alice"),
+            "example.com",
+        )
+        .unwrap();
         cli.suspend("alice").unwrap();
         assert!(matches!(
             cli.passwd("alice", "hash"),
@@ -1162,9 +1224,13 @@ mod tests {
     #[test]
     fn offer_seal_resolve_status_round_trip() {
         let mut cli = OfferCli::new(BTreeSet::new());
-        cli.ledger_mut().cell_mut(CellId::from("cellA")).add_user(KdUserId::from("alice"));
         cli.ledger_mut()
-            .register_artifact(Artifact::new(ArtifactId::from("art-1"), ArtifactKind::Operational));
+            .cell_mut(CellId::from("cellA"))
+            .add_user(KdUserId::from("alice"));
+        cli.ledger_mut().register_artifact(Artifact::new(
+            ArtifactId::from("art-1"),
+            ArtifactKind::Operational,
+        ));
 
         let record = RecordKey {
             user: KdUserId::from("alice"),
@@ -1172,8 +1238,12 @@ mod tests {
             artifact: ArtifactId::from("art-1"),
         };
 
-        cli.seal(KdUserId::from("alice"), CellId::from("cellA"), ArtifactId::from("art-1"))
-            .unwrap();
+        cli.seal(
+            KdUserId::from("alice"),
+            CellId::from("cellA"),
+            ArtifactId::from("art-1"),
+        )
+        .unwrap();
         assert!(cli.status(&record).offered);
         assert!(!cli.status(&record).admitted);
 
@@ -1189,12 +1259,20 @@ mod tests {
     #[test]
     fn offer_seal_refuses_a_root_artifact() {
         let mut cli = OfferCli::new(BTreeSet::new());
-        cli.ledger_mut().cell_mut(CellId::from("cellA")).add_user(KdUserId::from("alice"));
         cli.ledger_mut()
-            .register_artifact(Artifact::new(ArtifactId::from("root-1"), ArtifactKind::Root));
+            .cell_mut(CellId::from("cellA"))
+            .add_user(KdUserId::from("alice"));
+        cli.ledger_mut().register_artifact(Artifact::new(
+            ArtifactId::from("root-1"),
+            ArtifactKind::Root,
+        ));
 
         let err = cli
-            .seal(KdUserId::from("alice"), CellId::from("cellA"), ArtifactId::from("root-1"))
+            .seal(
+                KdUserId::from("alice"),
+                CellId::from("cellA"),
+                ArtifactId::from("root-1"),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1315,13 +1393,25 @@ mod tests {
     fn grant_check_and_who_can_are_pure_views() {
         let authority = WotAuthority::new(nid("root"), 4);
         let mut grants = GrantCli::new();
-        grants.add(nid("alice"), Capability::from("stream:append"), GrantEffect::Allow);
-        grants.add(nid("eve"), Capability::from("stream:append"), GrantEffect::Deny);
+        grants.add(
+            nid("alice"),
+            Capability::from("stream:append"),
+            GrantEffect::Allow,
+        );
+        grants.add(
+            nid("eve"),
+            Capability::from("stream:append"),
+            GrantEffect::Deny,
+        );
 
         let before = grants.grants().to_vec();
 
         assert_eq!(
-            grants.check(&authority, &nid("alice"), &Capability::from("stream:append")),
+            grants.check(
+                &authority,
+                &nid("alice"),
+                &Capability::from("stream:append")
+            ),
             Decision::Allow
         );
         assert_eq!(
@@ -1329,7 +1419,11 @@ mod tests {
             Decision::Deny
         );
         assert_eq!(
-            grants.check(&authority, &nid("stranger"), &Capability::from("stream:append")),
+            grants.check(
+                &authority,
+                &nid("stranger"),
+                &Capability::from("stream:append")
+            ),
             Decision::Deny
         );
 
@@ -1346,7 +1440,13 @@ mod tests {
         let decider = RbacDecider::new(&authority, &[], &[]);
         let mut users = UserCli::new();
         let err = users
-            .add(&decider, &nid("stranger"), "mallory", nid("id-mallory"), "example.com")
+            .add(
+                &decider,
+                &nid("stranger"),
+                "mallory",
+                nid("id-mallory"),
+                "example.com",
+            )
             .unwrap_err();
         assert!(matches!(err, UserCliError::Unauthorized { .. }));
         assert!(users.list().is_empty());
@@ -1402,7 +1502,11 @@ mod tests {
             &authority,
             &grants,
             &nid("alice"),
-            &[Capability::from("a"), Capability::from("b"), Capability::from("c")],
+            &[
+                Capability::from("a"),
+                Capability::from("b"),
+                Capability::from("c"),
+            ],
         );
         assert_eq!(caps, BTreeSet::from([Capability::from("a")]));
     }

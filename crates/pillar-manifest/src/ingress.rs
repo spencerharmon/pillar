@@ -582,7 +582,10 @@ mod tests {
         // Put the far (wrong-zone) candidate FIRST so the naive "pick
         // first" fallback would get it wrong -- proves locality actually
         // steers the choice.
-        let candidates = vec![(far, Backend::new("far-backend")), (near, Backend::new("near-backend"))];
+        let candidates = vec![
+            (far, Backend::new("far-backend")),
+            (near, Backend::new("near-backend")),
+        ];
         let chosen = policy
             .select("req-1", &candidates, &client, &topology)
             .expect("a candidate is chosen");

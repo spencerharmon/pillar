@@ -288,8 +288,8 @@ impl IdentityLog {
     /// CID is unaffected. Returns the newly installed generation.
     pub fn rotate(&mut self, rotation: Rotation) -> Result<u64, IdentityLogError> {
         let signer = &rotation.sig.signer;
-        let authorized = signer == self.current_primary()
-            || self.genesis.recovery.as_ref() == Some(signer);
+        let authorized =
+            signer == self.current_primary() || self.genesis.recovery.as_ref() == Some(signer);
         if !authorized {
             return Err(IdentityLogError::UnauthorizedRotation {
                 signer: signer.clone(),
@@ -550,8 +550,14 @@ mod tests {
         let issuer = log.current_primary().clone();
         log.certify_domain_subkey(Domain::from("d1"), KeyId::from("sub:d1"), &issuer)
             .expect("one-hop certification by primary");
-        assert_eq!(log.domain_subkey(&Domain::from("d1")), Some(&KeyId::from("sub:d1")));
-        assert_eq!(log.subkey_certifying_generation(&Domain::from("d1")), Some(0));
+        assert_eq!(
+            log.domain_subkey(&Domain::from("d1")),
+            Some(&KeyId::from("sub:d1"))
+        );
+        assert_eq!(
+            log.subkey_certifying_generation(&Domain::from("d1")),
+            Some(0)
+        );
     }
 
     #[test]
@@ -589,7 +595,10 @@ mod tests {
             sig: Sig::by(primary0),
         })
         .unwrap();
-        assert_eq!(log.subkey_certifying_generation(&Domain::from("d1")), Some(0));
+        assert_eq!(
+            log.subkey_certifying_generation(&Domain::from("d1")),
+            Some(0)
+        );
         assert!(log.primary_at(0).is_some());
     }
 
@@ -755,9 +764,15 @@ mod tests {
         buf.extend_from_slice(ip);
         buf.push(0u8);
         let expected = pillar_crypto::content::content_address(&buf).expect("address");
-        let expected_hex: String =
-            expected.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, expected_hex, "CID must be the real crypto content address");
+        let expected_hex: String = expected
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex, expected_hex,
+            "CID must be the real crypto content address"
+        );
     }
 
     #[test]
@@ -769,6 +784,9 @@ mod tests {
         let err = log
             .certify_domain_subkey(Domain::from("d1"), KeyId::from("sub:d1b"), &primary)
             .unwrap_err();
-        assert_eq!(err, IdentityLogError::DomainAlreadyCertified(Domain::from("d1")));
+        assert_eq!(
+            err,
+            IdentityLogError::DomainAlreadyCertified(Domain::from("d1"))
+        );
     }
 }

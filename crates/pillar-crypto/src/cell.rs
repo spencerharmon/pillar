@@ -13,7 +13,9 @@
 //! shared [`crate::seal`] operation.
 
 use crate::error::Result;
-use crate::types::{Ciphertext, SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed, SymmetricKey};
+use crate::types::{
+    Ciphertext, SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed, SymmetricKey,
+};
 
 /// The symmetric group key of a cell. Encrypts the cell's database records and
 /// broadcast messages; distributed to members as a sealed artifact.
@@ -38,7 +40,9 @@ pub fn group_key_from_seed(seed: &Seed) -> Result<CellGroupKey> {
     let mut h = Sha256::new();
     h.update(b"pillar-crypto/cell/group-key/seed-v1");
     h.update(seed.as_bytes());
-    Ok(CellGroupKey(SymmetricKey::from_bytes(h.finalize().to_vec())))
+    Ok(CellGroupKey(SymmetricKey::from_bytes(
+        h.finalize().to_vec(),
+    )))
 }
 
 /// Encrypt a streaming-database record or a broadcast message under the cell

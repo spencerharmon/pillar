@@ -211,10 +211,7 @@ impl MetadataStore {
     /// with at most one distinct label set.
     #[must_use]
     pub fn transitions(&self, entity: &EntityId) -> &[LabelTransition] {
-        self.history
-            .get(entity)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.history.get(entity).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Every entity currently known to the store.
@@ -305,11 +302,17 @@ mod tests {
             transitions[1].diff.changed.get("zone"),
             Some(&("a".to_string(), "b".to_string()))
         );
-        assert_eq!(transitions[1].diff.added.get("tier"), Some(&"hot".to_string()));
+        assert_eq!(
+            transitions[1].diff.added.get("tier"),
+            Some(&"hot".to_string())
+        );
 
         // Third: tier removed.
         assert_eq!(transitions[2].tick, 9);
-        assert_eq!(transitions[2].diff.removed.get("tier"), Some(&"hot".to_string()));
+        assert_eq!(
+            transitions[2].diff.removed.get("tier"),
+            Some(&"hot".to_string())
+        );
 
         // Current view reflects the latest set.
         assert_eq!(
@@ -326,7 +329,9 @@ mod tests {
         let mut store = MetadataStore::new();
         let entity = e("node-1");
         let set = labels(&[("role", "worker")]);
-        assert!(store.ingest(LabelObservation::new(entity.clone(), set.clone(), 0)).is_some());
+        assert!(store
+            .ingest(LabelObservation::new(entity.clone(), set.clone(), 0))
+            .is_some());
         // Same labels again, different tick and key insertion order: no change.
         let reordered: LabelSet = set.clone();
         assert!(store
@@ -342,7 +347,11 @@ mod tests {
     fn single_observation_has_current_labels_and_one_initial_transition() {
         let mut store = MetadataStore::new();
         let entity = e("solo");
-        store.ingest(LabelObservation::new(entity.clone(), labels(&[("k", "v")]), 0));
+        store.ingest(LabelObservation::new(
+            entity.clone(),
+            labels(&[("k", "v")]),
+            0,
+        ));
         assert_eq!(store.current_labels(&entity), Some(&labels(&[("k", "v")])));
         assert_eq!(store.transitions(&entity).len(), 1);
     }

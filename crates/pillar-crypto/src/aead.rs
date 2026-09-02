@@ -38,7 +38,13 @@ pub fn seal_symmetric(key: &SymmetricKey, plaintext: &[u8], aad: &[u8]) -> Resul
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
 
     let ct = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::DecryptionFailed)?;
 
     // Envelope layout: nonce || ciphertext-with-tag.

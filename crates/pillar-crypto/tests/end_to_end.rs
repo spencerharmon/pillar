@@ -29,7 +29,8 @@ fn node_unlocks_cell_key_and_user_key() {
 
     // (a) a cell group key sealed to the node.
     let group = group_key_from_seed(&seed("cellA-group")).expect("group");
-    let sealed_group = distribute_group_key(&group, std::slice::from_ref(&node_pub.sealing)).expect("seal cell key");
+    let sealed_group = distribute_group_key(&group, std::slice::from_ref(&node_pub.sealing))
+        .expect("seal cell key");
     assert_eq!(
         recover_group_key(&sealed_group, &node_sec.sealing),
         Ok(group),
@@ -53,11 +54,17 @@ fn cell_key_encrypts_database_and_broadcasts() {
 
     let db_record = b"streaming-db op #42: append member(bob, role=admin)";
     let rec_ct = cell_encrypt(&group, db_record, b"db").expect("encrypt db");
-    assert_eq!(cell_decrypt(&group, &rec_ct, b"db").as_deref(), Ok(db_record.as_ref()));
+    assert_eq!(
+        cell_decrypt(&group, &rec_ct, b"db").as_deref(),
+        Ok(db_record.as_ref())
+    );
 
     let broadcast = b"cell broadcast: topology changed, tier=edge";
     let bc_ct = cell_encrypt(&group, broadcast, b"broadcast").expect("encrypt broadcast");
-    assert_eq!(cell_decrypt(&group, &bc_ct, b"broadcast").as_deref(), Ok(broadcast.as_ref()));
+    assert_eq!(
+        cell_decrypt(&group, &bc_ct, b"broadcast").as_deref(),
+        Ok(broadcast.as_ref())
+    );
 }
 
 /// User keys sign and send a message encrypted for their cell.
@@ -103,8 +110,14 @@ fn user_subkeys_across_cells_validate_one_another() {
     let cert_b = certify_subkey(&master_sec.signing, &sub_b, &cell_b).expect("cert B");
 
     // Both subkeys chain to the same master -> proven the same user across cells.
-    assert_eq!(verify_subkey(&master_pub.signing, &sub_a, &cell_a, &cert_a), Ok(()));
-    assert_eq!(verify_subkey(&master_pub.signing, &sub_b, &cell_b, &cert_b), Ok(()));
+    assert_eq!(
+        verify_subkey(&master_pub.signing, &sub_a, &cell_a, &cert_a),
+        Ok(())
+    );
+    assert_eq!(
+        verify_subkey(&master_pub.signing, &sub_b, &cell_b, &cert_b),
+        Ok(())
+    );
 }
 
 /// Cell-to-cell messaging: a cell is a principal, so cell A seals to cell B.
@@ -115,7 +128,10 @@ fn cell_to_cell_messaging() {
 
     let msg = b"cell-A -> cell-B: cross-cell access grant for alice";
     let sealed = seal_to_recipients(msg, &[cell_b_pub.sealing]).expect("seal to cell B");
-    assert_eq!(unseal(&sealed, &cell_b_sec.sealing).as_deref(), Ok(msg.as_ref()));
+    assert_eq!(
+        unseal(&sealed, &cell_b_sec.sealing).as_deref(),
+        Ok(msg.as_ref())
+    );
 }
 
 /// User-to-user across cells: sealing is independent of cell membership.

@@ -207,11 +207,18 @@ mod tests {
         let l = store.write(SignalKind::Log, b"level=warn msg=hot".to_vec(), 0);
         let t = store.write(SignalKind::TraceSpan, b"span=1 parent=0".to_vec(), 0);
         let p = store.write(SignalKind::ProfileSample, b"stack=a;b;c".to_vec(), 0);
-        let d = store.write(SignalKind::MetadataSample, b"entity=n-1 role=worker".to_vec(), 0);
+        let d = store.write(
+            SignalKind::MetadataSample,
+            b"entity=n-1 role=worker".to_vec(),
+            0,
+        );
 
         // All five read back from the single store.
         for id in [m, l, t, p, d] {
-            assert!(store.contains(id), "kind read-back missing on one substrate");
+            assert!(
+                store.contains(id),
+                "kind read-back missing on one substrate"
+            );
         }
         assert_eq!(store.held_len(), 5);
 
@@ -263,20 +270,36 @@ mod tests {
 
         index.register(
             SignalId(1),
-            &SignalRef { kind: SignalKind::TraceSpan, correlation: Some(trace.clone()), labels: with_node.clone() },
+            &SignalRef {
+                kind: SignalKind::TraceSpan,
+                correlation: Some(trace.clone()),
+                labels: with_node.clone(),
+            },
         );
         index.register(
             SignalId(2),
-            &SignalRef { kind: SignalKind::Metric, correlation: Some(trace.clone()), labels: with_node.clone() },
+            &SignalRef {
+                kind: SignalKind::Metric,
+                correlation: Some(trace.clone()),
+                labels: with_node.clone(),
+            },
         );
         index.register(
             SignalId(3),
-            &SignalRef { kind: SignalKind::MetadataSample, correlation: None, labels: with_node.clone() },
+            &SignalRef {
+                kind: SignalKind::MetadataSample,
+                correlation: None,
+                labels: with_node.clone(),
+            },
         );
 
         assert_eq!(index.by_correlation(&trace).len(), 2);
-        assert!(index.kinds_for_correlation(&trace).contains(&SignalKind::TraceSpan));
-        assert!(index.kinds_for_correlation(&trace).contains(&SignalKind::Metric));
+        assert!(index
+            .kinds_for_correlation(&trace)
+            .contains(&SignalKind::TraceSpan));
+        assert!(index
+            .kinds_for_correlation(&trace)
+            .contains(&SignalKind::Metric));
         // Shared label crosses kinds including metadata.
         assert_eq!(index.by_label(&node).len(), 3);
     }

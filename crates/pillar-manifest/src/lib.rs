@@ -494,9 +494,7 @@ impl Envelope {
     /// deployment binds `signer` to an operator-held secret key instead; the
     /// contract — a real asymmetric signature whose forgery is infeasible from
     /// the public key alone — is identical.
-    fn keypair_for_signer(
-        signer: &str,
-    ) -> (SigningPublicKey, SigningSecretKey) {
+    fn keypair_for_signer(signer: &str) -> (SigningPublicKey, SigningSecretKey) {
         let mut seed_material = Vec::new();
         seed_material.extend_from_slice(b"pillar-manifest/signer-key-v1/");
         seed_material.extend_from_slice(signer.as_bytes());
@@ -611,7 +609,12 @@ impl Envelope {
             &self.causal_parents,
             &self.capability_scope,
         );
-        verify(&self.signature.verifying_key, &message, &self.signature.signature).is_ok()
+        verify(
+            &self.signature.verifying_key,
+            &message,
+            &self.signature.signature,
+        )
+        .is_ok()
     }
 }
 

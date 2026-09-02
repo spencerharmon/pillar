@@ -334,8 +334,12 @@ mod tests {
         {
             let mut db = PersistentStream::open(&root).unwrap();
             let a = db.append(b"alpha".to_vec(), SideEffect::Exclusive).unwrap();
-            let b = db.append(b"bravo".to_vec(), SideEffect::Convergent).unwrap();
-            let c = db.append(b"charlie".to_vec(), SideEffect::Exclusive).unwrap();
+            let b = db
+                .append(b"bravo".to_vec(), SideEffect::Convergent)
+                .unwrap();
+            let c = db
+                .append(b"charlie".to_vec(), SideEffect::Exclusive)
+                .unwrap();
             ids = vec![a, b, c];
             order_before = db
                 .stream()
@@ -375,7 +379,9 @@ mod tests {
     fn on_disk_layout_is_content_addressed() {
         let root = tmp_root("layout");
         let mut db = PersistentStream::open(&root).unwrap();
-        let id = db.append(b"payload".to_vec(), SideEffect::Exclusive).unwrap();
+        let id = db
+            .append(b"payload".to_vec(), SideEffect::Exclusive)
+            .unwrap();
 
         let path = ops_dir(&root).join(op_filename(id));
         assert!(path.is_file(), "op stored under its content-addressed name");
@@ -411,8 +417,7 @@ mod tests {
     #[test]
     fn relaxed_store_refuses_exclusive_and_persists_nothing() {
         let root = tmp_root("policy");
-        let mut db =
-            PersistentStream::open_with_policy(&root, ViewPolicy::Relaxed).unwrap();
+        let mut db = PersistentStream::open_with_policy(&root, ViewPolicy::Relaxed).unwrap();
         let err = db
             .append(b"fire".to_vec(), SideEffect::Exclusive)
             .unwrap_err();

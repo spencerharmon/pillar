@@ -189,11 +189,7 @@ impl StreamCli {
     /// [`TamperedOp`] wrapped as [`StreamCliError::Policy`]-adjacent is
     /// surfaced directly via the `Err` variant's [`TamperedOp`] (see return
     /// type) so a caller can report exactly which entry was mangled.
-    pub fn sync(
-        &mut self,
-        name: &str,
-        candidates: &[ClaimedOp],
-    ) -> Result<usize, SyncError> {
+    pub fn sync(&mut self, name: &str, candidates: &[ClaimedOp]) -> Result<usize, SyncError> {
         let entry = self
             .streams
             .get_mut(name)
@@ -509,7 +505,7 @@ mod tests {
     fn verify_ops_detects_a_tampered_event() {
         let honest = ClaimedOp::honest(b"original payload".to_vec());
         let tampered = ClaimedOp {
-            claimed_id: honest.claimed_id, // stale address...
+            claimed_id: honest.claimed_id,        // stale address...
             payload: b"mutated payload".to_vec(), // ...for DIFFERENT bytes
         };
 
@@ -594,7 +590,10 @@ mod tests {
         cli.create("s", None, ViewPolicy::Strict).unwrap();
         cli.subscribe("s", "watcher-1").unwrap();
         cli.subscribe("s", "watcher-2").unwrap();
-        assert_eq!(cli.subscribers("s").unwrap(), vec!["watcher-1", "watcher-2"]);
+        assert_eq!(
+            cli.subscribers("s").unwrap(),
+            vec!["watcher-1", "watcher-2"]
+        );
         cli.unsubscribe("s", "watcher-1").unwrap();
         assert_eq!(cli.subscribers("s").unwrap(), vec!["watcher-2"]);
     }

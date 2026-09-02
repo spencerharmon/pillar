@@ -96,9 +96,7 @@ impl CustodyChoice {
     #[must_use]
     pub fn build_backend(&self, key_id: &str) -> Box<dyn SignerBackend> {
         match self.kind {
-            CustodyKind::FileKeyring => {
-                Box::new(FileKeyringBackend::new(key_id).unlocked())
-            }
+            CustodyKind::FileKeyring => Box::new(FileKeyringBackend::new(key_id).unlocked()),
             CustodyKind::Tpm => Box::new(TpmBackend::new(key_id)),
             CustodyKind::Passkey => Box::new(PasskeyBackend::new(key_id, true)),
             CustodyKind::Password => Box::new(PasswordBackend::new(key_id)),

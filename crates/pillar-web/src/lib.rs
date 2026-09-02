@@ -32,8 +32,8 @@
 pub mod key_login;
 pub mod node_custody;
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, TcpListener};
 
@@ -84,7 +84,11 @@ impl AuthMode {
     /// [`AuthError::NotLocalhost`] if the peer is not loopback;
     /// [`AuthError::SecondFactorRequired`] in [`AuthMode::SecondFactor`] mode
     /// when `second_factor` is absent or does not match.
-    pub fn authorize(&self, peer: &SocketAddr, second_factor: Option<&str>) -> Result<(), AuthError> {
+    pub fn authorize(
+        &self,
+        peer: &SocketAddr,
+        second_factor: Option<&str>,
+    ) -> Result<(), AuthError> {
         if !peer.ip().is_loopback() {
             return Err(AuthError::NotLocalhost);
         }
@@ -150,7 +154,11 @@ impl PasskeyAuthenticator {
     /// given the authenticator's private secret. Only the resulting
     /// [`PasskeyCredential`] and its derived public verifier are retained;
     /// the secret itself is never stored server-side.
-    pub fn register(&mut self, credential: impl Into<PasskeyCredential>, secret: &str) -> PasskeyCredential {
+    pub fn register(
+        &mut self,
+        credential: impl Into<PasskeyCredential>,
+        secret: &str,
+    ) -> PasskeyCredential {
         let credential = credential.into();
         let verifier = deterministic_digest(&["pillar-passkey-register", &credential.0, secret]);
         self.credentials.insert(credential.clone(), verifier);
@@ -175,7 +183,8 @@ impl PasskeyAuthenticator {
         let Some(&verifier) = self.credentials.get(credential) else {
             return false;
         };
-        let expected = deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()]);
+        let expected =
+            deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()]);
         response == expected.to_string()
     }
 
@@ -185,7 +194,8 @@ impl PasskeyAuthenticator {
     #[must_use]
     pub fn sign_challenge(credential: &PasskeyCredential, secret: &str, challenge: &str) -> String {
         let verifier = deterministic_digest(&["pillar-passkey-register", &credential.0, secret]);
-        deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()]).to_string()
+        deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()])
+            .to_string()
     }
 }
 
@@ -252,7 +262,12 @@ pub fn declared_second_factor_provider(manifest: &Crd) -> Option<&str> {
 /// verifies `presented` against it. `false` if the manifest declares no
 /// provider, or names one that is not registered.
 #[must_use]
-pub fn second_factor_honored(providers: &SecondFactorProviders, manifest: &Crd, user: &str, presented: &str) -> bool {
+pub fn second_factor_honored(
+    providers: &SecondFactorProviders,
+    manifest: &Crd,
+    user: &str,
+    presented: &str,
+) -> bool {
     match declared_second_factor_provider(manifest) {
         Some(name) => providers.verify(name, user, presented),
         None => false,
@@ -303,10 +318,15 @@ pub fn authorize_signing_action(
         return Err(AuthError::NotLocalhost);
     }
     let verified = match gate {
-        SigningGate::Passkey { authenticator, credential } => authenticator.assert(credential, challenge, presented),
-        SigningGate::ExternalProvider { providers, manifest, user } => {
-            second_factor_honored(providers, manifest, user, presented)
-        }
+        SigningGate::Passkey {
+            authenticator,
+            credential,
+        } => authenticator.assert(credential, challenge, presented),
+        SigningGate::ExternalProvider {
+            providers,
+            manifest,
+            user,
+        } => second_factor_honored(providers, manifest, user, presented),
     };
     if verified {
         Ok(())
@@ -488,8 +508,8 @@ mod tests {
 
     #[test]
     fn bind_web_binds_a_non_loopback_address_on_an_ephemeral_port() {
-        let listener =
-            bind_web(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0).expect("bind an ephemeral non-loopback port");
+        let listener = bind_web(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
+            .expect("bind an ephemeral non-loopback port");
         let addr = listener.local_addr().expect("local_addr");
         assert!(!addr.ip().is_loopback());
     }
@@ -504,7 +524,10 @@ mod tests {
 
     #[test]
     fn loopback_signing_action_keeps_the_bootstrap_exemption_even_without_a_session() {
-        assert_eq!(authorize_nonloopback_signing_action(&loopback(8080), None), Ok(()));
+        assert_eq!(
+            authorize_nonloopback_signing_action(&loopback(8080), None),
+            Ok(())
+        );
     }
 
     #[test]
@@ -536,7 +559,15 @@ mod tests {
         actor.refresh(&authority);
 
         let session = verifier
-            .admit(&nonce, &signature, &subkey, issuer.origin(), 0, &authority, &actor)
+            .admit(
+                &nonce,
+                &signature,
+                &subkey,
+                issuer.origin(),
+                0,
+                &authority,
+                &actor,
+            )
             .expect("admitted");
 
         assert_eq!(
@@ -548,17 +579,22 @@ mod tests {
     #[test]
     fn passkey_registration_and_assertion_gates_a_signing_action() {
         let mut authenticator = PasskeyAuthenticator::new();
-        let credential = authenticator.register(PasskeyCredential::from("cred-1"), "authenticator-secret");
+        let credential =
+            authenticator.register(PasskeyCredential::from("cred-1"), "authenticator-secret");
         assert!(authenticator.is_registered(&credential));
 
         let challenge = "sign-node-42";
-        let response = PasskeyAuthenticator::sign_challenge(&credential, "authenticator-secret", challenge);
+        let response =
+            PasskeyAuthenticator::sign_challenge(&credential, "authenticator-secret", challenge);
 
         let gate = SigningGate::Passkey {
             authenticator: &authenticator,
             credential: &credential,
         };
-        assert_eq!(authorize_signing_action(&loopback(8080), &gate, challenge, &response), Ok(()));
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, challenge, &response),
+            Ok(())
+        );
     }
 
     #[test]
@@ -628,7 +664,10 @@ mod tests {
             SECOND_FACTOR_PROVIDER_FIELD,
             Value::String("stub-totp".to_owned()),
         );
-        assert_eq!(declared_second_factor_provider(&manifest), Some("stub-totp"));
+        assert_eq!(
+            declared_second_factor_provider(&manifest),
+            Some("stub-totp")
+        );
 
         let mut providers = SecondFactorProviders::new();
         providers.register(Box::new(StubTotpProvider {

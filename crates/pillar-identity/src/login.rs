@@ -789,7 +789,10 @@ mod tests {
     #[test]
     fn ungranted_device_never_logs_in() {
         let store = IdentityStore::new();
-        assert_eq!(store.login(&dev("orphan")), Err(LoginError::DeviceUngranted));
+        assert_eq!(
+            store.login(&dev("orphan")),
+            Err(LoginError::DeviceUngranted)
+        );
     }
 
     /// Delegation-grant enrolls a new op key WITHOUT the cold key, inheriting
@@ -901,10 +904,8 @@ mod tests {
         store.certify_op(cell, user_op.clone());
         store.grant_device(user_op.clone(), device.clone());
 
-        let cert = RevocationCert::stage(
-            RevocationSubject::Op(user_op.clone()),
-            "designated-revoker",
-        );
+        let cert =
+            RevocationCert::stage(RevocationSubject::Op(user_op.clone()), "designated-revoker");
 
         // A non-designated caller cannot fire it.
         assert_eq!(
@@ -914,7 +915,10 @@ mod tests {
         assert!(store.login(&device).is_ok());
 
         // The designated revoker can — without the op key's private key.
-        assert_eq!(store.fire_revocation_cert(&cert, "designated-revoker"), Ok(()));
+        assert_eq!(
+            store.fire_revocation_cert(&cert, "designated-revoker"),
+            Ok(())
+        );
         assert_eq!(store.login(&device), Err(LoginError::OpRevoked));
     }
 
@@ -957,7 +961,10 @@ mod tests {
             );
         }
 
-        assert!(TpmBackend::new("h").is_recommended(), "TPM recommended for node keys");
+        assert!(
+            TpmBackend::new("h").is_recommended(),
+            "TPM recommended for node keys"
+        );
         assert!(
             !PasswordBackend::new("k").is_recommended(),
             "password supported but not recommended"
@@ -969,7 +976,9 @@ mod tests {
     #[test]
     fn unavailable_backend_declines_to_sign() {
         assert!(FileKeyringBackend::new("k").sign_challenge("c").is_none());
-        assert!(PasskeyBackend::new("c", false).sign_challenge("c").is_none());
+        assert!(PasskeyBackend::new("c", false)
+            .sign_challenge("c")
+            .is_none());
     }
 
     // ---- per-key custody registry wiring ----
@@ -1027,8 +1036,8 @@ mod tests {
 
         let node_sig =
             sign_with_backend(&registry, "node-key", &tpm, "chal").expect("node key signs");
-        let user_sig = sign_with_backend(&registry, "user-op-key", &password, "chal")
-            .expect("user key signs");
+        let user_sig =
+            sign_with_backend(&registry, "user-op-key", &password, "chal").expect("user key signs");
 
         assert!(node_sig.starts_with("tpm:"));
         assert!(user_sig.starts_with("password:"));

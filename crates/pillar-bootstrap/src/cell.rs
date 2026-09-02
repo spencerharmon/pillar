@@ -460,7 +460,10 @@ mod tests {
         assert_eq!(outcome.user_custody, CustodyKind::Passkey);
         assert!(outcome.cell_genesis_signature.starts_with("tpm:"));
         assert!(outcome.user_genesis_signature.starts_with("passkey:"));
-        assert_ne!(outcome.cell_genesis_signature, outcome.user_genesis_signature);
+        assert_ne!(
+            outcome.cell_genesis_signature,
+            outcome.user_genesis_signature
+        );
 
         // The registry actually labeled each key: a mismatched backend for
         // either is refused.
@@ -504,9 +507,7 @@ mod tests {
             4,
         )
         .expect("bootstrap");
-        assert!(outcome
-            .cell_genesis_signature
-            .starts_with("file-keyring:"));
+        assert!(outcome.cell_genesis_signature.starts_with("file-keyring:"));
         assert!(outcome.user_genesis_signature.starts_with("password:"));
     }
 }

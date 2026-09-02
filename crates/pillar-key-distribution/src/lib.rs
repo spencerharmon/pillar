@@ -282,7 +282,11 @@ impl fmt::Display for KeyDistributionError {
             KeyDistributionError::UnknownCell(c) => write!(f, "unknown cell {}", c.0),
             KeyDistributionError::UnknownArtifact(a) => write!(f, "unknown artifact {}", a.0),
             KeyDistributionError::RootArtifactNotDistributable(a) => {
-                write!(f, "artifact {} is root-typed and cannot be distributed", a.0)
+                write!(
+                    f,
+                    "artifact {} is root-typed and cannot be distributed",
+                    a.0
+                )
             }
             KeyDistributionError::UserNotSelected { user, cell } => {
                 write!(f, "user {} is not selected by cell {}", user.0, cell.0)
@@ -718,7 +722,10 @@ impl Escrow {
     /// Only the legitimate client, holding the password-derived value that
     /// never leaves it, can supply this. Deliberately independent of
     /// `server_compromised` in either direction (`ClientParticipate`).
-    pub fn client_participate(&mut self, artifact: &ArtifactId) -> Result<(), KeyDistributionError> {
+    pub fn client_participate(
+        &mut self,
+        artifact: &ArtifactId,
+    ) -> Result<(), KeyDistributionError> {
         if !self.envelope.contains(artifact) {
             return Err(KeyDistributionError::UnknownArtifact(artifact.clone()));
         }
@@ -791,9 +798,13 @@ mod tests {
 
     fn setup() -> (KeyDistributionLedger, RecordKey) {
         let mut ledger = KeyDistributionLedger::new(BTreeSet::new());
-        ledger.cell_mut(CellId::from("cell-a")).add_user(UserId::from("alice"));
         ledger
-            .register_artifact(Artifact::new(ArtifactId::from("op-key-1"), ArtifactKind::Operational));
+            .cell_mut(CellId::from("cell-a"))
+            .add_user(UserId::from("alice"));
+        ledger.register_artifact(Artifact::new(
+            ArtifactId::from("op-key-1"),
+            ArtifactKind::Operational,
+        ));
         let record = RecordKey {
             user: UserId::from("alice"),
             cell: CellId::from("cell-a"),
@@ -808,7 +819,11 @@ mod tests {
         let (mut ledger, record) = setup();
         assert!(ledger.admit(&record).is_err());
         ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
             .unwrap();
         assert!(ledger.admit(&record).is_err(), "not yet accepted");
         ledger.accept(&record).unwrap();
@@ -825,7 +840,11 @@ mod tests {
             .add_node_to_allowlist(&record.cell, NodeId::from("node-1"))
             .unwrap();
         ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
             .unwrap();
         ledger.accept(&record).unwrap();
         ledger.admit(&record).unwrap();
@@ -847,7 +866,11 @@ mod tests {
             .add_node_to_allowlist(&record.cell, NodeId::from("node-1"))
             .unwrap();
         ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
             .unwrap();
         ledger.accept(&record).unwrap();
         ledger.admit(&record).unwrap();
@@ -877,9 +900,16 @@ mod tests {
             .unwrap();
         assert!(ledger.seal_of(&record).is_empty());
         ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
             .unwrap();
-        assert!(ledger.seal_of(&record).is_empty(), "offered but not admitted");
+        assert!(
+            ledger.seal_of(&record).is_empty(),
+            "offered but not admitted"
+        );
     }
 
     // CrossOwnerGate: an unconfirmed cross-owner record's admission is
@@ -891,8 +921,13 @@ mod tests {
     #[test]
     fn cross_owner_offer_requires_confirmation_before_admit() {
         let mut ledger = KeyDistributionLedger::new(nodes(&["foreign-1"]));
-        ledger.cell_mut(CellId::from("cell-a")).add_user(UserId::from("alice"));
-        ledger.register_artifact(Artifact::new(ArtifactId::from("op-key-1"), ArtifactKind::Operational));
+        ledger
+            .cell_mut(CellId::from("cell-a"))
+            .add_user(UserId::from("alice"));
+        ledger.register_artifact(Artifact::new(
+            ArtifactId::from("op-key-1"),
+            ArtifactKind::Operational,
+        ));
         ledger
             .add_node_to_allowlist(&CellId::from("cell-a"), NodeId::from("foreign-1"))
             .unwrap();
@@ -903,7 +938,11 @@ mod tests {
         };
         assert!(ledger.cross_owner(&record));
         ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
             .unwrap();
         ledger.accept(&record).unwrap();
 
@@ -923,8 +962,13 @@ mod tests {
     #[test]
     fn later_allowlist_edit_never_bypasses_unconfirmed_cross_owner_gate() {
         let mut ledger = KeyDistributionLedger::new(nodes(&["foreign-1", "foreign-2"]));
-        ledger.cell_mut(CellId::from("cell-a")).add_user(UserId::from("alice"));
-        ledger.register_artifact(Artifact::new(ArtifactId::from("op-key-1"), ArtifactKind::Operational));
+        ledger
+            .cell_mut(CellId::from("cell-a"))
+            .add_user(UserId::from("alice"));
+        ledger.register_artifact(Artifact::new(
+            ArtifactId::from("op-key-1"),
+            ArtifactKind::Operational,
+        ));
         ledger
             .add_node_to_allowlist(&CellId::from("cell-a"), NodeId::from("home-1"))
             .unwrap();
@@ -935,7 +979,11 @@ mod tests {
         };
         // Not cross-owner yet (only home-1 in the allow-list) -- admits silently.
         ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
             .unwrap();
         ledger.accept(&record).unwrap();
         ledger.admit(&record).unwrap();
@@ -962,7 +1010,9 @@ mod tests {
     #[test]
     fn root_artifact_is_never_distributable_or_escrowable() {
         let mut ledger = KeyDistributionLedger::new(BTreeSet::new());
-        ledger.cell_mut(CellId::from("cell-a")).add_user(UserId::from("alice"));
+        ledger
+            .cell_mut(CellId::from("cell-a"))
+            .add_user(UserId::from("alice"));
         let root = Artifact::new(ArtifactId::from("cold-root"), ArtifactKind::Root);
         ledger.register_artifact(root.clone());
 
@@ -1067,7 +1117,10 @@ mod tests {
     fn offer_requires_user_in_cell_selector() {
         let mut ledger = KeyDistributionLedger::new(BTreeSet::new());
         ledger.cell_mut(CellId::from("cell-a"));
-        ledger.register_artifact(Artifact::new(ArtifactId::from("op-key-1"), ArtifactKind::Operational));
+        ledger.register_artifact(Artifact::new(
+            ArtifactId::from("op-key-1"),
+            ArtifactKind::Operational,
+        ));
         assert!(matches!(
             ledger.offer(
                 UserId::from("alice"),
@@ -1083,10 +1136,18 @@ mod tests {
     fn duplicate_offer_and_accept_are_refused() {
         let (mut ledger, record) = setup();
         ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
             .unwrap();
         assert!(ledger
-            .offer(record.user.clone(), record.cell.clone(), record.artifact.clone())
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone()
+            )
             .is_err());
         ledger.accept(&record).unwrap();
         assert!(ledger.accept(&record).is_err());

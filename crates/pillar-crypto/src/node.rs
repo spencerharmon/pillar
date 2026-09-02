@@ -5,9 +5,9 @@
 //! key-distribution model is to **unseal**: recover a cell group key or a user
 //! private key that was sealed to the node's sealing public key.
 
-use crate::error::Result;
 #[cfg(test)]
 use crate::error::CryptoError;
+use crate::error::Result;
 use crate::types::{SealedEnvelope, SealingSecretKey};
 
 /// Unlock (unseal) an artifact that was sealed to this node — a sealed cell key
@@ -16,7 +16,10 @@ use crate::types::{SealedEnvelope, SealingSecretKey};
 ///
 /// Contract: recovers the plaintext when this node is a recipient;
 /// [`CryptoError::NotARecipient`] otherwise.
-pub fn node_unlock(node_sealing_secret: &SealingSecretKey, sealed: &SealedEnvelope) -> Result<Vec<u8>> {
+pub fn node_unlock(
+    node_sealing_secret: &SealingSecretKey,
+    sealed: &SealedEnvelope,
+) -> Result<Vec<u8>> {
     crate::seal::unseal(sealed, node_sealing_secret)
 }
 

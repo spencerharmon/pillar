@@ -167,7 +167,8 @@ impl NodeRoleConfig {
         // The node may only assert its own authoritative serving role if the
         // decider currently grants it — same revoke-before-act fence as a read.
         actor.act(authority, declaration.node())?;
-        self.roles.insert(declaration.node().clone(), declaration.role());
+        self.roles
+            .insert(declaration.node().clone(), declaration.role());
         Ok(())
     }
 }
@@ -192,7 +193,10 @@ mod tests {
         let decl = SignedNodeRole::sign(n("owner"), NodeRole::SubscribeAndServe);
         config.accept(&authority, &actor, &decl).unwrap();
 
-        assert_eq!(config.role_of(&n("owner")), Some(NodeRole::SubscribeAndServe));
+        assert_eq!(
+            config.role_of(&n("owner")),
+            Some(NodeRole::SubscribeAndServe)
+        );
         assert!(config.serves(&n("owner")));
         assert!(config.subscribes(&n("owner")));
     }

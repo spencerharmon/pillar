@@ -372,7 +372,11 @@ impl<'a> RbacDecider<'a> {
     /// are resolved directly against `authority` (see module docs) rather
     /// than an asserted side table.
     #[must_use]
-    pub fn new(authority: &'a WotAuthority, policies: &'a [PolicyEvent], grants: &'a [ExplicitGrant]) -> Self {
+    pub fn new(
+        authority: &'a WotAuthority,
+        policies: &'a [PolicyEvent],
+        grants: &'a [ExplicitGrant],
+    ) -> Self {
         RbacDecider {
             authority,
             policies,
@@ -417,7 +421,11 @@ impl<'a> RbacDecider<'a> {
     /// specificity resolve to whichever is satisfied; among equally
     /// specific satisfied policies the choice is immaterial since they all
     /// grant `Allow`.
-    fn most_specific_satisfied_policy(&self, request: &Request, depth: u8) -> Option<&'a PolicyEvent> {
+    fn most_specific_satisfied_policy(
+        &self,
+        request: &Request,
+        depth: u8,
+    ) -> Option<&'a PolicyEvent> {
         self.policies
             .iter()
             .filter(|p| p.capability == request.capability)
@@ -434,7 +442,8 @@ impl<'a> RbacDecider<'a> {
         let Some(depth) = self.authority.reachable_depth(&request.subject) else {
             return false;
         };
-        self.most_specific_satisfied_policy(request, depth).is_some()
+        self.most_specific_satisfied_policy(request, depth)
+            .is_some()
     }
 
     /// Decide `request`, per the four-rung precedence lattice in the module
@@ -576,7 +585,8 @@ mod tests {
         }];
         let grants = vec![];
         let decider = RbacDecider::new(&a, &policies, &grants);
-        let request = req("alice", &cap("stream:append")).with_resource_class(ResourceClass::Compute);
+        let request =
+            req("alice", &cap("stream:append")).with_resource_class(ResourceClass::Compute);
 
         assert_eq!(decider.decide(&request), Decision::Allow);
     }
@@ -591,7 +601,8 @@ mod tests {
         }];
         let grants = vec![];
         let decider = RbacDecider::new(&a, &policies, &grants);
-        let request = req("alice", &cap("stream:append")).with_resource_class(ResourceClass::Network);
+        let request =
+            req("alice", &cap("stream:append")).with_resource_class(ResourceClass::Network);
 
         assert_eq!(decider.decide(&request), Decision::Deny);
     }
@@ -676,8 +687,11 @@ mod tests {
         let grants = vec![];
         let decider = RbacDecider::new(&a, &policies, &grants);
 
-        let matching = req("alice", &cap("stream:append"))
-            .with_labels(BTreeSet::from(["gpu".to_string(), "us-east".to_string(), "extra".to_string()]));
+        let matching = req("alice", &cap("stream:append")).with_labels(BTreeSet::from([
+            "gpu".to_string(),
+            "us-east".to_string(),
+            "extra".to_string(),
+        ]));
         assert_eq!(decider.decide(&matching), Decision::Allow);
 
         let partial =
@@ -726,10 +740,7 @@ mod tests {
 
         // Node-specific policy alone satisfies -> Allow, even though the
         // less-specific group/all policies at the same request would deny.
-        assert_eq!(
-            decider.decide(&req("alice", &c)),
-            Decision::Allow
-        );
+        assert_eq!(decider.decide(&req("alice", &c)), Decision::Allow);
     }
 
     #[test]
@@ -1002,7 +1013,11 @@ mod tests {
             .find(|p| matches!(p.target, PolicyTarget::ResourceClass(ResourceClass::All)))
             .unwrap()
             .depth_threshold;
-        for class in [ResourceClass::Compute, ResourceClass::Network, ResourceClass::Storage] {
+        for class in [
+            ResourceClass::Compute,
+            ResourceClass::Network,
+            ResourceClass::Storage,
+        ] {
             let t = defaults
                 .iter()
                 .find(|p| matches!(&p.target, PolicyTarget::ResourceClass(rc) if *rc == class))
@@ -1082,7 +1097,8 @@ mod tests {
         }];
         let grants = vec![];
         let decider = RbacDecider::new(&a, &policies, &grants);
-        let request = req("alice", &cap("stream:append")).with_resource_class(ResourceClass::Compute);
+        let request =
+            req("alice", &cap("stream:append")).with_resource_class(ResourceClass::Compute);
         assert_eq!(
             decider.explain(&request),
             Exercised::WotDepthDefault {
@@ -1109,11 +1125,18 @@ mod tests {
 
     #[test]
     fn exercised_display_renders_a_readable_sentence() {
-        assert_eq!(Exercised::ExplicitAllow.to_string(), "explicit grant (allow)");
+        assert_eq!(
+            Exercised::ExplicitAllow.to_string(),
+            "explicit grant (allow)"
+        );
         assert_eq!(Exercised::ExplicitDeny.to_string(), "explicit grant (deny)");
         assert_eq!(Exercised::DenyAll.to_string(), "none (deny-all default)");
         assert_eq!(
-            Exercised::WotDepthDefault { depth: 2, threshold: 2 }.to_string(),
+            Exercised::WotDepthDefault {
+                depth: 2,
+                threshold: 2
+            }
+            .to_string(),
             "WoT-depth default (reachable at depth 2, threshold 2)"
         );
     }

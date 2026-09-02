@@ -54,12 +54,18 @@ mod tests {
         // A one-byte change must produce a completely different address.
         let base = content_address(b"pillar-op-0000").expect("address");
         let flipped = content_address(b"pillar-op-0001").expect("address");
-        assert_ne!(base, flipped, "a small input change must change the address");
+        assert_ne!(
+            base, flipped,
+            "a small input change must change the address"
+        );
     }
 
     #[test]
     fn empty_input_still_addresses() {
         let empty = content_address(b"").expect("address");
-        assert!(empty.len() >= 32, "even the empty input hashes to full width");
+        assert!(
+            empty.len() >= 32,
+            "even the empty input hashes to full width"
+        );
     }
 }

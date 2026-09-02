@@ -139,48 +139,48 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::time::Instant;
 
-use pillar_core::{Epoch, NodeId};
-use pillar_coordination::LeaseRegister;
-use pillar_eventlog::{Author, EventId, EventLog};
-use pillar_rbac::{
-    default_resource_class_policies, Capability as RbacCapability, Decision, PolicyEvent, PolicyTarget,
-    RbacDecider, Request as RbacRequest, ResourceClass,
+use pillar_bootstrap::custody::parse_custody_kind;
+use pillar_bootstrap::{
+    BootstrapRequestId, BootstrapRequestKind, BootstrapRequestQueue, CustodyKind, NodeIdentity,
+    RequestError,
 };
+use pillar_coordination::LeaseRegister;
+use pillar_core::{Epoch, NodeId};
+use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_identity::global_identity::{
     Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
     Rotation as IdentityRotation, Sig as IdentitySig,
 };
 use pillar_identity::session_registry::{RevokeError, Session, SessionRegistry};
 use pillar_identity::NodeSubkey;
+use pillar_rbac::{
+    default_resource_class_policies, Capability as RbacCapability, Decision, PolicyEvent,
+    PolicyTarget, RbacDecider, Request as RbacRequest, ResourceClass,
+};
 use pillar_streamdb::{OpId, OpLog};
+use pillar_trust_artifacts::{
+    parse_quota, Attest, Capacity as TrustCapacity, Cid as TrustCid, GraphEdge, Predicate,
+    Proof as TrustProof, Sig as TrustSig, TrustError, TrustStore,
+};
 use pillar_web::key_login::{LoginSession, Origin};
 use pillar_web::node_custody::{
     BootstrapError, CellBootstrap, CellNameRegistry, CellNameStatus, Cid, InMemoryCellNameRegistry,
     NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey, CELL_NAME_IN_USE_MESSAGE,
 };
 use pillar_web::{authorize_nonloopback_signing_action, bind_web};
-use pillar_bootstrap::custody::parse_custody_kind;
-use pillar_bootstrap::{
-    BootstrapRequestId, BootstrapRequestKind, BootstrapRequestQueue, CustodyKind, NodeIdentity,
-    RequestError,
-};
 use pillar_wot_authority::{FencedActor, WotAuthority};
-use pillar_trust_artifacts::{
-    parse_quota, Attest, Capacity as TrustCapacity, Cid as TrustCid, GraphEdge, Predicate,
-    Proof as TrustProof, Sig as TrustSig, TrustError, TrustStore,
-};
 
+use crate::observability_ui::ObservabilityBuilders;
+use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
+use crate::Platform;
 use pillar_manifest::{
-    Crd, Metadata as CrdMetadata, SchemaRegistry, Schema, FieldType, Value as CrdValue,
+    Crd, FieldType, Metadata as CrdMetadata, Schema, SchemaRegistry, Value as CrdValue,
 };
+use pillar_observability::SignalKind;
 use pillar_topology::{
     Assignment as TopologyAssignment, Label as TopologyLabel, Mismatch as TopologyMismatch,
     TierHierarchy, Topology as TopologyRegistry, ATTEST_ACTION as TOPOLOGY_ATTEST_ACTION,
 };
-use pillar_observability::SignalKind;
-use crate::observability_ui::ObservabilityBuilders;
-use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
-use crate::Platform;
 
 /// A read-only snapshot of this node's identity/reachability, as the
 /// authenticated portal renders it: [`NodeId`]-derived peer id, the
@@ -374,10 +374,7 @@ fn resource_registry() -> SchemaRegistry {
             .property("replicas", FieldType::Integer)
             .property("generation", FieldType::Integer),
     );
-    reg.register(
-        Schema::new(RESOURCE_API, IDENTITY_KIND)
-            .required("handle", FieldType::String),
-    );
+    reg.register(Schema::new(RESOURCE_API, IDENTITY_KIND).required("handle", FieldType::String));
     reg
 }
 
@@ -440,7 +437,11 @@ impl WebAuthContext {
         let lease_epoch = Epoch(1);
         // A solo node is its own voter and candidate: self-grant + acquire so
         // a fresh node reports itself as the lease holder out of the box.
-        let _ = lease.grant(owner_for_lease.clone(), owner_for_lease.clone(), lease_epoch);
+        let _ = lease.grant(
+            owner_for_lease.clone(),
+            owner_for_lease.clone(),
+            lease_epoch,
+        );
         let _ = lease.try_acquire(&owner_for_lease, lease_epoch);
         WebAuthContext {
             verifier: NodeCustodyVerifier::new(node_key, Origin::from(origin.as_str())),
@@ -521,13 +522,17 @@ impl WebAuthContext {
     /// `(signer, content)`.
     #[must_use]
     pub fn get_layout(&self, id: OpId) -> Option<(String, String)> {
-        self.layouts.order().into_iter().find(|op| op.id() == id).and_then(|op| {
-            let text = String::from_utf8_lossy(op.payload());
-            let mut lines = text.splitn(2, '\n');
-            let signer = lines.next()?.to_owned();
-            let content = lines.next().unwrap_or("").to_owned();
-            Some((signer, content))
-        })
+        self.layouts
+            .order()
+            .into_iter()
+            .find(|op| op.id() == id)
+            .and_then(|op| {
+                let text = String::from_utf8_lossy(op.payload());
+                let mut lines = text.splitn(2, '\n');
+                let signer = lines.next()?.to_owned();
+                let content = lines.next().unwrap_or("").to_owned();
+                Some((signer, content))
+            })
     }
 
     /// The streaming tip (Merkle root) of the layout resource log.
@@ -749,7 +754,9 @@ impl WebAuthContext {
     #[must_use]
     pub fn exercised_authority(&self, actor: &NodeId) -> String {
         match self.authority.reachable_depth(actor) {
-            Some(depth) => format!("WoT-depth-default (reachable-depth {depth} satisfies threshold 0)"),
+            Some(depth) => {
+                format!("WoT-depth-default (reachable-depth {depth} satisfies threshold 0)")
+            }
             None => "(unreachable; no authority to exercise)".to_owned(),
         }
     }
@@ -802,9 +809,12 @@ impl WebAuthContext {
             sig: TrustSig::by(issuer),
         };
         let cid = self.trust.issue_attest(attest)?;
-        let proof = self.trust.verify(&cid).map_err(|_| TrustError::CapacityNotHeld {
-            issuer: self.trust.genesis().clone(),
-        })?;
+        let proof = self
+            .trust
+            .verify(&cid)
+            .map_err(|_| TrustError::CapacityNotHeld {
+                issuer: self.trust.genesis().clone(),
+            })?;
         Ok((cid, proof))
     }
 
@@ -954,7 +964,12 @@ impl WebAuthContext {
     ) -> (Vec<(NodeId, Option<String>)>, bool) {
         let assignments: Vec<(NodeId, Option<String>)> = nodes
             .iter()
-            .map(|n| (n.clone(), self.topology.placement(n).at(tier).map(str::to_owned)))
+            .map(|n| {
+                (
+                    n.clone(),
+                    self.topology.placement(n).at(tier).map(str::to_owned),
+                )
+            })
             .collect();
         let domains = self.topology.domains_at(tier, nodes);
         let warn = nodes.len() >= 2 && domains.len() < 2;
@@ -1041,7 +1056,8 @@ impl WebAuthContext {
         // already-emitted resource event is ever discarded here — asserted by
         // rebuilding only while the plane's event log is still empty.
         let resource_root = self.resource_authority.owner().clone();
-        self.resource_authority.issue_edge(resource_root, subject, level);
+        self.resource_authority
+            .issue_edge(resource_root, subject, level);
         if self.resource_platform.event_count() == 0 {
             self.resource_platform = Platform::new(
                 resource_registry(),
@@ -1105,13 +1121,9 @@ impl WebAuthContext {
     }
 
     fn workload_body(&self, name: &str, image: &str, replicas: i64) -> Crd {
-        Crd::new(
-            &self.resource_api,
-            WORKLOAD_KIND,
-            CrdMetadata::new(name),
-        )
-        .with_spec("image", CrdValue::String(image.to_owned()))
-        .with_spec("replicas", CrdValue::Integer(replicas))
+        Crd::new(&self.resource_api, WORKLOAD_KIND, CrdMetadata::new(name))
+            .with_spec("image", CrdValue::String(image.to_owned()))
+            .with_spec("replicas", CrdValue::Integer(replicas))
     }
 
     /// `apply` (ACT): declarative upsert of a workload, emitting exactly one
@@ -1160,7 +1172,12 @@ impl WebAuthContext {
     ) -> Result<String, ResourceError> {
         let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
         plane
-            .scale(actor, RESOURCE_CAP, &Address::new(WORKLOAD_KIND, name), replicas)
+            .scale(
+                actor,
+                RESOURCE_CAP,
+                &Address::new(WORKLOAD_KIND, name),
+                replicas,
+            )
             .map(|applied| format!("{}", applied.event.0))
     }
 
@@ -1368,6 +1385,7 @@ impl WebAuthContext {
         self.name_registry.lookup(name)
     }
 
+    /// Create a cell, enforcing name-registry uniqueness.
     pub fn create_cell(&mut self, cell: NodeId) -> Result<(), BootstrapError> {
         self.bootstrap
             .create_cell_checked(cell.clone(), self.name_registry.as_ref())?;
@@ -1664,7 +1682,7 @@ fn dispatch_http(
                 Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
             }
         }
-        ("GET", p) if p == "/bootstrap/name-check" => {
+        ("GET", "/bootstrap/name-check") => {
             // INLINE, live cell-name uniqueness for the web UI: resolve the
             // proposed name through the SAME peer-sourced `name_registry` the
             // create-cell step validates against, so the operator sees an "in
@@ -1752,7 +1770,9 @@ fn dispatch_http(
         ("POST", "/portal/sessions/revoke-all") => dispatch_sessions_revoke_all(ctx, request),
         ("POST", "/portal/attestations/build") => dispatch_attestation_build(ctx, request),
         ("GET", "/portal/trust-graph") => dispatch_trust_graph_view(ctx, request),
-        ("GET", p) if p.starts_with("/portal/topology/tree") => dispatch_topology_tree(ctx, request),
+        ("GET", p) if p.starts_with("/portal/topology/tree") => {
+            dispatch_topology_tree(ctx, request)
+        }
         ("GET", p) if p.starts_with("/portal/topology/mismatches") => {
             dispatch_topology_mismatches(ctx, request)
         }
@@ -1761,7 +1781,9 @@ fn dispatch_http(
         ("GET", p) if p.starts_with("/portal/topology/failure-domain") => {
             dispatch_topology_failure_domain(ctx, request)
         }
-        ("GET", p) if p.starts_with("/portal/topology/facet") => dispatch_topology_facet(ctx, request),
+        ("GET", p) if p.starts_with("/portal/topology/facet") => {
+            dispatch_topology_facet(ctx, request)
+        }
         ("POST", "/portal/custody/migrate") => dispatch_custody_migrate(ctx, request),
         ("POST", "/portal/custody/rotate") => dispatch_custody_rotate(ctx, request),
         ("POST", "/portal/custody/seal") => dispatch_custody_seal(ctx, request),
@@ -1782,9 +1804,13 @@ fn dispatch_http(
         ("GET", p) if p.starts_with("/portal/resource/forward") => {
             dispatch_resource_runtime(ctx, request, RuntimeReach::Forward)
         }
-        ("POST", "/portal/resource/apply") => dispatch_resource_act(ctx, request, ResourceAct::Apply),
+        ("POST", "/portal/resource/apply") => {
+            dispatch_resource_act(ctx, request, ResourceAct::Apply)
+        }
         ("POST", "/portal/resource/edit") => dispatch_resource_act(ctx, request, ResourceAct::Edit),
-        ("POST", "/portal/resource/scale") => dispatch_resource_act(ctx, request, ResourceAct::Scale),
+        ("POST", "/portal/resource/scale") => {
+            dispatch_resource_act(ctx, request, ResourceAct::Scale)
+        }
         ("POST", "/portal/resource/rollout") => {
             dispatch_resource_act(ctx, request, ResourceAct::Rollout)
         }
@@ -2341,7 +2367,10 @@ fn trust_error_reason(e: &TrustError) -> String {
         }
         TrustError::UnknownTarget(cid) => format!("unknown-target-{}", cid.0),
         TrustError::NotAQuotaPredicate => "not-a-quota-predicate".to_owned(),
-        TrustError::QuotaExceeded { requested, remaining } => {
+        TrustError::QuotaExceeded {
+            requested,
+            remaining,
+        } => {
             format!("quota-exceeded-{requested}-remaining-{remaining}")
         }
     }
@@ -2369,7 +2398,11 @@ fn dispatch_attestation_build(ctx: &mut WebAuthContext, request: &HttpRequest) -
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     }
-    if issuer.is_empty() || subject.is_empty() || action.is_empty() || resource.is_empty() || scope.is_empty()
+    if issuer.is_empty()
+        || subject.is_empty()
+        || action.is_empty()
+        || resource.is_empty()
+        || scope.is_empty()
     {
         return text_response(400, "Bad Request", "MISSING field".to_owned());
     }
@@ -2411,7 +2444,11 @@ fn dispatch_attestation_build(ctx: &mut WebAuthContext, request: &HttpRequest) -
             }
             text_response(200, "OK", body)
         }
-        Err(e) => text_response(403, "Forbidden", format!("DENIED {}", trust_error_reason(&e))),
+        Err(e) => text_response(
+            403,
+            "Forbidden",
+            format!("DENIED {}", trust_error_reason(&e)),
+        ),
     }
 }
 
@@ -2424,7 +2461,10 @@ fn dispatch_trust_graph_view(ctx: &WebAuthContext, request: &HttpRequest) -> Htt
     }
     let mut body = String::new();
     for e in ctx.trust_graph_edges() {
-        body.push_str(&format!("EDGE {} -> {} LABEL {}\n", e.from.0, e.to.0, e.label));
+        body.push_str(&format!(
+            "EDGE {} -> {} LABEL {}\n",
+            e.from.0, e.to.0, e.label
+        ));
     }
     text_response(200, "OK", body)
 }
@@ -2549,10 +2589,7 @@ fn dispatch_topology_label_declare(
 /// (`capacity-spec` is `self` or `<role>@<scope>`, exactly like the
 /// attestation builder). Emits ONE signed `topology:label` attest event;
 /// refused (403) if `issuer` does not hold the declared capacity.
-fn dispatch_topology_label_attest(
-    ctx: &mut WebAuthContext,
-    request: &HttpRequest,
-) -> HttpResponse {
+fn dispatch_topology_label_attest(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let mut lines = request.body.lines();
     let token = lines.next().unwrap_or("").trim();
     let issuer = lines.next().unwrap_or("").trim();
@@ -2565,7 +2602,11 @@ fn dispatch_topology_label_attest(
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     }
-    if issuer.is_empty() || subject.is_empty() || tier.is_empty() || value.is_empty() || scope.is_empty()
+    if issuer.is_empty()
+        || subject.is_empty()
+        || tier.is_empty()
+        || value.is_empty()
+        || scope.is_empty()
     {
         return text_response(400, "Bad Request", "MISSING field".to_owned());
     }
@@ -2594,7 +2635,11 @@ fn dispatch_topology_label_attest(
         scope,
     ) {
         Ok(cid) => text_response(200, "OK", format!("ATTESTED CID {}", cid.0)),
-        Err(e) => text_response(403, "Forbidden", format!("DENIED {}", trust_error_reason(&e))),
+        Err(e) => text_response(
+            403,
+            "Forbidden",
+            format!("DENIED {}", trust_error_reason(&e)),
+        ),
     }
 }
 
@@ -2603,10 +2648,7 @@ fn dispatch_topology_label_attest(
 /// Computes each named node's replica spread across `tier` and warns when
 /// 2+ replicas land in the SAME failure domain (e.g. the same rack). A pure
 /// view — signs nothing.
-fn dispatch_topology_failure_domain(
-    ctx: &WebAuthContext,
-    request: &HttpRequest,
-) -> HttpResponse {
+fn dispatch_topology_failure_domain(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let token = query_value(&request.path, "token").unwrap_or("");
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
@@ -3039,7 +3081,11 @@ mod tests {
         // POST /portal/members/add WITH the token → 200, one signed,
         // decider-authorized event with provenance (signer, exercised
         // authority, event CID).
-        let act_resp = post(&mut ctx, "/portal/members/add", &format!("{token}\ncarol\nmember"));
+        let act_resp = post(
+            &mut ctx,
+            "/portal/members/add",
+            &format!("{token}\ncarol\nmember"),
+        );
         assert_eq!(
             act_resp.status, 200,
             "authenticated signed act: {}",
@@ -3047,7 +3093,11 @@ mod tests {
         );
         assert!(act_resp.body.contains("MEMBER carol ROLE member"));
         assert!(act_resp.body.contains("SIGNER"), "got: {}", act_resp.body);
-        assert!(act_resp.body.contains("EVENT-CID"), "got: {}", act_resp.body);
+        assert!(
+            act_resp.body.contains("EVENT-CID"),
+            "got: {}",
+            act_resp.body
+        );
         assert!(
             act_resp.body.contains("EXERCISED-AUTHORITY"),
             "got: {}",
@@ -3201,7 +3251,11 @@ mod tests {
         assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
 
         // Cannot create a user before the cell.
-        let early = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
+        let early = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("spencer\n{PASSWORD}"),
+        );
         assert_eq!(early.status, 409);
         assert!(early.body.contains("NoCellYet"), "got: {}", early.body);
 
@@ -3211,7 +3265,11 @@ mod tests {
         assert!(cell.body.contains("CELL-CREATED"));
 
         // (b) create the first user — consumes the one-shot capability.
-        let user = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
+        let user = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("spencer\n{PASSWORD}"),
+        );
         assert_eq!(user.status, 200);
         assert!(user.body.contains("USER-CREATED spencer"));
 
@@ -3223,7 +3281,11 @@ mod tests {
         assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
 
         // A SECOND cell-key create-user is refused (capability spent).
-        let second = post(&mut ctx, "/bootstrap/create-user", &format!("second-user\n{PASSWORD}"));
+        let second = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("second-user\n{PASSWORD}"),
+        );
         assert_eq!(second.status, 409);
         assert!(
             second.body.contains("CapabilitySpent"),
@@ -3250,12 +3312,22 @@ mod tests {
 
         let cell = post(&mut ctx, "/bootstrap/create-cell", "cell-genesis");
         assert_eq!(cell.status, 200);
-        let user = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
+        let user = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("spencer\n{PASSWORD}"),
+        );
         assert_eq!(user.status, 200, "got: {}", user.body);
 
         // Log in as the just-created user with NO further offer provisioning.
         let nonce_resp = get(&mut ctx, "/nonce");
-        let id: u64 = nonce_resp.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let id: u64 = nonce_resp
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let login = post(&mut ctx, "/login", &format!("spencer\n{PASSWORD}\n{id}"));
         assert_eq!(
             login.status, 200,
@@ -3268,12 +3340,17 @@ mod tests {
         // unlock-failed, never the no-offer mode — proving the offer really
         // is present and the failure mode is unlock-specific.
         let nonce_resp2 = get(&mut ctx, "/nonce");
-        let id2: u64 = nonce_resp2.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let id2: u64 = nonce_resp2
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let bad = post(&mut ctx, "/login", &format!("spencer\nwrong\n{id2}"));
         assert_eq!(bad.status, 401);
         assert!(bad.body.contains("unlock-failed"), "got: {}", bad.body);
     }
-
 
     #[test]
     fn a_bootstrapped_node_reports_bootstrapped_directly() {
@@ -3346,7 +3423,11 @@ mod tests {
             &format!("spencer-cell\nspencer\n{PASSWORD}"),
         );
         assert_eq!(done.status, 200, "got: {}", done.body);
-        assert!(done.body.contains("BOOTSTRAPPED spencer"), "got: {}", done.body);
+        assert!(
+            done.body.contains("BOOTSTRAPPED spencer"),
+            "got: {}",
+            done.body
+        );
         assert_eq!(
             get(&mut ctx, "/bootstrap/status").body.trim(),
             "BOOTSTRAPPED"
@@ -3355,7 +3436,13 @@ mod tests {
 
         // The just-created user logs in immediately (offer escrowed atomically).
         let nonce = get(&mut ctx, "/nonce");
-        let id: u64 = nonce.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let id: u64 = nonce
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let login = post(&mut ctx, "/login", &format!("spencer\n{PASSWORD}\n{id}"));
         assert_eq!(login.status, 200, "got: {}", login.body);
     }
@@ -3379,7 +3466,11 @@ mod tests {
             &format!("spencer-cell\nspencer\n{PASSWORD}"),
         );
         assert_eq!(done.status, 200, "got: {}", done.body);
-        assert!(done.body.contains("BOOTSTRAPPED spencer"), "got: {}", done.body);
+        assert!(
+            done.body.contains("BOOTSTRAPPED spencer"),
+            "got: {}",
+            done.body
+        );
         assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
     }
 
@@ -3387,7 +3478,11 @@ mod tests {
     fn login_alice(ctx: &mut WebAuthContext) -> String {
         let nonce = get(ctx, "/nonce");
         let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
-        let login = post(ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nonce_id}"));
+        let login = post(
+            ctx,
+            "/login",
+            &format!("alice@pillar\n{PASSWORD}\n{nonce_id}"),
+        );
         assert_eq!(login.status, 200, "login body: {}", login.body);
         login.session_token.expect("session token")
     }
@@ -3400,13 +3495,20 @@ mod tests {
             post(&mut ctx, "/bootstrap/request/node", "new-node").status,
             409
         );
-        assert_eq!(post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status, 200);
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status,
+            200
+        );
 
         // Submit a node request carrying identifying info.
         let body = "new-node\n12D3KooWpeer\npillar 0.0.0\nlinux\nbafy-nodekey\ntpm\npub=/ip4/203.0.113.7/tcp/4001\nlabel=edge";
         let submitted = post(&mut ctx, "/bootstrap/request/node", body);
         assert_eq!(submitted.status, 200);
-        assert!(submitted.body.starts_with("REQUEST "), "got: {}", submitted.body);
+        assert!(
+            submitted.body.starts_with("REQUEST "),
+            "got: {}",
+            submitted.body
+        );
         let id = submitted.body.trim_start_matches("REQUEST ").trim();
 
         // It shows up in the pending list.
@@ -3414,29 +3516,60 @@ mod tests {
         assert!(list.body.contains("node new-node"), "got: {}", list.body);
 
         // Approving without authentication is refused.
-        let unauth = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\nnot-a-token"));
+        let unauth = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\nnot-a-token"),
+        );
         assert_eq!(unauth.status, 401);
 
         // Authenticated approval seals the cell key and returns its CID.
         let token = login_alice(&mut ctx);
-        let approved = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        let approved = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\n{token}"),
+        );
         assert_eq!(approved.status, 200, "got: {}", approved.body);
-        assert!(approved.body.contains("APPROVED bafy-cellkey-"), "got: {}", approved.body);
+        assert!(
+            approved.body.contains("APPROVED bafy-cellkey-"),
+            "got: {}",
+            approved.body
+        );
 
         // The request is terminal: a second decision is refused.
-        let again = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        let again = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\n{token}"),
+        );
         assert_eq!(again.status, 409);
     }
 
     #[test]
     fn user_bootstrap_request_approval_escrows_and_returns_no_cell_key() {
         let (mut ctx, _subkey) = provisioned_ctx();
-        assert_eq!(post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status, 200);
-        let submitted = post(&mut ctx, "/bootstrap/request/user", "new-user\npassword\nlabel=ops");
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status,
+            200
+        );
+        let submitted = post(
+            &mut ctx,
+            "/bootstrap/request/user",
+            "new-user\npassword\nlabel=ops",
+        );
         assert_eq!(submitted.status, 200);
-        let id = submitted.body.trim_start_matches("REQUEST ").trim().to_owned();
+        let id = submitted
+            .body
+            .trim_start_matches("REQUEST ")
+            .trim()
+            .to_owned();
         let token = login_alice(&mut ctx);
-        let approved = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        let approved = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\n{token}"),
+        );
         assert_eq!(approved.status, 200, "got: {}", approved.body);
         assert!(approved.body.contains("ESCROWED"), "got: {}", approved.body);
     }
@@ -3449,7 +3582,11 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let resp = get(&mut ctx, "/portal/status?token=not-a-token");
         assert_eq!(resp.status, 401);
-        assert!(resp.body.contains("not-authenticated"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("not-authenticated"),
+            "got: {}",
+            resp.body
+        );
     }
 
     // Once admitted, the portal renders node/identity status (PeerId, listen
@@ -3467,18 +3604,30 @@ mod tests {
 
         let resp = get(&mut ctx, &format!("/portal/status?token={token}"));
         assert_eq!(resp.status, 200, "got: {}", resp.body);
-        assert!(resp.body.contains("PEER-ID 12D3KooWThisNode"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("PEER-ID 12D3KooWThisNode"),
+            "got: {}",
+            resp.body
+        );
         assert!(
             resp.body.contains("LISTEN /ip4/0.0.0.0/tcp/4001"),
             "got: {}",
             resp.body
         );
         assert!(resp.body.contains("PEER-COUNT 2"), "got: {}", resp.body);
-        assert!(resp.body.contains("PEERS peer-a,peer-b"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("PEERS peer-a,peer-b"),
+            "got: {}",
+            resp.body
+        );
         assert!(resp.body.contains("UPTIME-SECS"), "got: {}", resp.body);
         // A solo node self-grants its lease at construction, so it reports
         // itself ("owner") as holder out of the box.
-        assert!(resp.body.contains("LEASE-HOLDER owner"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("LEASE-HOLDER owner"),
+            "got: {}",
+            resp.body
+        );
     }
 
     // A UI-persisted layout is a signed, content-addressed resource riding the
@@ -3493,28 +3642,59 @@ mod tests {
 
         // Unauthenticated view/enroll is refused.
         assert_eq!(get(&mut ctx, "/portal/identity?token=nope").status, 401);
-        assert_eq!(post(&mut ctx, "/portal/identity/enroll", "nope\nwork").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/identity/enroll", "nope\nwork").status,
+            401
+        );
 
         let cid_before = ctx.identity_log().cid().0.clone();
 
-        let enrolled = post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        let enrolled = post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
         assert_eq!(enrolled.status, 200, "got: {}", enrolled.body);
-        assert!(enrolled.body.contains("DOMAIN work KEY"), "got: {}", enrolled.body);
+        assert!(
+            enrolled.body.contains("DOMAIN work KEY"),
+            "got: {}",
+            enrolled.body
+        );
 
         // A second enroll for the SAME domain is refused — one subkey per
         // domain.
-        let dup = post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        let dup = post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
         assert_eq!(dup.status, 409, "got: {}", dup.body);
 
         let view = get(&mut ctx, &format!("/portal/identity?token={token}"));
         assert_eq!(view.status, 200, "got: {}", view.body);
-        assert!(view.body.contains(&format!("CID {cid_before}")), "got: {}", view.body);
-        assert!(view.body.contains("DOMAIN work KEY"), "must show the per-domain key: {}", view.body);
+        assert!(
+            view.body.contains(&format!("CID {cid_before}")),
+            "got: {}",
+            view.body
+        );
+        assert!(
+            view.body.contains("DOMAIN work KEY"),
+            "must show the per-domain key: {}",
+            view.body
+        );
 
         // rotate-primary preserves the identity CID.
-        let rotated = post(&mut ctx, "/portal/identity/rotate", &format!("{token}\nprimary-2"));
+        let rotated = post(
+            &mut ctx,
+            "/portal/identity/rotate",
+            &format!("{token}\nprimary-2"),
+        );
         assert_eq!(rotated.status, 200, "got: {}", rotated.body);
-        assert!(rotated.body.contains(&format!("CID {cid_before}")), "got: {}", rotated.body);
+        assert!(
+            rotated.body.contains(&format!("CID {cid_before}")),
+            "got: {}",
+            rotated.body
+        );
         assert_eq!(ctx.identity_log().cid().0, cid_before);
         assert_eq!(ctx.identity_log().head_generation(), 1);
 
@@ -3522,7 +3702,11 @@ mod tests {
         // authorized by the genesis recovery key (never the current primary).
         let recovered = post(&mut ctx, "/portal/identity/recover", token.as_str());
         assert_eq!(recovered.status, 200, "got: {}", recovered.body);
-        assert!(recovered.body.contains(&format!("CID {cid_before}")), "got: {}", recovered.body);
+        assert!(
+            recovered.body.contains(&format!("CID {cid_before}")),
+            "got: {}",
+            recovered.body
+        );
         assert_eq!(ctx.identity_log().head_generation(), 2);
         assert_eq!(ctx.identity_log().cid().0, cid_before);
     }
@@ -3534,18 +3718,40 @@ mod tests {
     fn domain_grouping_view_lists_cells_and_signs_nothing() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
 
         assert_eq!(get(&mut ctx, "/portal/domains?token=nope").status, 401);
         let view = get(&mut ctx, &format!("/portal/domains?token={token}"));
         assert_eq!(view.status, 200, "got: {}", view.body);
-        assert!(view.body.contains("DOMAIN work CELLS"), "must list the domain's cells: {}", view.body);
+        assert!(
+            view.body.contains("DOMAIN work CELLS"),
+            "must list the domain's cells: {}",
+            view.body
+        );
         assert!(view.body.contains("work-cell-1"), "got: {}", view.body);
 
         // Property: no domain-signing/granting/coordinating route exists.
-        assert_eq!(post(&mut ctx, "/portal/domains/sign", &format!("{token}\nwork")).status, 404);
-        assert_eq!(post(&mut ctx, "/portal/domains/grant", &format!("{token}\nwork")).status, 404);
-        assert_eq!(post(&mut ctx, "/portal/domains/coordinate", &format!("{token}\nwork")).status, 404);
+        assert_eq!(
+            post(&mut ctx, "/portal/domains/sign", &format!("{token}\nwork")).status,
+            404
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/domains/grant", &format!("{token}\nwork")).status,
+            404
+        );
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/portal/domains/coordinate",
+                &format!("{token}\nwork")
+            )
+            .status,
+            404
+        );
     }
 
     // User/member management: add/invite/role changes are signed acts
@@ -3561,34 +3767,76 @@ mod tests {
         // bad/absent session on a non-loopback peer is always 403), then
         // through the decider; `/portal/members/role` has no peer gate, so
         // an unauthenticated caller reads 401.
-        assert_eq!(post(&mut ctx, "/portal/members/add", "bad-token\nbob\nmember").status, 403);
-        assert_eq!(post(&mut ctx, "/portal/members/role", "bad-token\nbob\nadmin").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/members/add", "bad-token\nbob\nmember").status,
+            403
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/members/role", "bad-token\nbob\nadmin").status,
+            401
+        );
 
-        let added = post(&mut ctx, "/portal/members/add", &format!("{token}\nbob\nmember"));
+        let added = post(
+            &mut ctx,
+            "/portal/members/add",
+            &format!("{token}\nbob\nmember"),
+        );
         assert_eq!(added.status, 200, "got: {}", added.body);
-        assert!(added.body.contains("MEMBER bob ROLE member"), "got: {}", added.body);
+        assert!(
+            added.body.contains("MEMBER bob ROLE member"),
+            "got: {}",
+            added.body
+        );
         // The real signed-action surface: provenance is rendered — signer,
         // the exercised WoT authority, and the emitted event's CID.
         assert!(added.body.contains("SIGNER"), "got: {}", added.body);
         assert!(added.body.contains("EVENT-CID"), "got: {}", added.body);
-        assert!(added.body.contains("EXERCISED-AUTHORITY"), "got: {}", added.body);
+        assert!(
+            added.body.contains("EXERCISED-AUTHORITY"),
+            "got: {}",
+            added.body
+        );
 
         let listed = get(&mut ctx, &format!("/portal/members?token={token}"));
         assert_eq!(listed.status, 200, "got: {}", listed.body);
-        assert!(listed.body.contains("MEMBER bob ROLE member"), "got: {}", listed.body);
+        assert!(
+            listed.body.contains("MEMBER bob ROLE member"),
+            "got: {}",
+            listed.body
+        );
 
-        let role_changed = post(&mut ctx, "/portal/members/role", &format!("{token}\nbob\nadmin"));
+        let role_changed = post(
+            &mut ctx,
+            "/portal/members/role",
+            &format!("{token}\nbob\nadmin"),
+        );
         assert_eq!(role_changed.status, 200, "got: {}", role_changed.body);
-        assert!(role_changed.body.contains("MEMBER bob ROLE admin"), "got: {}", role_changed.body);
+        assert!(
+            role_changed.body.contains("MEMBER bob ROLE admin"),
+            "got: {}",
+            role_changed.body
+        );
 
         // Role change on an unknown member is refused.
-        let unknown = post(&mut ctx, "/portal/members/role", &format!("{token}\nghost\nadmin"));
+        let unknown = post(
+            &mut ctx,
+            "/portal/members/role",
+            &format!("{token}\nghost\nadmin"),
+        );
         assert_eq!(unknown.status, 404, "got: {}", unknown.body);
 
         // Multi-domain view: one global identity across multiple domains,
         // each with its own per-domain key.
-        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
-        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nhome"));
+        post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
+        post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nhome"),
+        );
         let view = get(&mut ctx, &format!("/portal/identity?token={token}"));
         assert!(view.body.contains("DOMAIN work KEY"), "got: {}", view.body);
         assert!(view.body.contains("DOMAIN home KEY"), "got: {}", view.body);
@@ -3604,21 +3852,35 @@ mod tests {
     fn perform_signed_act_authorizes_wot_reachable_subjects_and_refuses_unreachable_ones() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        let session = ctx.login_session_for(&token).cloned().expect("admitted session");
+        let session = ctx
+            .login_session_for(&token)
+            .cloned()
+            .expect("admitted session");
         let admitted = session.subject.clone();
 
         let before = ctx.act_log.len();
         let event = ctx
             .perform_signed_act(&admitted, "portal:members:write", "MEMBER-ADD bob member")
             .expect("an admitted (WoT-reachable) subject is authorized");
-        assert_eq!(ctx.act_log.len(), before + 1, "exactly one signed event emitted");
-        assert!(ctx.exercised_authority(&admitted).contains("WoT-depth-default"));
+        assert_eq!(
+            ctx.act_log.len(),
+            before + 1,
+            "exactly one signed event emitted"
+        );
+        assert!(ctx
+            .exercised_authority(&admitted)
+            .contains("WoT-depth-default"));
         let _ = event;
 
         let stranger = NodeId::from("never-admitted-stranger");
         let before = ctx.act_log.len();
-        let refused = ctx.perform_signed_act(&stranger, "portal:members:write", "MEMBER-ADD ghost member");
-        assert_eq!(refused, Err(stranger.clone()), "an unreachable subject is refused");
+        let refused =
+            ctx.perform_signed_act(&stranger, "portal:members:write", "MEMBER-ADD ghost member");
+        assert_eq!(
+            refused,
+            Err(stranger.clone()),
+            "an unreachable subject is refused"
+        );
         assert_eq!(ctx.act_log.len(), before, "a refused act emits no event");
         assert_eq!(
             ctx.exercised_authority(&stranger),
@@ -3632,16 +3894,46 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let resp = get(&mut ctx, "/");
         let body = &resp.body;
-        assert!(body.contains("id=\"identity-tile\""), "must render the identity tile");
-        assert!(body.contains("id=\"identity-domain-input\""), "must offer enroll --domain");
-        assert!(body.contains("id=\"identity-rotate-btn\""), "must offer rotate-primary");
-        assert!(body.contains("id=\"identity-recover-btn\""), "must offer recover");
-        assert!(body.contains("id=\"identity-domain-keys\""), "must show per-domain keys");
-        assert!(body.contains("id=\"domain-tile\""), "must render the domain grouping view");
-        assert!(body.contains("id=\"members-tile\""), "must render user/member management");
-        assert!(body.contains("id=\"member-add-form\""), "must offer add/invite");
-        assert!(body.contains("id=\"sessions-tile\""), "must render the session-management panel");
-        assert!(body.contains("id=\"session-list\""), "must render the active-sessions list");
+        assert!(
+            body.contains("id=\"identity-tile\""),
+            "must render the identity tile"
+        );
+        assert!(
+            body.contains("id=\"identity-domain-input\""),
+            "must offer enroll --domain"
+        );
+        assert!(
+            body.contains("id=\"identity-rotate-btn\""),
+            "must offer rotate-primary"
+        );
+        assert!(
+            body.contains("id=\"identity-recover-btn\""),
+            "must offer recover"
+        );
+        assert!(
+            body.contains("id=\"identity-domain-keys\""),
+            "must show per-domain keys"
+        );
+        assert!(
+            body.contains("id=\"domain-tile\""),
+            "must render the domain grouping view"
+        );
+        assert!(
+            body.contains("id=\"members-tile\""),
+            "must render user/member management"
+        );
+        assert!(
+            body.contains("id=\"member-add-form\""),
+            "must offer add/invite"
+        );
+        assert!(
+            body.contains("id=\"sessions-tile\""),
+            "must render the session-management panel"
+        );
+        assert!(
+            body.contains("id=\"session-list\""),
+            "must render the active-sessions list"
+        );
         assert!(
             body.contains("id=\"signout-everywhere-btn\""),
             "must offer sign-out-everywhere"
@@ -3658,7 +3950,6 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
 
-
         // Unauthenticated store is refused.
         let refused = post(&mut ctx, "/portal/layout", "bad-token\n{\"widgets\":[]}");
         assert_eq!(refused.status, 401);
@@ -3670,7 +3961,11 @@ mod tests {
             &format!("{token}\n{{\"widgets\":[\"peers\",\"inbox\"]}}"),
         );
         assert_eq!(stored.status, 200, "got: {}", stored.body);
-        assert!(stored.body.starts_with("LAYOUT-CID "), "got: {}", stored.body);
+        assert!(
+            stored.body.starts_with("LAYOUT-CID "),
+            "got: {}",
+            stored.body
+        );
         let cid: u64 = stored
             .body
             .split_whitespace()
@@ -3691,7 +3986,9 @@ mod tests {
         assert_eq!(fetched.status, 200, "got: {}", fetched.body);
         assert!(fetched.body.contains("SIGNER"), "got: {}", fetched.body);
         assert!(
-            fetched.body.contains("CONTENT {\"widgets\":[\"peers\",\"inbox\"]}"),
+            fetched
+                .body
+                .contains("CONTENT {\"widgets\":[\"peers\",\"inbox\"]}"),
             "got: {}",
             fetched.body
         );
@@ -3705,19 +4002,33 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let resp = get(&mut ctx, "/");
         let body = &resp.body;
-        assert!(body.contains("id=\"inbox-list\""), "must render an inbox list container");
+        assert!(
+            body.contains("id=\"inbox-list\""),
+            "must render an inbox list container"
+        );
         assert!(
             body.contains("/bootstrap/request/list"),
             "must fetch the pending request list"
         );
         assert!(
-            body.contains("/bootstrap/request/approve") && body.contains("/bootstrap/request/reject"),
+            body.contains("/bootstrap/request/approve")
+                && body.contains("/bootstrap/request/reject"),
             "must dispatch Approve/Reject through the existing endpoints"
         );
-        assert!(body.contains("Approve") && body.contains("Reject"), "got: {}", body);
+        assert!(
+            body.contains("Approve") && body.contains("Reject"),
+            "got: {}",
+            body
+        );
         // The identity/peer/lease-holder tile is also rendered.
-        assert!(body.contains("id=\"portal-peer-id\""), "must render node identity");
-        assert!(body.contains("id=\"portal-lease-holder\""), "must render lease holder");
+        assert!(
+            body.contains("id=\"portal-peer-id\""),
+            "must render node identity"
+        );
+        assert!(
+            body.contains("id=\"portal-lease-holder\""),
+            "must render lease holder"
+        );
     }
 
     // The shipped bootstrap flow + status semantics still pass unchanged —
@@ -3768,7 +4079,9 @@ mod tests {
         assert_eq!(taken.status, 200, "got: {}", taken.body);
         assert!(taken.body.starts_with("IN-USE"), "got: {}", taken.body);
         assert!(
-            taken.body.contains("cell name already in use — choose another"),
+            taken
+                .body
+                .contains("cell name already in use — choose another"),
             "got: {}",
             taken.body
         );
@@ -3803,7 +4116,10 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let body = get(&mut ctx, "/").body;
         // The pending-state helper exists and gates double-submit + re-enables.
-        assert!(body.contains("withPending"), "must have a pending-state wrapper");
+        assert!(
+            body.contains("withPending"),
+            "must have a pending-state wrapper"
+        );
         assert!(
             body.contains("aria-busy") && body.contains("guard double-submit"),
             "must set a busy state and guard against double-submit"
@@ -3860,8 +4176,7 @@ mod tests {
         // The inbox approval explainer, describing the attestation the approval
         // signs.
         assert!(
-            body.contains("What happens next")
-                && body.contains("signs an attestation"),
+            body.contains("What happens next") && body.contains("signs an attestation"),
             "the approval act must render a what-happens-next explainer"
         );
         assert!(
@@ -3894,7 +4209,9 @@ mod tests {
             listed.body
         );
         assert!(
-            listed.body.contains(&format!("SESSION {first} NODE this-node")),
+            listed
+                .body
+                .contains(&format!("SESSION {first} NODE this-node")),
             "must render the node/domain the session was issued on: {}",
             listed.body
         );
@@ -3911,7 +4228,9 @@ mod tests {
         let listed2 = get(&mut ctx, &format!("/portal/sessions?token={first}"));
         assert!(
             listed2.body.contains(&format!("SESSION {second} "))
-                && listed2.body.contains(&format!("SESSION {second} NODE this-node ISSUED"))
+                && listed2
+                    .body
+                    .contains(&format!("SESSION {second} NODE this-node ISSUED"))
                 && listed2
                     .body
                     .lines()
@@ -3935,33 +4254,66 @@ mod tests {
 
         // The victim session currently admits a bearer action.
         assert_eq!(
-            post(&mut ctx, "/portal/members/add", &format!("{victim}\ndan\nmember")).status,
+            post(
+                &mut ctx,
+                "/portal/members/add",
+                &format!("{victim}\ndan\nmember")
+            )
+            .status,
             200
         );
 
         // Unauthorized revoke attempt (bad caller token) is refused.
         assert_eq!(
-            post(&mut ctx, "/portal/sessions/revoke", &format!("bad-token\n{victim}")).status,
+            post(
+                &mut ctx,
+                "/portal/sessions/revoke",
+                &format!("bad-token\n{victim}")
+            )
+            .status,
             401
         );
         // Revoking an unknown id is refused.
         assert_eq!(
-            post(&mut ctx, "/portal/sessions/revoke", &format!("{survivor}\nno-such-id")).status,
+            post(
+                &mut ctx,
+                "/portal/sessions/revoke",
+                &format!("{survivor}\nno-such-id")
+            )
+            .status,
             404
         );
 
-        let revoked = post(&mut ctx, "/portal/sessions/revoke", &format!("{survivor}\n{victim}"));
+        let revoked = post(
+            &mut ctx,
+            "/portal/sessions/revoke",
+            &format!("{survivor}\n{victim}"),
+        );
         assert_eq!(revoked.status, 200, "got: {}", revoked.body);
-        assert!(revoked.body.contains(&format!("REVOKED {victim}")), "got: {}", revoked.body);
+        assert!(
+            revoked.body.contains(&format!("REVOKED {victim}")),
+            "got: {}",
+            revoked.body
+        );
 
         // The revoked session's bearer actions now fail closed.
         assert_eq!(
-            post(&mut ctx, "/portal/members/add", &format!("{victim}\neve\nmember")).status,
+            post(
+                &mut ctx,
+                "/portal/members/add",
+                &format!("{victim}\neve\nmember")
+            )
+            .status,
             403
         );
         // The surviving sibling session is untouched.
         assert_eq!(
-            post(&mut ctx, "/portal/members/add", &format!("{survivor}\nfrank\nmember")).status,
+            post(
+                &mut ctx,
+                "/portal/members/add",
+                &format!("{survivor}\nfrank\nmember")
+            )
+            .status,
             200
         );
 
@@ -3984,7 +4336,10 @@ mod tests {
         let three = login_alice(&mut ctx);
 
         // Unauthorized revoke-all attempt is refused.
-        assert_eq!(post(&mut ctx, "/portal/sessions/revoke-all", "bad-token").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/sessions/revoke-all", "bad-token").status,
+            401
+        );
 
         let resp = post(&mut ctx, "/portal/sessions/revoke-all", &one);
         assert_eq!(resp.status, 200, "got: {}", resp.body);
@@ -3992,7 +4347,12 @@ mod tests {
 
         for token in [&one, &two, &three] {
             assert_eq!(
-                post(&mut ctx, "/portal/members/add", &format!("{token}\ngrace\nmember")).status,
+                post(
+                    &mut ctx,
+                    "/portal/members/add",
+                    &format!("{token}\ngrace\nmember")
+                )
+                .status,
                 403,
                 "every session must fail closed after sign-out-everywhere"
             );
@@ -4039,7 +4399,11 @@ mod tests {
             "sentence must render the full proof chain back to genesis: {}",
             built.body
         );
-        assert!(built.body.contains("CHAIN "), "must render the CID chain: {}", built.body);
+        assert!(
+            built.body.contains("CHAIN "),
+            "must render the CID chain: {}",
+            built.body
+        );
     }
 
     // An attestation the signer lacks capacity for is refused
@@ -4104,16 +4468,35 @@ mod tests {
 
         // Unauthorized attempts are refused for every custody act.
         assert_eq!(
-            post(&mut ctx, "/portal/custody/migrate", "bad\nalice\nnode-2\ncid-2").status,
+            post(
+                &mut ctx,
+                "/portal/custody/migrate",
+                "bad\nalice\nnode-2\ncid-2"
+            )
+            .status,
             401
         );
-        assert_eq!(post(&mut ctx, "/portal/custody/rotate", "bad\nalice\ncid-3").status, 401);
-        assert_eq!(post(&mut ctx, "/portal/custody/seal", "bad\nalice").status, 401);
-        assert_eq!(post(&mut ctx, "/portal/custody/revoke", "bad\nalice").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/rotate", "bad\nalice\ncid-3").status,
+            401
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/seal", "bad\nalice").status,
+            401
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/revoke", "bad\nalice").status,
+            401
+        );
 
         // Rotate/seal on an unknown handle is refused (no custody record yet).
         assert_eq!(
-            post(&mut ctx, "/portal/custody/rotate", &format!("{token}\nalice\ncid-3")).status,
+            post(
+                &mut ctx,
+                "/portal/custody/rotate",
+                &format!("{token}\nalice\ncid-3")
+            )
+            .status,
             404
         );
         assert_eq!(
@@ -4128,8 +4511,15 @@ mod tests {
             &format!("{token}\nalice\nnode-2\ncid-2"),
         );
         assert_eq!(migrated.status, 200, "got: {}", migrated.body);
-        assert!(migrated.body.contains("MIGRATED alice"), "got: {}", migrated.body);
-        assert_eq!(ctx.custody_of("alice").unwrap().holder, NodeId::from("node-2"));
+        assert!(
+            migrated.body.contains("MIGRATED alice"),
+            "got: {}",
+            migrated.body
+        );
+        assert_eq!(
+            ctx.custody_of("alice").unwrap().holder,
+            NodeId::from("node-2")
+        );
 
         // Rotate now succeeds against the existing record.
         let rotated = post(
@@ -4146,11 +4536,20 @@ mod tests {
         assert!(ctx.custody_of("alice").unwrap().sealed);
 
         // Revoke drops the record; a second revoke is refused (already gone).
-        let revoked = post(&mut ctx, "/portal/custody/revoke", &format!("{token}\nalice"));
+        let revoked = post(
+            &mut ctx,
+            "/portal/custody/revoke",
+            &format!("{token}\nalice"),
+        );
         assert_eq!(revoked.status, 200, "got: {}", revoked.body);
         assert!(ctx.custody_of("alice").is_none());
         assert_eq!(
-            post(&mut ctx, "/portal/custody/revoke", &format!("{token}\nalice")).status,
+            post(
+                &mut ctx,
+                "/portal/custody/revoke",
+                &format!("{token}\nalice")
+            )
+            .status,
             404
         );
     }
@@ -4175,37 +4574,78 @@ mod tests {
 
         // An empty get is a view: zero events.
         let before = ctx.resource_event_count();
-        let empty = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
+        let empty = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=Workload"),
+        );
         assert_eq!(empty.status, 200, "got: {}", empty.body);
-        assert!(empty.body.contains("EVENTS 0"), "a view signs nothing: {}", empty.body);
+        assert!(
+            empty.body.contains("EVENTS 0"),
+            "a view signs nothing: {}",
+            empty.body
+        );
         assert_eq!(ctx.resource_event_count(), before);
 
         // apply → exactly one event.
-        let applied = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        let applied = post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
         assert_eq!(applied.status, 200, "got: {}", applied.body);
         assert!(applied.body.starts_with("EVENT "), "got: {}", applied.body);
         assert_eq!(ctx.resource_event_count(), 1, "one act, one event");
 
         // get now lists the workload, still signing nothing.
-        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
-        assert!(listed.body.contains("Workload/web replicas=1"), "got: {}", listed.body);
-        assert!(listed.body.contains("EVENTS 1"), "a view added no event: {}", listed.body);
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=Workload"),
+        );
+        assert!(
+            listed.body.contains("Workload/web replicas=1"),
+            "got: {}",
+            listed.body
+        );
+        assert!(
+            listed.body.contains("EVENTS 1"),
+            "a view added no event: {}",
+            listed.body
+        );
         assert_eq!(ctx.resource_event_count(), 1);
 
         // edit → one more event.
-        let edited = post(&mut ctx, "/portal/resource/edit", &format!("{token}\nweb\napp:v2"));
+        let edited = post(
+            &mut ctx,
+            "/portal/resource/edit",
+            &format!("{token}\nweb\napp:v2"),
+        );
         assert_eq!(edited.status, 200, "got: {}", edited.body);
         assert_eq!(ctx.resource_event_count(), 2);
 
         // scale → one more event, and the view reflects the new replica count.
-        let scaled = post(&mut ctx, "/portal/resource/scale", &format!("{token}\nweb\n5"));
+        let scaled = post(
+            &mut ctx,
+            "/portal/resource/scale",
+            &format!("{token}\nweb\n5"),
+        );
         assert_eq!(scaled.status, 200, "got: {}", scaled.body);
         assert_eq!(ctx.resource_event_count(), 3);
-        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
-        assert!(listed.body.contains("Workload/web replicas=5"), "got: {}", listed.body);
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=Workload"),
+        );
+        assert!(
+            listed.body.contains("Workload/web replicas=5"),
+            "got: {}",
+            listed.body
+        );
 
         // rollout → one more event.
-        let rolled = post(&mut ctx, "/portal/resource/rollout", &format!("{token}\nweb\n"));
+        let rolled = post(
+            &mut ctx,
+            "/portal/resource/rollout",
+            &format!("{token}\nweb\n"),
+        );
         assert_eq!(rolled.status, 200, "got: {}", rolled.body);
         assert_eq!(ctx.resource_event_count(), 4);
     }
@@ -4239,13 +4679,25 @@ mod tests {
         );
         let nonce = get(&mut ctx, "/nonce");
         let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
-        let login = post(&mut ctx, "/login", &format!("stranger@pillar\n{PASSWORD}\n{nonce_id}"));
+        let login = post(
+            &mut ctx,
+            "/login",
+            &format!("stranger@pillar\n{PASSWORD}\n{nonce_id}"),
+        );
         assert_eq!(login.status, 200, "got: {}", login.body);
         let token = login.session_token.expect("session token");
 
         let before = ctx.resource_event_count();
-        let refused = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
-        assert_eq!(refused.status, 403, "an unauthorized act must be refused: {}", refused.body);
+        let refused = post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
+        assert_eq!(
+            refused.status, 403,
+            "an unauthorized act must be refused: {}",
+            refused.body
+        );
         assert_eq!(
             ctx.resource_event_count(),
             before,
@@ -4264,12 +4716,24 @@ mod tests {
         let before = ctx.resource_event_count();
         let preview = get(&mut ctx, &format!("/portal/resource/dry-run?token={token}"));
         assert_eq!(preview.status, 200, "got: {}", preview.body);
-        assert!(preview.body.contains("PREDICTED ALLOW"), "got: {}", preview.body);
-        assert_eq!(ctx.resource_event_count(), before, "a dry-run signs nothing");
+        assert!(
+            preview.body.contains("PREDICTED ALLOW"),
+            "got: {}",
+            preview.body
+        );
+        assert_eq!(
+            ctx.resource_event_count(),
+            before,
+            "a dry-run signs nothing"
+        );
 
         // The ENFORCED act then succeeds — the predicted ALLOW matches the
         // enforced outcome (the debug_assert in the handler also checks this).
-        let applied = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        let applied = post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
         assert_eq!(applied.status, 200, "predicted==enforced: {}", applied.body);
     }
 
@@ -4279,21 +4743,41 @@ mod tests {
     fn describe_renders_provenance_signer_authority_and_event_cid() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
 
         let desc = get(
             &mut ctx,
             &format!("/portal/resource/describe?token={token}&kind=Workload&name=web"),
         );
         assert_eq!(desc.status, 200, "got: {}", desc.body);
-        assert!(desc.body.contains("Signer:"), "provenance signer: {}", desc.body);
-        assert!(desc.body.contains("Event-CID:"), "provenance event CID: {}", desc.body);
+        assert!(
+            desc.body.contains("Signer:"),
+            "provenance signer: {}",
+            desc.body
+        );
+        assert!(
+            desc.body.contains("Event-CID:"),
+            "provenance event CID: {}",
+            desc.body
+        );
         // The signer is the admitted portal subject (the authority that signed).
-        assert!(desc.body.contains("op-subkey-alice"), "signer identity: {}", desc.body);
+        assert!(
+            desc.body.contains("op-subkey-alice"),
+            "signer identity: {}",
+            desc.body
+        );
 
         // Unauthenticated describe is refused.
         assert_eq!(
-            get(&mut ctx, "/portal/resource/describe?token=nope&kind=Workload&name=web").status,
+            get(
+                &mut ctx,
+                "/portal/resource/describe?token=nope&kind=Workload&name=web"
+            )
+            .status,
             401
         );
     }
@@ -4304,18 +4788,35 @@ mod tests {
     fn logs_exec_forward_reach_a_running_workload() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
         let events_after_apply = ctx.resource_event_count();
 
-        let logs = get(&mut ctx, &format!("/portal/resource/logs?token={token}&name=web"));
+        let logs = get(
+            &mut ctx,
+            &format!("/portal/resource/logs?token={token}&name=web"),
+        );
         assert_eq!(logs.status, 200, "got: {}", logs.body);
-        assert!(logs.body.contains("LOGS Workload/web"), "got: {}", logs.body);
+        assert!(
+            logs.body.contains("LOGS Workload/web"),
+            "got: {}",
+            logs.body
+        );
 
-        let exec = get(&mut ctx, &format!("/portal/resource/exec?token={token}&name=web&cmd=sh"));
+        let exec = get(
+            &mut ctx,
+            &format!("/portal/resource/exec?token={token}&name=web&cmd=sh"),
+        );
         assert_eq!(exec.status, 200, "got: {}", exec.body);
         assert!(exec.body.contains("EXEC sh"), "got: {}", exec.body);
 
-        let fwd = get(&mut ctx, &format!("/portal/resource/forward?token={token}&name=web&port=8080"));
+        let fwd = get(
+            &mut ctx,
+            &format!("/portal/resource/forward?token={token}&name=web&port=8080"),
+        );
         assert_eq!(fwd.status, 200, "got: {}", fwd.body);
         assert!(fwd.body.contains("FORWARD 8080"), "got: {}", fwd.body);
 
@@ -4324,10 +4825,17 @@ mod tests {
 
         // A missing workload is refused; unauthenticated reach is refused.
         assert_eq!(
-            get(&mut ctx, &format!("/portal/resource/logs?token={token}&name=ghost")).status,
+            get(
+                &mut ctx,
+                &format!("/portal/resource/logs?token={token}&name=ghost")
+            )
+            .status,
             404
         );
-        assert_eq!(get(&mut ctx, "/portal/resource/logs?token=nope&name=web").status, 401);
+        assert_eq!(
+            get(&mut ctx, "/portal/resource/logs?token=nope&name=web").status,
+            401
+        );
     }
 
     // The resource UI is polymorphic over an IDENTITY kind too, using the SAME
@@ -4340,7 +4848,10 @@ mod tests {
         // identity object directly through the shared plane substrate.
         let sub = ctx.identity_actor_for_test();
         ctx.apply_identity_for_test(&sub, "alice");
-        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=User"));
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=User"),
+        );
         assert_eq!(listed.status, 200, "got: {}", listed.body);
         assert!(listed.body.contains("User/alice"), "got: {}", listed.body);
     }
@@ -4360,21 +4871,34 @@ mod tests {
             &format!("{token}\nworkload-grid: [web, db]"),
         );
         assert_eq!(stored.status, 200, "got: {}", stored.body);
-        assert!(stored.body.contains("LAYOUT-CID "), "content address: {}", stored.body);
-        assert!(stored.body.contains(" TIP "), "streaming tip: {}", stored.body);
+        assert!(
+            stored.body.contains("LAYOUT-CID "),
+            "content address: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains(" TIP "),
+            "streaming tip: {}",
+            stored.body
+        );
         let cid = stored
             .body
             .split_whitespace()
             .nth(1)
             .expect("cid token")
             .to_owned();
-        let fetched = get(
-            &mut ctx,
-            &format!("/portal/layout?token={token}&cid={cid}"),
-        );
+        let fetched = get(&mut ctx, &format!("/portal/layout?token={token}&cid={cid}"));
         assert_eq!(fetched.status, 200, "got: {}", fetched.body);
-        assert!(fetched.body.contains("SIGNER "), "signed by its author: {}", fetched.body);
-        assert!(fetched.body.contains("workload-grid"), "content preserved: {}", fetched.body);
+        assert!(
+            fetched.body.contains("SIGNER "),
+            "signed by its author: {}",
+            fetched.body
+        );
+        assert!(
+            fetched.body.contains("workload-grid"),
+            "content preserved: {}",
+            fetched.body
+        );
     }
 
     // The topology explorer renders the derived tier tree (config-ordered
@@ -4384,15 +4908,24 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
 
-        assert_eq!(get(&mut ctx, "/portal/topology/tree?token=nope").status, 401);
+        assert_eq!(
+            get(&mut ctx, "/portal/topology/tree?token=nope").status,
+            401
+        );
 
         ctx.topology_declare(
             NodeId::from("node-a"),
-            vec![TopologyLabel::new("rack", "r1"), TopologyLabel::new("zone", "z1")],
+            vec![
+                TopologyLabel::new("rack", "r1"),
+                TopologyLabel::new("zone", "z1"),
+            ],
         );
         ctx.topology_declare(
             NodeId::from("node-b"),
-            vec![TopologyLabel::new("rack", "r2"), TopologyLabel::new("zone", "z1")],
+            vec![
+                TopologyLabel::new("rack", "r2"),
+                TopologyLabel::new("zone", "z1"),
+            ],
         );
         ctx.topology_register_node("node-a", "ok", 10);
         ctx.topology_register_node("node-b", "degraded", 20);
@@ -4402,10 +4935,15 @@ mod tests {
             &format!("/portal/topology/tree?token={token}&rollup-tier=rack"),
         );
         assert_eq!(view.status, 200, "got: {}", view.body);
-        assert!(view.body.starts_with("TIERS region,zone,site,room,cage,rack,chassis,node"));
+        assert!(view
+            .body
+            .starts_with("TIERS region,zone,site,room,cage,rack,chassis,node"));
         assert!(
-            view.body.contains("NODE node-a PATH rack=r1,zone=z1 HEALTH ok CAPACITY 10")
-                || view.body.contains("NODE node-a PATH zone=z1,rack=r1 HEALTH ok CAPACITY 10"),
+            view.body
+                .contains("NODE node-a PATH rack=r1,zone=z1 HEALTH ok CAPACITY 10")
+                || view
+                    .body
+                    .contains("NODE node-a PATH zone=z1,rack=r1 HEALTH ok CAPACITY 10"),
             "got: {}",
             view.body
         );
@@ -4414,8 +4952,16 @@ mod tests {
             "got: {}",
             view.body
         );
-        assert!(view.body.contains("ROLLUP rack r1=10\n"), "got: {}", view.body);
-        assert!(view.body.contains("ROLLUP rack r2=20\n"), "got: {}", view.body);
+        assert!(
+            view.body.contains("ROLLUP rack r1=10\n"),
+            "got: {}",
+            view.body
+        );
+        assert!(
+            view.body.contains("ROLLUP rack r2=20\n"),
+            "got: {}",
+            view.body
+        );
     }
 
     // The label editor emits signed label/attestation events — the attested
@@ -4450,20 +4996,26 @@ mod tests {
             &format!("{token}\nowner\ncell-authority@cell-b\n\nnode-7\nrack\nr7\ncell-b"),
         );
         assert_eq!(attested.status, 200, "got: {}", attested.body);
-        assert!(attested.body.starts_with("ATTESTED CID "), "got: {}", attested.body);
+        assert!(
+            attested.body.starts_with("ATTESTED CID "),
+            "got: {}",
+            attested.body
+        );
 
         // The attested label is now the trust-graph's edge too (reuses the
         // SAME attest primitive, no new signing plane).
         let graph = get(&mut ctx, &format!("/portal/trust-graph?token={token}"));
         assert!(
-            graph.body.contains("EDGE owner -> node-7 ")
-                && graph.body.contains("rack=r7"),
+            graph.body.contains("EDGE owner -> node-7 ") && graph.body.contains("rack=r7"),
             "got: {}",
             graph.body
         );
 
         // The mismatch view surfaces the declared-vs-attested disagreement.
-        let mismatches = get(&mut ctx, &format!("/portal/topology/mismatches?token={token}"));
+        let mismatches = get(
+            &mut ctx,
+            &format!("/portal/topology/mismatches?token={token}"),
+        );
         assert_eq!(mismatches.status, 200, "got: {}", mismatches.body);
         assert!(
             mismatches
@@ -4491,9 +5043,21 @@ mod tests {
             &format!("/portal/topology/failure-domain?token={token}&tier=rack&nodes=a,b"),
         );
         assert_eq!(warned.status, 200, "got: {}", warned.body);
-        assert!(warned.body.contains("REPLICA a rack=r1"), "got: {}", warned.body);
-        assert!(warned.body.contains("REPLICA b rack=r1"), "got: {}", warned.body);
-        assert!(warned.body.contains("WARN same-rack"), "got: {}", warned.body);
+        assert!(
+            warned.body.contains("REPLICA a rack=r1"),
+            "got: {}",
+            warned.body
+        );
+        assert!(
+            warned.body.contains("REPLICA b rack=r1"),
+            "got: {}",
+            warned.body
+        );
+        assert!(
+            warned.body.contains("WARN same-rack"),
+            "got: {}",
+            warned.body
+        );
 
         // a, c span distinct racks: no warning.
         let ok = get(

@@ -303,11 +303,7 @@ impl Verb {
     #[must_use]
     pub fn kind(self) -> VerbKind {
         match self {
-            Verb::Get
-            | Verb::Describe
-            | Verb::Explain
-            | Verb::Diff
-            | Verb::Watch => VerbKind::View,
+            Verb::Get | Verb::Describe | Verb::Explain | Verb::Diff | Verb::Watch => VerbKind::View,
             Verb::Apply
             | Verb::Create
             | Verb::Edit
@@ -518,10 +514,7 @@ impl<'p> ResourcePlane<'p> {
             }
             rows.push(Row {
                 address: Address::new(kind, key.name.clone()),
-                columns: columns
-                    .iter()
-                    .map(|c| labels.get(c).cloned())
-                    .collect(),
+                columns: columns.iter().map(|c| labels.get(c).cloned()).collect(),
             });
         }
         rows
@@ -555,7 +548,13 @@ impl<'p> ResourcePlane<'p> {
     /// any failure NOTHING is mutated.
     pub fn apply(&mut self, actor: &NodeId, capability: &str, body: Crd) -> ActResult {
         self.platform
-            .apply(actor, capability, body, [], [ManifestCapability::from(capability)])
+            .apply(
+                actor,
+                capability,
+                body,
+                [],
+                [ManifestCapability::from(capability)],
+            )
             .map_err(ResourceError::Apply)
     }
 
@@ -761,7 +760,13 @@ impl<'p> ResourcePlane<'p> {
         addr: &Address,
         replicas: i64,
     ) -> ActResult {
-        self.patch(actor, capability, addr, "replicas", Value::Integer(replicas))
+        self.patch(
+            actor,
+            capability,
+            addr,
+            "replicas",
+            Value::Integer(replicas),
+        )
     }
 
     /// `pillar scale --dry-run` (VIEW): preview [`ResourcePlane::scale`] with
@@ -776,7 +781,13 @@ impl<'p> ResourcePlane<'p> {
         addr: &Address,
         replicas: i64,
     ) -> DryRunResult {
-        self.dry_run_patch(actor, capability, addr, "replicas", Value::Integer(replicas))
+        self.dry_run_patch(
+            actor,
+            capability,
+            addr,
+            "replicas",
+            Value::Integer(replicas),
+        )
     }
 }
 
@@ -829,14 +840,22 @@ mod tests {
     }
 
     fn workload(name: &str) -> Crd {
-        Crd::new(API, WORKLOAD, Metadata::new(name).with_label("tier", "edge"))
-            .with_spec("image", Value::String("app:v1".into()))
-            .with_spec("replicas", Value::Integer(1))
+        Crd::new(
+            API,
+            WORKLOAD,
+            Metadata::new(name).with_label("tier", "edge"),
+        )
+        .with_spec("image", Value::String("app:v1".into()))
+        .with_spec("replicas", Value::Integer(1))
     }
 
     fn identity(name: &str) -> Crd {
-        Crd::new(API, IDENTITY, Metadata::new(name).with_label("tier", "core"))
-            .with_spec("handle", Value::String(format!("@{name}")))
+        Crd::new(
+            API,
+            IDENTITY,
+            Metadata::new(name).with_label("tier", "core"),
+        )
+        .with_spec("handle", Value::String(format!("@{name}")))
     }
 
     fn issuer() -> TokenIssuer {
@@ -881,7 +900,9 @@ mod tests {
         session.logout(&mut i);
         // After logout the SAME token is revoked — fail-closed.
         assert_eq!(
-            store.authenticate(&i, 10).expect_err("revoked after logout"),
+            store
+                .authenticate(&i, 10)
+                .expect_err("revoked after logout"),
             LoginTokenError::Revoked
         );
     }
@@ -913,7 +934,13 @@ mod tests {
 
     #[test]
     fn views_and_acts_are_classified_by_the_verb_not_convention() {
-        for v in [Verb::Get, Verb::Describe, Verb::Explain, Verb::Diff, Verb::Watch] {
+        for v in [
+            Verb::Get,
+            Verb::Describe,
+            Verb::Explain,
+            Verb::Diff,
+            Verb::Watch,
+        ] {
             assert!(v.is_view(), "{v:?} must be a view");
             assert!(!v.is_act());
         }
@@ -1062,9 +1089,7 @@ mod tests {
         // create
         plane.create(&owner, CAP, workload("web")).expect("create");
         assert!(matches!(
-            plane
-                .create(&owner, CAP, workload("web"))
-                .expect_err("dup"),
+            plane.create(&owner, CAP, workload("web")).expect_err("dup"),
             ResourceError::AlreadyExists(_)
         ));
         // label, patch, scale each re-apply as ONE event.
@@ -1079,10 +1104,7 @@ mod tests {
         plane.scale(&owner, CAP, &addr, 5).expect("scale");
         assert_eq!(plane.platform.event_count(), n0 + 3);
         // The label and scale took effect in the view.
-        let got = plane
-            .platform
-            .get(API, WORKLOAD, "web")
-            .expect("in view");
+        let got = plane.platform.get(API, WORKLOAD, "web").expect("in view");
         assert_eq!(got.metadata.labels.get("env"), Some(&"prod".to_owned()));
         assert_eq!(got.spec.get("replicas"), Some(&Value::Integer(5)));
         // delete emits a tombstone act.
@@ -1100,7 +1122,10 @@ mod tests {
             Address::parse("web").unwrap_err(),
             ResourceError::BadAddress("web".to_owned())
         );
-        assert_eq!(Address::parse("cell/cellA").unwrap(), Address::new("cell", "cellA"));
+        assert_eq!(
+            Address::parse("cell/cellA").unwrap(),
+            Address::new("cell", "cellA")
+        );
         assert!(matches!(
             Selector::parse("bogus").unwrap_err(),
             ResourceError::BadSelector(_)
@@ -1118,12 +1143,20 @@ mod tests {
         let preview = plane
             .dry_run_apply(&NodeId::from(OWNER), CAP, &workload("web"))
             .expect("owner authorized to preview");
-        assert_eq!(plane.platform.event_count(), before, "dry-run emits no event");
+        assert_eq!(
+            plane.platform.event_count(),
+            before,
+            "dry-run emits no event"
+        );
         // An IDENTITY-kind act previews identically.
         let id_preview = plane
             .dry_run_apply(&NodeId::from(OWNER), CAP, &identity("alice"))
             .expect("owner authorized to preview an identity kind too");
-        assert_eq!(plane.platform.event_count(), before, "dry-run emits no event");
+        assert_eq!(
+            plane.platform.event_count(),
+            before,
+            "dry-run emits no event"
+        );
 
         // Now perform the REAL acts: predicted == enforced — same outcome,
         // same content-hash, and the log only advances on the REAL act.
@@ -1152,7 +1185,11 @@ mod tests {
             preview_err,
             ResourceError::Apply(ApplyError::Unauthorized { .. })
         ));
-        assert_eq!(plane.platform.event_count(), before, "a denied dry-run emits nothing");
+        assert_eq!(
+            plane.platform.event_count(),
+            before,
+            "a denied dry-run emits nothing"
+        );
 
         // The REAL act refuses IDENTICALLY.
         drop(plane);
@@ -1164,7 +1201,11 @@ mod tests {
             real_err,
             ResourceError::Apply(ApplyError::Unauthorized { .. })
         ));
-        assert_eq!(plane.platform.event_count(), before, "the real refusal emits nothing either");
+        assert_eq!(
+            plane.platform.event_count(),
+            before,
+            "the real refusal emits nothing either"
+        );
     }
 
     #[test]
@@ -1195,13 +1236,25 @@ mod tests {
         plane
             .dry_run_scale(&owner, CAP, &addr, 5)
             .expect("scale previewed");
-        plane.dry_run_delete(&owner, CAP, &addr).expect("delete previewed");
+        plane
+            .dry_run_delete(&owner, CAP, &addr)
+            .expect("delete previewed");
 
         // None of the previews mutated the view or emitted an event.
-        assert_eq!(plane.platform.event_count(), before, "no dry-run may append an event");
+        assert_eq!(
+            plane.platform.event_count(),
+            before,
+            "no dry-run may append an event"
+        );
         let still_unchanged = plane.platform.get(API, WORKLOAD, "web").unwrap();
         assert_eq!(still_unchanged.metadata.labels.get("env"), None);
-        assert_eq!(still_unchanged.spec.get("replicas"), Some(&Value::Integer(1)));
-        assert_eq!(still_unchanged.metadata.labels.get("pillar.dev/deleted"), None);
+        assert_eq!(
+            still_unchanged.spec.get("replicas"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            still_unchanged.metadata.labels.get("pillar.dev/deleted"),
+            None
+        );
     }
 }

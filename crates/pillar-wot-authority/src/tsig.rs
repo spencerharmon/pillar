@@ -155,7 +155,13 @@ mod tests {
     fn full_trust_tsig_parses_level_and_amount() {
         let area = tsig_subpacket(2, 120);
         let tsig = parse_trust_signature(&area).unwrap();
-        assert_eq!(tsig, TrustSignature { level: 2, amount: 120 });
+        assert_eq!(
+            tsig,
+            TrustSignature {
+                level: 2,
+                amount: 120
+            }
+        );
     }
 
     #[test]
@@ -174,7 +180,10 @@ mod tests {
         // Some unrelated subpacket (e.g. Issuer, type 16, 8-byte body) with
         // no Trust Signature present at all.
         let area = vec![9, 16, 1, 2, 3, 4, 5, 6, 7, 8];
-        assert_eq!(parse_trust_signature(&area), Err(TsigError::NoTrustSignature));
+        assert_eq!(
+            parse_trust_signature(&area),
+            Err(TsigError::NoTrustSignature)
+        );
     }
 
     #[test]
@@ -191,7 +200,10 @@ mod tests {
     fn truncated_subpacket_area_is_rejected() {
         // Header claims a 3-byte body but only 1 byte follows.
         let area = vec![3, TRUST_SIGNATURE_TYPE, 5];
-        assert_eq!(parse_trust_signature(&area), Err(TsigError::TruncatedSubpacket));
+        assert_eq!(
+            parse_trust_signature(&area),
+            Err(TsigError::TruncatedSubpacket)
+        );
     }
 
     #[test]
@@ -216,6 +228,12 @@ mod tests {
         area.push(200); // filler subpacket type (non-tsig, high bit unset)
         area.extend_from_slice(&[0u8; 194]);
         let tsig = parse_trust_signature(&area).unwrap();
-        assert_eq!(tsig, TrustSignature { level: 1, amount: 120 });
+        assert_eq!(
+            tsig,
+            TrustSignature {
+                level: 1,
+                amount: 120
+            }
+        );
     }
 }

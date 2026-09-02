@@ -380,10 +380,12 @@ fn parse_listen(value: &str) -> Result<Multiaddr, ConfigError> {
 }
 
 fn parse_web_bind(value: &str) -> Result<IpAddr, ConfigError> {
-    value.parse::<IpAddr>().map_err(|e| ConfigError::BadWebBind {
-        value: value.to_owned(),
-        reason: e.to_string(),
-    })
+    value
+        .parse::<IpAddr>()
+        .map_err(|e| ConfigError::BadWebBind {
+            value: value.to_owned(),
+            reason: e.to_string(),
+        })
 }
 
 fn parse_web_port(value: &str) -> Result<u16, ConfigError> {
@@ -531,7 +533,9 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // selects whether the transport is pnet-walled to a private swarm.
     let root = match &config.network_root {
         Some(secret) => {
-            tracing::info!("pillar peer configured with a PRIVATE network root (pnet-walled transport)");
+            tracing::info!(
+                "pillar peer configured with a PRIVATE network root (pnet-walled transport)"
+            );
             pillar_net::PrivateSwarmKey::from_root_secret(secret)
         }
         None => pillar_net::PrivateSwarmKey::disabled(),
@@ -575,7 +579,10 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     }
     let added = pillar_net::seed_event_dht(&mut swarm, &seeds);
     if added > 0 {
-        tracing::info!(seeds = added, "pillar peer bootstrapping DHT from federation seed(s)");
+        tracing::info!(
+            seeds = added,
+            "pillar peer bootstrapping DHT from federation seed(s)"
+        );
     } else {
         tracing::info!("pillar peer has no federation seed; acting as a seed/first node");
     }
@@ -733,14 +740,12 @@ mod tests {
 
     #[test]
     fn web_bind_flag_configures_a_non_loopback_surface() {
-        let args = vec![
-            s("--web-bind"),
-            s("0.0.0.0"),
-            s("--web-port"),
-            s("9999"),
-        ];
+        let args = vec![s("--web-bind"), s("0.0.0.0"), s("--web-port"), s("9999")];
         let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
-        assert_eq!(cfg.web_bind, Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+        assert_eq!(
+            cfg.web_bind,
+            Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        );
         assert_eq!(cfg.web_port, 9999);
     }
 
@@ -752,7 +757,10 @@ mod tests {
             _ => None,
         };
         let cfg = NodeConfig::from_args_env(&[], env).unwrap();
-        assert_eq!(cfg.web_bind, Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+        assert_eq!(
+            cfg.web_bind,
+            Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        );
         assert_eq!(cfg.web_port, 7777);
     }
 
@@ -898,7 +906,10 @@ mod tests {
     #[test]
     fn seed_defaults_empty_and_is_distinct_from_dial() {
         let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
-        assert!(cfg.seed.is_empty(), "no seed by default (a seed/first node)");
+        assert!(
+            cfg.seed.is_empty(),
+            "no seed by default (a seed/first node)"
+        );
         assert!(cfg.dial.is_empty(), "no dial by default");
     }
 

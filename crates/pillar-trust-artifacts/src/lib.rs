@@ -66,7 +66,9 @@ impl Sig {
     /// A signature produced by `signer`.
     #[must_use]
     pub fn by(signer: impl Into<NodeId>) -> Self {
-        Sig { signer: signer.into() }
+        Sig {
+            signer: signer.into(),
+        }
     }
 }
 
@@ -484,7 +486,11 @@ impl TrustStore {
         }
         out.push_str(&format!(
             "Revoked:     {}\n",
-            if self.revoked.contains(cid) { "yes" } else { "no" }
+            if self.revoked.contains(cid) {
+                "yes"
+            } else {
+                "no"
+            }
         ));
         Some(out)
     }
@@ -544,7 +550,10 @@ impl TrustStore {
     /// The reservation is per-artifact: a BUDGET ledger, not a bare boolean
     /// allow.
     pub fn admit_quota(&mut self, cid: &Cid, amt: u64) -> Result<(), TrustError> {
-        let a = self.attests.get(cid).ok_or_else(|| VerifyError::Broken(cid.clone()));
+        let a = self
+            .attests
+            .get(cid)
+            .ok_or_else(|| VerifyError::Broken(cid.clone()));
         let a = match a {
             Ok(a) => a,
             Err(_) => return Err(TrustError::UnknownTarget(cid.clone())),
@@ -806,7 +815,10 @@ mod tests {
             target: Cid("trust:doesnotexist".to_owned()),
             sig: Sig::by(n("owner")),
         };
-        assert!(matches!(store.revoke(&r), Err(TrustError::UnknownTarget(_))));
+        assert!(matches!(
+            store.revoke(&r),
+            Err(TrustError::UnknownTarget(_))
+        ));
     }
 
     // --- capacity checked at signing time --------------------------------
@@ -876,7 +888,9 @@ mod tests {
             epoch: 0,
             sig: Sig::by(n("alice")),
         };
-        let cid = store.issue_attest(a).expect("self capacity is unconditional");
+        let cid = store
+            .issue_attest(a)
+            .expect("self capacity is unconditional");
         assert!(store.verify(&cid).is_ok());
     }
 
@@ -1076,7 +1090,10 @@ mod tests {
             sig: Sig::by(n("owner")),
         };
         let cid = store.issue_attest(grant).unwrap();
-        assert_eq!(store.admit_quota(&cid, 1), Err(TrustError::NotAQuotaPredicate));
+        assert_eq!(
+            store.admit_quota(&cid, 1),
+            Err(TrustError::NotAQuotaPredicate)
+        );
     }
 
     #[test]

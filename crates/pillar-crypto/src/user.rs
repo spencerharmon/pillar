@@ -16,12 +16,12 @@
 //!   ACROSS cells identically, since sealing is independent of cell membership.
 
 use crate::cell::CellGroupKey;
-use crate::error::Result;
 #[cfg(test)]
 use crate::error::CryptoError;
+use crate::error::Result;
 use crate::principal::PrincipalPublic;
 use crate::types::{
-    Ciphertext, CellId, SealedEnvelope, SealingSecretKey, Signature, SigningPublicKey,
+    CellId, Ciphertext, SealedEnvelope, SealingSecretKey, Signature, SigningPublicKey,
     SigningSecretKey,
 };
 
@@ -207,8 +207,14 @@ mod tests {
         let cert_a = certify_subkey(&master_sec.signing, &sub_a_pub, &cell_a).expect("cert A");
         let cert_b = certify_subkey(&master_sec.signing, &sub_b_pub, &cell_b).expect("cert B");
 
-        assert_eq!(verify_subkey(&master_pub.signing, &sub_a_pub, &cell_a, &cert_a), Ok(()));
-        assert_eq!(verify_subkey(&master_pub.signing, &sub_b_pub, &cell_b, &cert_b), Ok(()));
+        assert_eq!(
+            verify_subkey(&master_pub.signing, &sub_a_pub, &cell_a, &cert_a),
+            Ok(())
+        );
+        assert_eq!(
+            verify_subkey(&master_pub.signing, &sub_b_pub, &cell_b, &cert_b),
+            Ok(())
+        );
 
         // A cert from a different master must not validate alice's subkey.
         let (mallory_pub, _) = principal_from_seed(&seed("mallory-master")).expect("mallory");

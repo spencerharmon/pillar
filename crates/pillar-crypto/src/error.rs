@@ -38,12 +38,16 @@ pub enum CryptoError {
 impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CryptoError::NotImplemented(op) => write!(f, "cryptographic operation not implemented: {op}"),
+            CryptoError::NotImplemented(op) => {
+                write!(f, "cryptographic operation not implemented: {op}")
+            }
             CryptoError::InvalidKey => write!(f, "invalid key material"),
             CryptoError::InvalidLength => write!(f, "invalid input length"),
             CryptoError::VerificationFailed => write!(f, "signature verification failed"),
             CryptoError::DecryptionFailed => write!(f, "decryption failed"),
-            CryptoError::NotARecipient => write!(f, "secret key is not a recipient of this envelope"),
+            CryptoError::NotARecipient => {
+                write!(f, "secret key is not a recipient of this envelope")
+            }
             CryptoError::UnsupportedCustody(k) => write!(f, "unsupported custody backend: {k:?}"),
             CryptoError::Backend(msg) => write!(f, "custody/hardware backend error: {msg}"),
         }

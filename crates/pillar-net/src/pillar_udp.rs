@@ -406,11 +406,7 @@ pub fn encode(message: &[u8], k: usize, m: usize) -> Result<Vec<Shard>, ShardErr
 /// Returns [`ShardError::Empty`] if `k == 0`, [`ShardError::MissingLength`] if
 /// `orig_len` is zero, or [`ShardError::InsufficientShards`] if fewer than `k`
 /// data positions can be recovered from the verified shards.
-pub fn reconstruct(
-    shards: &[Shard],
-    k: usize,
-    orig_len: usize,
-) -> Result<Vec<u8>, ShardError> {
+pub fn reconstruct(shards: &[Shard], k: usize, orig_len: usize) -> Result<Vec<u8>, ShardError> {
     if k == 0 {
         return Err(ShardError::Empty);
     }
@@ -524,7 +520,10 @@ mod tests {
                 processed += 1;
             }
         }
-        assert_eq!(processed, 1, "message processed exactly once across 4 copies");
+        assert_eq!(
+            processed, 1,
+            "message processed exactly once across 4 copies"
+        );
         assert!(dedup.has_seen(cid));
     }
 
@@ -572,7 +571,10 @@ mod tests {
 
         let set_a = reply_node_set(&ipam_a, cid, 3, false, None);
         let set_b = reply_node_set(&ipam_b, cid, 3, false, None);
-        assert_eq!(set_a, set_b, "two independent computations agree bit-for-bit");
+        assert_eq!(
+            set_a, set_b,
+            "two independent computations agree bit-for-bit"
+        );
         // K=3 over 2 bound sites spans both distinct regions (west + east).
         assert_eq!(set_a.len(), 2, "one address per distinct failure domain");
         assert!(set_a.iter().any(|a| a.to_string().starts_with("10.1")));
@@ -617,7 +619,10 @@ mod tests {
         let mut gate = AntiAmplificationGate::new(3);
         // Client not yet validated: no reply commits, budget is zero.
         assert_eq!(gate.budget(), 0);
-        assert!(!gate.try_commit_reply(false), "unvalidated client gets no reply");
+        assert!(
+            !gate.try_commit_reply(false),
+            "unvalidated client gets no reply"
+        );
         // Even claiming validated=true, with zero validated requests the budget
         // is zero so nothing commits.
         assert!(!gate.try_commit_reply(true));
@@ -636,7 +641,10 @@ mod tests {
                 committed += 1;
             }
         }
-        assert_eq!(committed, 6, "replies bounded to factor * validated requests");
+        assert_eq!(
+            committed, 6,
+            "replies bounded to factor * validated requests"
+        );
     }
 
     // --- K+M shard reconstruction with bad-CID rejection (TLA: ReconstructOrReject) ---
@@ -650,10 +658,16 @@ mod tests {
         // Corrupt one data shard's bytes WITHOUT updating its CID: it must be
         // rejected on verify, and reconstruction falls back to a parity shard.
         shards[1].bytes[0] ^= 0xFF;
-        assert!(!shards[1].verify(), "corrupted shard fails CID verification");
+        assert!(
+            !shards[1].verify(),
+            "corrupted shard fails CID verification"
+        );
 
         let recovered = reconstruct(&shards, k, message.len()).unwrap();
-        assert_eq!(recovered, message, "reconstructed from surviving+parity shards");
+        assert_eq!(
+            recovered, message,
+            "reconstructed from surviving+parity shards"
+        );
     }
 
     #[test]

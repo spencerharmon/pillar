@@ -195,8 +195,7 @@ impl NodeCustody for TpmCustody {
 
         let secret: Vec<u8> = ctx
             .execute_with_nullauth_session(|ctx| {
-                let object =
-                    ctx.load(parent_object.into(), private.clone(), public.clone())?;
+                let object = ctx.load(parent_object.into(), private.clone(), public.clone())?;
                 if !auth.is_empty() {
                     let auth_value = Auth::try_from(auth.clone())?;
                     ctx.tr_set_auth(object.into(), auth_value)?;
@@ -249,8 +248,11 @@ impl NodeCustody for PasskeyCustody {
         // The assertion challenge only needs to be present; we consume the
         // hmac-secret output, not the signature, so a domain-bound deterministic
         // challenge avoids pulling in an RNG while staying credential-specific.
-        let challenge =
-            hkdf32(b"pillar-crypto/custody/passkey/challenge-v1", &self.credential_id, &self.prf_salt);
+        let challenge = hkdf32(
+            b"pillar-crypto/custody/passkey/challenge-v1",
+            &self.credential_id,
+            &self.prf_salt,
+        );
 
         let args = GetAssertionArgsBuilder::new(&self.rp_id, &challenge)
             .credential_id(&self.credential_id)
@@ -269,7 +271,11 @@ impl NodeCustody for PasskeyCustody {
             })
             .ok_or_else(|| CryptoError::Backend("passkey: no hmac-secret output".into()))?;
 
-        let kek = hkdf32(b"pillar-crypto/custody/passkey/kek-v1", &self.prf_salt, &output);
+        let kek = hkdf32(
+            b"pillar-crypto/custody/passkey/kek-v1",
+            &self.prf_salt,
+            &output,
+        );
         unwrap_with_kek(kek, &self.wrapped)
     }
 }
