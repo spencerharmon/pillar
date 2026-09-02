@@ -2261,6 +2261,10 @@ name = "pillar-core"
 version = "0.0.0"
 
 [[package]]
+name = "pillar-crypto"
+version = "0.0.0"
+
+[[package]]
 name = "pillar-eventlog"
 version = "0.0.0"
 dependencies = [
