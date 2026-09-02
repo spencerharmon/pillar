@@ -607,19 +607,33 @@ impl KeyCli {
     }
 
     /// `pillar key escrow <id> --artifact <artifact-id>` — an ACT: store
-    /// this key's operational artifact into the shared escrow (refused for
-    /// a root artifact — the escrow authority bound).
-    pub fn escrow(&mut self, artifact: ArtifactId) -> Result<(), KeyCliError> {
+    /// this key's operational artifact into the shared escrow under the
+    /// client's `password` (real argon2id+AEAD), refused for a root artifact
+    /// (the escrow authority bound). The `plaintext` is the operational key
+    /// material to protect; neither it nor the password is retained.
+    pub fn escrow(
+        &mut self,
+        artifact: ArtifactId,
+        password: &[u8],
+        plaintext: &[u8],
+    ) -> Result<(), KeyCliError> {
         let artifact = Artifact::new(artifact, ArtifactKind::Operational);
-        self.escrow.store(&artifact).map_err(KeyCliError::from)
+        self.escrow
+            .store(&artifact, password, plaintext)
+            .map_err(KeyCliError::from)
     }
 
-    /// `pillar key recover <artifact-id>` — an ACT: client-cooperated
-    /// plaintext recovery over the shared [`Escrow`].
-    pub fn recover(&mut self, artifact: &ArtifactId) -> Result<(), KeyCliError> {
-        self.escrow.client_participate(artifact)?;
-        self.escrow.recover_plaintext(artifact)?;
-        Ok(())
+    /// `pillar key recover <artifact-id>` — an ACT: real password-based
+    /// plaintext recovery over the shared [`Escrow`], returning the recovered
+    /// operational key bytes.
+    pub fn recover(
+        &mut self,
+        artifact: &ArtifactId,
+        password: &[u8],
+    ) -> Result<Vec<u8>, KeyCliError> {
+        self.escrow
+            .recover_plaintext(artifact, password)
+            .map_err(KeyCliError::from)
     }
 
     fn record_mut(&mut self, id: &IdentityKeyId) -> Result<&mut KeyRecord, KeyCliError> {
@@ -711,14 +725,19 @@ impl OfferCli {
     }
 
     /// `pillar offer escrow <artifact-kind> <artifact-id>` — an ACT: store
-    /// the server-held envelope for an operational artifact.
+    /// the server-held envelope for an operational artifact under the client's
+    /// `password` (real argon2id+AEAD), protecting `plaintext`.
     pub fn escrow(
         &mut self,
         artifact: ArtifactId,
         kind: ArtifactKind,
+        password: &[u8],
+        plaintext: &[u8],
     ) -> Result<(), OfferCliError> {
         let artifact = Artifact::new(artifact, kind);
-        self.escrow.store(&artifact).map_err(OfferCliError::from)
+        self.escrow
+            .store(&artifact, password, plaintext)
+            .map_err(OfferCliError::from)
     }
 
     /// `pillar offer resolve <record>` — an ACT: the cell/node-side accept

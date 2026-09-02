@@ -31,7 +31,6 @@
 use std::collections::{BTreeSet, HashSet};
 
 use pillar_core::NodeId;
-use pillar_key_distribution::SealedArtifact;
 use pillar_net::blob::{BlobDigest, BlobStore};
 use pillar_rbac::Capability;
 use pillar_wot_authority::WotAuthority;
@@ -189,7 +188,7 @@ impl BackupBlob {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwarmBackup {
     digest: BlobDigest,
-    sealed: SealedArtifact,
+    sealed_to: BTreeSet<NodeId>,
 }
 
 impl SwarmBackup {
@@ -202,7 +201,7 @@ impl SwarmBackup {
     /// Whether `node` is within the federation-restricted seal.
     #[must_use]
     pub fn is_sealed_to(&self, node: &NodeId) -> bool {
-        self.sealed.is_sealed_to(node)
+        self.sealed_to.contains(node)
     }
 }
 
@@ -221,8 +220,8 @@ pub fn store_backup(
     }
     let digest = store.insert(blob.to_bytes());
     Ok(SwarmBackup {
-        digest: digest.clone(),
-        sealed: SealedArtifact::new(digest, sealed_to),
+        digest,
+        sealed_to,
     })
 }
 
