@@ -17,7 +17,7 @@
 //! rather than a generic non-zero with no diagnosis.
 
 use pillar_core::NodeId;
-use pillar_identity::{AdmissionError, NodeSubkey, Registry, Signature, UserPrimary};
+use pillar_identity::{AdmissionError, NodeSubkey, PrimaryKeypair, Registry, UserPrimary};
 use pillar_rbac::{
     Capability, Decision, ExplicitGrant, PolicyEvent, PolicyTarget, RbacDecider, Request,
     ResourceClass,
@@ -41,6 +41,15 @@ fn ok(step: &str) {
 
 fn fail(step: &str, why: impl std::fmt::Display) -> String {
     format!("FAIL: {step}: {why}")
+}
+
+/// A deterministic REAL ed25519 primary keypair from a label; its
+/// [`UserPrimary`] fingerprint is derived from the public key, and only its
+/// held secret can mint certifications that admission will accept.
+fn onboard_keypair(label: &str) -> PrimaryKeypair {
+    PrimaryKeypair::from_secret_seed(&pillar_crypto::Seed::from_bytes(
+        format!("pillar-onboard-primary::{label}").into_bytes(),
+    ))
 }
 
 /// Step 1 — primary keygen: a fresh [`UserPrimary`] is unregistered until
@@ -70,14 +79,14 @@ fn step_keygen_and_registration() -> Result<(), String> {
 fn step_node_key_signing_admits_only_chained() -> Result<(), String> {
     const STEP: &str = "node-key-signing";
     let mut registry = Registry::new();
-    let alice = UserPrimary::from("alice-primary");
-    let rogue = UserPrimary::from("rogue-primary");
+    let alice = onboard_keypair("alice-primary");
+    let rogue = onboard_keypair("rogue-primary");
     let good_node = NodeSubkey::from("alice-node-1");
     let bad_node = NodeSubkey::from("rogue-node-1");
 
-    registry.register(alice.clone());
-    registry.issue_subkey(Signature::new(good_node.clone(), alice));
-    registry.issue_subkey(Signature::new(bad_node.clone(), rogue));
+    registry.register(alice.primary());
+    registry.issue_subkey(alice.certify(&good_node));
+    registry.issue_subkey(rogue.certify(&bad_node));
 
     let admitted = registry
         .handshake(&good_node)
@@ -187,11 +196,11 @@ fn step_policy_config_gates_by_depth() -> Result<(), String> {
 fn step_out_of_order_admission_fails_closed() -> Result<(), String> {
     const STEP: &str = "out-of-order-fails-closed";
     let mut registry = Registry::new();
-    let alice = UserPrimary::from("alice-primary");
+    let alice = onboard_keypair("alice-primary");
     let node = NodeSubkey::from("alice-node-early");
 
     // Subkey signed and handshake attempted BEFORE alice ever registers.
-    registry.issue_subkey(Signature::new(node.clone(), alice.clone()));
+    registry.issue_subkey(alice.certify(&node));
     match registry.handshake(&node) {
         Err(AdmissionError::UnauthorizedIssuer { .. }) => {}
         other => {
@@ -212,7 +221,7 @@ fn step_out_of_order_admission_fails_closed() -> Result<(), String> {
     // earlier failed attempt; a FRESH handshake is required and now
     // succeeds because the chain is checked live, not memoized as a
     // permanent refusal.
-    registry.register(alice);
+    registry.register(alice.primary());
     let admitted = registry.handshake(&node).map_err(|e| {
         fail(
             STEP,

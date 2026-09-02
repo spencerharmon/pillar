@@ -309,10 +309,12 @@ impl EncryptedSecret {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Signature;
+    use crate::PrimaryKeypair;
 
-    fn primary(s: &str) -> crate::UserPrimary {
-        crate::UserPrimary::from(s)
+    fn keypair(label: &str) -> PrimaryKeypair {
+        PrimaryKeypair::from_secret_seed(&Seed::from_bytes(
+            format!("pillar-identity-cap-test-primary::{label}").into_bytes(),
+        ))
     }
 
     fn subkey(s: &str) -> NodeSubkey {
@@ -324,13 +326,13 @@ mod tests {
         // runs the controller (and will be granted its capability / sealed
         // its secret), the other is a foreign, equally-admitted node.
         let mut reg = Registry::new();
-        let alice = primary("alice-primary");
+        let alice = keypair("alice-primary");
         let controller_node = subkey("controller-node");
         let foreign_node = subkey("foreign-node");
 
-        reg.register(alice.clone());
-        reg.issue_subkey(Signature::new(controller_node.clone(), alice.clone()));
-        reg.issue_subkey(Signature::new(foreign_node.clone(), alice));
+        reg.register(alice.primary());
+        assert!(reg.issue_subkey(alice.certify(&controller_node)));
+        assert!(reg.issue_subkey(alice.certify(&foreign_node)));
         reg.handshake(&controller_node).unwrap();
         reg.handshake(&foreign_node).unwrap();
 
