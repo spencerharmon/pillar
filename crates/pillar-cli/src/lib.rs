@@ -117,7 +117,7 @@ impl std::error::Error for ApplyError {}
 /// The record of one successful apply: the emitted event and the sealed
 /// manifest's content-hash. Returned so a caller can correlate the CLI action
 /// with the log entry it produced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     /// The id of the signed event emitted for this apply.
     pub event: EventId,
@@ -132,7 +132,7 @@ pub struct Applied {
 /// real apply of this exact body would seal, so `preview(..).content_hash ==
 /// apply(..).content_hash` holds whenever both succeed: predicted ==
 /// enforced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Previewed {
     /// The content-hash the sealed envelope would carry if applied for real.
     pub content_hash: ContentHash,
@@ -240,10 +240,10 @@ impl Platform {
         let author = Author(actor.0.clone());
         let event = self
             .log
-            .append(&author, content_hash.0.to_le_bytes().to_vec());
+            .append(&author, content_hash.as_bytes().to_vec());
 
-        self.store.insert(content_hash, envelope);
-        self.applied.push(content_hash);
+        self.store.insert(content_hash.clone(), envelope);
+        self.applied.push(content_hash.clone());
         self.applied_events.push(event);
 
         Ok(Applied {
@@ -367,7 +367,7 @@ impl Platform {
         }
         out.push_str("Envelope:\n");
         out.push_str(&format!("  Signer:        {}\n", env.signer()));
-        out.push_str(&format!("  Content-Hash:  {}\n", env.content_hash().0));
+        out.push_str(&format!("  Content-Hash:  {}\n", env.content_hash()));
         if let Some(cid) = self.event_cid(&key) {
             out.push_str(&format!("  Event-CID:     {}\n", cid.0));
         }
@@ -381,7 +381,7 @@ impl Platform {
         } else {
             out.push('\n');
             for p in env.causal_parents() {
-                out.push_str(&format!("    {}\n", p.0));
+                out.push_str(&format!("    {p}\n"));
             }
         }
         out.push_str("  Capability-Scope:");

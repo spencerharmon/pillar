@@ -2345,7 +2345,6 @@ version = "0.0.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
- "pillar-streamdb",
  "pillar-topology",
  "pillar-trust-artifacts",
 ]
