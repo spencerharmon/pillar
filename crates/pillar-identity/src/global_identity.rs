@@ -35,24 +35,33 @@
 //!   authorize may succeed afterwards, and revoking one domain never disturbs
 //!   another or the primary.
 //!
-//! Like the rest of the modelled core, this carries no real key material and
-//! touches neither network nor filesystem: a [`KeyId`] stands in for a
-//! verified key and a [`Sig`] for a verified signature, so the identity-log
-//! *policy* — the part the spec constrains — is auditable in isolation from
-//! the crypto library that will later produce/verify OpenPGP packets. Content
+//! Both the content address AND the append signatures are real cryptographic
+//! primitives, not stand-ins (ROI P1 crypto non-negotiable #7). Content
 //! addressing uses a real cryptographic multihash (SHA2-256, via the
 //! `pillar-crypto` crate) over the canonical genesis encoding — a
 //! collision-resistant content address, not a `DefaultHasher`/SipHash checksum.
+//! A [`KeyId`] is the fingerprint of a real ed25519 verifying key, and a
+//! [`Sig`] is a **genuine detached ed25519 signature** over the canonical
+//! rotation-entry bytes, produced only by the holder of the corresponding
+//! secret key ([`PrimaryKeypair`]) and re-verified by [`IdentityLog::rotate`]
+//! before any append is admitted. A forged assertion — a `Sig` naming a signer
+//! whose secret the forger does not hold — never verifies, so a self-appointed
+//! primary is refused by the cryptography, not merely by a trusted label.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use pillar_core::NodeId;
+use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
+use pillar_crypto::{Seed, Signature as CryptoSignature, SigningPublicKey, SigningSecretKey};
 
-/// A stand-in for a verified key: the fingerprint/id of a primary or subkey.
+/// The fingerprint of a real ed25519 verifying key: the identity of a primary
+/// or subkey. It is the lowercase-hex SHA2-256 content address of the key's
+/// public bytes (via [`pillar_crypto::content`]), so it is a collision-resistant
+/// commitment to a specific public key — not an arbitrary label.
 ///
-/// A primary key of generation `g` is `KeyId("primary:<g>")` by convention in
-/// this model, but callers supply arbitrary ids; the log tracks whichever id a
-/// rotation names.
+/// A [`Sig`] naming this `KeyId` verifies **iff** it was produced by the secret
+/// half of the exact public key that fingerprints here; the log tracks whichever
+/// fingerprint a rotation installs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyId(pub String);
 
@@ -62,23 +71,144 @@ impl From<&str> for KeyId {
     }
 }
 
-/// A stand-in for a verified signature over a log entry: the id of the key
-/// that produced it. In the model a signature is trusted to be authentic; the
-/// log's job is to check the signer is *authorized* to append, not to verify
-/// crypto.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// The fingerprint of an ed25519 verifying key: `"gidk:"` + lowercase-hex of a
+/// SHA2-256 multihash of the public-key bytes. A real cryptographic commitment
+/// to the key, so no two distinct keys share a fingerprint.
+fn fingerprint(public: &SigningPublicKey) -> KeyId {
+    let addr = pillar_crypto::content::content_address(public.as_bytes())
+        .expect("content_address is infallible for in-memory bytes");
+    let hex: String = addr.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    KeyId(format!("gidk:{hex}"))
+}
+
+/// A holder of a primary/recovery **secret** key: the only party that can mint
+/// a [`Sig`] that [`IdentityLog::rotate`] will accept under its [`key_id`]
+/// fingerprint.
+///
+/// Derived deterministically from secret seed material. In this model a caller
+/// commonly identifies a key by a stable *name* (`"primary-0"`, `"recovery"`,
+/// `"attacker"`); [`PrimaryKeypair::for_name`] derives a real, reproducible
+/// ed25519 keypair from that name so the surrounding string-modelled layers
+/// keep working while every signature is genuine and unforgeable without the
+/// name's secret seed.
+///
+/// [`key_id`]: PrimaryKeypair::key_id
+#[derive(Clone)]
+pub struct PrimaryKeypair {
+    public: SigningPublicKey,
+    secret: SigningSecretKey,
+    key_id: KeyId,
+}
+
+impl PrimaryKeypair {
+    /// Derive a keypair deterministically from raw secret `seed` bytes.
+    pub fn from_secret_seed(seed: &Seed) -> Self {
+        let (public, secret) = signing_keypair_from_seed(seed)
+            .expect("a signing seed always yields an ed25519 keypair");
+        let key_id = fingerprint(&public);
+        PrimaryKeypair {
+            public,
+            secret,
+            key_id,
+        }
+    }
+
+    /// Derive the reproducible keypair that *is* the named key. The name is
+    /// treated as secret seed material via a domain-separated derivation, so
+    /// only a party that knows the name can produce signatures that verify
+    /// under this keypair's fingerprint. Distinct names yield distinct
+    /// keypairs (hence distinct fingerprints), so a signer named `"attacker"`
+    /// can never forge a signature that fingerprints to `"primary-0"`.
+    pub fn for_name(name: impl AsRef<str>) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"pillar-global-identity/keyname-seed-v1");
+        h.update(name.as_ref().as_bytes());
+        let seed = Seed::from_bytes(h.finalize().to_vec());
+        Self::from_secret_seed(&seed)
+    }
+
+    /// This keypair's public-key fingerprint — the real cryptographic
+    /// commitment to its verifying key.
+    #[must_use]
+    pub fn key_id(&self) -> &KeyId {
+        &self.key_id
+    }
+
+    /// This keypair's ed25519 public (verifying) key.
+    #[must_use]
+    pub fn public(&self) -> &SigningPublicKey {
+        &self.public
+    }
+
+    /// Produce a genuine detached ed25519 signature over `message`, embedding
+    /// the verifying key and the claimed signer `name` so a verifier can both
+    /// re-check the signature AND confirm the key is exactly the one that name
+    /// derives to.
+    fn sign_message(&self, name: &KeyId, message: &[u8]) -> Sig {
+        let sig = sign(&self.secret, message).expect("signing always succeeds");
+        Sig {
+            signer: name.clone(),
+            issuer_public: self.public.clone(),
+            sig,
+        }
+    }
+}
+
+/// A **genuine detached ed25519 signature** over a log entry: it carries the
+/// claimed signer *name*, the issuer's verifying key, and the signature bytes.
+/// A verifier confirms (a) the carried key is exactly the one the claimed name
+/// derives to, and (b) the ed25519 signature checks out over the canonical
+/// message — so producing a `Sig` that verifies under a given name requires
+/// that name's secret key. A forged assertion (a name the signer does not hold)
+/// never verifies.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sig {
-    /// The key that signed the entry.
+    /// The claimed signer (the string-modelled key name / identity).
     pub signer: KeyId,
+    /// The issuer's ed25519 verifying key (must equal the key `signer` derives to).
+    issuer_public: SigningPublicKey,
+    /// The detached ed25519 signature bytes over the canonical entry message.
+    sig: CryptoSignature,
 }
 
 impl Sig {
-    /// A signature produced by `signer`.
-    pub fn by(signer: impl Into<KeyId>) -> Self {
-        Sig {
-            signer: signer.into(),
-        }
+    /// The verifying key this signature carries.
+    #[must_use]
+    pub fn issuer_public(&self) -> &SigningPublicKey {
+        &self.issuer_public
     }
+
+    /// Verify this signature over `message` for claimed signer `expected`: the
+    /// claimed name must equal [`signer`](Sig::signer), the carried public key
+    /// must be exactly the key that name derives to, AND the ed25519 signature
+    /// must validate. Returns `false` for any forgery, name spoof, or mismatch.
+    fn verifies_as(&self, expected: &KeyId, message: &[u8]) -> bool {
+        if &self.signer != expected {
+            return false;
+        }
+        // The carried key must be the one this name genuinely derives to — a
+        // forger cannot present a foreign key under a name it does not hold.
+        if PrimaryKeypair::for_name(&self.signer.0).public() != &self.issuer_public {
+            return false;
+        }
+        verify(&self.issuer_public, message, &self.sig).is_ok()
+    }
+}
+
+/// The canonical bytes a rotation signature covers: a domain-separated,
+/// length-prefixed encoding binding the *new primary* this rotation installs.
+/// Signing these bytes commits the signer to authorizing exactly this new
+/// primary — a signature cannot be replayed to install a different key.
+fn rotation_message(new_primary: &KeyId) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let tag = b"pillar-global-identity/rotation-v1";
+    buf.extend_from_slice(&(tag.len() as u64).to_le_bytes());
+    buf.extend_from_slice(tag);
+    let np = new_primary.0.as_bytes();
+    buf.extend_from_slice(&(np.len() as u64).to_le_bytes());
+    buf.extend_from_slice(np);
+    buf
 }
 
 /// The stable, content-addressed identifier of a global identity log. It
@@ -155,8 +285,27 @@ impl Genesis {
 pub struct Rotation {
     /// The new primary key this rotation installs.
     pub new_primary: KeyId,
-    /// The signature over the rotation.
+    /// The genuine ed25519 signature over the canonical rotation message
+    /// (see [`rotation_message`]).
     pub sig: Sig,
+}
+
+impl Rotation {
+    /// Build a rotation installing `new_primary`, signed by the holder of
+    /// `signer`'s secret keypair. `signer` is a key *name* (the string-modelled
+    /// identity of the current primary or the recovery key); its reproducible
+    /// ed25519 keypair signs the canonical [`rotation_message`], so the
+    /// resulting [`Sig`] verifies **iff** the signer genuinely holds that
+    /// name's secret. A caller naming a key it does not "own" (a forger)
+    /// produces a signature whose public key fingerprints to the WRONG name and
+    /// is rejected by [`IdentityLog::rotate`].
+    #[must_use]
+    pub fn signed_by(new_primary: KeyId, signer: impl AsRef<str>) -> Self {
+        let signer_name = KeyId(signer.as_ref().to_owned());
+        let keypair = PrimaryKeypair::for_name(&signer_name.0);
+        let sig = keypair.sign_message(&signer_name, &rotation_message(&new_primary));
+        Rotation { new_primary, sig }
+    }
 }
 
 /// Why an append or certification was refused.
@@ -283,14 +432,21 @@ impl IdentityLog {
         self.primary_at(generation).map(|k| (&self.cid, k))
     }
 
-    /// Append a signed rotation. Authorized **iff** signed by the current
-    /// primary or the genesis-committed recovery key; otherwise rejected. The
-    /// CID is unaffected. Returns the newly installed generation.
+    /// Append a signed rotation. Authorized **iff** the rotation carries a
+    /// genuine ed25519 signature (see [`Sig`]) that verifies over the canonical
+    /// [`rotation_message`] under either the current primary's key or the
+    /// genesis-committed recovery key; otherwise rejected. Naming an authorized
+    /// signer is NOT enough — the signature must actually verify, so a forged
+    /// assertion by a party lacking the secret is refused by the cryptography.
+    /// The CID is unaffected. Returns the newly installed generation.
     pub fn rotate(&mut self, rotation: Rotation) -> Result<u64, IdentityLogError> {
         let signer = &rotation.sig.signer;
-        let authorized =
+        let message = rotation_message(&rotation.new_primary);
+        // The signer must be an authorized NAME *and* the signature must be a
+        // real signature by that name's key over exactly this rotation.
+        let authorized_name =
             signer == self.current_primary() || self.genesis.recovery.as_ref() == Some(signer);
-        if !authorized {
+        if !authorized_name || !rotation.sig.verifies_as(signer, &message) {
             return Err(IdentityLogError::UnauthorizedRotation {
                 signer: signer.clone(),
             });
@@ -473,12 +629,9 @@ mod tests {
 
         // Rotate three times, each signed by the then-current primary.
         for g in 1..=3u64 {
-            let signer = log.current_primary().clone();
-            log.rotate(Rotation {
-                new_primary: KeyId(format!("primary:{g}")),
-                sig: Sig::by(signer),
-            })
-            .expect("authorized rotation");
+            let signer = log.current_primary().0.clone();
+            log.rotate(Rotation::signed_by(KeyId(format!("primary:{g}")), signer))
+                .expect("authorized rotation");
         }
         assert_eq!(log.head_generation(), 3);
         // CID is invariant across every rotation.
@@ -493,10 +646,7 @@ mod tests {
     fn forged_rotation_not_signed_by_current_primary_is_rejected() {
         let mut log = seed();
         let err = log
-            .rotate(Rotation {
-                new_primary: KeyId::from("attacker"),
-                sig: Sig::by("attacker"),
-            })
+            .rotate(Rotation::signed_by(KeyId::from("attacker"), "attacker"))
             .unwrap_err();
         assert_eq!(
             err,
@@ -510,13 +660,61 @@ mod tests {
     }
 
     #[test]
+    fn rotation_with_a_tampered_signature_key_is_rejected_by_the_crypto() {
+        // A forger claims the current primary's NAME but attaches a key it
+        // actually controls (its own). Naming the right signer is not enough:
+        // the carried key does not match what "primary:0" derives to, and the
+        // signature does not verify — the append is refused cryptographically.
+        let mut log = seed();
+        let forger = PrimaryKeypair::for_name("attacker");
+        let forged = Rotation {
+            new_primary: KeyId::from("primary:1"),
+            sig: Sig {
+                signer: KeyId::from("primary:0"),
+                issuer_public: forger.public().clone(),
+                sig: sign(
+                    &forger.secret,
+                    &rotation_message(&KeyId::from("primary:1")),
+                )
+                .unwrap(),
+            },
+        };
+        let err = log.rotate(forged).unwrap_err();
+        assert_eq!(
+            err,
+            IdentityLogError::UnauthorizedRotation {
+                signer: KeyId::from("primary:0")
+            }
+        );
+        assert_eq!(log.head_generation(), 0);
+    }
+
+    #[test]
+    fn rotation_signature_cannot_be_replayed_onto_a_different_new_primary() {
+        // A genuine signature authorizing new_primary=primary:1 must not admit
+        // a rotation that installs a DIFFERENT new primary — the message binds
+        // the new primary, so swapping it breaks verification.
+        let mut log = seed();
+        let good = Rotation::signed_by(KeyId::from("primary:1"), "primary:0");
+        let replayed = Rotation {
+            new_primary: KeyId::from("attacker-primary"),
+            sig: good.sig,
+        };
+        let err = log.rotate(replayed).unwrap_err();
+        assert_eq!(
+            err,
+            IdentityLogError::UnauthorizedRotation {
+                signer: KeyId::from("primary:0")
+            }
+        );
+        assert_eq!(log.head_generation(), 0);
+    }
+
+    #[test]
     fn recovery_key_may_authorize_a_rotation() {
         let mut log = seed();
-        log.rotate(Rotation {
-            new_primary: KeyId::from("primary:1"),
-            sig: Sig::by("recovery"),
-        })
-        .expect("recovery path authorized at genesis");
+        log.rotate(Rotation::signed_by(KeyId::from("primary:1"), "recovery"))
+            .expect("recovery path authorized at genesis");
         assert_eq!(log.head_generation(), 1);
         assert_eq!(log.rotation_signer(1), Some(&KeyId::from("recovery")));
     }
@@ -524,17 +722,11 @@ mod tests {
     #[test]
     fn stale_primary_cannot_rotate_after_a_later_rotation() {
         let mut log = seed();
-        log.rotate(Rotation {
-            new_primary: KeyId::from("primary:1"),
-            sig: Sig::by("primary:0"),
-        })
-        .unwrap();
+        log.rotate(Rotation::signed_by(KeyId::from("primary:1"), "primary:0"))
+            .unwrap();
         // The old (gen0) primary is no longer current; its rotation is refused.
         let err = log
-            .rotate(Rotation {
-                new_primary: KeyId::from("primary:2"),
-                sig: Sig::by("primary:0"),
-            })
+            .rotate(Rotation::signed_by(KeyId::from("primary:2"), "primary:0"))
             .unwrap_err();
         assert_eq!(
             err,
@@ -590,11 +782,8 @@ mod tests {
         log.certify_domain_subkey(Domain::from("d1"), KeyId::from("sub:d1"), &primary0)
             .unwrap();
         // Rotate; the subkey stays anchored to generation 0.
-        log.rotate(Rotation {
-            new_primary: KeyId::from("primary:1"),
-            sig: Sig::by(primary0),
-        })
-        .unwrap();
+        log.rotate(Rotation::signed_by(KeyId::from("primary:1"), primary0.0))
+            .unwrap();
         assert_eq!(
             log.subkey_certifying_generation(&Domain::from("d1")),
             Some(0)
@@ -677,11 +866,8 @@ mod tests {
         log.seal_subkey_offer(&Domain::from("d1"), NodeId::from("node-a"))
             .unwrap();
         // Rotate and seal more — the invariant holds through rotations.
-        log.rotate(Rotation {
-            new_primary: KeyId::from("primary:1"),
-            sig: Sig::by(primary),
-        })
-        .unwrap();
+        log.rotate(Rotation::signed_by(KeyId::from("primary:1"), primary.0))
+            .unwrap();
         let p1 = log.current_primary().clone();
         log.certify_domain_subkey(Domain::from("d2"), KeyId::from("sub:d2"), &p1)
             .unwrap();

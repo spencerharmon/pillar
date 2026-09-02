@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use pillar_core::NodeId;
 use pillar_identity::global_identity::{
     Cid as IdentityCid, Domain, Genesis, IdentityLog, IdentityLogError, KeyId as IdentityKeyId,
-    Rotation, Sig as IdentitySig,
+    Rotation,
 };
 use pillar_key_distribution::{
     Artifact, ArtifactId, ArtifactKind, CellId, Escrow, KeyDistributionError,
@@ -151,10 +151,7 @@ impl IdentityCli {
         signer: IdentityKeyId,
     ) -> Result<u64, IdentityCliError> {
         self.log
-            .rotate(Rotation {
-                new_primary,
-                sig: IdentitySig::by(signer),
-            })
+            .rotate(Rotation::signed_by(new_primary, signer.0))
             .map_err(IdentityCliError::from)
     }
 

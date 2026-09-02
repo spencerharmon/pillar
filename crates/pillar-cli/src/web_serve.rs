@@ -149,7 +149,7 @@ use pillar_core::{Epoch, NodeId};
 use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_identity::global_identity::{
     Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
-    Rotation as IdentityRotation, Sig as IdentitySig,
+    Rotation as IdentityRotation,
 };
 use pillar_identity::session_registry::{RevokeError, Session, SessionRegistry};
 use pillar_identity::NodeSubkey;
@@ -654,10 +654,10 @@ impl WebAuthContext {
         new_primary: &str,
     ) -> Result<u64, pillar_identity::global_identity::IdentityLogError> {
         let signer = self.identity_log.current_primary().clone();
-        self.identity_log.rotate(IdentityRotation {
-            new_primary: IdentityKeyId::from(new_primary),
-            sig: IdentitySig::by(signer),
-        })
+        self.identity_log.rotate(IdentityRotation::signed_by(
+            IdentityKeyId::from(new_primary),
+            signer.0,
+        ))
     }
 
     /// Recover: rotate to a fresh primary using the genesis-committed
@@ -673,10 +673,10 @@ impl WebAuthContext {
             .cloned()
             .unwrap_or_else(|| IdentityKeyId::from("no-recovery-configured"));
         let gen = self.identity_log.head_generation() + 1;
-        self.identity_log.rotate(IdentityRotation {
-            new_primary: IdentityKeyId::from(format!("recovered-primary-{gen}").as_str()),
-            sig: IdentitySig::by(recovery),
-        })
+        self.identity_log.rotate(IdentityRotation::signed_by(
+            IdentityKeyId::from(format!("recovered-primary-{gen}").as_str()),
+            recovery.0,
+        ))
     }
 
     /// The domain (naming-only) grouping view: each domain's cells. Read-only
