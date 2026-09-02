@@ -16,22 +16,38 @@
 //!    refused just as surely as an unadmitted one ([`ScopeError::OutOfScope`]
 //!    / [`ScopeError::NotAdmitted`]).
 //! 2. **Controller secrets are readable only by nodes running that
-//!    controller.** [`EncryptedSecret`] models a PGP-encrypted payload sealed
-//!    to an explicit recipient set (the stand-in for "encrypted to these
-//!    nodes' subkeys"). [`EncryptedSecret::decrypt`] succeeds only for a
-//!    node in that set; any other node — including one that is otherwise
-//!    fully admitted — cannot decrypt it.
-//!
-//! As with the rest of this crate, no real key material or crypto library is
-//! involved: [`EncryptedSecret`] stands in for a verified PGP recipient list
-//! so the *authorization policy* is auditable in isolation from the crypto
-//! that will later produce the actual ciphertext.
+//!    controller.** [`EncryptedSecret`] is a real X25519-sealed envelope
+//!    (via [`pillar_crypto::seal`]) addressed to an explicit recipient set —
+//!    each node's sealing keypair is deterministically derived from its
+//!    [`NodeId`] via [`pillar_crypto::principal::principal_from_seed`], the
+//!    same keygen every principal in this system uses.
+//!    [`EncryptedSecret::decrypt`] recovers the plaintext only for a node in
+//!    that recipient set (an authentic Diffie-Hellman unseal, not a set
+//!    membership check on the plaintext ID); any other node — including one
+//!    that is otherwise fully admitted — learns nothing and gets
+//!    [`DecryptError::NotARecipient`].
 
 use std::collections::{HashMap, HashSet};
 
 use pillar_core::NodeId;
+use pillar_crypto::principal::principal_from_seed;
+use pillar_crypto::seal::{seal_to_recipients, unseal};
+use pillar_crypto::{SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed};
 
 use crate::{AdmissionError, NodeSubkey, Registry};
+
+/// Derive the deterministic sealing keypair for `node`.
+///
+/// Every principal in this system (node, cell, user, subkey) is derived from
+/// seed material via [`principal_from_seed`]; a node's identity string *is*
+/// its seed, so distinct nodes get distinct, unforgeable X25519 keypairs and
+/// the same node always recovers the same keypair.
+fn node_sealing_keypair(node: &NodeId) -> (SealingPublicKey, SealingSecretKey) {
+    let seed = Seed::from_bytes(format!("pillar-controller-secret/node/{}", node.0).into_bytes());
+    let (public, secret) =
+        principal_from_seed(&seed).expect("deterministic seed always yields a keypair");
+    (public.sealing, secret.sealing)
+}
 
 /// One specific, named action a controller subkey may be granted to perform.
 ///
@@ -131,29 +147,37 @@ impl CapabilityRegistry {
 /// Why a decryption attempt failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecryptError {
-    /// `node` is not among the recipients this secret was sealed to.
+    /// `node` is not among the recipients this secret was sealed to — the
+    /// X25519 unseal genuinely fails (no shared secret recovers the wrapped
+    /// content key), not merely a set-membership check on an ID.
     NotARecipient,
+    /// The envelope was corrupt or the recovered plaintext was not valid
+    /// UTF-8 (should not occur for a genuinely-sealed secret).
+    Malformed,
 }
 
-/// A controller secret PGP-encrypted to an explicit recipient set: the
-/// nodes running the controller that owns it.
+/// A controller secret sealed (X25519 + AEAD, via [`pillar_crypto::seal`]) to
+/// an explicit recipient set: the nodes running the controller that owns it.
 ///
-/// Stands in for a real OpenPGP message encrypted to those nodes' public
-/// subkeys — no key material or ciphertext format is modelled, only the
-/// recipient-gated read policy the real encryption would enforce.
+/// Each recipient's public sealing key is deterministically derived from its
+/// [`NodeId`] ([`node_sealing_keypair`]); the envelope itself carries no
+/// plaintext and can only be opened by a holder of one of those recipients'
+/// secret keys.
 #[derive(Clone, Debug)]
 pub struct EncryptedSecret {
-    payload: String,
-    recipients: HashSet<NodeId>,
+    envelope: SealedEnvelope,
 }
 
 impl EncryptedSecret {
     /// Seal `payload` so only `recipients` can ever decrypt it.
-    pub fn seal(payload: impl Into<String>, recipients: impl IntoIterator<Item = NodeId>) -> Self {
-        EncryptedSecret {
-            payload: payload.into(),
-            recipients: recipients.into_iter().collect(),
-        }
+    pub fn seal(payload: impl AsRef<str>, recipients: impl IntoIterator<Item = NodeId>) -> Self {
+        let recipient_keys: Vec<_> = recipients
+            .into_iter()
+            .map(|node| node_sealing_keypair(&node).0)
+            .collect();
+        let envelope = seal_to_recipients(payload.as_ref().as_bytes(), &recipient_keys)
+            .expect("sealing to a non-empty recipient set always succeeds");
+        EncryptedSecret { envelope }
     }
 
     /// Attempt to decrypt as `node`.
@@ -162,18 +186,19 @@ impl EncryptedSecret {
     /// a node running the controller this secret belongs to. Any other node,
     /// foreign to that controller, is refused even if it is otherwise fully
     /// admitted by the identity registry: controller-secret readability is
-    /// scoped independently of general cluster admission.
+    /// scoped independently of general cluster admission, and is enforced by
+    /// a genuine X25519 Diffie-Hellman unseal — a foreign node's derived
+    /// secret key shares no wrapped content key with the envelope.
     ///
     /// # Errors
     ///
     /// Returns [`DecryptError::NotARecipient`] when `node` was not among the
-    /// sealed recipients.
-    pub fn decrypt(&self, node: &NodeId) -> Result<&str, DecryptError> {
-        if self.recipients.contains(node) {
-            Ok(&self.payload)
-        } else {
-            Err(DecryptError::NotARecipient)
-        }
+    /// sealed recipients, or [`DecryptError::Malformed`] if the recovered
+    /// plaintext is not valid UTF-8.
+    pub fn decrypt(&self, node: &NodeId) -> Result<String, DecryptError> {
+        let (_public, secret) = node_sealing_keypair(node);
+        let plaintext = unseal(&self.envelope, &secret).map_err(|_| DecryptError::NotARecipient)?;
+        String::from_utf8(plaintext).map_err(|_| DecryptError::Malformed)
     }
 }
 
@@ -278,7 +303,7 @@ mod tests {
 
         assert_eq!(
             secret.decrypt(&controller_node.node_id()),
-            Ok("db-password")
+            Ok("db-password".to_string())
         );
     }
 
