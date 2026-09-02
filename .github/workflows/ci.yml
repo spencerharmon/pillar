@@ -9,33 +9,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Formatting only — rustfmt parses, it does not compile, so this needs no
-  # system libraries and stays on the pinned stable toolchain the repo is
-  # formatted against (keeping the formatting contract stable regardless of the
-  # nixpkgs rust version the compile jobs below pull).
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  # Clippy + tests compile the whole workspace, including the hardware custody
-  # backends, so they need the native libraries those crates link:
-  #   * tpm2-tss    — TpmCustody via tss-esapi (+ tss-esapi-sys bindgen)
-  #   * hidapi/libusb — PasskeyCustody via ctap-hid-fido2 (vendored hidapi build)
-  #   * clang/libclang — bindgen build scripts (tss-esapi-sys, cryptoki-sys)
-  #   * pkg-config/gcc/binutils — native build + link
-  # Provided by a nixery shell image. git lets us check out without a node.js
-  # runtime (the shell image has none, so actions/checkout can't run).
-  check:
-    name: clippy / test
+  # fmt + clippy + test all run through the flake devShell (`nix develop`), so
+  # they share ONE reproducible toolchain pinned by flake.lock (rustfmt / clippy
+  # / cargo from nixpkgs) and get the native libraries the hardware custody
+  # backends link — tpm2-tss (tss-esapi), hidapi + libusb1 (ctap-hid-fido2), and
+  # libclang for the bindgen build scripts (tss-esapi-sys, cryptoki-sys). A bare
+  # nixery `shell` image only ships a package's runtime output, so its headers /
+  # .pc files / libclang would be missing; the devShell (mkShell) exposes the
+  # `.dev` outputs correctly.
+  rust:
+    name: fmt / clippy / test
     runs-on: ubuntu-latest
     container:
-      image: nixery.dev/shell/git/gcc/binutils/pkg-config/cargo/rustc/clippy/clang/tpm2-tss/hidapi/libusb1/systemdLibs/openssl
+      image: nixery.dev/shell/nix/git/bash/coreutils
     env:
       # The nixery shell image has no /etc/passwd entry or writable /root for
       # the runner uid; point HOME at a dir Actions provisions writable.
@@ -55,26 +41,27 @@ jobs:
           git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
           git checkout --detach "${GITHUB_SHA}"
 
-      - name: Locate native build inputs
+      - name: Enable nix flakes
         run: |
           set -euo pipefail
-          # A bare nixery container does not run nix setup-hooks, so the bindgen
-          # build scripts won't find libclang and pkg-config won't find the
-          # nix-provided .pc files unless we point them explicitly.
-          libclang_so="$(find /nix/store -name 'libclang.so*' 2>/dev/null | head -1)"
-          if [ -z "$libclang_so" ]; then echo "libclang not found in image" >&2; exit 1; fi
-          echo "LIBCLANG_PATH=$(dirname "$libclang_so")" >> "$GITHUB_ENV"
-          pc="$(find /nix/store -type d -name pkgconfig 2>/dev/null | paste -sd: -)"
-          echo "PKG_CONFIG_PATH=${pc}" >> "$GITHUB_ENV"
-          # tss-esapi-sys / cryptoki-sys link the shared libs at test-run time.
-          libdirs="$(find /nix/store -type d -name lib 2>/dev/null | paste -sd: -)"
-          echo "LD_LIBRARY_PATH=${libdirs}" >> "$GITHUB_ENV"
+          mkdir -p ~/.config/nix
+          # Flakes on; disable build-users-group since this single-container CI
+          # has no nixbld users provisioned (same as the image-build workflow).
+          printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > ~/.config/nix/nix.conf
+          # nix's home/user resolution consults getpwuid; the image has no
+          # passwd entry for the runner uid, so add one.
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+
+      - name: rustfmt
+        run: nix develop -c bash -c 'cargo fmt --all -- --check'
 
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: nix develop -c bash -c 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
 
       - name: test
-        run: cargo test --all
+        run: nix develop -c bash -c 'cargo test --all'
 
   tlc:
     name: TLA+ model check

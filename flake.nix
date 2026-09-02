@@ -103,5 +103,30 @@
           inherit pillar pillar-oci-image;
           default = pillar-oci-image;
         };
+
+        # Dev shell for CI's fmt/clippy/test (and local dev): the SAME native
+        # inputs the reproducible `pillar` build uses, but exposed through
+        # mkShell so their `.dev` outputs (headers + pkg-config `.pc` files)
+        # are on the compiler / pkg-config search path. A bare nixery `shell`
+        # image only carries a package's runtime output, so the bindgen build
+        # scripts (tss-esapi-sys, cryptoki-sys) and pkg-config could not find
+        # libclang / tss2 headers there; `nix develop` against this shell fixes
+        # that reproducibly. The whole Rust toolchain (cargo/rustc/clippy/
+        # rustfmt) comes from the flake-pinned nixpkgs, so every lint/test in
+        # CI runs on one reproducible toolchain (flake.lock) — no version drift
+        # between the formatter that shaped the tree and the one CI checks with.
+        devShells.default = pkgs.mkShell {
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.clang
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
+            pkgs.rustfmt
+            pkgs.git
+          ];
+          buildInputs = [ pkgs.tpm2-tss pkgs.hidapi pkgs.libusb1 ];
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        };
       });
 }
