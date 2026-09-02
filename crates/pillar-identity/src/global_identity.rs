@@ -40,11 +40,11 @@
 //! verified key and a [`Sig`] for a verified signature, so the identity-log
 //! *policy* — the part the spec constrains — is auditable in isolation from
 //! the crypto library that will later produce/verify OpenPGP packets. Content
-//! addressing uses a stable structural digest of the genesis entry.
+//! addressing uses a real cryptographic multihash (SHA2-256, via the
+//! `pillar-crypto` crate) over the canonical genesis encoding — a
+//! collision-resistant content address, not a `DefaultHasher`/SipHash checksum.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
 
@@ -113,18 +113,39 @@ impl Genesis {
     /// Compute this genesis's content address (the stable global CID). Two
     /// genesis entries with identical fields address the same identity; any
     /// difference yields a different CID.
+    ///
+    /// The address is a **real cryptographic content address**: a SHA2-256
+    /// multihash (via [`pillar_crypto::content::content_address`]) over a
+    /// length-prefixed canonical encoding of the genesis fields. A
+    /// non-cryptographic hash (SipHash/`DefaultHasher`, FNV) is a checksum, not
+    /// a content address — it is collision-prone and forgeable, so it must not
+    /// address a self-certifying identity. The canonical encoding is
+    /// unambiguous (each field length-prefixed) so distinct genesis structures
+    /// can never encode to the same bytes.
     fn cid(&self) -> Cid {
-        let mut h = DefaultHasher::new();
-        "pillar-global-identity-genesis-v1".hash(&mut h);
-        self.initial_primary.0.hash(&mut h);
+        let mut buf = Vec::new();
+        // Domain-separation tag, length-prefixed.
+        let tag = b"pillar-global-identity-genesis-v1";
+        buf.extend_from_slice(&(tag.len() as u64).to_le_bytes());
+        buf.extend_from_slice(tag);
+        // initial_primary, length-prefixed.
+        let ip = self.initial_primary.0.as_bytes();
+        buf.extend_from_slice(&(ip.len() as u64).to_le_bytes());
+        buf.extend_from_slice(ip);
+        // recovery: presence byte then length-prefixed value.
         match &self.recovery {
             Some(r) => {
-                1u8.hash(&mut h);
-                r.0.hash(&mut h);
+                buf.push(1u8);
+                let rb = r.0.as_bytes();
+                buf.extend_from_slice(&(rb.len() as u64).to_le_bytes());
+                buf.extend_from_slice(rb);
             }
-            None => 0u8.hash(&mut h),
+            None => buf.push(0u8),
         }
-        Cid(format!("gid:{:016x}", h.finish()))
+        let addr = pillar_crypto::content::content_address(&buf)
+            .expect("content_address is infallible for in-memory bytes");
+        let hex: String = addr.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        Cid(format!("gid:{hex}"))
     }
 }
 
@@ -697,6 +718,46 @@ mod tests {
             recovery: None,
         });
         assert_ne!(a.cid(), c.cid());
+    }
+
+    #[test]
+    fn cid_is_a_real_cryptographic_content_address_not_a_checksum() {
+        // The CID must be a real cryptographic multihash (SHA2-256 => 32-byte
+        // digest, at least 64 hex chars after the "gid:" prefix), never a
+        // 64-bit DefaultHasher/SipHash checksum (which would render as 16 hex
+        // chars). This is the regression guard for ROI non-negotiable #7:
+        // content addressing on real primitives only.
+        let log = IdentityLog::genesis(Genesis {
+            initial_primary: KeyId::from("primary:0"),
+            recovery: None,
+        });
+        let cid = log.cid().0.clone();
+        let hex = cid.strip_prefix("gid:").expect("cid carries gid: prefix");
+        assert!(
+            hex.len() >= 64,
+            "a cryptographic content address is >= 256 bits (>= 64 hex chars), got {} chars: {hex}",
+            hex.len()
+        );
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "content address must be lowercase hex digest, got {hex}"
+        );
+
+        // It must agree byte-for-byte with the pillar-crypto content address of
+        // the same canonical genesis encoding — i.e. it genuinely delegates to
+        // the real primitive, not a local re-hash.
+        let mut buf = Vec::new();
+        let tag = b"pillar-global-identity-genesis-v1";
+        buf.extend_from_slice(&(tag.len() as u64).to_le_bytes());
+        buf.extend_from_slice(tag);
+        let ip = b"primary:0";
+        buf.extend_from_slice(&(ip.len() as u64).to_le_bytes());
+        buf.extend_from_slice(ip);
+        buf.push(0u8);
+        let expected = pillar_crypto::content::content_address(&buf).expect("address");
+        let expected_hex: String =
+            expected.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, expected_hex, "CID must be the real crypto content address");
     }
 
     #[test]
