@@ -841,16 +841,19 @@ impl AttestCli {
         scope: impl Into<String>,
     ) -> Result<TrustCid, TrustError> {
         let epoch = store.epoch();
-        store.issue_attest(Attest {
-            issuer: issuer.clone(),
-            capacity,
-            authority,
-            subject,
-            predicate,
-            scope: scope.into(),
-            epoch,
-            sig: TrustSig::by(issuer),
-        })
+        store.issue_attest(
+            Attest {
+                issuer,
+                capacity,
+                authority,
+                subject,
+                predicate,
+                scope: scope.into(),
+                epoch,
+                sig: TrustSig::sign_as(NodeId::from(""), b""),
+            }
+            .signed_by_issuer(),
+        )
     }
 
     /// The `--quota N` path: admit `amount` against a JUST-issued quota
@@ -1007,10 +1010,7 @@ impl RevokeCli {
         target: TrustCid,
         signer: NodeId,
     ) -> Result<(), TrustError> {
-        store.revoke(&Revoke {
-            target,
-            sig: TrustSig::by(signer),
-        })
+        store.revoke(&Revoke::signed(target, signer))
     }
 }
 

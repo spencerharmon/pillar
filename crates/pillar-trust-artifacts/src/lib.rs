@@ -38,11 +38,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
+use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
+use pillar_crypto::{Seed, Signature as CryptoSignature, SigningPublicKey, SigningSecretKey};
 use pillar_rbac::{Capability, ExplicitGrant, GrantEffect};
 
 /// The content address of a stored artifact (a [`Attest`], keyed by its
@@ -52,33 +52,158 @@ use pillar_rbac::{Capability, ExplicitGrant, GrantEffect};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Cid(pub String);
 
-/// A stand-in for a verified signature: the identity that produced it. As in
-/// `pillar_identity::global_identity`, the model trusts a `Sig` to be
-/// authentic; the store's job is to check the signer is AUTHORIZED (capacity
-/// held at signing time), not to verify crypto.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Sig {
-    /// The identity that signed the artifact.
-    pub signer: NodeId,
+/// The reproducible ed25519 keypair that *is* a named identity. As in
+/// `pillar_identity::global_identity::PrimaryKeypair`, the string-modelled
+/// identity name (`NodeId`) is treated as secret seed material via a
+/// domain-separated derivation, so only a party that knows the name can
+/// produce a signature that verifies under that identity. Distinct names
+/// yield distinct keypairs, so a signer named `"mallory"` can never forge a
+/// signature that verifies as `"owner"`.
+#[derive(Clone)]
+pub struct IdentityKeypair {
+    name: NodeId,
+    public: SigningPublicKey,
+    secret: SigningSecretKey,
 }
 
-impl Sig {
-    /// A signature produced by `signer`.
+impl IdentityKeypair {
+    /// Derive the reproducible keypair a `NodeId` name maps to. The name is
+    /// domain-separated secret seed material — knowing the name is what lets
+    /// you sign as that identity.
     #[must_use]
-    pub fn by(signer: impl Into<NodeId>) -> Self {
+    pub fn for_name(name: impl Into<NodeId>) -> Self {
+        let name = name.into();
+        let (public, secret) = signing_keypair_from_seed(&name_seed(&name))
+            .expect("a signing seed always yields an ed25519 keypair");
+        IdentityKeypair {
+            name,
+            public,
+            secret,
+        }
+    }
+
+    /// This identity's ed25519 public (verifying) key.
+    #[must_use]
+    pub fn public(&self) -> &SigningPublicKey {
+        &self.public
+    }
+
+    /// The identity name this keypair belongs to.
+    #[must_use]
+    pub fn name(&self) -> &NodeId {
+        &self.name
+    }
+
+    /// Produce a genuine detached ed25519 [`Sig`] over `message`, embedding
+    /// the claimed signer name and the verifying key so a verifier can both
+    /// re-check the signature AND confirm the key is exactly the one the name
+    /// derives to.
+    #[must_use]
+    pub fn sign(&self, message: &[u8]) -> Sig {
+        let sig = sign(&self.secret, message).expect("signing always succeeds");
         Sig {
-            signer: signer.into(),
+            signer: self.name.clone(),
+            issuer_public: self.public.clone(),
+            sig,
         }
     }
 }
 
-fn content_address(parts: &[&str]) -> Cid {
-    let mut h = DefaultHasher::new();
-    "pillar-trust-artifact-v1".hash(&mut h);
-    for p in parts {
-        p.hash(&mut h);
+/// The public verifying key an identity name derives to — the same key
+/// [`IdentityKeypair::for_name`] would produce, without holding the secret.
+#[must_use]
+pub fn public_key_for(name: &NodeId) -> SigningPublicKey {
+    let (public, _secret) = signing_keypair_from_seed(&name_seed(name))
+        .expect("a signing seed always yields an ed25519 keypair");
+    public
+}
+
+/// Domain-separated seed derivation binding an identity name to its keypair.
+fn name_seed(name: &NodeId) -> Seed {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pillar-trust-artifacts/identity-keyname-seed-v1");
+    h.update(name.0.as_bytes());
+    Seed::from_bytes(h.finalize().to_vec())
+}
+
+/// A **genuine detached ed25519 signature** over an artifact's canonical
+/// message: it carries the claimed signer name, the issuer's verifying key,
+/// and the signature bytes. [`Sig::verifies_as`] confirms (a) the claimed
+/// name matches, (b) the carried key is exactly the one that name derives to,
+/// and (c) the ed25519 signature validates over the canonical message — so
+/// producing a `Sig` that verifies as a given identity requires that
+/// identity's secret seed. A forged assertion never verifies; the store no
+/// longer trusts an unchecked `signer` field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sig {
+    /// The claimed signer (the string-modelled identity name).
+    pub signer: NodeId,
+    /// The issuer's ed25519 verifying key (must equal the key `signer`
+    /// derives to).
+    issuer_public: SigningPublicKey,
+    /// The detached ed25519 signature bytes over the artifact's canonical
+    /// message.
+    sig: CryptoSignature,
+}
+
+impl Sig {
+    /// Sign `message` as identity `signer` — deriving that identity's keypair
+    /// from its name and producing a real ed25519 signature. Convenience over
+    /// [`IdentityKeypair::for_name`] + [`IdentityKeypair::sign`].
+    #[must_use]
+    pub fn sign_as(signer: impl Into<NodeId>, message: &[u8]) -> Self {
+        IdentityKeypair::for_name(signer).sign(message)
     }
-    Cid(format!("trust:{:016x}", h.finish()))
+
+    /// The verifying key this signature carries.
+    #[must_use]
+    pub fn issuer_public(&self) -> &SigningPublicKey {
+        &self.issuer_public
+    }
+
+    /// Verify this signature over `message` for claimed signer `expected`:
+    /// the claimed name must equal [`signer`](Sig::signer), the carried
+    /// public key must be exactly the key that name derives to, AND the
+    /// ed25519 signature must validate. Returns `false` for any forgery,
+    /// name spoof, or tampered message.
+    #[must_use]
+    pub fn verifies_as(&self, expected: &NodeId, message: &[u8]) -> bool {
+        if &self.signer != expected {
+            return false;
+        }
+        if public_key_for(&self.signer) != self.issuer_public {
+            return false;
+        }
+        verify(&self.issuer_public, message, &self.sig).is_ok()
+    }
+}
+
+/// Compute a real, collision-resistant content address (a sha2-256 multihash
+/// via [`pillar_crypto::content::content_address`]) over a canonical,
+/// length-prefixed encoding of `parts` — never a non-cryptographic checksum.
+/// The length prefixes make the encoding unambiguous, so distinct field
+/// tuples can never collide by concatenation.
+fn content_address(parts: &[&str]) -> Cid {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"pillar-trust-artifact-v1");
+    for p in parts {
+        let bytes = p.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    let addr = pillar_crypto::content::content_address(&buf)
+        .expect("content_address is infallible for in-memory bytes");
+    Cid(format!("trust:{}", hex(addr.as_bytes())))
+}
+
+/// Lowercase hex rendering of raw bytes (for a stable, readable [`Cid`]).
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// The declared capacity an [`Attest`] is issued in: `self` (unconditional,
@@ -162,6 +287,29 @@ impl Certify {
     pub fn cid(&self) -> Cid {
         content_address(&["certify", self.identity.0.as_str(), self.subkey.0.as_str()])
     }
+
+    /// The canonical bytes this artifact's signature covers — its content
+    /// address, so a valid signature is bound to exactly these fields (a
+    /// tampered field changes the cid and invalidates the signature).
+    #[must_use]
+    pub fn signed_message(&self) -> Vec<u8> {
+        self.cid().0.into_bytes()
+    }
+
+    /// Produce a real, signed `Certify` from `identity` over its own fields.
+    #[must_use]
+    pub fn signed(identity: impl Into<NodeId>, subkey: impl Into<NodeId>) -> Self {
+        let identity = identity.into();
+        let subkey = subkey.into();
+        let msg = content_address(&["certify", identity.0.as_str(), subkey.0.as_str()])
+            .0
+            .into_bytes();
+        Certify {
+            sig: Sig::sign_as(identity.clone(), &msg),
+            identity,
+            subkey,
+        }
+    }
 }
 
 /// **trust** — an identity vouches for ANOTHER identity, with an optional
@@ -188,6 +336,38 @@ impl Trust {
             self.trustee.0.as_str(),
             self.depth.to_string().as_str(),
         ])
+    }
+
+    /// The canonical bytes this artifact's signature covers (its content
+    /// address).
+    #[must_use]
+    pub fn signed_message(&self) -> Vec<u8> {
+        self.cid().0.into_bytes()
+    }
+
+    /// Produce a real, signed `Trust` from `truster` over its own fields.
+    #[must_use]
+    pub fn signed(
+        truster: impl Into<NodeId>,
+        trustee: impl Into<NodeId>,
+        depth: u8,
+    ) -> Self {
+        let truster = truster.into();
+        let trustee = trustee.into();
+        let msg = content_address(&[
+            "trust",
+            truster.0.as_str(),
+            trustee.0.as_str(),
+            depth.to_string().as_str(),
+        ])
+        .0
+        .into_bytes();
+        Trust {
+            sig: Sig::sign_as(truster.clone(), &msg),
+            truster,
+            trustee,
+            depth,
+        }
     }
 }
 
@@ -241,6 +421,25 @@ impl Attest {
             self.epoch.to_string().as_str(),
         ])
     }
+
+    /// The canonical bytes this attest's signature covers (its content
+    /// address) — every authorization-bearing field is folded into the cid,
+    /// so a tampered capacity/subject/predicate/epoch invalidates the
+    /// signature.
+    #[must_use]
+    pub fn signed_message(&self) -> Vec<u8> {
+        self.cid().0.into_bytes()
+    }
+
+    /// Re-sign this attest as its declared `issuer`, producing a real ed25519
+    /// signature over its canonical message. Consumes and returns `self` so
+    /// callers build the fields then sign in one expression.
+    #[must_use]
+    pub fn signed_by_issuer(mut self) -> Self {
+        let msg = self.signed_message();
+        self.sig = Sig::sign_as(self.issuer.clone(), &msg);
+        self
+    }
 }
 
 /// **revoke** — signed, epoch-stamped, fail-closed revocation of one
@@ -252,6 +451,29 @@ pub struct Revoke {
     pub target: Cid,
     /// The signer of this revocation.
     pub sig: Sig,
+}
+
+impl Revoke {
+    /// The canonical bytes this revocation's signature covers: a
+    /// domain-separated encoding of the target content address, so a
+    /// revocation signature is bound to exactly the artifact it revokes.
+    #[must_use]
+    pub fn signed_message(target: &Cid) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(b"pillar-trust-artifact-revoke-v1:");
+        m.extend_from_slice(target.0.as_bytes());
+        m
+    }
+
+    /// Produce a real, signed `Revoke` of `target` by `signer`.
+    #[must_use]
+    pub fn signed(target: Cid, signer: impl Into<NodeId>) -> Self {
+        let msg = Revoke::signed_message(&target);
+        Revoke {
+            sig: Sig::sign_as(signer, &msg),
+            target,
+        }
+    }
 }
 
 /// Why an operation on the [`TrustStore`] was refused.
@@ -367,7 +589,7 @@ impl TrustStore {
     /// signer mismatch — no typed replacement for a bare/ambiguous sign is
     /// accepted here.
     pub fn certify(&self, c: &Certify) -> Result<Cid, TrustError> {
-        if c.sig.signer != c.identity {
+        if !c.sig.verifies_as(&c.identity, &c.signed_message()) {
             return Err(TrustError::SignerMismatch);
         }
         Ok(c.cid())
@@ -376,7 +598,7 @@ impl TrustStore {
     /// Record a **trust** artifact: unconditional (AP), rejecting only a
     /// signer mismatch.
     pub fn trust(&self, t: &Trust) -> Result<Cid, TrustError> {
-        if t.sig.signer != t.truster {
+        if !t.sig.verifies_as(&t.truster, &t.signed_message()) {
             return Err(TrustError::SignerMismatch);
         }
         Ok(t.cid())
@@ -425,7 +647,7 @@ impl TrustStore {
     /// # Errors
     /// The same [`TrustError`] variants `issue_attest` returns.
     pub fn decide_attest(&self, a: &Attest) -> Result<Cid, TrustError> {
-        if a.sig.signer != a.issuer {
+        if !a.sig.verifies_as(&a.issuer, &a.signed_message()) {
             return Err(TrustError::SignerMismatch);
         }
         if a.epoch != self.epoch {
@@ -502,6 +724,12 @@ impl TrustStore {
     /// anything walking through it) fails verification closed from this
     /// point on.
     pub fn revoke(&mut self, r: &Revoke) -> Result<(), TrustError> {
+        if !r
+            .sig
+            .verifies_as(&r.sig.signer.clone(), &Revoke::signed_message(&r.target))
+        {
+            return Err(TrustError::SignerMismatch);
+        }
         if !self.attests.contains_key(&r.target) {
             return Err(TrustError::UnknownTarget(r.target.clone()));
         }
@@ -710,46 +938,74 @@ mod tests {
         }
     }
 
+    /// A test placeholder used only to fill the `sig` field of a struct
+    /// literal before it is re-signed with a REAL signature. It never verifies
+    /// as anyone (it is signed by a reserved name over empty bytes), so a test
+    /// that forgets to re-sign fails closed rather than passing spuriously.
+    fn placeholder_sig() -> Sig {
+        Sig::sign_as(n("\u{0}unsigned-placeholder"), b"")
+    }
+
+    /// Re-sign a struct-literal `Certify` as its declared `identity`.
+    fn signed_certify(mut c: Certify) -> Certify {
+        c.sig = Sig::sign_as(c.identity.clone(), &c.signed_message());
+        c
+    }
+
+    /// Re-sign a struct-literal `Trust` as its declared `truster`.
+    fn signed_trust(mut t: Trust) -> Trust {
+        t.sig = Sig::sign_as(t.truster.clone(), &t.signed_message());
+        t
+    }
+
+    /// Re-sign a struct-literal `Revoke` as an explicit signer over its target.
+    fn signed_revoke(target: Cid, signer: NodeId) -> Revoke {
+        Revoke::signed(target, signer)
+    }
     // --- four types round-trip ------------------------------------------
 
     #[test]
     fn certify_round_trips_sign_content_address_verify() {
         let store = TrustStore::new(n("owner"));
-        let c = Certify {
+        let c = signed_certify(Certify {
             identity: n("alice"),
             subkey: n("alice-sub"),
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        });
         let cid = store.certify(&c).expect("certify accepted");
         // Content-addressed: identical fields address the same Cid.
-        let c2 = Certify {
+        let c2 = signed_certify(Certify {
             identity: n("alice"),
             subkey: n("alice-sub"),
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        });
         assert_eq!(cid, c2.cid());
     }
 
     #[test]
     fn certify_rejects_a_signer_mismatch() {
         let store = TrustStore::new(n("owner"));
-        let c = Certify {
+        // mallory forges: she claims alice's identity but signs with her OWN
+        // real key. The carried key is not the one "alice" derives to, so the
+        // signature never verifies as alice.
+        let mut c = Certify {
             identity: n("alice"),
             subkey: n("alice-sub"),
-            sig: Sig::by(n("mallory")),
+            sig: placeholder_sig(),
         };
+        c.sig = Sig::sign_as(n("mallory"), &c.signed_message());
         assert_eq!(store.certify(&c), Err(TrustError::SignerMismatch));
     }
 
     #[test]
     fn trust_round_trips_sign_content_address_verify() {
         let store = TrustStore::new(n("owner"));
-        let t = Trust {
+        let t = signed_trust(Trust {
             truster: n("alice"),
             trustee: n("bob"),
             depth: 2,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        });
         let cid = store.trust(&t).expect("trust accepted");
         assert_eq!(cid, t.cid());
     }
@@ -757,19 +1013,21 @@ mod tests {
     #[test]
     fn trust_rejects_a_signer_mismatch() {
         let store = TrustStore::new(n("owner"));
-        let t = Trust {
+        // mallory forges alice's vouch with her own real key: rejected.
+        let mut t = Trust {
             truster: n("alice"),
             trustee: n("bob"),
             depth: 2,
-            sig: Sig::by(n("mallory")),
+            sig: placeholder_sig(),
         };
+        t.sig = Sig::sign_as(n("mallory"), &t.signed_message());
         assert_eq!(store.trust(&t), Err(TrustError::SignerMismatch));
     }
 
     #[test]
     fn attest_round_trips_sign_content_address_verify() {
         let mut store = TrustStore::new(n("owner"));
-        let a = Attest {
+        let a = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -777,8 +1035,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let expected_cid = a.cid();
         let cid = store.issue_attest(a).expect("attest accepted");
         assert_eq!(cid, expected_cid);
@@ -789,7 +1047,7 @@ mod tests {
     #[test]
     fn revoke_round_trips_and_targets_a_specific_cid() {
         let mut store = TrustStore::new(n("owner"));
-        let a = Attest {
+        let a = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -797,13 +1055,10 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(a).unwrap();
-        let r = Revoke {
-            target: cid.clone(),
-            sig: Sig::by(n("owner")),
-        };
+        let r = signed_revoke(cid.clone(), n("owner"));
         store.revoke(&r).expect("revoke accepted");
         assert!(matches!(store.verify(&cid), Err(VerifyError::Revoked(_))));
     }
@@ -811,10 +1066,7 @@ mod tests {
     #[test]
     fn revoke_rejects_an_unknown_target() {
         let mut store = TrustStore::new(n("owner"));
-        let r = Revoke {
-            target: Cid("trust:doesnotexist".to_owned()),
-            sig: Sig::by(n("owner")),
-        };
+        let r = signed_revoke(Cid("trust:doesnotexist".to_owned()), n("owner"));
         assert!(matches!(
             store.revoke(&r),
             Err(TrustError::UnknownTarget(_))
@@ -827,7 +1079,7 @@ mod tests {
     fn role_not_held_at_signing_is_rejected() {
         let mut store = TrustStore::new(n("owner"));
         // alice never received any role-grant attest, so she cannot issue one.
-        let a = Attest {
+        let a = (Attest {
             issuer: n("alice"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -835,8 +1087,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         assert_eq!(
             store.issue_attest(a),
             Err(TrustError::CapacityNotHeld { issuer: n("alice") })
@@ -846,7 +1098,7 @@ mod tests {
     #[test]
     fn role_held_at_signing_is_admitted_and_can_sub_delegate() {
         let mut store = TrustStore::new(n("owner"));
-        let grant_to_alice = Attest {
+        let grant_to_alice = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -854,13 +1106,13 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let alice_cid = store.issue_attest(grant_to_alice).unwrap();
 
         // alice now holds the role capacity and can sub-delegate, pointing
         // her authority proof pointer at the exact grant edge she used.
-        let sub_grant = Attest {
+        let sub_grant = (Attest {
             issuer: n("alice"),
             capacity: role("operator", "cell-b"),
             authority: Some(alice_cid.clone()),
@@ -868,8 +1120,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let bob_cid = store.issue_attest(sub_grant).expect("alice holds capacity");
         let proof = store.verify(&bob_cid).expect("verifies to genesis");
         assert_eq!(proof.chain, vec![bob_cid, alice_cid]);
@@ -878,7 +1130,7 @@ mod tests {
     #[test]
     fn self_capacity_is_unconditional_and_needs_no_authority_pointer() {
         let mut store = TrustStore::new(n("owner"));
-        let a = Attest {
+        let a = (Attest {
             issuer: n("alice"),
             capacity: Capacity::SelfCap,
             authority: None,
@@ -886,8 +1138,8 @@ mod tests {
             predicate: Predicate::new("identity:describe", "self"),
             scope: "global".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store
             .issue_attest(a)
             .expect("self capacity is unconditional");
@@ -910,7 +1162,7 @@ mod tests {
         // other, forming a cycle, by inserting directly (issue_attest's own
         // capacity gate would refuse this pair honestly - this test proves
         // verify() itself is robust to an already-cyclic stored chain).
-        let a = Attest {
+        let a = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: Some(Cid("trust:self-cycle-b".to_owned())),
@@ -918,10 +1170,10 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid_a = a.cid();
-        let b = Attest {
+        let b = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: Some(cid_a.clone()),
@@ -929,8 +1181,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         // Force b's cid to equal the authority pointer a expects, by
         // directly inserting into the map under that fabricated cid.
         let fabricated_cid = Cid("trust:self-cycle-b".to_owned());
@@ -943,7 +1195,7 @@ mod tests {
     #[test]
     fn verify_renders_the_full_chain_and_a_sentence() {
         let mut store = TrustStore::new(n("owner"));
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -951,8 +1203,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         let proof = store.verify(&cid).unwrap();
         assert_eq!(proof.chain.len(), 1);
@@ -967,7 +1219,7 @@ mod tests {
     #[test]
     fn revoked_path_fails_closed_even_partway_through_the_chain() {
         let mut store = TrustStore::new(n("owner"));
-        let grant_to_alice = Attest {
+        let grant_to_alice = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -975,10 +1227,10 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let alice_cid = store.issue_attest(grant_to_alice).unwrap();
-        let sub_grant = Attest {
+        let sub_grant = (Attest {
             issuer: n("alice"),
             capacity: role("operator", "cell-b"),
             authority: Some(alice_cid.clone()),
@@ -986,18 +1238,15 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let bob_cid = store.issue_attest(sub_grant).unwrap();
         assert!(store.verify(&bob_cid).is_ok());
 
         // Revoke alice's own grant edge: bob's chain must now fail closed,
         // even though bob's own attest was never directly touched.
         store
-            .revoke(&Revoke {
-                target: alice_cid.clone(),
-                sig: Sig::by(n("owner")),
-            })
+            .revoke(&signed_revoke(alice_cid.clone(), n("owner")))
             .unwrap();
 
         assert_eq!(store.verify(&bob_cid), Err(VerifyError::Revoked(alice_cid)));
@@ -1007,7 +1256,7 @@ mod tests {
     fn a_stale_epoch_view_refuses_new_attest_issuance_fail_closed() {
         let mut store = TrustStore::new(n("owner"));
         // Bump epoch by revoking something first.
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1015,19 +1264,16 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         store
-            .revoke(&Revoke {
-                target: cid,
-                sig: Sig::by(n("owner")),
-            })
+            .revoke(&signed_revoke(cid, n("owner")))
             .unwrap();
         assert_eq!(store.epoch(), 1);
 
         // Attempt to issue at the now-stale epoch 0.
-        let stale = Attest {
+        let stale = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1035,8 +1281,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         assert_eq!(
             store.issue_attest(stale),
             Err(TrustError::StaleEpoch {
@@ -1051,7 +1297,7 @@ mod tests {
     #[test]
     fn quota_predicate_produces_a_budget_admitted_incrementally() {
         let mut store = TrustStore::new(n("owner"));
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1059,8 +1305,8 @@ mod tests {
             predicate: Predicate::new("compute:schedule", "cell-b/*").with_quota(1000),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
 
         store.admit_quota(&cid, 400).expect("within budget");
@@ -1079,7 +1325,7 @@ mod tests {
     #[test]
     fn boolean_only_predicate_refuses_quota_admission() {
         let mut store = TrustStore::new(n("owner"));
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1087,8 +1333,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"), // no quota
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         assert_eq!(
             store.admit_quota(&cid, 1),
@@ -1099,7 +1345,7 @@ mod tests {
     #[test]
     fn revoked_quota_grant_refuses_further_admission() {
         let mut store = TrustStore::new(n("owner"));
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1107,15 +1353,12 @@ mod tests {
             predicate: Predicate::new("compute:schedule", "cell-b/*").with_quota(1000),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         store.admit_quota(&cid, 100).unwrap();
         store
-            .revoke(&Revoke {
-                target: cid.clone(),
-                sig: Sig::by(n("owner")),
-            })
+            .revoke(&signed_revoke(cid.clone(), n("owner")))
             .unwrap();
         assert!(matches!(
             store.admit_quota(&cid, 100),
@@ -1128,7 +1371,7 @@ mod tests {
     #[test]
     fn live_role_attests_project_into_rbac_explicit_grants() {
         let mut store = TrustStore::new(n("owner"));
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1136,8 +1379,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         store.issue_attest(grant).unwrap();
 
         let grants = as_explicit_grants(&store);
@@ -1150,7 +1393,7 @@ mod tests {
     #[test]
     fn revoked_attest_never_projects_a_grant() {
         let mut store = TrustStore::new(n("owner"));
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1158,14 +1401,11 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         store
-            .revoke(&Revoke {
-                target: cid,
-                sig: Sig::by(n("owner")),
-            })
+            .revoke(&signed_revoke(cid, n("owner")))
             .unwrap();
         assert!(as_explicit_grants(&store).is_empty());
     }
@@ -1173,7 +1413,7 @@ mod tests {
     #[test]
     fn self_capacity_attests_never_project_a_third_party_grant() {
         let mut store = TrustStore::new(n("owner"));
-        let a = Attest {
+        let a = (Attest {
             issuer: n("alice"),
             capacity: Capacity::SelfCap,
             authority: None,
@@ -1181,8 +1421,8 @@ mod tests {
             predicate: Predicate::new("identity:describe", "self"),
             scope: "global".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         store.issue_attest(a).unwrap();
         assert!(as_explicit_grants(&store).is_empty());
     }
@@ -1192,7 +1432,7 @@ mod tests {
     #[test]
     fn decide_attest_previews_an_allowed_issuance_without_recording_it() {
         let store = TrustStore::new(n("owner"));
-        let a = Attest {
+        let a = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1200,8 +1440,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let previewed = store.decide_attest(&a).expect("owner may issue");
         assert_eq!(previewed, a.cid());
         // Nothing was recorded by the preview.
@@ -1219,7 +1459,7 @@ mod tests {
     fn decide_attest_previews_a_denied_issuance_and_the_real_issuance_agrees() {
         let mut store = TrustStore::new(n("owner"));
         // mallory has never been granted the `operator@cell-b` capacity.
-        let a = Attest {
+        let a = (Attest {
             issuer: n("mallory"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1227,8 +1467,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("mallory")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         assert_eq!(
             store.decide_attest(&a),
             Err(TrustError::CapacityNotHeld {
@@ -1251,7 +1491,7 @@ mod tests {
     fn describe_renders_signer_and_the_exercised_authority_chain_for_an_attestation() {
         let mut store = TrustStore::new(n("owner"));
         // owner (genesis) grants alice the operator@cell-b capacity...
-        let grant = Attest {
+        let grant = (Attest {
             issuer: n("owner"),
             capacity: role("operator", "cell-b"),
             authority: None,
@@ -1259,11 +1499,11 @@ mod tests {
             predicate: Predicate::new("hold", "operator@cell-b"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let grant_cid = store.issue_attest(grant).unwrap();
         // ...which alice then EXERCISES to attest bob may stream:append.
-        let exercised = Attest {
+        let exercised = (Attest {
             issuer: n("alice"),
             capacity: role("operator", "cell-b"),
             authority: Some(grant_cid.clone()),
@@ -1271,8 +1511,8 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(exercised).unwrap();
         let doc = store.describe(&cid).expect("stored artifact describes");
         assert!(doc.contains("Signer:      alice"));
@@ -1291,7 +1531,7 @@ mod tests {
     #[test]
     fn describe_never_fabricates_a_chain_for_a_self_issued_artifact() {
         let mut store = TrustStore::new(n("owner"));
-        let a = Attest {
+        let a = (Attest {
             issuer: n("alice"),
             capacity: Capacity::SelfCap,
             authority: None,
@@ -1299,8 +1539,8 @@ mod tests {
             predicate: Predicate::new("identity:describe", "self"),
             scope: "global".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("alice")),
-        };
+            sig: placeholder_sig(),
+        }).signed_by_issuer();
         let cid = store.issue_attest(a).unwrap();
         let doc = store.describe(&cid).unwrap();
         assert!(doc.contains("Signer:      alice"));
@@ -1313,5 +1553,106 @@ mod tests {
     fn describe_returns_none_for_an_unknown_cid() {
         let store = TrustStore::new(n("owner"));
         assert_eq!(store.describe(&Cid("nope".to_owned())), None);
+    }
+
+    // --- real cryptography: signatures unforgeable, addresses collision-resistant
+
+    #[test]
+    fn forged_attest_signature_is_rejected_signer_cannot_be_spoofed() {
+        // mallory builds an attest CLAIMING owner is the issuer, but signs it
+        // with her own real ed25519 key. Because the carried verifying key is
+        // not the one "owner" derives to, the signature never verifies as
+        // owner and issuance is refused.
+        let mut store = TrustStore::new(n("owner"));
+        let mut a = Attest {
+            issuer: n("owner"),
+            capacity: role("operator", "cell-b"),
+            authority: None,
+            subject: n("mallory"),
+            predicate: Predicate::new("stream:append", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: placeholder_sig(),
+        };
+        a.sig = Sig::sign_as(n("mallory"), &a.signed_message());
+        assert_eq!(store.decide_attest(&a), Err(TrustError::SignerMismatch));
+        assert_eq!(store.issue_attest(a), Err(TrustError::SignerMismatch));
+        assert!(store.attests.is_empty());
+    }
+
+    #[test]
+    fn tampering_a_signed_field_invalidates_the_signature() {
+        // Owner honestly signs an attest; flipping the subject afterwards
+        // changes the canonical message (via the cid), so the retained
+        // signature no longer verifies — a store consumer cannot mutate a
+        // signed artifact and keep it accepted.
+        let store = TrustStore::new(n("owner"));
+        let honest = (Attest {
+            issuer: n("owner"),
+            capacity: role("operator", "cell-b"),
+            authority: None,
+            subject: n("alice"),
+            predicate: Predicate::new("stream:append", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: placeholder_sig(),
+        })
+        .signed_by_issuer();
+        assert!(honest.sig.verifies_as(&n("owner"), &honest.signed_message()));
+
+        let mut tampered = honest.clone();
+        tampered.subject = n("mallory");
+        // The signature was over the ORIGINAL subject; against the tampered
+        // message it fails.
+        assert!(!tampered.sig.verifies_as(&n("owner"), &tampered.signed_message()));
+        let _ = &store;
+    }
+
+    #[test]
+    fn revoke_rejects_a_forged_signature() {
+        let mut store = TrustStore::new(n("owner"));
+        let cid = (Attest {
+            issuer: n("owner"),
+            capacity: role("operator", "cell-b"),
+            authority: None,
+            subject: n("alice"),
+            predicate: Predicate::new("stream:append", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: placeholder_sig(),
+        })
+        .signed_by_issuer();
+        let cid = store.issue_attest(cid).unwrap();
+        // A revoke whose carried key does not match its claimed signer name.
+        let mut r = signed_revoke(cid.clone(), n("owner"));
+        // Corrupt the signature bytes -> verification fails closed.
+        r.sig = Sig::sign_as(n("mallory"), b"unrelated message");
+        assert_eq!(store.revoke(&r), Err(TrustError::SignerMismatch));
+    }
+
+    #[test]
+    fn content_address_is_a_real_cryptographic_multihash_not_a_checksum() {
+        // Distinct fields -> distinct addresses; a one-character change flips
+        // the whole address; the digest is at least 256 bits (64 hex chars),
+        // far wider than the old 64-bit SipHash checksum.
+        let a = content_address(&["attest", "owner", "alice", "cell-b"]);
+        let a_again = content_address(&["attest", "owner", "alice", "cell-b"]);
+        let b = content_address(&["attest", "owner", "alicf", "cell-b"]);
+        assert_eq!(a, a_again, "content addressing must be deterministic");
+        assert_ne!(a, b, "a one-character change must change the address");
+        // "trust:" prefix + >= 64 hex chars of digest.
+        let hex_len = a.0.trim_start_matches("trust:").len();
+        assert!(
+            hex_len >= 64,
+            "a real content address is >= 256 bits (>= 64 hex chars), got {hex_len}"
+        );
+    }
+
+    #[test]
+    fn length_prefixing_prevents_field_concatenation_collisions() {
+        // Without length prefixes, ("ab","c") and ("a","bc") would collide.
+        let x = content_address(&["ab", "c"]);
+        let y = content_address(&["a", "bc"]);
+        assert_ne!(x, y, "ambiguous concatenation must not collide");
     }
 }

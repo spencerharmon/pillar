@@ -372,8 +372,9 @@ mod tests {
             predicate: Predicate::new("topology:sign", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: store.epoch(),
-            sig: Sig::by(n("owner")),
-        };
+            sig: Sig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
         let grant_cid = store.issue_attest(grant).unwrap();
         let a = Assignment::attested(
             authority.clone(),

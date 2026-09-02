@@ -806,8 +806,10 @@ impl WebAuthContext {
             predicate,
             scope: scope.to_owned(),
             epoch,
-            sig: TrustSig::by(issuer),
-        };
+            sig: TrustSig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
+        let _ = &issuer;
         let cid = self.trust.issue_attest(attest)?;
         let proof = self
             .trust
@@ -892,8 +894,10 @@ impl WebAuthContext {
             predicate: Predicate::new(TOPOLOGY_ATTEST_ACTION, label.resource()),
             scope: scope.to_owned(),
             epoch,
-            sig: TrustSig::by(issuer),
-        };
+            sig: TrustSig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
+        let _ = &issuer;
         let cid = self.trust.issue_attest(attest.clone())?;
         let assignment = TopologyAssignment::Attested {
             attest: Box::new(attest),

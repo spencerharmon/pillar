@@ -264,17 +264,17 @@ impl Assignment {
         scope: impl Into<String>,
         epoch: u64,
     ) -> Assignment {
-        let authority = authority.into();
         let attest = Attest {
-            issuer: authority.clone(),
+            issuer: authority.into(),
             capacity,
             authority: authority_proof,
             subject: node.into(),
             predicate: Predicate::new(ATTEST_ACTION, label.resource()),
             scope: scope.into(),
             epoch,
-            sig: pillar_trust_artifacts::Sig::by(authority),
-        };
+            sig: pillar_trust_artifacts::Sig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
         let cid = attest.cid();
         Assignment::Attested {
             attest: Box::new(attest),
@@ -730,8 +730,9 @@ mod tests {
             predicate: Predicate::new("topology:sign", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: store.epoch(),
-            sig: Sig::by(n("owner")),
-        };
+            sig: Sig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
         let grant_cid = store.issue_attest(grant).unwrap();
         let a = Assignment::attested(
             authority.clone(),

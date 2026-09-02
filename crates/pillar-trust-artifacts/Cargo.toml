@@ -11,6 +11,7 @@ description = "Four distinct content-addressed signed trust artifacts (certify/t
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-rbac = { path = "../pillar-rbac" }
+sha2 = "0.10"
 
 [lints]
 workspace = true

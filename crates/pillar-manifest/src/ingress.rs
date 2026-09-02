@@ -443,8 +443,9 @@ mod tests {
             predicate: Predicate::new(ATTACH_ACTION, frontend),
             scope: "default".to_owned(),
             epoch: store.epoch(),
-            sig: Sig::by(genesis.clone()),
-        };
+            sig: Sig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
         store.issue_attest(attest).expect("grant issues");
     }
 
@@ -535,10 +536,7 @@ mod tests {
             .expect("edge present")
             .cid;
         store
-            .revoke(&pillar_trust_artifacts::Revoke {
-                target: cid,
-                sig: Sig::by(genesis),
-            })
+            .revoke(&pillar_trust_artifacts::Revoke::signed(cid, genesis))
             .expect("revoke succeeds");
         let table2 = derive_routing_table(&[frontend], &[route], &store);
         assert_eq!(table2.status_of("r1"), Some(&RouteStatus::Refused));

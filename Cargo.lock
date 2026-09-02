@@ -2797,6 +2797,7 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-rbac",
+ "sha2",
 ]
 
 [[package]]

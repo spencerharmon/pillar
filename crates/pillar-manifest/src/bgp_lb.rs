@@ -235,16 +235,19 @@ mod tests {
         let mut store = TrustStore::new(genesis.clone());
         let app = NodeId::from("app-a");
         store
-            .issue_attest(Attest {
-                issuer: genesis.clone(),
-                capacity: Capacity::SelfCap,
-                authority: None,
-                subject: app.clone(),
-                predicate: Predicate::new(ATTACH_ACTION, "edge"),
-                scope: "default".to_owned(),
-                epoch: store.epoch(),
-                sig: Sig::by(genesis),
-            })
+            .issue_attest(
+                Attest {
+                    issuer: genesis.clone(),
+                    capacity: Capacity::SelfCap,
+                    authority: None,
+                    subject: app.clone(),
+                    predicate: Predicate::new(ATTACH_ACTION, "edge"),
+                    scope: "default".to_owned(),
+                    epoch: store.epoch(),
+                    sig: Sig::sign_as(NodeId::from(""), b""),
+                }
+                .signed_by_issuer(),
+            )
             .expect("grant issues");
         let route = Route::new("r1", app, "edge", RouteKind::Udp);
         let table = derive_routing_table(&[fe()], &[route], &store);
