@@ -133,4 +133,8 @@ pub enum CustodyKind {
     Tpm,
     /// Unlocked via a passkey / WebAuthn authenticator (e.g. PRF extension).
     Passkey,
+    /// Held by a PKCS#11 hardware security module / smart card (YubiHSM,
+    /// Nitrokey HSM, SoftHSM, cloud HSM, PIV smart card, …): the HSM decrypts
+    /// the wrapped sealing secret with a key that never leaves the device.
+    Pkcs11,
 }

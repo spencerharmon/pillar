@@ -9,19 +9,70 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: fmt / clippy / test
+  # Formatting only — rustfmt parses, it does not compile, so this needs no
+  # system libraries and stays on the pinned stable toolchain the repo is
+  # formatted against (keeping the formatting contract stable regardless of the
+  # nixpkgs rust version the compile jobs below pull).
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --all -- --check
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Clippy + tests compile the whole workspace, including the hardware custody
+  # backends, so they need the native libraries those crates link:
+  #   * tpm2-tss    — TpmCustody via tss-esapi (+ tss-esapi-sys bindgen)
+  #   * hidapi/libusb — PasskeyCustody via ctap-hid-fido2 (vendored hidapi build)
+  #   * clang/libclang — bindgen build scripts (tss-esapi-sys, cryptoki-sys)
+  #   * pkg-config/gcc/binutils — native build + link
+  # Provided by a nixery shell image. git lets us check out without a node.js
+  # runtime (the shell image has none, so actions/checkout can't run).
+  check:
+    name: clippy / test
+    runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/git/gcc/binutils/pkg-config/cargo/rustc/clippy/clang/tpm2-tss/hidapi/libusb1/systemdLibs/openssl
+    env:
+      # The nixery shell image has no /etc/passwd entry or writable /root for
+      # the runner uid; point HOME at a dir Actions provisions writable.
+      HOME: /github/home
+    steps:
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          # actions/checkout needs a node runtime this image lacks; bare-clone
+          # instead. github's git-over-HTTP wants the token as the basic-auth
+          # password, so embed it as x-access-token in the URL.
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Locate native build inputs
+        run: |
+          set -euo pipefail
+          # A bare nixery container does not run nix setup-hooks, so the bindgen
+          # build scripts won't find libclang and pkg-config won't find the
+          # nix-provided .pc files unless we point them explicitly.
+          libclang_so="$(find /nix/store -name 'libclang.so*' 2>/dev/null | head -1)"
+          if [ -z "$libclang_so" ]; then echo "libclang not found in image" >&2; exit 1; fi
+          echo "LIBCLANG_PATH=$(dirname "$libclang_so")" >> "$GITHUB_ENV"
+          pc="$(find /nix/store -type d -name pkgconfig 2>/dev/null | paste -sd: -)"
+          echo "PKG_CONFIG_PATH=${pc}" >> "$GITHUB_ENV"
+          # tss-esapi-sys / cryptoki-sys link the shared libs at test-run time.
+          libdirs="$(find /nix/store -type d -name lib 2>/dev/null | paste -sd: -)"
+          echo "LD_LIBRARY_PATH=${libdirs}" >> "$GITHUB_ENV"
+
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: test
         run: cargo test --all
 

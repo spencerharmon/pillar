@@ -29,7 +29,7 @@ fn node_unlocks_cell_key_and_user_key() {
 
     // (a) a cell group key sealed to the node.
     let group = group_key_from_seed(&seed("cellA-group")).expect("group");
-    let sealed_group = distribute_group_key(&group, &[node_pub.sealing.clone()]).expect("seal cell key");
+    let sealed_group = distribute_group_key(&group, std::slice::from_ref(&node_pub.sealing)).expect("seal cell key");
     assert_eq!(
         recover_group_key(&sealed_group, &node_sec.sealing),
         Ok(group),
