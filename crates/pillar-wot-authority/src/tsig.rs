@@ -26,6 +26,9 @@
 
 #![forbid(unsafe_code)]
 
+use pillar_crypto::sign::verify as crypto_verify;
+use pillar_crypto::{Signature as CryptoSignature, SigningPublicKey};
+
 /// A parsed OpenPGP Trust Signature subpacket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrustSignature {
@@ -60,6 +63,11 @@ pub enum TsigError {
         /// The amount actually presented.
         amount: u8,
     },
+    /// The claimed signer's ed25519 signature over the signed material did
+    /// not verify against `signer`'s real public key — a forged or corrupted
+    /// certification. Real cryptographic verification (`pillar_crypto::sign`,
+    /// ed25519), never a placeholder hash/XOR check.
+    SignatureVerificationFailed,
 }
 
 /// One decoded (type, body) subpacket from a hashed subpacket area.
@@ -141,9 +149,41 @@ pub fn parse_trust_signature(data: &[u8]) -> Result<TrustSignature, TsigError> {
     Ok(TrustSignature { level, amount })
 }
 
+/// Verify a certification's real ed25519 signature against the claimed
+/// signer's public key, then extract and enforce its Trust Signature.
+///
+/// This is the actual entry point a caller must use for a certification
+/// received from the wire: unlike [`parse_trust_signature`] (which trusts its
+/// caller to have already verified the signature — used internally by tests
+/// and by callers that verify through a different path), this function
+/// performs the cryptographic verification itself, via
+/// `pillar_crypto::sign::verify` (real ed25519, never a placeholder
+/// hash/XOR check). `signed_material` is the exact bytes the signature was
+/// computed over (per RFC 9580 §5.2.4: the hashed packet content, salt, and
+/// trailer); `hashed_subpacket_area` is the hashed subpacket area within it
+/// from which the Trust Signature subpacket is decoded.
+///
+/// # Errors
+///
+/// [`TsigError::SignatureVerificationFailed`] if `signature` does not verify
+/// against `signer` over `signed_material`; otherwise the same errors as
+/// [`parse_trust_signature`].
+pub fn verify_and_parse_trust_signature(
+    signer: &SigningPublicKey,
+    signed_material: &[u8],
+    signature: &CryptoSignature,
+    hashed_subpacket_area: &[u8],
+) -> Result<TrustSignature, TsigError> {
+    crypto_verify(signer, signed_material, signature)
+        .map_err(|_| TsigError::SignatureVerificationFailed)?;
+    parse_trust_signature(hashed_subpacket_area)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pillar_crypto::sign::{sign, signing_keypair_from_seed};
+    use pillar_crypto::Seed;
 
     /// Encode a single Trust Signature subpacket (short-form length header).
     fn tsig_subpacket(level: u8, amount: u8) -> Vec<u8> {
@@ -234,6 +274,77 @@ mod tests {
                 level: 1,
                 amount: 120
             }
+        );
+    }
+
+    // --- verify_and_parse_trust_signature: real ed25519, not a placeholder --
+
+    #[test]
+    fn genuine_ed25519_certification_verifies_and_yields_its_tsig() {
+        // Real cryptography end to end: an actual ed25519 keypair signs the
+        // real certification material, and only a signature that genuinely
+        // verifies against the claimed signer's public key ever yields a
+        // usable Trust Signature.
+        let seed = Seed::from_bytes(b"pillar-wot-authority/tsig-test/alice".to_vec());
+        let (signer_pk, signer_sk) = signing_keypair_from_seed(&seed).expect("keygen");
+
+        let area = tsig_subpacket(2, 120);
+        let signed_material = b"cert: alice-primary certifies bob-subkey; hashed-area follows";
+        let signature = sign(&signer_sk, signed_material).expect("sign");
+
+        let tsig =
+            verify_and_parse_trust_signature(&signer_pk, signed_material, &signature, &area)
+                .expect("genuine signature must verify and parse");
+        assert_eq!(
+            tsig,
+            TrustSignature {
+                level: 2,
+                amount: 120
+            }
+        );
+    }
+
+    #[test]
+    fn forged_signature_never_yields_a_trust_signature() {
+        // A signature from a DIFFERENT key (or over different material) must
+        // never be accepted -- exactly the asymmetry a real signature scheme
+        // (and not a hash/XOR placeholder) guarantees.
+        let alice_seed = Seed::from_bytes(b"pillar-wot-authority/tsig-test/alice".to_vec());
+        let mallory_seed = Seed::from_bytes(b"pillar-wot-authority/tsig-test/mallory".to_vec());
+        let (alice_pk, _) = signing_keypair_from_seed(&alice_seed).expect("keygen");
+        let (_, mallory_sk) = signing_keypair_from_seed(&mallory_seed).expect("keygen");
+
+        let area = tsig_subpacket(2, 120);
+        let signed_material = b"cert: alice-primary certifies bob-subkey; hashed-area follows";
+        // Mallory signs the same material, but the caller claims it came
+        // from alice -- verification against alice's real public key must
+        // fail.
+        let forged_signature = sign(&mallory_sk, signed_material).expect("sign");
+
+        assert_eq!(
+            verify_and_parse_trust_signature(
+                &alice_pk,
+                signed_material,
+                &forged_signature,
+                &area
+            ),
+            Err(TsigError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tampered_signed_material_never_yields_a_trust_signature() {
+        let seed = Seed::from_bytes(b"pillar-wot-authority/tsig-test/alice".to_vec());
+        let (signer_pk, signer_sk) = signing_keypair_from_seed(&seed).expect("keygen");
+
+        let area = tsig_subpacket(2, 120);
+        let original = b"cert: alice-primary certifies bob-subkey; hashed-area follows";
+        let signature = sign(&signer_sk, original).expect("sign");
+
+        let tampered = b"cert: alice-primary certifies carol-subkey; hashed-area follows";
+        assert_eq!(
+            verify_and_parse_trust_signature(&signer_pk, tampered, &signature, &area),
+            Err(TsigError::SignatureVerificationFailed)
         );
     }
 }
