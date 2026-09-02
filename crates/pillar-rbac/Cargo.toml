@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Single pure RBAC decider over the local materialized view: precedence lattice (explicit-deny > explicit-allow > WoT-depth-default > deny-all), used identically for controller enforcement and UI-predicted outcome."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 

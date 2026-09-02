@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "libp2p transport substrate for Pillar: gossipsub event log, Kademlia discovery, relay/dcutr NAT traversal."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 libp2p = { version = "0.56", features = [
     "gossipsub",
     "kad",

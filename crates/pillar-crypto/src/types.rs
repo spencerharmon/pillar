@@ -85,6 +85,11 @@ bytes_newtype!(
     ContentId
 );
 bytes_newtype!(
+    /// A cell identifier. Binds a user subkey certificate to the cell it is
+    /// valid in (see [`crate::user::certify_subkey`]).
+    CellId
+);
+bytes_newtype!(
     /// Deterministic seed material used to derive a keypair in tests and in
     /// reproducible key generation. Real generation may draw from an OS CSPRNG
     /// instead; this exists so keypairs are reproducible from a fixture.

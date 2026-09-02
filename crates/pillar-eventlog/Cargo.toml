@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "PGP-signed hash-linked event DAG over the content-addressed store: the Rust refinement of specs/EventDAG.tla."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 serde = { version = "1", features = ["derive"] }

@@ -42,15 +42,20 @@ mod error;
 mod types;
 
 pub mod aead;
+pub mod cell;
 pub mod content;
 pub mod custody;
 pub mod kdf;
+pub mod node;
+pub mod principal;
 pub mod seal;
 pub mod sign;
+pub mod user;
 
 pub use error::{CryptoError, Result};
+pub use principal::{PrincipalPublic, PrincipalSecret};
 pub use types::{
-    Ciphertext, ContentId, CustodyKind, KdfParams, Password, Salt, SealedEnvelope,
+    Ciphertext, CellId, ContentId, CustodyKind, KdfParams, Password, Salt, SealedEnvelope,
     SealingPublicKey, SealingSecretKey, Seed, Signature, SigningPublicKey, SigningSecretKey,
     SymmetricKey,
 };

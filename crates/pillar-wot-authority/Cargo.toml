@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Web-of-trust authority: tsig parsing, owner-anchored bounded-depth reachability, and revoke-before-act, refining specs/WoTAuthority.tla."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 
 [lints]

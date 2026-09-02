@@ -2193,6 +2193,7 @@ name = "pillar-bootstrap"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-identity",
  "pillar-rbac",
  "pillar-wot-authority",
@@ -2203,6 +2204,7 @@ name = "pillar-cells"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-key-distribution",
 ]
 
@@ -2259,6 +2261,9 @@ dependencies = [
 [[package]]
 name = "pillar-core"
 version = "0.0.0"
+dependencies = [
+ "pillar-crypto",
+]
 
 [[package]]
 name = "pillar-crypto"
@@ -2269,6 +2274,7 @@ name = "pillar-eventlog"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-streamdb",
  "serde",
 ]
@@ -2278,6 +2284,7 @@ name = "pillar-identity"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
 ]
 
 [[package]]
@@ -2295,6 +2302,7 @@ name = "pillar-key-distribution"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-net",
 ]
 
@@ -2303,6 +2311,7 @@ name = "pillar-manifest"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-streamdb",
  "pillar-topology",
  "pillar-trust-artifacts",
@@ -2315,6 +2324,7 @@ dependencies = [
  "futures",
  "libp2p",
  "pillar-core",
+ "pillar-crypto",
  "pillar-eventlog",
  "pillar-ipam",
  "pillar-streamdb",
@@ -2350,6 +2360,7 @@ name = "pillar-rbac"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-wot-authority",
 ]
 
@@ -2358,6 +2369,7 @@ name = "pillar-recovery"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-key-distribution",
  "pillar-net",
  "pillar-rbac",
@@ -2370,6 +2382,7 @@ name = "pillar-streamdb"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
 ]
 
 [[package]]
@@ -2385,6 +2398,7 @@ name = "pillar-trust-artifacts"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-rbac",
 ]
 
@@ -2394,6 +2408,7 @@ version = "0.0.0"
 dependencies = [
  "pillar-bootstrap",
  "pillar-core",
+ "pillar-crypto",
  "pillar-identity",
  "pillar-manifest",
  "pillar-rbac",
@@ -2405,6 +2420,7 @@ name = "pillar-wot-authority"
 version = "0.0.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
 ]
 
 [[package]]

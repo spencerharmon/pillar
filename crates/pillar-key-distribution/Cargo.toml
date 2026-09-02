@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "L0 sealed-artifact envelope, L1 offer/accept event-sourced admission, L2 tag-based policy auto-distribution, cross-owner(-cell) confirmation gate, and OPAQUE-shaped escrow: the Rust refinement of specs/KeyDistribution.tla."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-net = { path = "../pillar-net" }
 

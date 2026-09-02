@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Cells & confidentiality: per-object visibility classes (public / cell-encrypted / recipient-sealed at per-node/per-cell/per-user scope) enforced by a single decider, offer-system membership, group-key rotation with forward secrecy + atomicity, cross-cell user grants, and an IPNS-format naming pointer — the Rust refinement of specs/Cells.tla."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-key-distribution = { path = "../pillar-key-distribution" }
 

@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Shared bootstrap library: cell/user/node onboarding sequence, name-uniqueness, bootstrap requests, and login-token issuance, reused by pillar-web and pillar-cli."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-identity = { path = "../pillar-identity" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }

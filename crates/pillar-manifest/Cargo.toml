@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Signed intent manifests: a CRD-compatible body inside a pillar-native envelope (signer-key, causal-parents, content-hash, capability-scope) riding the merkle-DAG log."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-core = { path = "../pillar-core" }
 pillar-topology = { path = "../pillar-topology" }
