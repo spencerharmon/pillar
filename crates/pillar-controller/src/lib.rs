@@ -680,7 +680,7 @@ impl RunningWorkload {
 mod tests {
     use super::*;
     use pillar_coordination::LeaseRegister;
-    use pillar_identity::{Signature, UserPrimary};
+    use pillar_identity::PrimaryKeypair;
     use pillar_net::BlobStore;
     use pillar_streamdb::Stream;
 
@@ -691,12 +691,14 @@ mod tests {
     /// (nothing granted yet).
     fn admitted() -> (Registry, NodeSubkey, NodeSubkey) {
         let mut reg = Registry::new();
-        let primary = UserPrimary::from("op-primary");
+        let primary = PrimaryKeypair::from_secret_seed(
+            &pillar_crypto::Seed::from_bytes(b"pillar-controller-test-op-primary".to_vec()),
+        );
         let controller = NodeSubkey::from("controller-node");
         let foreign = NodeSubkey::from("foreign-node");
-        reg.register(primary.clone());
-        reg.issue_subkey(Signature::new(controller.clone(), primary.clone()));
-        reg.issue_subkey(Signature::new(foreign.clone(), primary));
+        reg.register(primary.primary());
+        assert!(reg.issue_subkey(primary.certify(&controller)));
+        assert!(reg.issue_subkey(primary.certify(&foreign)));
         reg.handshake(&controller).unwrap();
         reg.handshake(&foreign).unwrap();
         (reg, controller, foreign)

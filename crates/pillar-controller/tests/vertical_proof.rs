@@ -23,7 +23,7 @@ use pillar_controller::{Controller, WorkloadSpec, RUN_WORKLOAD_CAPABILITY};
 use pillar_coordination::LeaseRegister;
 use pillar_core::{Epoch, NodeId, SideEffect};
 use pillar_identity::capability::{Capability, CapabilityRegistry};
-use pillar_identity::{NodeSubkey, Registry, Signature, UserPrimary};
+use pillar_identity::{NodeSubkey, PrimaryKeypair, Registry};
 use pillar_net::{
     build_blob_swarm, BlobBehaviour, BlobBehaviourEvent, BlobDigest, BlobRequest, BlobStore,
 };
@@ -90,10 +90,12 @@ async fn vertical_proof_runs_declared_workload_over_libp2p() {
     // --- identity/controller layer: the controller node is admitted under a
     // registered primary and explicitly granted the run-workload capability.
     let mut identity = Registry::new();
-    let primary = UserPrimary::from("operator-primary");
+    let primary = PrimaryKeypair::from_secret_seed(&pillar_crypto::Seed::from_bytes(
+        b"pillar-vertical-proof-operator-primary".to_vec(),
+    ));
     let controller_key = NodeSubkey::from("vertical-proof-controller");
-    identity.register(primary.clone());
-    identity.issue_subkey(Signature::new(controller_key.clone(), primary));
+    identity.register(primary.primary());
+    assert!(identity.issue_subkey(primary.certify(&controller_key)));
     identity.handshake(&controller_key).unwrap();
 
     let mut caps = CapabilityRegistry::new();
