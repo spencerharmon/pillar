@@ -26,6 +26,11 @@ use pillar_core::{SideEffect, ViewPolicy};
 mod persist;
 pub use persist::{PersistError, PersistentStream};
 
+pub mod store;
+pub use store::{
+    Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, StoreError, Visibility,
+};
+
 /// A content address: the identity of an [`Op`], derived purely from its
 /// payload bytes via a **collision-resistant cryptographic** hash.
 ///
