@@ -788,6 +788,146 @@ impl Escrow {
     }
 }
 
+/// L0 REAL cryptographic sealing: the concrete refinement of the abstract
+/// [`SealedArtifact`] seal target into an actual recipient-sealed envelope.
+///
+/// [`SealedArtifact`] and [`KeyDistributionLedger`] model *who* a record is
+/// entitled to (the seal target as a [`BTreeSet<NodeId>`]) — the admission /
+/// re-seal / cross-owner-gate policy. This module performs the matching
+/// cryptography: it takes the artifact's plaintext bytes and the recipient
+/// nodes' **sealing public keys** and produces a [`pillar_crypto`]
+/// X25519+AEAD sealed envelope from which ONLY a holder of one recipient
+/// node's sealing secret can recover the plaintext. No `DefaultHasher` KDF,
+/// no FNV content address, no XOR "seal": every primitive is the real one
+/// factored into `pillar-crypto` and gated GREEN by its contract tests.
+///
+/// The two layers compose: the ledger decides the seal target set, this
+/// module enforces it cryptographically, and the resulting envelope's digest
+/// (a real SHA2-256 multihash via [`BlobDigest::of`]) is the content address
+/// carried by [`SealedArtifact`].
+pub mod crypto_seal {
+    use super::{BlobDigest, NodeId};
+    use pillar_crypto::seal::{seal_to_recipients, unseal};
+    use pillar_crypto::{SealedEnvelope, SealingPublicKey, SealingSecretKey};
+    use std::collections::BTreeMap;
+
+    /// The public sealing key registry for a set of recipient nodes: the map
+    /// the ledger consults to turn a seal target ([`NodeId`] set) into the
+    /// concrete recipient public keys an envelope is sealed to.
+    #[derive(Clone, Debug, Default)]
+    pub struct NodeSealingKeys {
+        keys: BTreeMap<NodeId, SealingPublicKey>,
+    }
+
+    impl NodeSealingKeys {
+        /// An empty registry.
+        #[must_use]
+        pub fn new() -> Self {
+            NodeSealingKeys {
+                keys: BTreeMap::new(),
+            }
+        }
+
+        /// Register (or replace) a node's sealing public key.
+        pub fn register(&mut self, node: NodeId, key: SealingPublicKey) {
+            self.keys.insert(node, key);
+        }
+
+        /// The sealing public key for `node`, if registered.
+        #[must_use]
+        pub fn get(&self, node: &NodeId) -> Option<&SealingPublicKey> {
+            self.keys.get(node)
+        }
+    }
+
+    /// Errors from the real L0 sealing layer.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum CryptoSealError {
+        /// A node in the seal target has no registered sealing public key, so
+        /// the artifact cannot be sealed to it — fail closed rather than drop
+        /// a required recipient silently.
+        UnknownRecipientKey(NodeId),
+        /// The underlying `pillar-crypto` operation failed (seal/unseal).
+        Crypto(pillar_crypto::CryptoError),
+    }
+
+    impl core::fmt::Display for CryptoSealError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                CryptoSealError::UnknownRecipientKey(n) => {
+                    write!(f, "no sealing public key registered for recipient node {n:?}")
+                }
+                CryptoSealError::Crypto(e) => write!(f, "crypto error: {e:?}"),
+            }
+        }
+    }
+
+    impl std::error::Error for CryptoSealError {}
+
+    /// A genuinely sealed L0 artifact: the recipient-sealed envelope plus its
+    /// content address. The envelope is opaque ciphertext — only a holder of
+    /// one recipient node's sealing secret can [`recover`](SealedBlob::recover)
+    /// the plaintext.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SealedBlob {
+        envelope: SealedEnvelope,
+        digest: BlobDigest,
+    }
+
+    impl SealedBlob {
+        /// Cryptographically seal `plaintext` to the sealing public keys of
+        /// every node in `seal_target`, in the target's canonical order.
+        ///
+        /// Fails closed with [`CryptoSealError::UnknownRecipientKey`] if any
+        /// targeted node has no registered key: a required recipient is never
+        /// silently dropped.
+        pub fn seal<'a, I>(
+            plaintext: &[u8],
+            seal_target: I,
+            keys: &NodeSealingKeys,
+        ) -> Result<Self, CryptoSealError>
+        where
+            I: IntoIterator<Item = &'a NodeId>,
+        {
+            let mut recipients: Vec<SealingPublicKey> = Vec::new();
+            for node in seal_target {
+                let key = keys
+                    .get(node)
+                    .ok_or_else(|| CryptoSealError::UnknownRecipientKey(node.clone()))?;
+                recipients.push(key.clone());
+            }
+            let envelope =
+                seal_to_recipients(plaintext, &recipients).map_err(CryptoSealError::Crypto)?;
+            let digest = BlobDigest::of(envelope.as_bytes());
+            Ok(SealedBlob { envelope, digest })
+        }
+
+        /// The content address (real SHA2-256 multihash) of the sealed
+        /// ciphertext — the digest a [`super::SealedArtifact`] carries.
+        #[must_use]
+        pub fn digest(&self) -> BlobDigest {
+            self.digest.clone()
+        }
+
+        /// The opaque sealed envelope.
+        #[must_use]
+        pub fn envelope(&self) -> &SealedEnvelope {
+            &self.envelope
+        }
+
+        /// Recover the plaintext with a recipient node's sealing secret.
+        /// Returns [`pillar_crypto::CryptoError::NotARecipient`] for a secret
+        /// that is not one of the envelope's recipients — the real
+        /// cryptographic enforcement of the seal target, not a set lookup.
+        pub fn recover(
+            &self,
+            recipient_secret: &SealingSecretKey,
+        ) -> Result<Vec<u8>, CryptoSealError> {
+            unseal(&self.envelope, recipient_secret).map_err(CryptoSealError::Crypto)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,5 +1291,112 @@ mod tests {
             .is_err());
         ledger.accept(&record).unwrap();
         assert!(ledger.accept(&record).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // L0 REAL cryptographic sealing (crypto_seal): the abstract seal target
+    // is enforced by actual X25519+AEAD recipient sealing via pillar-crypto,
+    // NOT by a plaintext NodeId-set lookup. A non-recipient CANNOT recover the
+    // plaintext even holding the whole envelope; a recipient can.
+    // ---------------------------------------------------------------------
+
+    use crypto_seal::{CryptoSealError, NodeSealingKeys, SealedBlob};
+    use pillar_crypto::principal::principal_from_seed;
+    use pillar_crypto::{PrincipalSecret, Seed};
+
+    fn node_keys(names: &[&str]) -> (NodeSealingKeys, BTreeMap<NodeId, PrincipalSecret>) {
+        let mut reg = NodeSealingKeys::new();
+        let mut secrets = BTreeMap::new();
+        for n in names {
+            let (pubk, seck) =
+                principal_from_seed(&Seed::from_bytes(n.as_bytes().to_vec())).expect("keygen");
+            reg.register(NodeId::from(*n), pubk.sealing.clone());
+            secrets.insert(NodeId::from(*n), seck);
+        }
+        (reg, secrets)
+    }
+
+    // A recipient recovers the exact plaintext; every non-recipient — even one
+    // holding a validly-generated sealing key that was simply not a target —
+    // is cryptographically refused. This is the real security effect the task
+    // was reopened to deliver.
+    #[test]
+    fn sealed_blob_only_a_recipient_node_can_recover_the_plaintext() {
+        let (reg, secrets) = node_keys(&["node-1", "node-2", "outsider"]);
+        let plaintext = b"the escrowed operational private key (opaque)";
+        let target = nodes(&["node-1", "node-2"]);
+
+        let sealed = SealedBlob::seal(plaintext, &target, &reg).expect("seal");
+
+        // Every targeted recipient recovers the exact bytes.
+        for n in &["node-1", "node-2"] {
+            let sec = &secrets[&NodeId::from(*n)];
+            assert_eq!(
+                sealed.recover(&sec.sealing).expect("recipient recovers"),
+                plaintext,
+                "recipient {n} must recover the plaintext"
+            );
+        }
+
+        // A non-targeted node, though it has a real sealing key, is refused by
+        // the cryptography — NOT by any NodeId set membership check.
+        let outsider = &secrets[&NodeId::from("outsider")];
+        assert!(
+            matches!(
+                sealed.recover(&outsider.sealing),
+                Err(CryptoSealError::Crypto(
+                    pillar_crypto::CryptoError::NotARecipient
+                ))
+            ),
+            "a non-recipient must be cryptographically unable to recover the plaintext"
+        );
+    }
+
+    // The seal fails CLOSED if a targeted node has no registered key: a
+    // required recipient is never silently dropped from the envelope.
+    #[test]
+    fn sealing_to_an_unknown_recipient_fails_closed() {
+        let (reg, _secrets) = node_keys(&["node-1"]);
+        let target = nodes(&["node-1", "node-missing"]);
+        assert!(matches!(
+            SealedBlob::seal(b"secret", &target, &reg),
+            Err(CryptoSealError::UnknownRecipientKey(_))
+        ));
+    }
+
+    // The content address is the real SHA2-256 multihash of the ciphertext and
+    // verifies against those exact bytes.
+    #[test]
+    fn sealed_blob_digest_is_a_real_content_address_of_the_ciphertext() {
+        let (reg, _secrets) = node_keys(&["node-1"]);
+        let sealed = SealedBlob::seal(b"payload", nodes(&["node-1"]).iter(), &reg).expect("seal");
+        assert!(
+            sealed.digest().verifies(sealed.envelope().as_bytes()),
+            "digest must be the content address of the sealed ciphertext"
+        );
+        assert!(
+            !sealed.digest().verifies(b"different bytes"),
+            "digest must not verify unrelated bytes"
+        );
+    }
+
+    // Re-sealing the same plaintext to the same target yields DIFFERENT
+    // ciphertext (fresh content key + ephemeral key): confirms real
+    // randomized encryption, not a deterministic XOR/hash stand-in.
+    #[test]
+    fn resealing_same_plaintext_yields_distinct_ciphertext() {
+        let (reg, secrets) = node_keys(&["node-1"]);
+        let target = nodes(&["node-1"]);
+        let a = SealedBlob::seal(b"same plaintext", &target, &reg).expect("seal a");
+        let b = SealedBlob::seal(b"same plaintext", &target, &reg).expect("seal b");
+        assert_ne!(
+            a.envelope().as_bytes(),
+            b.envelope().as_bytes(),
+            "randomized sealing must not produce identical ciphertext"
+        );
+        // Both still decrypt to the same plaintext for the recipient.
+        let sec = &secrets[&NodeId::from("node-1")];
+        assert_eq!(a.recover(&sec.sealing).unwrap(), b"same plaintext");
+        assert_eq!(b.recover(&sec.sealing).unwrap(), b"same plaintext");
     }
 }
