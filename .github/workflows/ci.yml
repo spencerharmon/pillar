@@ -11,12 +11,13 @@ env:
 jobs:
   # fmt + clippy + test all run through the flake devShell (`nix develop`), so
   # they share ONE reproducible toolchain pinned by flake.lock (rustfmt / clippy
-  # / cargo from nixpkgs) and get the native libraries the hardware custody
-  # backends link — tpm2-tss (tss-esapi), hidapi + libusb1 (ctap-hid-fido2), and
-  # libclang for the bindgen build scripts (tss-esapi-sys, cryptoki-sys). A bare
-  # nixery `shell` image only ships a package's runtime output, so its headers /
-  # .pc files / libclang would be missing; the devShell (mkShell) exposes the
-  # `.dev` outputs correctly.
+  # / cargo from nixpkgs). The HARDWARE custody backends (tss-esapi, cryptoki,
+  # ctap-hid-fido2) are opt-in Cargo features that are OFF here: this lane never
+  # compiles the bindgen crates (tss-esapi-sys, cryptoki-sys), their libclang
+  # build-time requirement, or the native libs (tpm2-tss, hidapi) — it stays
+  # lean. HSM compilation is validated separately by the `hsm-build` job below
+  # and by the distribution image build (`build-image.yaml`, which builds
+  # `-p pillar-cli --features hsm`).
   rust:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
@@ -58,10 +59,51 @@ jobs:
         run: nix develop -c bash -c 'cargo fmt --all -- --check'
 
       - name: clippy
-        run: nix develop -c bash -c 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
+        run: nix develop -c bash -c 'cargo clippy --workspace --all-targets -- -D warnings'
 
       - name: test
         run: nix develop -c bash -c 'cargo test --all'
+
+  # Dedicated guard that the OPT-IN hardware custody backends still compile and
+  # lint cleanly, so the main distribution (which ships them via
+  # `-p pillar-cli --features hsm`) can never silently break. Scoped to
+  # pillar-crypto with `--features hsm` — the only crate carrying feature-gated
+  # device code — so it compiles the three HSM crates ONCE rather than the whole
+  # workspace under `--all-features`. Kept out of the `rust` lane above so the
+  # everyday fmt/clippy/test path stays free of the bindgen/native-lib cost.
+  hsm-build:
+    name: hsm feature compile guard
+    runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/git/bash/coreutils
+    env:
+      HOME: /github/home
+    steps:
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > ~/.config/nix/nix.conf
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+
+      - name: clippy (hsm features)
+        run: nix develop -c bash -c 'cargo clippy -p pillar-crypto --features hsm --all-targets -- -D warnings'
+
+      - name: test (hsm features)
+        run: nix develop -c bash -c 'cargo test -p pillar-crypto --features hsm'
 
   tlc:
     name: TLA+ model check
