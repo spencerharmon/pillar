@@ -3222,6 +3222,7 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-wot-authority",
+ "sha2",
 ]
 
 [[package]]

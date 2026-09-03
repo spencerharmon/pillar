@@ -12,5 +12,8 @@ pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [lints]
 workspace = true
