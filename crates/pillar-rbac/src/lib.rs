@@ -264,6 +264,40 @@ pub enum Decision {
     Deny,
 }
 
+/// Evidence that the request carried a FRESH, already-cryptographically-
+/// verified WebAuthn step-up assertion (the P0 WebAuthn credential from the
+/// `webauthn-rp-endpoints` custody surface re-used as a step-up factor).
+///
+/// This is NOT where the assertion signature is checked — that is the RP
+/// endpoint's job ([`pillar_crypto::webauthn::verify_assertion`]), which the
+/// caller runs BEFORE constructing this value. What the decider consumes is
+/// the *proof of a successful, recent* step-up: the moment the assertion was
+/// verified (`verified_at_secs`, a Unix timestamp) and the credential id it
+/// was bound to. The decider then enforces the step-up rung purely on
+/// FRESHNESS (see [`StepUpPolicy::max_age_secs`]) inside the same `decide`
+/// path — a stale/expired proof is treated as if no step-up happened at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepUpAssertion {
+    /// Unix time (seconds) at which the WebAuthn assertion was successfully
+    /// verified by the RP. Freshness is measured against this.
+    pub verified_at_secs: u64,
+    /// The credential id the verified assertion was bound to (opaque handle,
+    /// as returned by
+    /// [`pillar_crypto::webauthn::RegisteredCredential::credential_id`]).
+    pub credential_id: Vec<u8>,
+}
+
+impl StepUpAssertion {
+    /// Build a step-up proof from a successfully verified assertion.
+    #[must_use]
+    pub fn new(verified_at_secs: u64, credential_id: impl Into<Vec<u8>>) -> Self {
+        StepUpAssertion {
+            verified_at_secs,
+            credential_id: credential_id.into(),
+        }
+    }
+}
+
 /// One `(subject, capability)` query against a specific [`ResourceClass`]
 /// and the subject's labels — everything [`RbacDecider::decide`] needs to
 /// resolve every [`PolicyTarget`] rung.
@@ -278,6 +312,15 @@ pub struct Request {
     pub resource_class: ResourceClass,
     /// The subject's labels, consulted by [`PolicyTarget::LabelSet`].
     pub subject_labels: BTreeSet<String>,
+    /// The current wall-clock (Unix seconds) at which this decision is made,
+    /// used to measure a [`StepUpAssertion`]'s freshness. The caller stamps
+    /// it from the same clock it verified the assertion under.
+    pub now_secs: u64,
+    /// A fresh WebAuthn step-up proof, if the caller re-authenticated the
+    /// subject for this request. `None` means "no step-up presented" — which
+    /// denies any capability the [`StepUpPolicy`] marks step-up-required, no
+    /// matter how strong the base auth is.
+    pub step_up: Option<StepUpAssertion>,
 }
 
 impl Request {
@@ -291,6 +334,8 @@ impl Request {
             capability,
             resource_class: ResourceClass::All,
             subject_labels: BTreeSet::new(),
+            now_secs: 0,
+            step_up: None,
         }
     }
 
@@ -305,6 +350,20 @@ impl Request {
     #[must_use]
     pub fn with_labels(mut self, labels: BTreeSet<String>) -> Self {
         self.subject_labels = labels;
+        self
+    }
+
+    /// Set the current wall-clock (Unix seconds) this request is decided at.
+    #[must_use]
+    pub fn at_time(mut self, now_secs: u64) -> Self {
+        self.now_secs = now_secs;
+        self
+    }
+
+    /// Attach a fresh WebAuthn step-up proof to this request.
+    #[must_use]
+    pub fn with_step_up(mut self, assertion: StepUpAssertion) -> Self {
+        self.step_up = Some(assertion);
         self
     }
 }
@@ -399,6 +458,66 @@ pub fn default_resource_class_policies(capability: &Capability) -> Vec<PolicyEve
         .collect()
 }
 
+/// The step-up (re-authentication) policy: which capabilities are gated on a
+/// FRESH WebAuthn assertion, and how fresh "fresh" must be.
+///
+/// Step-up is NOT a bespoke MFA subsystem and NOT a parallel gate: it is an
+/// ADDITIONAL required factor folded into the single [`RbacDecider::decide`]
+/// path. A capability listed here is refused unless the request also carries
+/// a [`StepUpAssertion`] no older than [`StepUpPolicy::max_age_secs`] — even
+/// when the base RBAC rungs (explicit-allow / WoT-depth-default) would grant
+/// it. The WebAuthn credential that satisfies step-up is the very same P0
+/// custody credential (`webauthn-rp-endpoints`); the caller verifies its
+/// assertion once and hands the decider the freshness proof.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepUpPolicy {
+    /// The set of capabilities that require a fresh step-up assertion before
+    /// they may be allowed (destructive/sensitive operations: key rotation,
+    /// secret reveal, cell-membership changes, …).
+    pub required: BTreeSet<Capability>,
+    /// The maximum age (seconds) a [`StepUpAssertion`] may have — measured as
+    /// `request.now_secs - assertion.verified_at_secs` — and still count as
+    /// "fresh". An assertion older than this (or from the future) is refused
+    /// exactly as if none were presented.
+    pub max_age_secs: u64,
+}
+
+impl StepUpPolicy {
+    /// Build a step-up policy requiring a fresh assertion for `capabilities`,
+    /// with the given freshness window in seconds.
+    #[must_use]
+    pub fn new(
+        capabilities: impl IntoIterator<Item = Capability>,
+        max_age_secs: u64,
+    ) -> Self {
+        StepUpPolicy {
+            required: capabilities.into_iter().collect(),
+            max_age_secs,
+        }
+    }
+
+    /// Whether `capability` requires a fresh step-up assertion under this
+    /// policy.
+    #[must_use]
+    pub fn requires_step_up(&self, capability: &Capability) -> bool {
+        self.required.contains(capability)
+    }
+
+    /// Whether `assertion` is fresh enough to satisfy step-up for a request
+    /// decided at `now_secs`: it must not be older than `max_age_secs` and
+    /// must not be dated in the future (a clock-skew / replay guard).
+    #[must_use]
+    pub fn assertion_is_fresh(&self, assertion: &StepUpAssertion, now_secs: u64) -> bool {
+        match now_secs.checked_sub(assertion.verified_at_secs) {
+            // Assertion verified at or before `now`: fresh iff within window.
+            Some(age) => age <= self.max_age_secs,
+            // verified_at is in the FUTURE relative to now — refuse (never
+            // treat a future-dated proof as fresh).
+            None => false,
+        }
+    }
+}
+
 /// The single, pure RBAC decider over a local materialized view: one
 /// `decide` computation, called identically for controller enforcement and
 /// UI prediction (see module docs).
@@ -407,6 +526,7 @@ pub struct RbacDecider<'a> {
     authority: &'a WotAuthority,
     policies: &'a [PolicyEvent],
     grants: &'a [ExplicitGrant],
+    step_up: &'a StepUpPolicy,
 }
 
 impl<'a> RbacDecider<'a> {
@@ -415,17 +535,38 @@ impl<'a> RbacDecider<'a> {
     /// currently-live explicit grants. Group membership and node ownership
     /// are resolved directly against `authority` (see module docs) rather
     /// than an asserted side table.
+    ///
+    /// The step-up policy defaults to EMPTY (no capability gated on a fresh
+    /// WebAuthn assertion); attach one with
+    /// [`with_step_up_policy`](Self::with_step_up_policy) to require step-up
+    /// re-authentication for destructive/sensitive capabilities.
     #[must_use]
     pub fn new(
         authority: &'a WotAuthority,
         policies: &'a [PolicyEvent],
         grants: &'a [ExplicitGrant],
     ) -> Self {
+        // A process-wide empty step-up policy so a decider built without one
+        // gates nothing on step-up (backwards-compatible default).
+        static EMPTY_STEP_UP: StepUpPolicy = StepUpPolicy {
+            required: BTreeSet::new(),
+            max_age_secs: 0,
+        };
         RbacDecider {
             authority,
             policies,
             grants,
+            step_up: &EMPTY_STEP_UP,
         }
+    }
+
+    /// Attach a [`StepUpPolicy`] so the named capabilities require a fresh
+    /// WebAuthn step-up assertion as an ADDITIONAL required factor within the
+    /// same `decide` path.
+    #[must_use]
+    pub fn with_step_up_policy(mut self, step_up: &'a StepUpPolicy) -> Self {
+        self.step_up = step_up;
+        self
     }
 
     /// Find this subject's explicit grant for `capability`, if any.
@@ -490,20 +631,52 @@ impl<'a> RbacDecider<'a> {
             .is_some()
     }
 
+    /// Whether `request` satisfies the step-up rung: either its capability is
+    /// NOT step-up-gated, or it IS gated and the request carries a FRESH
+    /// [`StepUpAssertion`] (per [`StepUpPolicy::assertion_is_fresh`]). A gated
+    /// capability with no assertion, or a stale/future-dated one, fails.
+    fn satisfies_step_up(&self, request: &Request) -> bool {
+        if !self.step_up.requires_step_up(&request.capability) {
+            return true;
+        }
+        match &request.step_up {
+            Some(assertion) => self.step_up.assertion_is_fresh(assertion, request.now_secs),
+            None => false,
+        }
+    }
+
     /// Decide `request`, per the four-rung precedence lattice in the module
     /// docs: explicit-deny > explicit-allow > WoT-depth-default > deny-all.
     ///
     /// This is the ONLY decision function in the crate: call it for
     /// controller enforcement AND for UI prediction so the two can never
     /// diverge.
+    ///
+    /// # Step-up factor
+    ///
+    /// A capability marked step-up-required by the attached [`StepUpPolicy`]
+    /// is an ADDITIONAL required factor folded into this same path — never a
+    /// parallel gate. An explicit deny still wins unconditionally (rung 1),
+    /// but any decision that would otherwise ALLOW (explicit-allow or
+    /// WoT-depth-default) is downgraded to [`Decision::Deny`] unless the
+    /// request also carries a fresh WebAuthn step-up assertion.
     #[must_use]
     pub fn decide(&self, request: &Request) -> Decision {
         match self.explicit_grant(&request.subject, &request.capability) {
+            // Explicit deny wins unconditionally, ahead of every factor.
             Some(GrantEffect::Deny) => return Decision::Deny,
-            Some(GrantEffect::Allow) => return Decision::Allow,
+            Some(GrantEffect::Allow) => {
+                // Base auth grants — but a step-up-gated capability still
+                // needs a fresh assertion as the additional factor.
+                return if self.satisfies_step_up(request) {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                };
+            }
             None => {}
         }
-        if self.satisfies_depth_default(request) {
+        if self.satisfies_depth_default(request) && self.satisfies_step_up(request) {
             Decision::Allow
         } else {
             Decision::Deny
@@ -529,17 +702,32 @@ impl<'a> RbacDecider<'a> {
     pub fn explain(&self, request: &Request) -> Exercised {
         match self.explicit_grant(&request.subject, &request.capability) {
             Some(GrantEffect::Deny) => return Exercised::ExplicitDeny,
-            Some(GrantEffect::Allow) => return Exercised::ExplicitAllow,
+            Some(GrantEffect::Allow) => {
+                // Base auth would allow; a step-up-gated capability without a
+                // fresh assertion is refused on the step-up rung instead.
+                if self.satisfies_step_up(request) {
+                    return Exercised::ExplicitAllow;
+                }
+                return Exercised::StepUpRequired;
+            }
             None => {}
         }
         let Some(depth) = self.authority.reachable_depth(&request.subject) else {
             return Exercised::DenyAll;
         };
         match self.most_specific_satisfied_policy(request, depth) {
-            Some(policy) => Exercised::WotDepthDefault {
-                depth,
-                threshold: policy.depth_threshold,
-            },
+            Some(policy) => {
+                if self.satisfies_step_up(request) {
+                    Exercised::WotDepthDefault {
+                        depth,
+                        threshold: policy.depth_threshold,
+                    }
+                } else {
+                    // The base depth default was satisfied, but the step-up
+                    // factor was not — that is what decided the (deny) verdict.
+                    Exercised::StepUpRequired
+                }
+            }
             None => Exercised::DenyAll,
         }
     }
@@ -563,6 +751,10 @@ pub enum Exercised {
         /// The satisfied policy's depth threshold.
         threshold: u8,
     },
+    /// The base RBAC rungs would have allowed the subject, but the capability
+    /// is step-up-gated and no FRESH WebAuthn assertion was presented — the
+    /// additional step-up factor is what produced the (deny) verdict.
+    StepUpRequired,
     /// No rung authorized the subject — the fail-closed default.
     DenyAll,
 }
@@ -576,6 +768,9 @@ impl fmt::Display for Exercised {
                 f,
                 "WoT-depth default (reachable at depth {depth}, threshold {threshold})"
             ),
+            Exercised::StepUpRequired => {
+                write!(f, "step-up re-authentication required (no fresh assertion)")
+            }
             Exercised::DenyAll => write!(f, "none (deny-all default)"),
         }
     }
@@ -1202,6 +1397,10 @@ mod tests {
         assert_eq!(Exercised::ExplicitDeny.to_string(), "explicit grant (deny)");
         assert_eq!(Exercised::DenyAll.to_string(), "none (deny-all default)");
         assert_eq!(
+            Exercised::StepUpRequired.to_string(),
+            "step-up re-authentication required (no fresh assertion)"
+        );
+        assert_eq!(
             Exercised::WotDepthDefault {
                 depth: 2,
                 threshold: 2
@@ -1209,5 +1408,220 @@ mod tests {
             .to_string(),
             "WoT-depth default (reachable at depth 2, threshold 2)"
         );
+    }
+
+    // --- step-up MFA: WebAuthn re-authentication as an additional factor ---
+
+    /// A depth-default policy + decider that would ALLOW `rotate:key` for
+    /// alice on base auth alone, with `rotate:key` marked step-up-required.
+    fn stepup_fixture(
+        max_age: u64,
+    ) -> (WotAuthority, Vec<PolicyEvent>, Vec<ExplicitGrant>, StepUpPolicy) {
+        let a = owner_authority_with_alice(3, 2);
+        let policies = vec![PolicyEvent {
+            target: PolicyTarget::ResourceClass(ResourceClass::All),
+            capability: cap("rotate:key"),
+            depth_threshold: 2,
+        }];
+        let grants = vec![];
+        let step_up = StepUpPolicy::new([cap("rotate:key")], max_age);
+        (a, policies, grants, step_up)
+    }
+
+    #[test]
+    fn step_up_gated_action_is_refused_without_a_fresh_assertion() {
+        // Base auth (depth default) is otherwise valid, but the destructive
+        // action is step-up-gated and NO assertion is presented -> deny.
+        let (a, policies, grants, step_up) = stepup_fixture(300);
+        let decider = RbacDecider::new(&a, &policies, &grants).with_step_up_policy(&step_up);
+
+        // Sanity: without the step-up gate the SAME base auth allows.
+        let base_decider = RbacDecider::new(&a, &policies, &grants);
+        assert_eq!(
+            base_decider.decide(&req("alice", &cap("rotate:key")).at_time(1_000)),
+            Decision::Allow,
+            "base auth alone would allow — proving the gate, not weak base auth, is what denies"
+        );
+
+        let request = req("alice", &cap("rotate:key")).at_time(1_000);
+        assert_eq!(decider.decide(&request), Decision::Deny);
+        assert_eq!(decider.explain(&request), Exercised::StepUpRequired);
+    }
+
+    #[test]
+    fn fresh_assertion_allows_the_action_through_the_same_rbac_path() {
+        // Providing a fresh valid step-up assertion allows the action through
+        // the SAME decide() path (no parallel gate).
+        let (a, policies, grants, step_up) = stepup_fixture(300);
+        let decider = RbacDecider::new(&a, &policies, &grants).with_step_up_policy(&step_up);
+
+        let request = req("alice", &cap("rotate:key"))
+            .at_time(1_000)
+            .with_step_up(StepUpAssertion::new(950, b"cred-1".to_vec()));
+        assert_eq!(decider.decide(&request), Decision::Allow);
+        // Same single path: predict == decide.
+        assert_eq!(decider.predict(&request), decider.decide(&request));
+        assert_eq!(
+            decider.explain(&request),
+            Exercised::WotDepthDefault {
+                depth: 2,
+                threshold: 2
+            }
+        );
+    }
+
+    #[test]
+    fn stale_or_expired_assertion_is_refused() {
+        // An assertion older than the freshness window is refused.
+        let (a, policies, grants, step_up) = stepup_fixture(300);
+        let decider = RbacDecider::new(&a, &policies, &grants).with_step_up_policy(&step_up);
+
+        // verified 400s ago, window is 300s -> stale -> deny.
+        let stale = req("alice", &cap("rotate:key"))
+            .at_time(1_000)
+            .with_step_up(StepUpAssertion::new(600, b"cred-1".to_vec()));
+        assert_eq!(decider.decide(&stale), Decision::Deny);
+        assert_eq!(decider.explain(&stale), Exercised::StepUpRequired);
+
+        // exactly at the boundary (age == max_age) is still fresh.
+        let boundary = req("alice", &cap("rotate:key"))
+            .at_time(1_000)
+            .with_step_up(StepUpAssertion::new(700, b"cred-1".to_vec()));
+        assert_eq!(decider.decide(&boundary), Decision::Allow);
+
+        // a future-dated proof (clock skew / replay) is refused.
+        let future = req("alice", &cap("rotate:key"))
+            .at_time(1_000)
+            .with_step_up(StepUpAssertion::new(1_050, b"cred-1".to_vec()));
+        assert_eq!(decider.decide(&future), Decision::Deny);
+    }
+
+    #[test]
+    fn step_up_does_not_gate_non_sensitive_capabilities() {
+        // A capability NOT in the step-up set is unaffected: base auth alone
+        // decides it, with or without an assertion.
+        let (a, policies, grants, step_up) = stepup_fixture(300);
+        let policies = {
+            let mut p = policies;
+            p.push(PolicyEvent {
+                target: PolicyTarget::ResourceClass(ResourceClass::All),
+                capability: cap("stream:read"),
+                depth_threshold: 2,
+            });
+            p
+        };
+        let decider = RbacDecider::new(&a, &policies, &grants).with_step_up_policy(&step_up);
+        assert_eq!(
+            decider.decide(&req("alice", &cap("stream:read")).at_time(1_000)),
+            Decision::Allow,
+            "a non-step-up capability is allowed on base auth with no assertion"
+        );
+    }
+
+    #[test]
+    fn explicit_deny_still_wins_over_a_fresh_step_up_assertion() {
+        // The step-up factor never overrides explicit-deny (rung 1).
+        let (a, policies, _grants, step_up) = stepup_fixture(300);
+        let grants = vec![ExplicitGrant {
+            subject: n("alice"),
+            capability: cap("rotate:key"),
+            effect: GrantEffect::Deny,
+        }];
+        let decider = RbacDecider::new(&a, &policies, &grants).with_step_up_policy(&step_up);
+        let request = req("alice", &cap("rotate:key"))
+            .at_time(1_000)
+            .with_step_up(StepUpAssertion::new(1_000, b"cred-1".to_vec()));
+        assert_eq!(decider.decide(&request), Decision::Deny);
+        assert_eq!(decider.explain(&request), Exercised::ExplicitDeny);
+    }
+
+    #[test]
+    fn explicit_allow_is_still_gated_by_step_up() {
+        // An explicit-allow grant does NOT bypass the step-up factor: a
+        // step-up-gated capability still needs a fresh assertion.
+        let a = owner_authority_with_alice(3, 2);
+        let policies = vec![];
+        let grants = vec![ExplicitGrant {
+            subject: n("alice"),
+            capability: cap("rotate:key"),
+            effect: GrantEffect::Allow,
+        }];
+        let step_up = StepUpPolicy::new([cap("rotate:key")], 300);
+        let decider = RbacDecider::new(&a, &policies, &grants).with_step_up_policy(&step_up);
+
+        // No assertion -> denied despite the explicit allow.
+        assert_eq!(
+            decider.decide(&req("alice", &cap("rotate:key")).at_time(1_000)),
+            Decision::Deny
+        );
+        // Fresh assertion -> the explicit allow now takes effect.
+        let with = req("alice", &cap("rotate:key"))
+            .at_time(1_000)
+            .with_step_up(StepUpAssertion::new(1_000, b"cred-1".to_vec()));
+        assert_eq!(decider.decide(&with), Decision::Allow);
+        assert_eq!(decider.explain(&with), Exercised::ExplicitAllow);
+    }
+
+    #[test]
+    fn step_up_reuses_the_real_p0_webauthn_credential() {
+        // End-to-end: the SAME P0 WebAuthn custody credential
+        // (pillar-crypto::webauthn) is verified, and its freshly-verified
+        // assertion drives the step-up rung of the RBAC decider — not a
+        // bespoke MFA credential.
+        use pillar_crypto::sign::signing_keypair_from_seed;
+        use pillar_crypto::Seed;
+        use pillar_crypto::webauthn::{
+            base64url_encode, ed25519_public_key_to_cose, verify_assertion,
+        };
+        use sha2::{Digest, Sha256};
+
+        // Register the credential (as webauthn-rp-endpoints would).
+        let (public, secret) =
+            signing_keypair_from_seed(&Seed::from_bytes(b"alice-authenticator".to_vec()))
+                .expect("keygen");
+        let cose = ed25519_public_key_to_cose(&public).expect("cose");
+        let credential_id = b"alice-cred".to_vec();
+
+        // Authenticator produces an assertion for a step-up challenge.
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://pillar.local"}}"#,
+            base64url_encode(b"stepup-challenge")
+        )
+        .into_bytes();
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&[0u8; 32]);
+        auth_data.push(0x01); // UP
+        auth_data.extend_from_slice(&7u32.to_be_bytes());
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data_json));
+        let sig = pillar_crypto::sign::sign(&secret, &signed).expect("sign");
+
+        // The RP verifies the assertion (the real crypto core) BEFORE it
+        // becomes a step-up proof for the decider.
+        let verified = verify_assertion(&cose, &auth_data, &client_data_json, sig.as_bytes())
+            .expect("assertion verifies");
+        assert_eq!(verified.sign_count, 7);
+
+        // Now feed the verified assertion into the SAME rbac path.
+        let a = owner_authority_with_alice(3, 2);
+        let policies = vec![PolicyEvent {
+            target: PolicyTarget::ResourceClass(ResourceClass::All),
+            capability: cap("secret:reveal"),
+            depth_threshold: 2,
+        }];
+        let grants = vec![];
+        let step_up = StepUpPolicy::new([cap("secret:reveal")], 300);
+        let decider = RbacDecider::new(&a, &policies, &grants).with_step_up_policy(&step_up);
+
+        // Without the verified assertion the sensitive action is refused.
+        assert_eq!(
+            decider.decide(&req("alice", &cap("secret:reveal")).at_time(1_000)),
+            Decision::Deny
+        );
+        // With the freshly verified real-WebAuthn assertion, it passes.
+        let request = req("alice", &cap("secret:reveal"))
+            .at_time(1_000)
+            .with_step_up(StepUpAssertion::new(980, credential_id));
+        assert_eq!(decider.decide(&request), Decision::Allow);
     }
 }
