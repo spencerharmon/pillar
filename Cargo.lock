@@ -2576,6 +2576,7 @@ dependencies = [
  "pillar-identity",
  "pillar-rbac",
  "pillar-wot-authority",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
