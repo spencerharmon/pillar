@@ -12,6 +12,7 @@ pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-topology = { path = "../pillar-topology" }
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+pillar-quota-ledger = { path = "../pillar-quota-ledger" }
 
 [lints]
 workspace = true

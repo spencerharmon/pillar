@@ -34,6 +34,7 @@ use pillar_crypto::content::content_address;
 use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
 use pillar_crypto::{Seed, Signature, SigningPublicKey, SigningSecretKey};
 
+pub mod admission;
 pub mod bgp_lb;
 pub mod builtin;
 pub mod ingress;

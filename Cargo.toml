@@ -21,6 +21,7 @@ members = [
     "crates/pillar-cli",
     "crates/pillar-web",
     "crates/pillar-web-frontend",
+    "crates/pillar-web-api",
     "crates/pillar-trust-artifacts",
     "crates/pillar-quota-ledger",
     "crates/pillar-topology",
