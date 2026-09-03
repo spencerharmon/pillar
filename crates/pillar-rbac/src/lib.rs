@@ -316,6 +316,47 @@ pub fn owns_node(authority: &WotAuthority, user_primary: &NodeId, node: &NodeId)
     authority.owns(user_primary, node)
 }
 
+/// A typed, non-fatal RBAC error: every RBAC failure mode is a value a
+/// caller can match on and fail the single request/action closed (deny)
+/// with, never a `panic!` that would crash the whole process/thread for a
+/// condition scoped to one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RbacError {
+    /// A caller asked for the shipped default [`PolicyEvent`] for
+    /// `ResourceClass`, but no such default exists in the given set (e.g. a
+    /// corrupted or hand-edited defaults fixture). Callers must treat this
+    /// as "fail this one lookup closed", never crash the process over it.
+    MissingDefaultPolicy(ResourceClass),
+}
+
+impl fmt::Display for RbacError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RbacError::MissingDefaultPolicy(class) => {
+                write!(f, "missing default policy for {class:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RbacError {}
+
+/// Look up `class`'s shipped default [`PolicyEvent`] within `defaults` (as
+/// produced by [`default_resource_class_policies`]), returning a typed
+/// [`RbacError::MissingDefaultPolicy`] rather than panicking if it is
+/// absent. A missing default is scoped to failing THIS lookup (the caller
+/// then denies the single request/action it was serving) — it must never
+/// crash the process.
+pub fn default_policy_for_class(
+    defaults: &[PolicyEvent],
+    class: ResourceClass,
+) -> Result<&PolicyEvent, RbacError> {
+    defaults
+        .iter()
+        .find(|p| matches!(&p.target, PolicyTarget::ResourceClass(rc) if *rc == class))
+        .ok_or(RbacError::MissingDefaultPolicy(class))
+}
+
 /// Ship sane, LOW default trust-depth thresholds per [`ResourceClass`], as
 /// a starting-point [`PolicyEvent`] set a deployment can layer more
 /// specific node/group/label-set policies on top of (which always win, per
@@ -992,10 +1033,8 @@ mod tests {
         let defaults = default_resource_class_policies(&c);
 
         for class in RESOURCE_CLASSES {
-            let matching = defaults
-                .iter()
-                .find(|p| matches!(&p.target, PolicyTarget::ResourceClass(rc) if *rc == class))
-                .unwrap_or_else(|| panic!("missing default policy for {class:?}"));
+            let matching = default_policy_for_class(&defaults, class)
+                .expect("shipped defaults must cover every resource class");
             // "LOW default trust level" means a comparatively strict
             // (nonzero, and non-trivially-low) depth threshold: nobody gets
             // this capability by default just for being loosely reachable.
@@ -1025,6 +1064,34 @@ mod tests {
                 .depth_threshold;
             assert!(all_threshold >= t);
         }
+    }
+
+    #[test]
+    fn missing_default_policy_returns_typed_error_not_panic() {
+        // A corrupted/hand-edited defaults fixture missing one resource
+        // class's entry must fail closed with a typed error -- the single
+        // lookup denies, the process/thread must NOT crash.
+        let c = cap("compute:schedule");
+        let mut defaults = default_resource_class_policies(&c);
+        defaults.retain(|p| {
+            !matches!(&p.target, PolicyTarget::ResourceClass(rc) if *rc == ResourceClass::Compute)
+        });
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            default_policy_for_class(&defaults, ResourceClass::Compute)
+        }));
+
+        let result = outcome.expect(
+            "a missing default policy must return a typed error, never panic/crash the thread",
+        );
+        assert_eq!(
+            result,
+            Err(RbacError::MissingDefaultPolicy(ResourceClass::Compute))
+        );
+
+        // Every OTHER class's default is unaffected -- only the single
+        // missing lookup fails, nothing else is dragged down with it.
+        assert!(default_policy_for_class(&defaults, ResourceClass::Network).is_ok());
     }
 
     #[test]

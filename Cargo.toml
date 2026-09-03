@@ -20,6 +20,7 @@ members = [
     "crates/pillar-recovery",
     "crates/pillar-cli",
     "crates/pillar-web",
+    "crates/pillar-web-frontend",
     "crates/pillar-trust-artifacts",
     "crates/pillar-quota-ledger",
     "crates/pillar-topology",
