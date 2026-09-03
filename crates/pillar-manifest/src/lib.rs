@@ -35,6 +35,7 @@ use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
 use pillar_crypto::{Seed, Signature, SigningPublicKey, SigningSecretKey};
 
 pub mod bgp_lb;
+pub mod builtin;
 pub mod ingress;
 
 /// The content-address of a manifest body — a real collision-resistant
