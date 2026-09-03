@@ -63,6 +63,10 @@ use pillar_core::NodeId;
 use pillar_crypto::{aead, kdf, sign};
 use pillar_crypto::{Ciphertext, KdfParams, Salt, Seed, SigningPublicKey, SymmetricKey};
 use pillar_identity::NodeSubkey;
+use pillar_key_distribution::{
+    Artifact, ArtifactId, ArtifactKind, CellId, KeyDistributionLedger, RecordKey,
+    UserId as KdUserId,
+};
 use pillar_wot_authority::{ActError, FencedActor, WotAuthority};
 
 use crate::key_login::{Nonce, Origin, Signature};
@@ -235,13 +239,22 @@ impl SealedOffer {
 
 /// The cell DB view a node needs to resolve node-side custody logins: it maps
 /// a user IDENTIFIER (`user@domain` / `username` / genesis CID) to the CID of
-/// that user's key-offer blob, and each CID to the node-sealed [`SealedOffer`]
-/// blob. This is the "CID → sealed blob" resolution the ROI requires the node
-/// to do so the USER never supplies the CID.
+/// that user's key-offer blob and to the [`RecordKey`] the REAL
+/// `pillar_key_distribution` ledger tracks admission under, and each CID to
+/// the node-sealed [`SealedOffer`] blob. This is the "CID → sealed blob"
+/// resolution the ROI requires the node to do so the USER never supplies the
+/// CID — and it is never treated as present unless the ledger's OWN
+/// bi-directional offer/accept/admit admission actually holds for the
+/// record (see [`NodeCustodyVerifier::admit`]), so a real ledger
+/// [`KeyDistributionLedger::revoke_offer`] fails the resolution closed
+/// exactly like every other consumer of that ledger.
 #[derive(Clone, Debug, Default)]
 pub struct NodeCellDb {
     /// user identifier -> the CID of that user's key offer.
     identifier_to_cid: HashMap<String, Cid>,
+    /// user identifier -> the key-distribution ledger record this offer is
+    /// admitted (or revoked) under.
+    identifier_to_record: HashMap<String, RecordKey>,
     /// CID -> the node-sealed offer blob.
     offers: HashMap<Cid, SealedOffer>,
     /// user identifier -> the human handle to greet them by on the portal.
@@ -258,17 +271,20 @@ impl NodeCellDb {
 
     /// Record a user's offer: `identifier` (any of the accepted identifier
     /// forms) resolves to `cid`, which addresses `offer`; the user is greeted
-    /// by `handle`.
+    /// by `handle`. `record` is the REAL key-distribution ledger record this
+    /// offer's admission is tracked under.
     pub fn put_offer(
         &mut self,
         identifier: impl Into<String>,
         handle: impl Into<String>,
         cid: Cid,
+        record: RecordKey,
         offer: SealedOffer,
     ) {
         let identifier = identifier.into();
         self.identifier_to_cid
             .insert(identifier.clone(), cid.clone());
+        self.identifier_to_record.insert(identifier.clone(), record);
         self.handles.insert(identifier, handle.into());
         self.offers.insert(cid, offer);
     }
@@ -278,6 +294,13 @@ impl NodeCellDb {
     #[must_use]
     pub fn resolve_cid(&self, identifier: &str) -> Option<&Cid> {
         self.identifier_to_cid.get(identifier)
+    }
+
+    /// The key-distribution ledger record this identifier's offer is tracked
+    /// under, if any.
+    #[must_use]
+    pub fn record_for(&self, identifier: &str) -> Option<&RecordKey> {
+        self.identifier_to_record.get(identifier)
     }
 
     /// The node-sealed offer blob for a CID.
@@ -400,11 +423,22 @@ pub struct NodeCustodyVerifier {
     issued: HashMap<u64, Nonce>,
     consumed: std::collections::HashSet<u64>,
     origin: Origin,
+    /// The REAL `pillar_key_distribution` bi-directional offer/accept/admit
+    /// ledger this node's offers are resolved through — the same engine
+    /// `key-distribution-offer-impl`'s `pillar offer` CLI family drives.
+    /// [`NodeCellDb`] never stands in for admission on its own: a CID/blob
+    /// pair is resolvable ONLY once this ledger's `is_admitted` holds for the
+    /// record, so [`KeyDistributionLedger::revoke_offer`]'s fail-closed
+    /// revocation is real here too (see
+    /// [`NodeCustodyVerifier::revoke_offer_for`]).
+    ledger: KeyDistributionLedger,
 }
 
 impl NodeCustodyVerifier {
     /// A verifier for a node holding `node_key`, serving the origin `origin`,
-    /// with an empty cell DB.
+    /// with an empty cell DB and a fresh key-distribution ledger with this
+    /// node as the only node ("foreign nodes" empty — the login path never
+    /// exercises cross-owner cells).
     #[must_use]
     pub fn new(node_key: NodeKey, origin: impl Into<Origin>) -> Self {
         NodeCustodyVerifier {
@@ -414,15 +448,30 @@ impl NodeCustodyVerifier {
             issued: HashMap::new(),
             consumed: std::collections::HashSet::new(),
             origin: origin.into(),
+            ledger: KeyDistributionLedger::new(std::collections::BTreeSet::new()),
         }
     }
 
-    /// Give this node an offer to custody: record it in the cell DB under
-    /// `identifier`/`cid` and register the operational key's public
-    /// verifier. The plaintext `secret` is NEVER retained server-side — the
-    /// real AEAD unlock recovers it from the sealed offer at login time. In a
-    /// real node the label + offer arrive via `pillar_key_distribution`; this
-    /// is the login path's view of that state.
+    /// This node's origin, as a key-distribution [`CellId`] — the single
+    /// cell every offer this node custodies is distributed through.
+    fn home_cell(&self) -> CellId {
+        CellId::from(self.origin.0.as_str())
+    }
+
+    /// Give this node an offer to custody: really OFFER + ACCEPT + ADMIT the
+    /// record through the REAL [`KeyDistributionLedger`] (the SAME
+    /// bi-directional admission `key-distribution-offer-impl`'s `pillar
+    /// offer seal`/`resolve` CLI already drives — never a second, divergent
+    /// admission path), seal the operational key to THIS node, and register
+    /// its public verifier. The plaintext `secret` is NEVER retained
+    /// server-side — the real AEAD unlock recovers it from the sealed offer
+    /// at login time.
+    ///
+    /// # Panics
+    ///
+    /// If the ledger refuses the offer/accept/admit sequence (e.g. the same
+    /// `identifier`+`cid` is provisioned twice) — a provisioning-time
+    /// programming error, not a runtime login condition.
     pub fn provision_offer(
         &mut self,
         identifier: impl Into<String>,
@@ -432,23 +481,26 @@ impl NodeCustodyVerifier {
         password: &str,
         secret: &str,
     ) {
-        let offer = SealedOffer::seal(
-            subkey.clone(),
+        let this_node = self.node_key.node().clone();
+        self.admit_offer_via_ledger(
+            identifier,
+            handle,
+            cid,
+            subkey,
             password,
             secret,
-            &self.node_key,
-            std::iter::once(self.node_key.node().clone()),
+            &self.node_key.clone(),
+            std::iter::once(this_node),
         );
-        self.registered.insert(
-            subkey.clone(),
-            RegisteredOperationalKey::register(subkey, password, secret),
-        );
-        self.cell_db.put_offer(identifier, handle, cid, offer);
     }
 
     /// Provision an offer whose blob is sealed to a DIFFERENT node than this
-    /// one (so this node cannot strip it) — used to model the `NoCustody`
-    /// path where the cell sealed the key to some other node.
+    /// one (so this node cannot strip it) — used to exercise the `NoCustody`
+    /// path where the cell sealed the key to some other node. The ledger
+    /// admission is still real: the record IS admitted (this node CAN
+    /// resolve the CID/blob), the crypto seal is simply to a node other than
+    /// this one, exactly mirroring a real cell that allow-listed a different
+    /// node.
     #[allow(clippy::too_many_arguments)]
     pub fn provision_offer_sealed_elsewhere(
         &mut self,
@@ -462,18 +514,98 @@ impl NodeCustodyVerifier {
         other_secret: &str,
     ) {
         let other_key = NodeKey::new(other_node.clone(), other_secret);
-        let offer = SealedOffer::seal(
-            subkey.clone(),
+        self.admit_offer_via_ledger(
+            identifier,
+            handle,
+            cid,
+            subkey,
             password,
             secret,
             &other_key,
             std::iter::once(other_node),
         );
+    }
+
+    /// The shared real-resolution path both provisioning entry points route
+    /// through: register the cell + user + artifact with the REAL
+    /// [`KeyDistributionLedger`], run its bi-directional `offer`/`accept`/
+    /// `admit` sequence, seal the operational key, and record the CID ->
+    /// blob mapping under the resulting [`RecordKey`] — the ONE resolver, no
+    /// duplicate modeled admission logic between the "sealed here" and
+    /// "sealed elsewhere" provisioning shapes.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_offer_via_ledger(
+        &mut self,
+        identifier: impl Into<String>,
+        handle: impl Into<String>,
+        cid: Cid,
+        subkey: NodeSubkey,
+        password: &str,
+        secret: &str,
+        seal_with: &NodeKey,
+        sealed_to: impl IntoIterator<Item = NodeId>,
+    ) {
+        let identifier = identifier.into();
+        let cell = self.home_cell();
+        let user = KdUserId::from(identifier.as_str());
+        let artifact_id = ArtifactId::from(cid.0.as_str());
+        let record = RecordKey {
+            user: user.clone(),
+            cell: cell.clone(),
+            artifact: artifact_id.clone(),
+        };
+
+        self.ledger.cell_mut(cell.clone()).add_user(user);
+        self.ledger
+            .register_artifact(Artifact::new(artifact_id, ArtifactKind::Operational));
+        for node in sealed_to
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            self.ledger
+                .add_node_to_allowlist(&cell, node)
+                .expect("cell was just registered above");
+        }
+        self.ledger
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
+            .expect("fresh (user, cell, artifact) record is never already offered/admitted");
+        self.ledger
+            .accept(&record)
+            .expect("just-offered record is always acceptable");
+        self.ledger
+            .admit(&record)
+            .expect("offered + accepted, non-cross-owner record always admits");
+
+        let offer = SealedOffer::seal(
+            subkey.clone(),
+            password,
+            secret,
+            seal_with,
+            self.ledger.seal_of(&record),
+        );
         self.registered.insert(
             subkey.clone(),
             RegisteredOperationalKey::register(subkey, password, secret),
         );
-        self.cell_db.put_offer(identifier, handle, cid, offer);
+        self.cell_db
+            .put_offer(identifier, handle, cid, record, offer);
+    }
+
+    /// Revoke a previously-provisioned offer through the REAL
+    /// [`KeyDistributionLedger::revoke_offer`] — fail-closed, exactly as
+    /// every other `pillar_key_distribution` consumer observes: after this,
+    /// `identifier` resolves to no admitted offer (`has_offer_for` is
+    /// `false`, [`Self::admit`] returns [`NodeCustodyError::NoOfferForUser`])
+    /// even though the sealed blob and CID mapping remain in the cell DB — a
+    /// live demonstration this path is no longer a modeled stand-in.
+    pub fn revoke_offer_for(&mut self, identifier: &str) {
+        if let Some(record) = self.cell_db.record_for(identifier).cloned() {
+            let _ = self.ledger.revoke_offer(&record);
+        }
     }
 
     /// This node's origin.
@@ -492,12 +624,18 @@ impl NodeCustodyVerifier {
 
     /// Whether this node can resolve an offer for `identifier` at all (used to
     /// surface the "no offer for this user / node unlabelled" message before
-    /// asking for a password).
+    /// asking for a password). Requires the REAL key-distribution ledger to
+    /// still consider the record admitted — a revoked offer reports `false`
+    /// here even though the sealed blob is still physically present.
     #[must_use]
     pub fn has_offer_for(&self, identifier: &str) -> bool {
         self.cell_db
             .resolve_cid(identifier)
             .is_some_and(|cid| self.cell_db.offer_for(cid).is_some())
+            && self
+                .cell_db
+                .record_for(identifier)
+                .is_some_and(|record| self.ledger.is_admitted(record))
     }
 
     /// Admit a NODE-SIDE custody login. The user supplied only `identifier`
@@ -527,10 +665,22 @@ impl NodeCustodyVerifier {
         authority: &WotAuthority,
         actor: &FencedActor,
     ) -> Result<NodeCustodySession, NodeCustodyError> {
-        // Step 1: resolve the offer server-side (the user never gave a CID).
+        // Step 1: resolve the offer server-side (the user never gave a CID) —
+        // through the REAL key-distribution ledger's admission, not a bare
+        // presence check: a record whose offer was revoked
+        // (`KeyDistributionLedger::revoke_offer`) reports no offer here even
+        // though its blob and CID mapping are still physically in the cell
+        // DB, so revocation fails this path closed exactly like every other
+        // ledger consumer.
         let Some(cid) = self.cell_db.resolve_cid(identifier).cloned() else {
             return Err(NodeCustodyError::NoOfferForUser);
         };
+        let Some(record) = self.cell_db.record_for(identifier) else {
+            return Err(NodeCustodyError::NoOfferForUser);
+        };
+        if !self.ledger.is_admitted(record) {
+            return Err(NodeCustodyError::NoOfferForUser);
+        }
         let Some(offer) = self.cell_db.offer_for(&cid).cloned() else {
             return Err(NodeCustodyError::NoOfferForUser);
         };
@@ -740,6 +890,50 @@ mod tests {
             Err(NodeCustodyError::NotAuthorized(ActError::NotAuthoritative)) => {}
             other => panic!("expected NotAuthoritative, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn revoking_the_offer_through_the_real_ledger_fails_the_login_closed() {
+        // The offer resolution path routes through the REAL
+        // `pillar_key_distribution::KeyDistributionLedger` admission, not a
+        // bare local presence check: revoking the offer through that real
+        // ledger must fail both `has_offer_for` and `admit` closed, even
+        // though the sealed blob and CID mapping are still physically
+        // present in the cell DB. This is exactly the modeled seam the ROI
+        // requires killed — a stand-in offer store could never observe a
+        // real ledger revocation.
+        let (mut v, subkey) = provisioned();
+        assert!(v.has_offer_for("alice@pillar"));
+
+        v.revoke_offer_for("alice@pillar");
+
+        assert!(
+            !v.has_offer_for("alice@pillar"),
+            "a revoked offer must no longer resolve"
+        );
+        let (auth, actor) = chained(&subkey);
+        let nonce = v.issue_nonce(10);
+        assert_eq!(
+            v.admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor),
+            Err(NodeCustodyError::NoOfferForUser),
+            "a revoked real-ledger offer must fail closed, not stand-in success"
+        );
+    }
+
+    #[test]
+    fn a_real_stored_offer_resolves_and_unlocks_through_the_real_ledger() {
+        // The positive case for the same real-resolution path: a genuinely
+        // admitted offer (offer+accept+admit all really run against
+        // `KeyDistributionLedger`) resolves and unlocks correctly end to
+        // end.
+        let (mut v, subkey) = provisioned();
+        assert!(v.has_offer_for("alice@pillar"));
+        let (auth, actor) = chained(&subkey);
+        let nonce = v.issue_nonce(10);
+        let session = v
+            .admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+            .expect("a real, admitted offer must resolve and unlock");
+        assert_eq!(session.subject, subkey.node_id());
     }
 
     #[test]

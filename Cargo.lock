@@ -2827,6 +2827,7 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-identity",
+ "pillar-key-distribution",
  "pillar-manifest",
  "pillar-rbac",
  "pillar-wot-authority",

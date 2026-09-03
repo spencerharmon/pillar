@@ -12,6 +12,7 @@ pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-bootstrap = { path = "../pillar-bootstrap" }
 pillar-identity = { path = "../pillar-identity" }
+pillar-key-distribution = { path = "../pillar-key-distribution" }
 pillar-manifest = { path = "../pillar-manifest" }
 pillar-rbac = { path = "../pillar-rbac" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
