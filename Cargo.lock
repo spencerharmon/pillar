@@ -3044,6 +3044,7 @@ dependencies = [
 name = "pillar-cli"
 version = "0.0.0"
 dependencies = [
+ "ciborium",
  "futures",
  "libp2p",
  "pillar-bootstrap",
@@ -3065,6 +3066,7 @@ dependencies = [
  "pillar-web",
  "pillar-web-api",
  "pillar-wot-authority",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -3106,6 +3108,7 @@ version = "0.0.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
+ "ciborium",
  "cryptoki",
  "ctap-hid-fido2",
  "ed25519-dalek",
@@ -3274,6 +3277,7 @@ dependencies = [
 name = "pillar-web"
 version = "0.0.0"
 dependencies = [
+ "ciborium",
  "pillar-bootstrap",
  "pillar-core",
  "pillar-crypto",
@@ -3281,6 +3285,7 @@ dependencies = [
  "pillar-manifest",
  "pillar-rbac",
  "pillar-wot-authority",
+ "sha2",
 ]
 
 [[package]]

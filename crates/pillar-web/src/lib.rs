@@ -31,6 +31,7 @@
 
 pub mod key_login;
 pub mod node_custody;
+pub mod webauthn;
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
