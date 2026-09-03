@@ -51,6 +51,11 @@ pub use store::{
 mod ipfs_persist;
 pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};
 
+pub mod geo_replication;
+pub use geo_replication::{
+    RemoteReplica, ReplicationError, ReplicationGrant, ReplicationTrust,
+};
+
 /// A content address: the identity of an [`Op`], derived purely from its
 /// payload bytes via a **collision-resistant cryptographic** hash.
 ///
