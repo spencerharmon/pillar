@@ -60,6 +60,21 @@ impl SignalId {
         self.0.as_bytes()
     }
 
+    /// The content address as lowercase hex — the same on-disk/wire form
+    /// `pillar_streamdb::OpId` uses, so a persisted materialized view can
+    /// round-trip signal ids without a second encoding.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
+
+    /// The inverse of [`SignalId::to_hex`]. Returns `None` for any string that
+    /// is not valid hex (defensive against on-disk corruption).
+    #[must_use]
+    pub fn from_hex(s: &str) -> Option<Self> {
+        Some(SignalId(pillar_streamdb::OpId::from_hex(s)?))
+    }
+
     /// A deterministic test-only content address derived from a numeric seed —
     /// a real SHA2-256 multihash of the seed bytes, so tests get distinct,
     /// stable ids without hand-constructing a placeholder integer id.
