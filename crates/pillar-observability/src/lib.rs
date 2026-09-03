@@ -32,7 +32,11 @@
 //!
 //! Raw queries and their materialized views are served over the message bus
 //! with a cache ([`ViewCache`]) keyed on the content-addressed op-set root, so
-//! a raw query is recomputed only when the underlying set changed.
+//! a raw query is recomputed only when the underlying set changed. That same
+//! `(query, root)` key generalizes into a **named, durably-persisted**
+//! materialized view ([`PersistedMaterializedView`]) that survives a process
+//! restart — the resource a Dashboard panel or RecordingRule references by
+//! name, reusing this one mechanism rather than a bespoke blob store.
 
 #![forbid(unsafe_code)]
 
@@ -48,7 +52,7 @@ pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
 pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };
-pub use query::{Query, ViewCache};
+pub use query::{PersistedMaterializedView, Query, ViewCache, ViewPersistError};
 pub use role::{NodeRole, NodeRoleConfig, RoleError, SignedNodeRole};
 pub use sampling::{Occurrence, SampleError, SamplingPolicy};
 
