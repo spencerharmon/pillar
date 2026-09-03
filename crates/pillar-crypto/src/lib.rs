@@ -29,14 +29,16 @@
 //! change them later. What is fixed is the **contract**: the behaviors the
 //! module-level unit tests assert.
 //!
-//! ## Every operation is `NotImplemented` — on purpose
+//! ## The contract is enforced by tests, not a source grep
 //!
-//! Each function returns [`CryptoError::NotImplemented`] today. The unit tests
-//! feed contrived fixtures through the real signatures and assert the contract
+//! Every operation is really implemented (argon2id, ed25519, X25519 sealed
+//! boxes, sha256/blake3 multihash, real custody backends). The module-level
+//! unit tests feed fixtures through the real signatures and assert the contract
 //! (a signature verifies and rejects tampering; a non-recipient cannot unseal;
 //! a wrong password yields a different key; a content address is deterministic,
-//! distinct, and wide). They are RED until a real implementation lands, which
-//! is the whole point: the tests — not a source grep — force compliance.
+//! distinct, and wide). They GREEN because the implementations satisfy those
+//! properties — the tests, not a source grep, are what force compliance and
+//! keep any future regression to a placeholder from passing.
 
 mod error;
 mod types;
