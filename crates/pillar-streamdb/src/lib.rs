@@ -328,7 +328,10 @@ impl fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BootstrapError::Unsupported(e) => {
-                write!(f, "snapshot has an unsupported materialized-view schema: {e}")
+                write!(
+                    f,
+                    "snapshot has an unsupported materialized-view schema: {e}"
+                )
             }
         }
     }

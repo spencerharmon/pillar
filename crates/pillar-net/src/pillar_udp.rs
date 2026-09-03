@@ -526,7 +526,10 @@ pub fn reconstruct(shards: &[Shard], k: usize, orig_len: usize) -> Result<Vec<u8
     }
     // Work over PAYLOADS (stamp stripped); every good shard has a payload since
     // it passed both the version gate and `verify`.
-    let shard_len = good[0].payload().expect("verified shard has a payload").len();
+    let shard_len = good[0]
+        .payload()
+        .expect("verified shard has a payload")
+        .len();
 
     // Collect available data shards by position.
     let mut data: Vec<Option<Vec<u8>>> = vec![None; k];
@@ -543,8 +546,10 @@ pub fn reconstruct(shards: &[Shard], k: usize, orig_len: usize) -> Result<Vec<u8
         let missing: Vec<usize> = (0..k).filter(|&i| data[i].is_none()).collect();
         if missing.len() == 1 {
             if let Some(parity) = good.iter().find(|s| s.index >= k) {
-                let mut recovered =
-                    parity.payload().expect("verified shard has a payload").to_vec();
+                let mut recovered = parity
+                    .payload()
+                    .expect("verified shard has a payload")
+                    .to_vec();
                 for d in data.iter().flatten() {
                     for (r, b) in recovered.iter_mut().zip(d) {
                         *r ^= *b;
@@ -805,11 +810,17 @@ mod tests {
         // stamp, and the CID addresses the payload (NOT the stamped bytes).
         for s in &shards {
             assert_eq!(&s.bytes[..2], &PROTOCOL_VERSION.to_be_bytes());
-            assert!(s.verify(), "payload hashes to its CID with the stamp excluded");
+            assert!(
+                s.verify(),
+                "payload hashes to its CID with the stamp excluded"
+            );
         }
 
         let recovered = reconstruct(&shards, k, message.len()).unwrap();
-        assert_eq!(recovered, message, "round-trips through the version-stamped wire form");
+        assert_eq!(
+            recovered, message,
+            "round-trips through the version-stamped wire form"
+        );
     }
 
     #[test]

@@ -131,7 +131,7 @@ async fn datagram_routes_end_to_end_over_pillar_udp() {
     // (the negotiated endpoint address is a pillar-UDP multiaddr).
     let connected_over_pillar_udp = {
         let deadline = Duration::from_secs(30);
-    let a_conn = drive_until(&mut a, deadline, |event| match event {
+        let a_conn = drive_until(&mut a, deadline, |event| match event {
             SwarmEvent::ConnectionEstablished { endpoint, .. } => {
                 Some(is_pillar_udp_addr(endpoint.get_remote_address()))
             }

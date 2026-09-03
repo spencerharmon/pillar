@@ -247,7 +247,7 @@ async fn pump(
                     }
                 }
             }
-                        TAG_ACK if pending.is_some() && seq == *send_seq => {
+            TAG_ACK if pending.is_some() && seq == *send_seq => {
                 *pending = None;
                 *send_seq += 1;
             }
@@ -381,10 +381,7 @@ impl Transport for PillarUdpTransport {
             .set_nonblocking(true)
             .map_err(TransportError::Other)?;
         let local = std_sock.local_addr().map_err(TransportError::Other)?;
-        let socket = Arc::new(
-            UdpSocket::from_std(std_sock)
-                .map_err(TransportError::Other)?,
-        );
+        let socket = Arc::new(UdpSocket::from_std(std_sock).map_err(TransportError::Other)?);
 
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         // Accept loop: demultiplex by source SocketAddr; a first datagram from
@@ -566,10 +563,12 @@ mod raw_tests {
             s.read_exact(&mut buf).await.unwrap();
             buf
         };
-        let (srv, cli) =
-            tokio::time::timeout(std::time::Duration::from_secs(8), futures::future::join(listen_side, dial_side))
-                .await
-                .expect("raw roundtrip");
+        let (srv, cli) = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            futures::future::join(listen_side, dial_side),
+        )
+        .await
+        .expect("raw roundtrip");
         assert_eq!(&srv, b"hello");
         assert_eq!(&cli, b"pong!");
     }

@@ -266,8 +266,7 @@ impl Event {
 
     /// The lowest event-envelope schema version this build still accepts on
     /// ingest.
-    pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion =
-        pillar_crypto::SurfaceVersion(1);
+    pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
 
     fn default_schema_version() -> pillar_crypto::SurfaceVersion {
         Event::SCHEMA_VERSION
@@ -640,9 +639,7 @@ mod tests {
             payload: b"seq2".to_vec(),
         };
         let sig2 = Signature::sign(&alice, &c2);
-        assert!(log
-            .ingest(Event::stamped(c2, sig2))
-            .is_ok());
+        assert!(log.ingest(Event::stamped(c2, sig2)).is_ok());
     }
 
     /// `PrevLinkIntegrity`: a rewritten (tampered) hash-link breaks the
@@ -799,7 +796,11 @@ mod tests {
         future.schema_version = pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1);
 
         // The envelope stamp did not perturb the content address.
-        assert_eq!(future.id(), expected_id, "envelope stamp must not change CID");
+        assert_eq!(
+            future.id(),
+            expected_id,
+            "envelope stamp must not change CID"
+        );
         // The signature still verifies (the stamp is outside the signed content).
         assert!(future.is_authentic());
 
@@ -807,7 +808,10 @@ mod tests {
         match log.ingest(future) {
             Err(EventError::UnsupportedSchemaVersion(
                 pillar_crypto::VersionError::Unsupported { found, .. },
-            )) => assert_eq!(found, pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1)),
+            )) => assert_eq!(
+                found,
+                pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1)
+            ),
             other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
         }
     }

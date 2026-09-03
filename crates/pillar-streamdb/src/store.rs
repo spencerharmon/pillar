@@ -228,7 +228,12 @@ pub struct HeadRecord {
 
 const HEAD_SIG_DOMAIN: &[u8] = b"pillar-streamdb/ipfs-store/ipns-head-v1";
 
-fn head_signing_material(owner: &SigningPublicKey, seq: u64, target: &Cid, ttl_secs: u64) -> Vec<u8> {
+fn head_signing_material(
+    owner: &SigningPublicKey,
+    seq: u64,
+    target: &Cid,
+    ttl_secs: u64,
+) -> Vec<u8> {
     let mut m = Vec::new();
     m.extend_from_slice(HEAD_SIG_DOMAIN);
     m.extend_from_slice(owner.as_bytes());
@@ -578,7 +583,11 @@ mod tests {
         let cid = store.put(seg.clone()).expect("put");
 
         // The CID is a real sha2-256 multihash: 0x12 0x20 + 32-byte digest.
-        assert_eq!(cid.as_bytes().len(), 34, "sha2-256 multihash, not a checksum");
+        assert_eq!(
+            cid.as_bytes().len(),
+            34,
+            "sha2-256 multihash, not a checksum"
+        );
         assert_eq!(cid.as_bytes()[0], 0x12, "multicodec sha2-256");
         assert_eq!(cid.as_bytes()[1], 0x20, "digest length 32");
         assert!(cid.verifies(seg.bytes()), "CID must verify against bytes");
@@ -605,7 +614,7 @@ mod tests {
         let (victim_pk, _victim_sk) = keypair("victim");
         let forged = SignedSegment::author(
             b"forged".to_vec(),
-            victim_pk, // claim victim as author...
+            victim_pk,  // claim victim as author...
             &forger_sk, // ...but sign with the forger's key
             Visibility::Public,
         )
@@ -636,14 +645,24 @@ mod tests {
             }
         };
         let got = node_b.get(&cid, &honest_peer).expect("backfill");
-        assert_eq!(got.bytes(), b"segment only A has", "byte-identical backfill");
-        assert!(node_b.contains(&cid), "backfilled segment is cached locally");
+        assert_eq!(
+            got.bytes(),
+            b"segment only A has",
+            "byte-identical backfill"
+        );
+        assert!(
+            node_b.contains(&cid),
+            "backfilled segment is cached locally"
+        );
 
         // A malicious peer that returns wrong bytes for the CID is rejected.
         let (wrong_seg, _) = segment(b"WRONG bytes", "author-a", Visibility::Cell);
         let mut node_c = ContentStore::new();
         let liar = move |_want: &Cid| Some(wrong_seg.clone());
-        assert_eq!(node_c.get(&cid, &liar).unwrap_err(), StoreError::CidMismatch);
+        assert_eq!(
+            node_c.get(&cid, &liar).unwrap_err(),
+            StoreError::CidMismatch
+        );
         assert!(!node_c.contains(&cid), "rejected content is never cached");
 
         // An unreachable CID yields NotFound.
@@ -682,7 +701,10 @@ mod tests {
         assert!(store.is_provided(&pub_cid));
 
         assert_eq!(store.provide(&cell_cid).unwrap_err(), StoreError::NotPublic);
-        assert_eq!(store.provide(&sealed_cid).unwrap_err(), StoreError::NotPublic);
+        assert_eq!(
+            store.provide(&sealed_cid).unwrap_err(),
+            StoreError::NotPublic
+        );
         assert!(!store.is_provided(&cell_cid));
         assert!(!store.is_provided(&sealed_cid));
 
@@ -738,7 +760,10 @@ mod tests {
             &owner_sk,
         )
         .expect("author stale");
-        assert_eq!(store.publish_head(stale).unwrap_err(), StoreError::StaleHead);
+        assert_eq!(
+            store.publish_head(stale).unwrap_err(),
+            StoreError::StaleHead
+        );
         assert_eq!(store.resolve_head(&owner_pk).unwrap().seq(), 2);
 
         // A forged head (higher seq, but signed by the WRONG key claiming owner)

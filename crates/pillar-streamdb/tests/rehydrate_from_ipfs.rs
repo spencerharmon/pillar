@@ -16,7 +16,9 @@ fn seed(label: &str) -> Seed {
 /// A closure-based [`pillar_streamdb::SegmentSource`] backed by another node's
 /// content store — the stand-in for the private swarm's backfill substrate a
 /// real libp2p/IPFS transport provides.
-fn source_from<'a>(remote: &'a pillar_streamdb::ContentStore) -> impl Fn(&Cid) -> Option<SignedSegment> + 'a {
+fn source_from<'a>(
+    remote: &'a pillar_streamdb::ContentStore,
+) -> impl Fn(&Cid) -> Option<SignedSegment> + 'a {
     move |cid: &Cid| remote.get_local(cid)
 }
 
@@ -29,9 +31,15 @@ fn fresh_node_rehydrates_from_ipfs_pinned_segments_not_local_disk() {
     // "swarm" state (no local filesystem involved anywhere in this module).
     let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
     let ids = [
-        node_a.append(b"alpha".to_vec(), SideEffect::Exclusive).unwrap(),
-        node_a.append(b"bravo".to_vec(), SideEffect::Convergent).unwrap(),
-        node_a.append(b"charlie".to_vec(), SideEffect::Exclusive).unwrap(),
+        node_a
+            .append(b"alpha".to_vec(), SideEffect::Exclusive)
+            .unwrap(),
+        node_a
+            .append(b"bravo".to_vec(), SideEffect::Convergent)
+            .unwrap(),
+        node_a
+            .append(b"charlie".to_vec(), SideEffect::Exclusive)
+            .unwrap(),
     ];
 
     let root_before = node_a.stream().log().root();
@@ -63,7 +71,10 @@ fn fresh_node_rehydrates_from_ipfs_pinned_segments_not_local_disk() {
     // Reconverges to EXACTLY the continuously-gossiped view: same op set,
     // same materialized order, same Merkle root — never lost a write.
     for id in &ids {
-        assert!(node_b.stream().log().contains(id), "rehydrated set holds every op");
+        assert!(
+            node_b.stream().log().contains(id),
+            "rehydrated set holds every op"
+        );
     }
     assert_eq!(node_b.stream().log().len(), 3);
     let order_after: Vec<_> = node_b
@@ -91,7 +102,9 @@ fn restarting_node_recovers_write_capability_via_custody_key_and_sealed_ipfs_seg
     let (node_pub, node_secret) = sealing_keypair_from_seed(&seed("node-custody")).expect("keygen");
 
     let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
-    node_a.append(b"pre-restart-op".to_vec(), SideEffect::Exclusive).unwrap();
+    node_a
+        .append(b"pre-restart-op".to_vec(), SideEffect::Exclusive)
+        .unwrap();
 
     // Seal the signing secret to the restarting node's custody public key and
     // pin the envelope to IPFS (Sealed visibility — never reaches the DHT).
@@ -111,10 +124,12 @@ fn restarting_node_recovers_write_capability_via_custody_key_and_sealed_ipfs_seg
 
     // Fresh node, empty disk: rehydrate read-only from IPFS...
     let source = source_from(node_a.store());
-    let mut node_b = IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &source)
-        .expect("rehydrate");
+    let mut node_b =
+        IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &source).expect("rehydrate");
     assert!(
-        node_b.append(b"should fail".to_vec(), SideEffect::Exclusive).is_err(),
+        node_b
+            .append(b"should fail".to_vec(), SideEffect::Exclusive)
+            .is_err(),
         "a purely rehydrated handle holds no signing secret yet"
     );
 

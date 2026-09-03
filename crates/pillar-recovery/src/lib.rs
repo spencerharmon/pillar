@@ -219,10 +219,7 @@ pub fn store_backup(
         return Err(RecoveryError::NotSealedToRequester);
     }
     let digest = store.insert(blob.to_bytes());
-    Ok(SwarmBackup {
-        digest,
-        sealed_to,
-    })
+    Ok(SwarmBackup { digest, sealed_to })
 }
 
 /// Fetch and decode the [`BackupBlob`] `swarm` addresses, refusing any

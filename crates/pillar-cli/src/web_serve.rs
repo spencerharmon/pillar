@@ -3038,7 +3038,10 @@ fn check_request_api_version(request: &HttpRequest) -> Option<HttpResponse> {
     let raw = request.api_version.as_deref()?;
     // Accept both the `Display` form (`v1`) and a bare number (`1`), so a
     // client may echo back exactly what a response advertised.
-    let digits = raw.strip_prefix('v').or_else(|| raw.strip_prefix('V')).unwrap_or(raw);
+    let digits = raw
+        .strip_prefix('v')
+        .or_else(|| raw.strip_prefix('V'))
+        .unwrap_or(raw);
     let Ok(n) = digits.parse::<u16>() else {
         // Illegible: a parse error (400), NOT the unsupported-version case.
         return Some(text_response(
