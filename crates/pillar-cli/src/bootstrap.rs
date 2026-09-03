@@ -53,7 +53,7 @@ pub struct HttpReply {
 /// HTTP connection, stripping any `http://`/`https://` scheme and defaulting
 /// the port to the node's web port (8642). Returns the authority and the
 /// original host (for `PILLAR_DOMAIN`).
-fn authority_of(domain: &str) -> (String, String) {
+pub(crate) fn authority_of(domain: &str) -> (String, String) {
     let stripped = domain
         .strip_prefix("https://")
         .or_else(|| domain.strip_prefix("http://"))
@@ -72,7 +72,7 @@ fn authority_of(domain: &str) -> (String, String) {
 /// # Errors
 ///
 /// Any connection / I/O / parse failure, as a human-readable string.
-fn http(authority: &str, method: &str, path: &str, body: &str) -> Result<HttpReply, String> {
+pub(crate) fn http(authority: &str, method: &str, path: &str, body: &str) -> Result<HttpReply, String> {
     let mut stream =
         TcpStream::connect(authority).map_err(|e| format!("cannot reach {authority}: {e}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok();

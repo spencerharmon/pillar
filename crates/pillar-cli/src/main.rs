@@ -28,6 +28,8 @@ fn usage() -> &'static str {
      \x20 pillar bootstrap node|user --domain <D> [opts]       submit a node/user join request\n\
      \x20 pillar bootstrap request list|approve <id> [--domain D]  review/decide join requests\n\
      \x20 pillar login --domain <D> --user <id> [--password P]    print export PILLAR_DOMAIN/PILLAR_TOKEN\n\
+     \x20 pillar webauthn register --user <handle> [--domain D] [--token T]  register a hardware credential (ctap-hid)\n\
+     \x20 pillar webauthn login [--domain D] [--token T] --credential-id <id>  authenticate with a hardware credential (ctap-hid)\n\
      \x20 pillar session ls|show <id>|revoke <id>|revoke-all       server-side sessions (ls/show view; revoke acts)\n\
      \x20 pillar logout | whoami | status           session lifecycle (see pillar_cli::resource::Session)\n\
      \x20 pillar use|ctx <ls|show|add|rm|rename|current>  local context (see pillar_cli::resource::ContextStore)\n\
@@ -91,6 +93,7 @@ fn main() -> ExitCode {
         Some("--web") => web(&args[1..]),
         Some("node") => node(&args[1..]),
         Some("bootstrap") => bootstrap(&args[1..]),
+        Some("webauthn") => webauthn(&args[1..]),
         Some("session") => session(&args[1..]),
         Some("identity") | Some("user") | Some("key") | Some("offer") | Some("trust")
         | Some("attest") | Some("grant") | Some("caps") | Some("revoke") | Some("audit") => {
@@ -180,6 +183,23 @@ fn login(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar webauthn register|login`: CLI-driven CTAP2 WebAuthn ceremonies
+/// (registration/assertion) over ctap-hid against a locally attached hardware
+/// authenticator — the SAME RP begin/finish endpoints, and the SAME
+/// COSE/CBOR credential record shape, the browser path uses.
+fn webauthn(args: &[String]) -> ExitCode {
+    match pillar_cli::webauthn_cli::run(args) {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
         }
     }
 }
