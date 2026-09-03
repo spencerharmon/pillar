@@ -10,10 +10,9 @@ pub type Result<T> = core::result::Result<T, CryptoError>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CryptoError {
-    /// The operation is defined but not yet implemented. Every function in this
-    /// crate starts here; the contract tests fail until a real implementation
-    /// replaces it. This is the forcing gate against placeholder cryptography.
-    /// The `&'static str` names the operation (e.g. `"sign::verify"`).
+    /// The operation is defined but not implemented in this build (e.g. a
+    /// backend compiled out on this platform). The `&'static str` names the
+    /// operation (e.g. `"sign::verify"`).
     NotImplemented(&'static str),
     /// Supplied key material was malformed or the wrong length for the chosen
     /// algorithm.
