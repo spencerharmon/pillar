@@ -17,12 +17,13 @@
 //!   links to the observed tips of OTHER authors (the cross-author causal /
 //!   happens-before edges).
 //!
-//! The signature and the collision-resistant hash are modelled with the same
-//! dependency-free stand-ins the rest of the crate graph uses (see
-//! `pillar_identity`): [`Signature`] asserts a *verified* PGP signature over
-//! an event's content digest, and content addresses are the streamdb content
-//! hash. This crate refines the AP integrity structure of the append log; the
-//! CP total order is supplied elsewhere (the coordination core).
+//! The signature is backed by real `pillar_crypto` ed25519 sign/verify (see
+//! [`author_signing_keypair`]) and the collision-resistant hash is the real
+//! streamdb content address: [`Signature`] asserts a *verified* ed25519
+//! signature over an event's content digest, and content addresses are the
+//! streamdb content hash. This crate refines the AP integrity structure of
+//! the append log; the CP total order is supplied elsewhere (the
+//! coordination core).
 //!
 //! The type mirrors, and its tests encode, the TLC-proven invariants of
 //! `EventDAG.tla`:
@@ -197,39 +198,90 @@ impl EventContent {
     }
 }
 
-/// A *verified* OpenPGP signature over an [`EventContent`] by its author — the
-/// dependency-free stand-in for a real PGP signature packet (the same
-/// modelling `pillar_identity::Signature` uses).
+/// Deterministically derive an author's real ed25519 signing keypair from
+/// its stable identifier.
+///
+/// This crate has no out-of-band keystore, so — mirroring the same
+/// seed-derived-keypair convention `pillar_identity::login::backend_keypair`
+/// uses for its own fixture identities — the keypair is derived from the
+/// author's name via a domain-separated seed
+/// ([`pillar_crypto::sign::signing_keypair_from_seed`]). A real deployment
+/// may instead draw the seed from an OS CSPRNG / an enrolled identity's
+/// actual key; either way the signature itself is genuine ed25519, not a
+/// dependency-free stand-in.
+fn author_signing_keypair(
+    author: &Author,
+) -> (pillar_crypto::SigningPublicKey, pillar_crypto::SigningSecretKey) {
+    let seed = pillar_crypto::Seed::from_bytes(
+        format!("pillar-eventlog/author-signing-seed::{}", author.0).into_bytes(),
+    );
+    pillar_crypto::sign::signing_keypair_from_seed(&seed)
+        .expect("deterministic seed-derived ed25519 keygen never fails")
+}
+
+/// A *verified* ed25519 signature over an [`EventContent`] by its author —
+/// backed by real `pillar_crypto` sign/verify (see
+/// [`author_signing_keypair`]), not a dependency-free stand-in.
 ///
 /// Constructing one via [`Signature::sign`] asserts the author signed the
-/// content's digest. [`Signature::verifies`] recomputes the content digest and
-/// checks it still matches: if any field of the content was rewritten after
-/// signing, the digest changes and the signature no longer verifies —
-/// tamper-evidence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// content's digest with their real ed25519 secret key.
+/// [`Signature::verifies`] recomputes the content digest and cryptographically
+/// verifies the signature against it with the author's derived public key: if
+/// any field of the content was rewritten after signing, the digest changes
+/// and verification fails; a signature forged without the author's secret key
+/// likewise fails, even if it happens to name the right digest —
+/// tamper-evidence AND authenticity.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature {
     author: Author,
-    signed_digest: EventId,
+    signature: pillar_crypto::Signature,
+}
+
+impl Serialize for Signature {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (&self.author, self.signature.as_bytes()).serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let (author, bytes): (Author, Vec<u8>) = Deserialize::deserialize(d)?;
+        Ok(Signature {
+            author,
+            signature: pillar_crypto::Signature::from_bytes(bytes),
+        })
+    }
 }
 
 impl Signature {
-    /// Sign `content` as `author`, binding the signature to the content's
-    /// current digest.
+    /// Sign `content` as `author`: derive the author's real ed25519 secret
+    /// key ([`author_signing_keypair`]) and sign the content's current
+    /// digest with it.
     #[must_use]
     pub fn sign(author: &Author, content: &EventContent) -> Self {
+        let (_public, secret) = author_signing_keypair(author);
+        let digest = content.digest();
+        let signature = pillar_crypto::sign::sign(&secret, digest.as_bytes())
+            .expect("ed25519 signing over a fixed-length digest never fails");
         Signature {
             author: author.clone(),
-            signed_digest: EventId(content.digest()),
+            signature,
         }
     }
 
-    /// Whether this signature verifies against `content`: it must have been
-    /// issued by the content's own author AND still cover the content's
-    /// (recomputed) digest. A rewritten link or payload changes the digest and
-    /// fails this check.
+    /// Whether this signature verifies against `content`: it must be a
+    /// genuine ed25519 signature, by the content's own author's derived
+    /// secret key, over the content's (recomputed) digest. A rewritten link
+    /// or payload changes the digest and fails this check; a forged
+    /// signature by a non-author also fails (asymmetry — the public key
+    /// alone cannot forge).
     #[must_use]
     pub fn verifies(&self, content: &EventContent) -> bool {
-        self.author == content.author && self.signed_digest.0 == content.digest()
+        if self.author != content.author {
+            return false;
+        }
+        let (public, _secret) = author_signing_keypair(&self.author);
+        let digest = content.digest();
+        pillar_crypto::sign::verify(&public, digest.as_bytes(), &self.signature).is_ok()
     }
 
     /// The author who issued this signature.
@@ -665,6 +717,90 @@ mod tests {
         let mut log2 = EventLog::new();
         log2.ingest(log.get(&g).unwrap().clone()).unwrap();
         assert_eq!(log2.ingest(tampered), Err(EventError::TamperedSignature));
+    }
+
+    /// A real ed25519 keypair signs an event, and the resulting signature
+    /// verifies via genuine `pillar_crypto` sign/verify — no dependency-free
+    /// stand-in remains.
+    #[test]
+    fn real_keypair_signs_and_verifies_the_envelope() {
+        let alice = author("alice");
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 0,
+            prev: None,
+            parents: BTreeSet::new(),
+            payload: b"hello".to_vec(),
+        };
+        let signature = Signature::sign(&alice, &content);
+
+        // The signature bytes are a genuine ed25519 detached signature (64
+        // bytes), not a stand-in digest copy.
+        assert_eq!(
+            signature.signature.as_bytes().len(),
+            64,
+            "must be a real ed25519 signature, not a stand-in"
+        );
+        assert!(
+            signature.verifies(&content),
+            "a genuine signature by the content's own author must verify"
+        );
+
+        let (public, _secret) = author_signing_keypair(&alice);
+        assert!(
+            pillar_crypto::sign::verify(&public, content.digest().as_bytes(), &signature.signature)
+                .is_ok(),
+            "the signature must verify directly against pillar_crypto::sign::verify too"
+        );
+    }
+
+    /// A forged event signature — one produced by a different author's key,
+    /// or hand-rolled bytes claiming to be alice's — is rejected both by
+    /// direct verification and by `EventLog::ingest` (the anti-entropy-sync
+    /// ingest path).
+    #[test]
+    fn forged_event_signature_is_rejected_by_ingest() {
+        let alice = author("alice");
+        let mallory = author("mallory");
+        let mut log = EventLog::new();
+        let g = log.append(&alice, b"seq0".to_vec());
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 1,
+            prev: Some(g),
+            parents: BTreeSet::new(),
+            payload: b"seq1".to_vec(),
+        };
+
+        // Forge #1: sign the SAME content with a different author's secret
+        // key, then claim it was alice's signature.
+        let mallory_sig_over_alice_content = Signature::sign(&mallory, &content);
+        let forged = Signature {
+            author: alice.clone(),
+            signature: mallory_sig_over_alice_content.signature,
+        };
+        assert!(
+            !forged.verifies(&content),
+            "a signature produced by a non-author's key must not verify, even \
+             relabelled with the victim's author id"
+        );
+        let event = Event::stamped(content.clone(), forged);
+        assert_eq!(
+            log.ingest(event),
+            Err(EventError::TamperedSignature),
+            "ingest must reject a forged signature"
+        );
+
+        // Forge #2: arbitrary bytes are not a valid signature at all.
+        let garbage = Signature {
+            author: alice.clone(),
+            signature: pillar_crypto::Signature::from_bytes(vec![0u8; 64]),
+        };
+        assert!(!garbage.verifies(&content));
+        assert_eq!(
+            log.ingest(Event::stamped(content, garbage)),
+            Err(EventError::TamperedSignature)
+        );
     }
 
     /// `ParentsCrossAuthorAndExist`: a parent link to a same-author event, or
