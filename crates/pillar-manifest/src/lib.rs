@@ -37,6 +37,7 @@ use pillar_crypto::{Seed, Signature, SigningPublicKey, SigningSecretKey};
 pub mod admission;
 pub mod bgp_lb;
 pub mod builtin;
+pub mod gitops;
 pub mod ingress;
 pub mod tls_cert;
 
