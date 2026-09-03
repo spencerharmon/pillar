@@ -14,6 +14,7 @@ pillar-identity = { path = "../pillar-identity" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-rbac = { path = "../pillar-rbac" }
 rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
 
 [lints]
 workspace = true

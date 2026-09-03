@@ -11,25 +11,57 @@
 //! ONLY to an approved request whose approver is an authorized member — the
 //! exact invariants TLC proves.
 //!
-//! This crate carries no real crypto (same convention as the rest of the
-//! codebase): the seal is a deterministic stand-in so the PROTOCOL — key
-//! material to an approved requester only, backed by an authorized approver —
-//! is modelled precisely.
+//! The seal is REAL cryptography: `pillar_crypto::seal` (X25519 key-agreement
+//! wrapping a fresh ChaCha20-Poly1305 content key, the same seal contract
+//! `cells-confidentiality-impl`/`key-distribution-offer-impl` already use).
+//! Only a holder of the approved node's derived sealing secret key can
+//! recover the cell key; a non-recipient (including the cell's own key) is
+//! refused cryptographically — `CryptoError::NotARecipient` — not by
+//! bookkeeping, and a tampered envelope fails AEAD authentication.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
-use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
+use pillar_crypto::seal::{seal_to_recipients, sealing_keypair_from_seed, unseal};
+use pillar_crypto::{CryptoError, SealedEnvelope, SealingSecretKey, Seed};
+use sha2::{Digest, Sha256};
 
 use crate::custody::CustodyKind;
 
-fn digest(parts: &[&str]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for part in parts {
-        part.hash(&mut hasher);
-    }
-    hasher.finish()
+/// Derive a node's real X25519 sealing keypair deterministically from its
+/// [`NodeId`] label (in production, the node's device-subkey secret would
+/// seed this instead). Deterministic in the id; distinct ids yield
+/// cryptographically independent keypairs. Public so a new node (or a test)
+/// can derive its own secret key to [`SealedCellKey::unseal`] the cell key
+/// sealed to it.
+///
+/// # Errors
+/// Propagates a `pillar_crypto` key-derivation failure.
+pub fn sealing_keypair_for(
+    node: &NodeId,
+) -> Result<(pillar_crypto::SealingPublicKey, SealingSecretKey), CryptoError> {
+    let seed =
+        Seed::from_bytes(format!("pillar-bootstrap/node-sealing-key-v1::{}", node.0).into_bytes());
+    sealing_keypair_from_seed(&seed)
+}
+
+/// Derive the plaintext cell-key material sealed to an approved node. A real
+/// deployment seals the actual cell secret key bytes; this derives a
+/// deterministic stand-in plaintext from the cell id so the same cell always
+/// seals the same key material (the PLAINTEXT is a stand-in — the seal is not).
+fn cell_key_plaintext(cell: &NodeId) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(b"pillar-bootstrap/cell-key-plaintext-v1");
+    h.update(cell.0.as_bytes());
+    h.finalize().to_vec()
+}
+
+/// Content id (hex SHA-256) of a sealed envelope's bytes, addressing the
+/// sealed blob a new node fetches.
+fn envelope_cid(envelope: &SealedEnvelope) -> String {
+    let mut h = Sha256::new();
+    h.update(envelope.as_bytes());
+    format!("bafy-cellkey-{:x}", h.finalize())
 }
 
 /// A monotonic request id, unique within a queue.
@@ -99,16 +131,40 @@ impl NodeIdentity {
 }
 
 /// The sealed cell key returned to an approved NODE: an existing node
-/// encrypted (sealed) the cell key to the new node; this is the CID of that
-/// sealed blob plus the node it is sealed to and the member that sealed it.
+/// REAL-sealed (X25519 + AEAD, `pillar_crypto::seal`) the cell key to the new
+/// node; this carries the content id of that sealed blob, the recipient-
+/// sealed envelope itself, the node it is sealed to, and the member that
+/// sealed it. Only a holder of `sealed_to`'s derived secret key can
+/// [`SealedCellKey::unseal`] it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedCellKey {
     /// The content id of the sealed cell-key blob (what the new node fetches).
     pub cid: String,
+    /// The real recipient-sealed envelope bytes (opaque to a non-recipient).
+    envelope: SealedEnvelope,
     /// The node the cell key was sealed to (the approved requester).
     pub sealed_to: NodeId,
     /// The existing cell member that sealed it.
     pub sealed_by: NodeId,
+}
+
+impl SealedCellKey {
+    /// Recover the sealed cell-key plaintext using `sealed_to`'s derived
+    /// sealing secret key. Fails cryptographically
+    /// ([`CryptoError::NotARecipient`]) for any other key, and on a tampered
+    /// envelope ([`CryptoError::DecryptionFailed`]) — AEAD authentication.
+    ///
+    /// # Errors
+    /// Propagates the underlying `pillar_crypto` unseal failure.
+    pub fn unseal(&self, secret: &SealingSecretKey) -> Result<Vec<u8>, CryptoError> {
+        unseal(&self.envelope, secret)
+    }
+
+    /// The raw sealed-envelope bytes (as stored/fetched by the new node).
+    #[must_use]
+    pub fn envelope_bytes(&self) -> &[u8] {
+        self.envelope.as_bytes()
+    }
 }
 
 /// A single bootstrap request.
@@ -342,19 +398,18 @@ impl BootstrapRequestQueue {
         match self.requests[idx].kind {
             BootstrapRequestKind::Node => {
                 let subject = self.requests[idx].subject.clone();
-                // An existing node seals the cell key to the approved node; the
-                // CID addresses that sealed blob (deterministic stand-in seal).
-                let cid = format!(
-                    "bafy-cellkey-{:016x}",
-                    digest(&[
-                        "pillar-cell-key-seal-v1",
-                        &self.cell.0,
-                        &subject.0,
-                        &member.0
-                    ])
-                );
+                // An existing node REAL-seals the cell key to the approved
+                // node's derived X25519 sealing public key (recipient-sealed,
+                // AEAD-authenticated — only that node's secret key can unseal).
+                let (recipient_pub, _recipient_secret) = sealing_keypair_for(&subject)
+                    .expect("deterministic sealing keypair derivation cannot fail");
+                let plaintext = cell_key_plaintext(&self.cell);
+                let envelope = seal_to_recipients(&plaintext, &[recipient_pub])
+                    .expect("sealing to a valid recipient key cannot fail");
+                let cid = envelope_cid(&envelope);
                 let sealed = SealedCellKey {
                     cid,
+                    envelope,
                     sealed_to: subject,
                     sealed_by: member.clone(),
                 };
@@ -441,6 +496,87 @@ mod tests {
         let req = q.all().iter().find(|r| r.id() == id).unwrap();
         assert_eq!(req.state(), RequestState::Approved);
         assert_eq!(req.kind(), BootstrapRequestKind::Node);
+    }
+
+    #[test]
+    fn the_seal_round_trips_real_plaintext_through_real_aead() {
+        let mut q = queue();
+        let id = q.submit_node(
+            NodeId::from("new-node"),
+            node_identity(),
+            CustodyKind::Tpm,
+            vec![],
+        );
+        let sealed = q
+            .approve(id, &NodeId::from("m1"))
+            .expect("approved")
+            .expect("node approval returns a sealed cell key");
+        let (_pk, secret) = sealing_keypair_for(&NodeId::from("new-node")).expect("keygen");
+        let expected = cell_key_plaintext(&NodeId::from("spencer-cell"));
+        assert_eq!(
+            sealed.unseal(&secret).as_deref(),
+            Ok(expected.as_slice()),
+            "the approved node must recover the real plaintext cell key"
+        );
+    }
+
+    #[test]
+    fn a_non_recipient_node_cannot_unseal_the_cell_key() {
+        let mut q = queue();
+        let id = q.submit_node(
+            NodeId::from("new-node"),
+            node_identity(),
+            CustodyKind::Tpm,
+            vec![],
+        );
+        let sealed = q
+            .approve(id, &NodeId::from("m1"))
+            .expect("approved")
+            .expect("sealed");
+        // A different node's derived secret is not a recipient.
+        let (_pk, other_secret) =
+            sealing_keypair_for(&NodeId::from("some-other-node")).expect("keygen");
+        assert_eq!(
+            sealed.unseal(&other_secret),
+            Err(CryptoError::NotARecipient),
+            "a non-recipient node must be refused cryptographically"
+        );
+        // Nor can the existing member/cell key itself unseal it.
+        let (_pk, member_secret) = sealing_keypair_for(&NodeId::from("m1")).expect("keygen");
+        assert_eq!(
+            sealed.unseal(&member_secret),
+            Err(CryptoError::NotARecipient)
+        );
+    }
+
+    #[test]
+    fn a_tampered_sealed_cell_key_is_rejected() {
+        let mut q = queue();
+        let id = q.submit_node(
+            NodeId::from("new-node"),
+            node_identity(),
+            CustodyKind::Tpm,
+            vec![],
+        );
+        let sealed = q
+            .approve(id, &NodeId::from("m1"))
+            .expect("approved")
+            .expect("sealed");
+        let (_pk, secret) = sealing_keypair_for(&NodeId::from("new-node")).expect("keygen");
+        // Flip a byte deep in the ciphertext payload — AEAD must reject it.
+        let mut bytes = sealed.envelope_bytes().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        let tampered = SealedCellKey {
+            cid: sealed.cid.clone(),
+            envelope: SealedEnvelope::from_bytes(bytes),
+            sealed_to: sealed.sealed_to.clone(),
+            sealed_by: sealed.sealed_by.clone(),
+        };
+        assert!(
+            tampered.unseal(&secret).is_err(),
+            "a tampered envelope must fail AEAD authentication, not silently decrypt"
+        );
     }
 
     #[test]
