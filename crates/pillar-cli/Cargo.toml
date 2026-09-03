@@ -23,6 +23,7 @@ pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 pillar-topology = { path = "../pillar-topology" }
 pillar-key-distribution = { path = "../pillar-key-distribution" }
 pillar-web = { path = "../pillar-web" }
+pillar-web-api = { path = "../pillar-web-api" }
 pillar-net = { path = "../pillar-net" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-controller = { path = "../pillar-controller" }
