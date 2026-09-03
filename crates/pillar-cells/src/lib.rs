@@ -55,7 +55,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use pillar_core::NodeId;
 use pillar_key_distribution::{CellId, UserId};
 
+pub mod federation;
 pub mod migration;
+pub use federation::{FederationCoordinator, FederationError};
 pub use migration::{MigrationCoordinator, MigrationError, ViewChoice};
 
 /// The recipient granularity of a [`VisClass::RecipientSealed`] object —
