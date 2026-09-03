@@ -101,13 +101,38 @@
 //! backend produces a challenge signature; the identity model above verifies
 //! the resulting public-key chain, so custody is orthogonal to admission.
 //!
-//! As with the rest of this crate, no real OpenPGP/crypto primitive is
-//! involved: signatures and ciphertext stand in for verified packets so the
-//! identity, enrollment, revocation and login *policy* is auditable in
-//! isolation from the crypto library that will later produce the real
-//! material.
+//! ## Real cryptography (ROI audit correction, 2026-08-31)
+//!
+//! Every custody backend's challenge signature and every encryption-subkey
+//! `E` ciphertext are now backed by the SAME real [`pillar_crypto`] primitives
+//! wired everywhere else in this crate (matching the parity already
+//! delivered by `pillar-web`'s `key_login` and [`crate::global_identity`]) —
+//! never a `DefaultHasher`/`SipHash`/`u64` digest stand-in:
+//! * [`SignerBackend::sign_challenge`] produces a **genuine detached ed25519
+//!   signature** ([`pillar_crypto::sign::sign`]) over the challenge, using a
+//!   real keypair deterministically derived
+//!   ([`pillar_crypto::sign::signing_keypair_from_seed`]) from the backend's
+//!   own identifier; [`SignerBackend::public_key`] exposes the matching
+//!   verifying key, and [`verify_backend_signature`] re-checks it
+//!   ([`pillar_crypto::sign::verify`]) exactly as a server-side verifier
+//!   would. A forged packet — a signature that did not come from the
+//!   claimed backend's secret key — never verifies.
+//! * [`EncryptionSubkey`] is a **real X25519** keypair
+//!   ([`pillar_crypto::seal::sealing_keypair_from_seed`]) backing
+//!   `KeyMaterialSet`'s optional encryption fingerprint; [`SealedToSubkey`]
+//!   is a genuine ChaCha20-Poly1305/X25519-sealed envelope
+//!   ([`pillar_crypto::seal::seal_to_recipients`] /
+//!   [`pillar_crypto::seal::unseal`]) — a real, tamper-evident AEAD
+//!   round-trip: any bit-flip in the envelope fails to open.
 
 use std::collections::{HashMap, HashSet};
+
+use pillar_crypto::seal::{seal_to_recipients, sealing_keypair_from_seed, unseal};
+use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
+use pillar_crypto::{
+    SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed, Signature as CryptoSignature,
+    SigningPublicKey, SigningSecretKey,
+};
 
 /// A cold-root (cell-key) genesis identity. Its string IS its canonical
 /// genesis CID — the anchor of an entire key hierarchy. Refines a `Roots`
@@ -181,6 +206,153 @@ impl KeyMaterialSet {
     pub fn can_receive_encrypted(&self) -> bool {
         self.encryption.is_some()
     }
+
+    /// Attach the real [`EncryptionSubkey`]'s fingerprint as this key's
+    /// dedicated encryption subkey `E` (builder-style) — the wiring point
+    /// between the string-modelled `KeyMaterialSet` and the genuine X25519
+    /// material [`SealedToSubkey`] actually seals to.
+    #[must_use]
+    pub fn with_real_encryption_subkey(self, subkey: &EncryptionSubkey) -> Self {
+        self.with_encryption_subkey(subkey.fingerprint().to_owned())
+    }
+}
+
+/// Derive the fingerprint of a real X25519 sealing (encryption-recipient)
+/// public key: the hex-encoded, domain-separated SHA-256 of its bytes.
+/// Mirrors `crate::fingerprint`/`global_identity::fingerprint` — a real
+/// cryptographic commitment to the key, not an arbitrary label.
+fn sealing_fingerprint(public: &SealingPublicKey) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pillar-identity/login/encryption-subkey-fingerprint-v1");
+    h.update(public.as_bytes());
+    hex_encode(&h.finalize())
+}
+
+/// A **real** X25519 keypair backing a [`KeyMaterialSet`]'s optional
+/// encryption subkey `E` — the actual material [`SealedToSubkey::seal`] seals
+/// content to and [`SealedToSubkey::open`] unseals with, via
+/// [`pillar_crypto::seal`] (ChaCha20-Poly1305 content encryption wrapped to
+/// the recipient by X25519 Diffie-Hellman, i.e. an X25519-HPKE-style
+/// construction). The secret half NEVER appears in [`KeyMaterialSet`] or
+/// anywhere server-observable — only [`Self::fingerprint`] (a one-way public
+/// commitment) and [`Self::public`] (safe to publish) do.
+#[derive(Clone)]
+pub struct EncryptionSubkey {
+    public: SealingPublicKey,
+    secret_seed: Seed,
+    fingerprint: String,
+}
+
+impl EncryptionSubkey {
+    /// Build an encryption subkey from real secret seed material (e.g. loaded
+    /// from custody).
+    #[must_use]
+    pub fn from_secret_seed(secret_seed: Seed) -> Self {
+        let (public, _secret) = sealing_keypair_from_seed(&secret_seed)
+            .expect("a sealing seed always yields an X25519 keypair");
+        let fingerprint = sealing_fingerprint(&public);
+        EncryptionSubkey {
+            public,
+            secret_seed,
+            fingerprint,
+        }
+    }
+
+    /// Mint a fresh encryption subkey from cryptographically-random secret
+    /// seed material (32 bytes from the OS CSPRNG).
+    #[must_use]
+    pub fn generate() -> Self {
+        use rand_core::{OsRng, RngCore};
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        Self::from_secret_seed(Seed::from_bytes(bytes.to_vec()))
+    }
+
+    /// This subkey's real X25519 public (sealing) key — safe to publish;
+    /// senders seal to it.
+    #[must_use]
+    pub fn public(&self) -> &SealingPublicKey {
+        &self.public
+    }
+
+    /// This subkey's real cryptographic fingerprint — the value
+    /// [`KeyMaterialSet::with_real_encryption_subkey`] records as `E`'s
+    /// public identity, and the value the receiving side looks this
+    /// `EncryptionSubkey` up by.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Recompute the SECRET X25519 key from the held seed, for unsealing.
+    /// Never stored directly, never returned to a caller.
+    fn secret(&self) -> SealingSecretKey {
+        let (_public, secret) = sealing_keypair_from_seed(&self.secret_seed)
+            .expect("a sealing seed always yields an X25519 keypair");
+        secret
+    }
+}
+
+/// Why opening a [`SealedToSubkey`] envelope failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SealOpenError {
+    /// The presented [`EncryptionSubkey`] is not among the envelope's
+    /// recipients (or the envelope was tampered with) — the real X25519/AEAD
+    /// authentication failed.
+    NotARecipient,
+}
+
+/// Real ChaCha20-Poly1305/X25519-sealed ciphertext addressed to one or more
+/// [`EncryptionSubkey`] recipients — the genuine AEAD material standing in
+/// for what the module docs used to call "ciphertext [that] stand[s] in for
+/// verified packets". Tamper-evident: any bit-flip anywhere in the envelope
+/// fails to open for every recipient, never silently returning corrupted
+/// plaintext.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedToSubkey {
+    envelope: SealedEnvelope,
+}
+
+impl SealedToSubkey {
+    /// Seal `plaintext` so that only the holder of one of `recipients`'
+    /// matching secret key can recover it.
+    #[must_use]
+    pub fn seal(plaintext: &[u8], recipients: &[&EncryptionSubkey]) -> Self {
+        let recipient_keys: Vec<SealingPublicKey> =
+            recipients.iter().map(|r| r.public().clone()).collect();
+        let envelope = seal_to_recipients(plaintext, &recipient_keys)
+            .expect("sealing to at least one valid recipient never fails");
+        SealedToSubkey { envelope }
+    }
+
+    /// Recover the plaintext, but ONLY for the holder of `subkey`'s matching
+    /// secret key. A non-recipient (or a tampered envelope) yields
+    /// [`SealOpenError::NotARecipient`], never a subtly-wrong plaintext.
+    ///
+    /// # Errors
+    ///
+    /// [`SealOpenError::NotARecipient`] if `subkey` was not among the sealed
+    /// recipients, or if the envelope bytes were tampered with.
+    pub fn open(&self, subkey: &EncryptionSubkey) -> Result<Vec<u8>, SealOpenError> {
+        unseal(&self.envelope, &subkey.secret()).map_err(|_| SealOpenError::NotARecipient)
+    }
+
+    /// The raw envelope bytes, e.g. to simulate transport/storage
+    /// corruption in a tamper test. Round-trips with [`Self::from_wire`].
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        self.envelope.as_bytes().to_vec()
+    }
+
+    /// Reconstruct a [`SealedToSubkey`] from raw envelope bytes (the
+    /// counterpart of [`Self::to_wire`]).
+    #[must_use]
+    pub fn from_wire(bytes: Vec<u8>) -> Self {
+        SealedToSubkey {
+            envelope: SealedEnvelope::from_bytes(bytes),
+        }
+    }
 }
 
 /// Which key-custody backend holds a private key. A per-key configuration
@@ -196,6 +368,57 @@ pub enum CustodyKind {
     Passkey,
     /// A password-derived key. Supported but NOT recommended.
     Password,
+}
+
+/// Hex-encode bytes (lowercase), used to embed a real signature inside the
+/// `<prefix>:<id>:<hex>` wire-token [`SignerBackend::sign_challenge`] returns.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode a lowercase-hex string back to bytes. Returns `None` on any
+/// malformed (odd-length or non-hex) input — a tampered/truncated token never
+/// decodes to something that could accidentally verify.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// Derive a **real** ed25519 keypair deterministically bound to a custody
+/// `kind` and the backend's own identifier (its key id / TPM handle /
+/// passkey credential id) via a domain-separated SHA-256 — mirrors
+/// [`crate::global_identity::PrimaryKeypair::for_name`]. Distinct identifiers
+/// (even under the same `kind`) always yield distinct, unforgeable keypairs,
+/// so no party without the identifier's derivation input (modelling "holds
+/// this backend's private key") can produce a signature that verifies under
+/// another identifier's public key.
+fn backend_keypair(kind: CustodyKind, id: &str) -> (SigningPublicKey, SigningSecretKey) {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pillar-identity/login/custody-backend-seed-v1");
+    h.update([match kind {
+        CustodyKind::FileKeyring => 0u8,
+        CustodyKind::Tpm => 1u8,
+        CustodyKind::Passkey => 2u8,
+        CustodyKind::Password => 3u8,
+    }]);
+    h.update(id.as_bytes());
+    let seed = Seed::from_bytes(h.finalize().to_vec());
+    signing_keypair_from_seed(&seed).expect("a signing seed always yields an ed25519 keypair")
 }
 
 /// A backend that produces a challenge signature on behalf of a private key
@@ -216,10 +439,40 @@ pub trait SignerBackend {
         !matches!(self.kind(), CustodyKind::Password)
     }
 
-    /// Produce a signature over `challenge` using the held private key,
-    /// yielding an opaque signature token. Returns `None` if this backend
-    /// cannot currently sign (e.g. locked/absent hardware).
+    /// Produce a signature over `challenge` using the held private key.
+    ///
+    /// The wire encoding is `"<prefix>:<id>:<hex-ed25519-sig>"` — the prefix
+    /// and id are retained for backward-compatible routing/labeling, but the
+    /// hex suffix is now a **genuine detached ed25519 signature**
+    /// ([`pillar_crypto::sign::sign`]) over the challenge bytes, produced by
+    /// the real keypair [`backend_keypair`] derives for this backend's own
+    /// identifier. Returns `None` if this backend cannot currently sign (e.g.
+    /// locked/absent hardware).
     fn sign_challenge(&self, challenge: &str) -> Option<String>;
+
+    /// This backend's real ed25519 **public** (verifying) key — the
+    /// counterpart [`verify_backend_signature`] checks a
+    /// [`sign_challenge`](Self::sign_challenge) token against. Deterministically
+    /// bound to the backend's own identifier; never derived from any secret.
+    fn public_key(&self) -> SigningPublicKey;
+}
+
+/// Verify a token produced by [`SignerBackend::sign_challenge`] against
+/// `public` over `challenge`: parses the hex signature suffix and re-checks
+/// it with [`pillar_crypto::sign::verify`]. Returns `false` for a forged
+/// signature, a signature from a different backend/keypair, a tampered
+/// challenge, or a malformed/truncated token — never panics on untrusted
+/// input.
+#[must_use]
+pub fn verify_backend_signature(public: &SigningPublicKey, challenge: &str, token: &str) -> bool {
+    let Some(hex) = token.rsplit(':').next() else {
+        return false;
+    };
+    let Some(bytes) = hex_decode(hex) else {
+        return false;
+    };
+    let sig = CryptoSignature::from_bytes(bytes);
+    verify(public, challenge.as_bytes(), &sig).is_ok()
 }
 
 /// File-keyring custody: the default backend.
@@ -253,8 +506,20 @@ impl SignerBackend for FileKeyringBackend {
     }
 
     fn sign_challenge(&self, challenge: &str) -> Option<String> {
-        self.unlocked
-            .then(|| format!("file-keyring:{}:{challenge}", self.key_id))
+        if !self.unlocked {
+            return None;
+        }
+        let (_public, secret) = backend_keypair(CustodyKind::FileKeyring, &self.key_id);
+        let sig = sign(&secret, challenge.as_bytes()).expect("ed25519 signing never fails");
+        Some(format!(
+            "file-keyring:{}:{}",
+            self.key_id,
+            hex_encode(sig.as_bytes())
+        ))
+    }
+
+    fn public_key(&self) -> SigningPublicKey {
+        backend_keypair(CustodyKind::FileKeyring, &self.key_id).0
     }
 }
 
@@ -281,7 +546,17 @@ impl SignerBackend for TpmBackend {
     }
 
     fn sign_challenge(&self, challenge: &str) -> Option<String> {
-        Some(format!("tpm:{}:{challenge}", self.handle))
+        let (_public, secret) = backend_keypair(CustodyKind::Tpm, &self.handle);
+        let sig = sign(&secret, challenge.as_bytes()).expect("ed25519 signing never fails");
+        Some(format!(
+            "tpm:{}:{}",
+            self.handle,
+            hex_encode(sig.as_bytes())
+        ))
+    }
+
+    fn public_key(&self) -> SigningPublicKey {
+        backend_keypair(CustodyKind::Tpm, &self.handle).0
     }
 }
 
@@ -310,8 +585,20 @@ impl SignerBackend for PasskeyBackend {
     }
 
     fn sign_challenge(&self, challenge: &str) -> Option<String> {
-        self.present
-            .then(|| format!("passkey:{}:{challenge}", self.credential_id))
+        if !self.present {
+            return None;
+        }
+        let (_public, secret) = backend_keypair(CustodyKind::Passkey, &self.credential_id);
+        let sig = sign(&secret, challenge.as_bytes()).expect("ed25519 signing never fails");
+        Some(format!(
+            "passkey:{}:{}",
+            self.credential_id,
+            hex_encode(sig.as_bytes())
+        ))
+    }
+
+    fn public_key(&self) -> SigningPublicKey {
+        backend_keypair(CustodyKind::Passkey, &self.credential_id).0
     }
 }
 
@@ -337,7 +624,17 @@ impl SignerBackend for PasswordBackend {
     }
 
     fn sign_challenge(&self, challenge: &str) -> Option<String> {
-        Some(format!("password:{}:{challenge}", self.key_id))
+        let (_public, secret) = backend_keypair(CustodyKind::Password, &self.key_id);
+        let sig = sign(&secret, challenge.as_bytes()).expect("ed25519 signing never fails");
+        Some(format!(
+            "password:{}:{}",
+            self.key_id,
+            hex_encode(sig.as_bytes())
+        ))
+    }
+
+    fn public_key(&self) -> SigningPublicKey {
+        backend_keypair(CustodyKind::Password, &self.key_id).0
     }
 }
 
@@ -1075,11 +1372,13 @@ mod tests {
     }
 
     /// Property: no key material (private key bytes / secrets) ever crosses
-    /// the signing boundary — only the opaque signature token returned by
-    /// [`SignerBackend::sign_challenge`] does. Backends here carry no
-    /// private-key field at all, so `sign_with_backend`'s output can only
-    /// ever be composed from the backend's own public id/handle and the
-    /// challenge, never a secret.
+    /// the signing boundary — only the real ed25519 signature token returned
+    /// by [`SignerBackend::sign_challenge`] does. Backends here carry no
+    /// private-key field at all (the real secret is derived on demand inside
+    /// [`backend_keypair`]), so the token can only ever be composed from the
+    /// backend's own public id/handle and a genuine detached signature —
+    /// never the raw challenge string itself (unlike the old placeholder,
+    /// which literally suffixed the challenge).
     #[test]
     fn no_key_material_crosses_the_signing_boundary() {
         for kind in [
@@ -1098,10 +1397,133 @@ mod tests {
             };
             let sig = sign_with_backend(&registry, "k", backend.as_ref(), "chal-xyz")
                 .expect("labeled + available backend signs");
-            // The signature is a formatted string over (backend-id, challenge)
-            // only — never a secret/private-key field, since none exists on
-            // any `SignerBackend` impl in this module.
-            assert!(sig.ends_with(":chal-xyz"));
+            // No longer a literal `<prefix>:<id>:chal-xyz` stand-in: the hex
+            // suffix is a genuine 64-byte ed25519 signature, never the raw
+            // challenge text.
+            assert!(
+                !sig.ends_with(":chal-xyz"),
+                "signature must not literally embed the plaintext challenge"
+            );
+            let hex_suffix = sig.rsplit(':').next().unwrap();
+            let sig_bytes = hex_decode(hex_suffix).expect("hex-decodable signature");
+            assert_eq!(sig_bytes.len(), 64, "a real detached ed25519 signature");
+            // And it genuinely verifies against the backend's own public key.
+            assert!(verify_backend_signature(
+                &backend.public_key(),
+                "chal-xyz",
+                &sig
+            ));
         }
+    }
+
+    /// A forged signature packet — one an attacker who never held the real
+    /// backend's derivation input produced under a DIFFERENT identifier — is
+    /// rejected: it never verifies against the victim's public key, even
+    /// though both are real, validly-formed ed25519 signatures.
+    #[test]
+    fn forged_signature_packet_is_rejected() {
+        let victim = TpmBackend::new("victim-handle");
+        let attacker = TpmBackend::new("attacker-handle");
+
+        let forged = attacker
+            .sign_challenge("login-nonce-1")
+            .expect("attacker backend signs");
+        assert!(
+            !verify_backend_signature(&victim.public_key(), "login-nonce-1", &forged),
+            "a signature from a different backend must never verify as the victim's"
+        );
+
+        // The victim's OWN genuine signature does verify.
+        let genuine = victim
+            .sign_challenge("login-nonce-1")
+            .expect("victim backend signs");
+        assert!(verify_backend_signature(
+            &victim.public_key(),
+            "login-nonce-1",
+            &genuine
+        ));
+    }
+
+    /// A signature valid for one challenge must never verify for a different
+    /// (tampered) challenge — binding, not merely well-formedness.
+    #[test]
+    fn tampered_challenge_never_verifies() {
+        let backend = PasswordBackend::new("user-key");
+        let sig = backend
+            .sign_challenge("original-challenge")
+            .expect("backend signs");
+        assert!(!verify_backend_signature(
+            &backend.public_key(),
+            "different-challenge",
+            &sig
+        ));
+    }
+
+    /// A bit-flipped / malformed token never verifies (and never panics).
+    #[test]
+    fn malformed_or_truncated_token_never_verifies() {
+        let backend = TpmBackend::new("h");
+        let sig = backend.sign_challenge("c").expect("backend signs");
+        let truncated = &sig[..sig.len() - 4];
+        assert!(!verify_backend_signature(&backend.public_key(), "c", truncated));
+        assert!(!verify_backend_signature(&backend.public_key(), "c", "garbage"));
+        assert!(!verify_backend_signature(&backend.public_key(), "c", ""));
+    }
+
+    // ---- real AEAD ciphertext for the encryption subkey `E` ----
+
+    /// A real ChaCha20-Poly1305/X25519 round-trip: the recipient recovers
+    /// exactly the sealed plaintext, and a non-recipient (or a party who
+    /// merely knows the fingerprint but not the secret seed) cannot.
+    #[test]
+    fn real_aead_round_trip_to_the_encryption_subkey() {
+        let recipient = EncryptionSubkey::generate();
+        let bystander = EncryptionSubkey::generate();
+        let plaintext = b"top-secret payload bound for subkey E";
+
+        let sealed = SealedToSubkey::seal(plaintext, &[&recipient]);
+        assert_eq!(sealed.open(&recipient).unwrap(), plaintext);
+        assert_eq!(
+            sealed.open(&bystander),
+            Err(SealOpenError::NotARecipient),
+            "a non-recipient must never recover the plaintext"
+        );
+
+        // Wired into `KeyMaterialSet` exactly as the model intends.
+        let key = KeyMaterialSet::bare().with_real_encryption_subkey(&recipient);
+        assert!(key.can_receive_encrypted());
+        assert_eq!(key.encryption.as_deref(), Some(recipient.fingerprint()));
+    }
+
+    /// Tamper-evidence: flipping ANY byte of the sealed envelope makes it
+    /// fail to open for the true recipient — a real AEAD authentication
+    /// failure, never a silently-corrupted plaintext.
+    #[test]
+    fn tampered_ciphertext_never_opens() {
+        let recipient = EncryptionSubkey::generate();
+        let sealed = SealedToSubkey::seal(b"authentic content", &[&recipient]);
+
+        let mut bytes = sealed.to_wire();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01; // flip one bit near the end (inside the AEAD tag/ciphertext)
+        let tampered = SealedToSubkey::from_wire(bytes);
+
+        assert_eq!(tampered.open(&recipient), Err(SealOpenError::NotARecipient));
+    }
+
+    /// Two distinct `EncryptionSubkey`s never share a fingerprint — a real
+    /// cryptographic commitment, not an arbitrary/colliding label.
+    #[test]
+    fn distinct_encryption_subkeys_have_distinct_fingerprints() {
+        let a = EncryptionSubkey::generate();
+        let b = EncryptionSubkey::generate();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+
+        // Deterministic in the seed: re-deriving from the same seed yields
+        // the same fingerprint.
+        let seed = Seed::from_bytes(b"fixed-seed-for-reproducibility".to_vec());
+        let a2 = EncryptionSubkey::from_secret_seed(seed.clone());
+        let a3 = EncryptionSubkey::from_secret_seed(seed);
+        assert_eq!(a2.fingerprint(), a3.fingerprint());
     }
 }
