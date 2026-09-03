@@ -16,5 +16,9 @@ pillar-manifest = { path = "../pillar-manifest" }
 pillar-rbac = { path = "../pillar-rbac" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 
+[dev-dependencies]
+ciborium = "0.2"
+sha2 = "0.10"
+
 [lints]
 workspace = true

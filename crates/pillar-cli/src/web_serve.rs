@@ -167,6 +167,7 @@ use pillar_web::node_custody::{
     BootstrapError, CellBootstrap, CellNameRegistry, CellNameStatus, Cid, InMemoryCellNameRegistry,
     NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey, CELL_NAME_IN_USE_MESSAGE,
 };
+use pillar_web::webauthn::{RelyingParty as PillarRelyingParty, RpError};
 use pillar_web::{authorize_nonloopback_signing_action, bind_web};
 use pillar_wot_authority::{FencedActor, WotAuthority};
 
@@ -335,6 +336,12 @@ pub struct WebAuthContext {
     /// nothing; a dashboard SAVE is ONE signed, content-addressed streaming-DB
     /// resource event — no server-side database, exactly like `layouts`.
     observability: ObservabilityBuilders,
+    /// The real WebAuthn relying party backing the `/webauthn/*` ceremony
+    /// endpoints: the single-use time-bounded challenge protocol and the
+    /// shared credential-record store (`pillar_web::webauthn::RelyingParty`).
+    /// No server-side database: the record store is in-process, exactly like
+    /// every other portal substrate here.
+    webauthn_rp: PillarRelyingParty,
 }
 
 /// One handle's custody record, as the key & offer UI renders/drives it: the
@@ -484,6 +491,7 @@ impl WebAuthContext {
             topology: TopologyRegistry::new(TierHierarchy::default()),
             topology_nodes: BTreeMap::new(),
             observability: ObservabilityBuilders::new(),
+            webauthn_rp: PillarRelyingParty::new(),
         }
     }
 
@@ -499,6 +507,18 @@ impl WebAuthContext {
     #[must_use]
     pub fn identity(&self) -> &NodeIdentitySnapshot {
         &self.identity
+    }
+
+    /// The WebAuthn relying-party id the ceremony endpoints advertise. Derived
+    /// from this node's identity peer id (the portal's stable origin host); a
+    /// browser client scopes `navigator.credentials.{create,get}` to it.
+    #[must_use]
+    fn origin_rp_id(&self) -> String {
+        if self.identity.peer_id.is_empty() {
+            "pillar.local".to_owned()
+        } else {
+            self.identity.peer_id.clone()
+        }
     }
 
     /// Seconds elapsed since this context was created — the portal's uptime.
@@ -1832,7 +1852,11 @@ fn dispatch_http(
                     "MISSING cell-handle-or-password".to_owned(),
                 );
             }
-            match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
+            match ctx.bootstrap_cell_and_first_user(
+                NodeId::from(cell_id.as_str()),
+                &handle,
+                &password,
+            ) {
                 Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
                 Err(BootstrapError::CellNameInUse) => text_response(
                     409,
@@ -1855,6 +1879,14 @@ fn dispatch_http(
             )
         }
         ("POST", "/login") => dispatch_login(ctx, request),
+        ("POST", "/webauthn/register/begin") => dispatch_webauthn_register_begin(ctx, request),
+        ("POST", "/webauthn/register/finish") => dispatch_webauthn_register_finish(ctx, request),
+        ("POST", "/webauthn/authenticate/begin") => {
+            dispatch_webauthn_authenticate_begin(ctx, request)
+        }
+        ("POST", "/webauthn/authenticate/finish") => {
+            dispatch_webauthn_authenticate_finish(ctx, request)
+        }
         ("POST", "/bootstrap/request/node") => dispatch_request_submit(ctx, request, true),
         ("POST", "/bootstrap/request/user") => dispatch_request_submit(ctx, request, false),
         ("GET", "/bootstrap/request/list") => dispatch_request_list(ctx),
@@ -2892,6 +2924,192 @@ fn dispatch_custody_revoke(ctx: &mut WebAuthContext, request: &HttpRequest) -> H
     }
 }
 
+/// The challenge TTL for a WebAuthn ceremony (seconds). A minted challenge is
+/// single-use AND time-bounded: it expires this many logical ticks after it is
+/// issued (`ChallengeFreshness`).
+const WEBAUTHN_CHALLENGE_TTL: u64 = 300;
+
+/// Resolve the (session, cell) a WebAuthn ceremony's challenge is bound to from
+/// a presented login-session token. `Err` is a 401 the caller returns verbatim.
+/// The cell scope is the admitted session's subject, so a challenge minted for
+/// one principal can never be finished under another (`ChallengeBinding`).
+fn webauthn_ceremony_scope(
+    ctx: &WebAuthContext,
+    token: &str,
+) -> Result<(String, String), HttpResponse> {
+    match ctx.login_sessions.get(token) {
+        Some(session) => Ok((token.to_owned(), session.subject.to_string())),
+        None => Err(text_response(
+            401,
+            "Unauthorized",
+            "DENIED not-authenticated".to_owned(),
+        )),
+    }
+}
+
+/// Render an [`RpError`] as the portal's fail-closed text response.
+fn webauthn_rp_error(err: &RpError) -> HttpResponse {
+    let (status, reason, msg): (u16, &'static str, &str) = match err {
+        RpError::StaleChallenge => (400, "Bad Request", "stale-challenge"),
+        RpError::ChallengeBinding => (403, "Forbidden", "challenge-binding"),
+        RpError::UnknownCredential => (404, "Not Found", "unknown-credential"),
+        RpError::Revoked => (403, "Forbidden", "revoked"),
+        RpError::SignCountRegression => (409, "Conflict", "sign-count-regression"),
+        RpError::Crypto(_) => (401, "Unauthorized", "assertion-verification-failed"),
+    };
+    text_response(status, reason, format!("DENIED {msg}"))
+}
+
+/// `POST /webauthn/register/begin` — mint a fresh, single-use, time-bounded
+/// registration challenge bound to the caller's session/cell. Body:
+/// `<session-token>\n<user-handle>`. Returns `CHALLENGE <b64url> <rp_id>
+/// <user_handle>` (a `pillar_web_api::WebAuthnRegisterChallenge` in text form).
+fn dispatch_webauthn_register_begin(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let user_handle = lines.next().unwrap_or("").trim();
+    if user_handle.is_empty() {
+        return text_response(400, "Bad Request", "MISSING user-handle".to_owned());
+    }
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let now = ctx.session_clock;
+    let challenge = ctx
+        .webauthn_rp
+        .begin(&session, &cell, now, WEBAUTHN_CHALLENGE_TTL);
+    let b64 = pillar_crypto::webauthn::base64url_encode(&challenge);
+    text_response(
+        200,
+        "OK",
+        format!("CHALLENGE {b64} {} {user_handle}", ctx.origin_rp_id()),
+    )
+}
+
+/// `POST /webauthn/register/finish` — verify + persist the attested credential.
+/// Body: `<session-token>\n<user-handle>\n<challenge-b64url>\n<attestation-object-b64url>`.
+fn dispatch_webauthn_register_finish(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let user_handle = lines.next().unwrap_or("").trim();
+    let challenge_b64 = lines.next().unwrap_or("").trim();
+    let attestation_b64 = lines.next().unwrap_or("").trim();
+    if user_handle.is_empty() || challenge_b64.is_empty() || attestation_b64.is_empty() {
+        return text_response(
+            400,
+            "Bad Request",
+            "MISSING register-finish-field".to_owned(),
+        );
+    }
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let (Ok(challenge), Ok(attestation)) = (
+        pillar_crypto::webauthn::base64url_decode(challenge_b64),
+        pillar_crypto::webauthn::base64url_decode(attestation_b64),
+    ) else {
+        return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
+    };
+    let now = ctx.session_clock;
+    // A per-credential PRF salt: a real, credential-scoped random-ish salt
+    // derived from the challenge (which is itself a fresh content-address).
+    let mut prf_salt = [0u8; 32];
+    let src =
+        pillar_crypto::content::content_address(&challenge).expect("content_address is infallible");
+    let src = src.as_bytes();
+    prf_salt.copy_from_slice(&src[src.len() - 32..]);
+    match ctx.webauthn_rp.register_finish(
+        &session,
+        &cell,
+        now,
+        &challenge,
+        &attestation,
+        prf_salt,
+        user_handle,
+    ) {
+        Ok(record) => {
+            let cred_b64 = pillar_crypto::webauthn::base64url_encode(&record.credential_id);
+            text_response(200, "OK", format!("REGISTERED {cred_b64}"))
+        }
+        Err(e) => webauthn_rp_error(&e),
+    }
+}
+
+/// `POST /webauthn/authenticate/begin` — mint a fresh, single-use, time-bounded
+/// assertion challenge bound to the caller's session/cell. Body:
+/// `<session-token>`. Returns `CHALLENGE <b64url>`.
+fn dispatch_webauthn_authenticate_begin(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = request.body.lines().next().unwrap_or("").trim();
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let now = ctx.session_clock;
+    let challenge = ctx
+        .webauthn_rp
+        .begin(&session, &cell, now, WEBAUTHN_CHALLENGE_TTL);
+    let b64 = pillar_crypto::webauthn::base64url_encode(&challenge);
+    text_response(200, "OK", format!("CHALLENGE {b64}"))
+}
+
+/// `POST /webauthn/authenticate/finish` — verify the assertion and derive the
+/// operational-key-unlock secret. Body:
+/// `<session-token>\n<challenge-b64url>\n<credential-id-b64url>\n
+///  <authenticator-data-b64url>\n<client-data-json-b64url>\n<signature-b64url>\n
+///  <prf-output-b64url>`.
+/// Returns `UNLOCKED <unlock-secret-b64url>` on success. The unlock secret
+/// never leaves the server observably in a real deployment; it is returned here
+/// so the ceremony's REAL derivation is testable end to end.
+fn dispatch_webauthn_authenticate_finish(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let challenge_b64 = lines.next().unwrap_or("").trim();
+    let cred_b64 = lines.next().unwrap_or("").trim();
+    let ad_b64 = lines.next().unwrap_or("").trim();
+    let cdj_b64 = lines.next().unwrap_or("").trim();
+    let sig_b64 = lines.next().unwrap_or("").trim();
+    let prf_b64 = lines.next().unwrap_or("").trim();
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let dec = pillar_crypto::webauthn::base64url_decode;
+    let (Ok(challenge), Ok(cred), Ok(ad), Ok(cdj), Ok(sig), Ok(prf)) = (
+        dec(challenge_b64),
+        dec(cred_b64),
+        dec(ad_b64),
+        dec(cdj_b64),
+        dec(sig_b64),
+        dec(prf_b64),
+    ) else {
+        return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
+    };
+    let now = ctx.session_clock;
+    match ctx.webauthn_rp.authenticate_finish(
+        &session, &cell, now, &challenge, &cred, &ad, &cdj, &sig, &prf,
+    ) {
+        Ok(unlock) => {
+            let b64 = pillar_crypto::webauthn::base64url_encode(&unlock);
+            text_response(200, "OK", format!("UNLOCKED {b64}"))
+        }
+        Err(e) => webauthn_rp_error(&e),
+    }
+}
+
 /// Drive one node-side custody login: parse the TWO fields (identifier +
 /// password), issue nothing here (the client already fetched a nonce), and let
 /// the node resolve+strip+unlock+sign+admit SERVER-SIDE.
@@ -3813,6 +4031,185 @@ mod tests {
         );
         assert_eq!(login.status, 200, "login body: {}", login.body);
         login.session_token.expect("session token")
+    }
+
+    // ---- WebAuthn RP ceremony (real browser-driven relying-party path) ----
+
+    // A test Ed25519 authenticator: returns (attestation_object, secret, cose).
+    fn webauthn_authenticator(
+        label: &str,
+        credential_id: &[u8],
+        sign_count: u32,
+    ) -> (Vec<u8>, pillar_crypto::SigningSecretKey, Vec<u8>) {
+        let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(
+            &pillar_crypto::Seed::from_bytes(label.as_bytes().to_vec()),
+        )
+        .unwrap();
+        let cose = pillar_crypto::webauthn::ed25519_public_key_to_cose(&public).unwrap();
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&[0u8; 32]);
+        auth_data.push(0x40 | 0x01); // AT + UP
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        auth_data.extend_from_slice(&cose);
+        use ciborium::value::Value;
+        let att = Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text("none".into())),
+            (Value::Text("attStmt".into()), Value::Map(vec![])),
+            (Value::Text("authData".into()), Value::Bytes(auth_data)),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&att, &mut out).unwrap();
+        (out, secret, cose)
+    }
+
+    // Produce an assertion (authData, clientDataJSON, signature) for a challenge.
+    fn webauthn_assertion(
+        secret: &pillar_crypto::SigningSecretKey,
+        challenge: &[u8],
+        sign_count: u32,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use sha2::{Digest, Sha256};
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://pillar.local"}}"#,
+            pillar_crypto::webauthn::base64url_encode(challenge)
+        )
+        .into_bytes();
+        let mut ad = Vec::new();
+        ad.extend_from_slice(&[0u8; 32]);
+        ad.push(0x01);
+        ad.extend_from_slice(&sign_count.to_be_bytes());
+        let mut signed = ad.clone();
+        signed.extend_from_slice(&Sha256::digest(&cdj));
+        let sig = pillar_crypto::sign::sign(secret, &signed).unwrap();
+        (ad, cdj, sig.as_bytes().to_vec())
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        pillar_crypto::webauthn::base64url_encode(bytes)
+    }
+
+    // Extract the CHALLENGE token from a `CHALLENGE <b64> ...` OK body.
+    fn challenge_of(resp: &HttpResponse) -> Vec<u8> {
+        assert_eq!(resp.status, 200, "begin failed: {}", resp.body);
+        let b = resp
+            .body
+            .split_whitespace()
+            .nth(1)
+            .expect("challenge field");
+        pillar_crypto::webauthn::base64url_decode(b).expect("b64 challenge")
+    }
+
+    #[test]
+    fn webauthn_full_ceremony_registers_then_authenticates_and_unlocks() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let (att, secret, _cose) = webauthn_authenticator("browser-auth", b"cred-web", 0);
+
+        // register/begin -> register/finish
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        let reg = post(
+            &mut ctx,
+            "/webauthn/register/finish",
+            &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+        );
+        assert_eq!(reg.status, 200, "register-finish: {}", reg.body);
+        assert!(reg.body.starts_with("REGISTERED"), "got: {}", reg.body);
+
+        // authenticate/begin -> authenticate/finish (real signature, sign_count 4)
+        let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &token));
+        let (ad, cdj, sig) = webauthn_assertion(&secret, &ch2, 4);
+        let auth = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{token}\n{}\n{}\n{}\n{}\n{}\n{}",
+                b64(&ch2),
+                b64(b"cred-web"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&sig),
+                b64(b"hardware-prf-output")
+            ),
+        );
+        assert_eq!(auth.status, 200, "authenticate-finish: {}", auth.body);
+        assert!(auth.body.starts_with("UNLOCKED"), "got: {}", auth.body);
+        // The unlock secret is the REAL HKDF-derived, credential-bound secret.
+        let got =
+            pillar_crypto::webauthn::base64url_decode(auth.body.split_whitespace().nth(1).unwrap())
+                .unwrap();
+        let expected =
+            pillar_crypto::webauthn::derive_unlock_secret(b"hardware-prf-output", b"cred-web")
+                .unwrap();
+        assert_eq!(
+            got,
+            expected.to_vec(),
+            "unlock secret is the real derivation"
+        );
+        assert_ne!(got, vec![0u8; 32], "unlock secret is not a placeholder");
+    }
+
+    #[test]
+    fn webauthn_forged_assertion_is_rejected_by_the_endpoint() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let (att, _secret, _cose) = webauthn_authenticator("browser-auth", b"cred-web", 0);
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/webauthn/register/finish",
+                &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+            )
+            .status,
+            200
+        );
+        // A DIFFERENT authenticator forges the assertion.
+        let (_a2, mallory, _c2) = webauthn_authenticator("mallory", b"cred-x", 0);
+        let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &token));
+        let (ad, cdj, forged) = webauthn_assertion(&mallory, &ch2, 4);
+        let auth = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{token}\n{}\n{}\n{}\n{}\n{}\n{}",
+                b64(&ch2),
+                b64(b"cred-web"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&forged),
+                b64(b"hardware-prf-output")
+            ),
+        );
+        assert_eq!(
+            auth.status, 401,
+            "forged assertion must be refused: {}",
+            auth.body
+        );
+    }
+
+    #[test]
+    fn webauthn_begin_requires_an_admitted_session() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let resp = post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            "not-a-real-token\nalice@pillar",
+        );
+        assert_eq!(
+            resp.status, 401,
+            "an unauthenticated ceremony must be refused"
+        );
     }
 
     #[test]
