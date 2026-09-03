@@ -1,0 +1,12 @@
+/* portal.css — the pillar portal's base stylesheet, served as a real static
+   asset (text/css) alongside the wasm/js bundle. Component-level styling is
+   done in Rust with stylist; this base sheet carries page-level resets so the
+   served-asset MIME map has a genuine text/css member to exercise. */
+:root {
+  color-scheme: light dark;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
