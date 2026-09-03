@@ -3063,6 +3063,7 @@ dependencies = [
  "pillar-topology",
  "pillar-trust-artifacts",
  "pillar-web",
+ "pillar-web-api",
  "pillar-wot-authority",
  "tempfile",
  "tokio",
@@ -3280,6 +3281,14 @@ dependencies = [
  "pillar-manifest",
  "pillar-rbac",
  "pillar-wot-authority",
+]
+
+[[package]]
+name = "pillar-web-api"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -181,23 +181,23 @@ use pillar_topology::{
     Assignment as TopologyAssignment, Label as TopologyLabel, Mismatch as TopologyMismatch,
     TierHierarchy, Topology as TopologyRegistry, ATTEST_ACTION as TOPOLOGY_ATTEST_ACTION,
 };
-
-/// A read-only snapshot of this node's identity/reachability, as the
-/// authenticated portal renders it: [`NodeId`]-derived peer id, the
-/// multiaddrs this node listens on, and the peers it currently considers
-/// connected. Real values are supplied by the boot-time `pillar-net` swarm
-/// (see `crates/pillar-cli/src/run.rs`); the default here is an empty view
-/// (a node with no configured listen/dial peers yet) until wired via
-/// [`WebAuthContext::with_identity`].
-#[derive(Clone, Debug, Default)]
-pub struct NodeIdentitySnapshot {
-    /// This node's libp2p-style peer id (derived from its identity keypair).
-    pub peer_id: String,
-    /// The multiaddrs this node listens on.
-    pub listen_addrs: Vec<String>,
-    /// The peers this node currently considers connected (peer ids).
-    pub connected_peers: Vec<String>,
-}
+// The shared client/server DTO crate (`pillar-web-api`): one type definition
+// for the portal's identity snapshot, session summary, and the
+// login/nonce/bootstrap wire-body framing, compiled into both this server
+// and the future Rust/WASM Yew client so the two cannot drift. A
+// `NodeIdentitySnapshot`/`SessionSummary` used to be defined HERE,
+// server-private; they now live in `pillar_web_api` and are re-exported
+// under their same names so every existing call site keeps compiling
+// unchanged. `CustodyRecord` stays server-local for now: its `holder`/`cid`
+// fields carry the server's internal `NodeId`/`Cid` newtypes, which this
+// wire-facing DTO crate deliberately does not depend on (see
+// `pillar_web_api::CustodyRecord`'s doc for the plain-`String` shared
+// shape a client would consume instead).
+pub use pillar_web_api::{NodeIdentitySnapshot, SessionSummary};
+use pillar_web_api::{
+    BootstrapCreateCellRequest, BootstrapCreateRequest, BootstrapCreateUserRequest,
+    BootstrapStatus, LoginRequest, LoginResponse, NonceResponse,
+};
 
 /// The server-side state the node-side-custody portal needs: the node-custody
 /// verifier (holding this node's node key + its cell-DB view of node-sealed
@@ -401,26 +401,8 @@ fn resource_registry() -> SchemaRegistry {
     reg
 }
 
-/// A portal session-management panel's per-session view: `(id, node/domain,
-/// issued-at, expiry, whether this IS the caller's own current session)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionSummary {
-    /// The session id (== the portal bearer token it was minted for).
-    pub id: String,
-    /// The node/domain this session was issued on (this node's own peer id
-    /// — a portal session is always local-node scoped).
-    pub node: String,
-    /// Logical issue time.
-    pub issued_at: u64,
-    /// Logical expiry time — the panel derives its live countdown from this.
-    pub expiry: u64,
-    /// Whether this is the session the panel's own caller is viewing under.
-    pub is_current: bool,
-}
-
-/// The fixed session lifetime (logical-clock ticks) every portal login mints
-/// under — long enough that a same-pass test sequence never trips it, short
-/// enough to be a real bound.
+/// A portal session-management panel's per-session view is now the shared
+/// [`SessionSummary`] DTO (re-exported above from `pillar_web_api`).
 const SESSION_TTL_TICKS: u64 = 1_000_000;
 
 impl WebAuthContext {
@@ -1778,18 +1760,19 @@ fn dispatch_http(
             // BOOTSTRAPPED on a cell alone is exactly what stranded the
             // operator (the login form showed but no user could log in).
             let status = if ctx.bootstrap().initial_user().is_some() {
-                "BOOTSTRAPPED"
+                BootstrapStatus::Bootstrapped
             } else {
-                "FRESH"
+                BootstrapStatus::Fresh
             };
-            text_response(200, "OK", status.to_owned())
+            text_response(200, "OK", status.to_wire().to_owned())
         }
         ("POST", "/bootstrap/create-cell") => {
-            let cell = request.body.trim();
-            if cell.is_empty() {
+            let BootstrapCreateCellRequest { cell_id } =
+                BootstrapCreateCellRequest::from_body(&request.body);
+            if cell_id.is_empty() {
                 return text_response(400, "Bad Request", "MISSING cell id".to_owned());
             }
-            match ctx.create_cell(NodeId::from(cell)) {
+            match ctx.create_cell(NodeId::from(cell_id.as_str())) {
                 Ok(()) => text_response(200, "OK", "CELL-CREATED".to_owned()),
                 Err(BootstrapError::CellNameInUse) => text_response(
                     409,
@@ -1817,37 +1800,39 @@ fn dispatch_http(
             }
         }
         ("POST", "/bootstrap/create-user") => {
-            // Body: "<handle>\n<password>" — the operator's chosen unlock
-            // factor for the new user, escrowed atomically (see
+            // Body: the shared `BootstrapCreateUserRequest` wire framing
+            // "<handle>\n<password>" — the operator's chosen unlock factor
+            // for the new user, escrowed atomically (see
             // `bootstrap_create_first_user`) so login works immediately.
-            let mut lines = request.body.lines();
-            let handle = lines.next().unwrap_or("").trim();
-            let password = lines.next().unwrap_or("").trim();
+            let BootstrapCreateUserRequest { handle, password } =
+                BootstrapCreateUserRequest::from_body(&request.body);
             if handle.is_empty() || password.is_empty() {
                 return text_response(400, "Bad Request", "MISSING handle-or-password".to_owned());
             }
-            match ctx.bootstrap_create_first_user(handle, password) {
+            match ctx.bootstrap_create_first_user(&handle, &password) {
                 Ok(()) => text_response(200, "OK", format!("USER-CREATED {handle}")),
                 Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
             }
         }
         ("POST", "/bootstrap/create") => {
-            // Body: "<cell>\n<handle>\n<password>" — the ONE atomic bootstrap
-            // action the portal uses (cell + first user together, so a reload
-            // between steps can never strand a cell with no first user). See
-            // `bootstrap_cell_and_first_user`.
-            let mut lines = request.body.lines();
-            let cell = lines.next().unwrap_or("").trim();
-            let handle = lines.next().unwrap_or("").trim();
-            let password = lines.next().unwrap_or("").trim();
-            if cell.is_empty() || handle.is_empty() || password.is_empty() {
+            // Body: the shared `BootstrapCreateRequest` wire framing
+            // "<cell_id>\n<handle>\n<password>" — the ONE atomic bootstrap
+            // action the portal uses (cell + first user together, so a
+            // reload between steps can never strand a cell with no first
+            // user). See `bootstrap_cell_and_first_user`.
+            let BootstrapCreateRequest {
+                cell_id,
+                handle,
+                password,
+            } = BootstrapCreateRequest::from_body(&request.body);
+            if cell_id.is_empty() || handle.is_empty() || password.is_empty() {
                 return text_response(
                     400,
                     "Bad Request",
                     "MISSING cell-handle-or-password".to_owned(),
                 );
             }
-            match ctx.bootstrap_cell_and_first_user(NodeId::from(cell), handle, password) {
+            match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
                 Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
                 Err(BootstrapError::CellNameInUse) => text_response(
                     409,
@@ -1862,7 +1847,11 @@ fn dispatch_http(
             text_response(
                 200,
                 "OK",
-                format!("NONCE {} {}", nonce.id(), nonce.expiry()),
+                NonceResponse {
+                    id: nonce.id(),
+                    expiry: nonce.expiry(),
+                }
+                .to_wire(),
             )
         }
         ("POST", "/login") => dispatch_login(ctx, request),
@@ -2907,19 +2896,16 @@ fn dispatch_custody_revoke(ctx: &mut WebAuthContext, request: &HttpRequest) -> H
 /// password), issue nothing here (the client already fetched a nonce), and let
 /// the node resolve+strip+unlock+sign+admit SERVER-SIDE.
 fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
-    // Body: "<identifier>\n<password>\n<nonce_id>". The client fetched the
-    // nonce via GET /nonce and echoes its id so the server can bind the login
-    // to that exact challenge; the password + identifier are the two human
+    // Body: the shared `pillar_web_api::LoginRequest` wire framing
+    // "<identifier>\n<password>\n<nonce_id>". The client fetched the nonce
+    // via GET /nonce and echoes its id so the server can bind the login to
+    // that exact challenge; the password + identifier are the two human
     // fields. The CID is NEVER in the body — the node resolves it.
-    let mut lines = request.body.lines();
-    let identifier = lines.next().unwrap_or("").trim();
-    let password = lines.next().unwrap_or("").trim();
-    let nonce_id: u64 = lines
-        .next()
-        .unwrap_or("")
-        .trim()
-        .parse()
-        .unwrap_or(u64::MAX);
+    let LoginRequest {
+        identifier,
+        password,
+        nonce_id,
+    } = LoginRequest::from_body(&request.body);
 
     if identifier.is_empty() || password.is_empty() {
         return text_response(401, "Unauthorized", "DENIED missing-field".to_owned());
@@ -2929,7 +2915,7 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
     let actor = ctx.actor.clone();
     match ctx
         .verifier
-        .admit(identifier, password, nonce_id, 0, &authority, &actor)
+        .admit(&identifier, &password, nonce_id, 0, &authority, &actor)
     {
         Ok(session) => {
             let handle = session.handle.clone();
@@ -2939,7 +2925,7 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
                 reason: "OK",
                 content_type: "text/plain; charset=utf-8",
                 session_token: Some(token),
-                body: format!("OK {handle}\n"),
+                body: LoginResponse { handle }.to_wire(),
                 bytes: None,
             }
         }
