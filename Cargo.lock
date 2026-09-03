@@ -2805,6 +2805,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-upgrade-gate"
+version = "0.0.0"
+dependencies = [
+ "pillar-cells",
+ "pillar-core",
+ "pillar-crypto",
+ "pillar-eventlog",
+ "pillar-identity",
+ "pillar-streamdb",
+ "pillar-trust-artifacts",
+]
+
+[[package]]
 name = "pillar-web"
 version = "0.0.0"
 dependencies = [

@@ -23,6 +23,7 @@ members = [
     "crates/pillar-trust-artifacts",
     "crates/pillar-quota-ledger",
     "crates/pillar-topology",
+    "crates/pillar-upgrade-gate",
 ]
 
 [workspace.package]
