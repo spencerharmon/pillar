@@ -44,6 +44,7 @@ pub mod block;
 pub mod correlation;
 pub mod metadata;
 pub mod query;
+pub mod retention;
 pub mod role;
 pub mod sampling;
 
@@ -53,6 +54,9 @@ pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };
 pub use query::{PersistedMaterializedView, Query, ViewCache, ViewPersistError};
+pub use retention::{
+    EffectiveRetention, LabelSelector, RetentionPolicy, RetentionPolicySet, RetentionPolicySpec,
+};
 pub use role::{NodeRole, NodeRoleConfig, RoleError, SignedNodeRole};
 pub use sampling::{Occurrence, SampleError, SamplingPolicy};
 
