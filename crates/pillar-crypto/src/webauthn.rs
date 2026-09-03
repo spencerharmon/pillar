@@ -297,6 +297,32 @@ pub fn parse_attestation(attestation_object: &[u8]) -> Result<RegisteredCredenti
     })
 }
 
+/// Encode a WebAuthn attestation object (CBOR map `{fmt, attStmt, authData}`)
+/// from an authenticator's raw `authData` bytes.
+///
+/// This is the encoding counterpart to [`parse_attestation`]: any client that
+/// holds real `authData` from a registration ceremony — a browser's
+/// `navigator.credentials.create()` result, or a CLI driving a CTAP2
+/// authenticator over ctap-hid — wraps it into the same wire-format
+/// attestation object the RP's [`parse_attestation`] consumes. `attStmt` is
+/// always the empty map (`fmt = "none"`, per WebAuthn's "none" attestation
+/// statement format): pillar's RP never validates attestation statements (it
+/// trusts the authData-embedded COSE key directly, per the crate's Ed25519-
+/// only model documented above), so no client needs to produce a real
+/// signed attestation statement.
+#[must_use]
+pub fn build_attestation_object(fmt: &str, auth_data: &[u8]) -> Vec<u8> {
+    use ciborium::value::Value;
+    let map = Value::Map(vec![
+        (Value::Text("fmt".into()), Value::Text(fmt.to_owned())),
+        (Value::Text("attStmt".into()), Value::Map(vec![])),
+        (Value::Text("authData".into()), Value::Bytes(auth_data.to_vec())),
+    ]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&map, &mut out).expect("attestation object CBOR encode is infallible");
+    out
+}
+
 /// The outcome of a verified assertion: the presented sign-count the caller
 /// must check for strict monotonicity against the stored value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -363,6 +389,169 @@ pub fn derive_unlock_secret(prf_output: &[u8], credential_id: &[u8]) -> Result<[
     hk.expand(b"pillar-crypto/webauthn/prf-unlock-v1", &mut out)
         .map_err(|_| CryptoError::InvalidLength)?;
     Ok(out)
+}
+
+/// Build a WebAuthn `clientDataJSON` for a `"webauthn.create"` (registration)
+/// or `"webauthn.get"` (assertion) ceremony, matching exactly what a browser's
+/// `navigator.credentials.{create,get}()` produces and what
+/// [`verify_assertion`] recomputes `SHA-256` of. A CLI driving a hardware
+/// authenticator over ctap-hid is a WebAuthn "client" too, and must build the
+/// SAME structure so the RP's real crypto (not a CLI-only shortcut) verifies
+/// it.
+///
+/// `ceremony_type` is `"webauthn.create"` or `"webauthn.get"`; `challenge` is
+/// the RP-issued base64url challenge; `origin` is the RP origin the ceremony
+/// is scoped to (e.g. `"https://pillar.local"`).
+#[must_use]
+pub fn client_data_json(ceremony_type: &str, challenge_b64url: &str, origin: &str) -> Vec<u8> {
+    format!(
+        r#"{{"type":"{ceremony_type}","challenge":"{challenge_b64url}","origin":"{origin}"}}"#
+    )
+    .into_bytes()
+}
+
+/// CLI-driven CTAP2 WebAuthn ceremonies over ctap-hid against a locally
+/// attached hardware authenticator — the CLI's counterpart to a browser's
+/// `navigator.credentials.{create,get}()`. Produces and consumes the SAME
+/// credential record shape ([`RegisteredCredential`] / the attestation-object
+/// wire format) as the browser path: same RP begin/finish endpoints, same
+/// COSE/CBOR wire format, real ctap-hid-fido2 device I/O.
+///
+/// Gated behind the crate's `passkey` feature (already pulled in by every
+/// deployed node's `hsm` build) so the everyday `cargo test` skips the
+/// hidapi/native dependency; a build without the feature never attempts
+/// device I/O (see [`crate::custody`] for the same fail-closed pattern).
+#[cfg(feature = "passkey")]
+pub mod ctap_client {
+    use super::{build_attestation_object, client_data_json};
+    use crate::error::{CryptoError, Result};
+    use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Extension as GetExtension;
+    use ctap_hid_fido2::fidokey::make_credential::make_credential_params::CredentialSupportedKeyType;
+    use ctap_hid_fido2::fidokey::{GetAssertionArgsBuilder, MakeCredentialArgsBuilder};
+    use ctap_hid_fido2::public_key_credential_user_entity::PublicKeyCredentialUserEntity;
+    use ctap_hid_fido2::{Cfg, FidoKeyHidFactory};
+    use sha2::{Digest, Sha256};
+
+    fn open_device() -> Result<ctap_hid_fido2::FidoKeyHid> {
+        FidoKeyHidFactory::create(&Cfg::init())
+            .map_err(|e| CryptoError::Backend(format!("webauthn: open authenticator: {e}")))
+    }
+
+    /// Drive a registration (`authenticatorMakeCredential`) ceremony over
+    /// ctap-hid: build the real WebAuthn `clientDataJSON`, hash it, ask the
+    /// attached authenticator to mint an Ed25519 credential over that hash,
+    /// and wrap the returned `authData` into the SAME attestation-object wire
+    /// format ([`build_attestation_object`]) the RP's [`super::parse_attestation`]
+    /// consumes — no CLI-only credential shape.
+    ///
+    /// Returns `(attestation_object, credential_id)`, both raw bytes ready for
+    /// base64url transport to `/webauthn/register/finish`.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Backend`] if no authenticator is attached or the
+    /// ceremony is refused by the device.
+    pub fn register(
+        rp_id: &str,
+        origin: &str,
+        challenge_b64url: &str,
+        user_id: &[u8],
+        user_name: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let device = open_device()?;
+        let cdj = client_data_json("webauthn.create", challenge_b64url, origin);
+        let client_data_hash = Sha256::digest(&cdj);
+        let user_entity = PublicKeyCredentialUserEntity::new(
+            Some(user_id),
+            Some(user_name),
+            Some(user_name),
+        );
+        let args = MakeCredentialArgsBuilder::new(rp_id, &client_data_hash)
+            .key_type(CredentialSupportedKeyType::Ed25519)
+            .user_entity(&user_entity)
+            .without_pin_and_uv()
+            .build();
+        let attestation = device
+            .make_credential_with_args(&args)
+            .map_err(|e| CryptoError::Backend(format!("webauthn: make credential: {e}")))?;
+        let attestation_object = build_attestation_object("none", &attestation.auth_data);
+        Ok((attestation_object, attestation.credential_descriptor.id))
+    }
+
+    /// Drive an assertion (`authenticatorGetAssertion`) ceremony over
+    /// ctap-hid: build the real `clientDataJSON`, hash it, ask the attached
+    /// authenticator (scoped to `credential_id`) to sign over that hash, and
+    /// return the raw `(authenticator_data, client_data_json, signature)` — the
+    /// SAME shape [`super::verify_assertion`] consumes.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Backend`] if no authenticator is attached, the
+    /// credential is unknown to it, or the ceremony is refused.
+    pub fn authenticate(
+        rp_id: &str,
+        origin: &str,
+        challenge_b64url: &str,
+        credential_id: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let device = open_device()?;
+        let cdj = client_data_json("webauthn.get", challenge_b64url, origin);
+        let client_data_hash = Sha256::digest(&cdj);
+        let args = GetAssertionArgsBuilder::new(rp_id, &client_data_hash)
+            .credential_id(credential_id)
+            .without_pin_and_uv()
+            .build();
+        let assertions = device
+            .get_assertion_with_args(&args)
+            .map_err(|e| CryptoError::Backend(format!("webauthn: get assertion: {e}")))?;
+        let assertion = assertions
+            .into_iter()
+            .next()
+            .ok_or_else(|| CryptoError::Backend("webauthn: no assertion returned".into()))?;
+        Ok((assertion.auth_data, cdj, assertion.signature))
+    }
+
+    /// Drive an assertion ceremony as [`authenticate`], additionally
+    /// requesting the `hmac-secret` extension output for a given `prf_salt` —
+    /// the PRF material `/webauthn/authenticate/finish` folds into the
+    /// operational-key-unlock secret via [`super::derive_unlock_secret`].
+    ///
+    /// # Errors
+    ///
+    /// As [`authenticate`], plus [`CryptoError::Backend`] if the authenticator
+    /// does not return an `hmac-secret` output.
+    pub fn authenticate_with_prf(
+        rp_id: &str,
+        origin: &str,
+        challenge_b64url: &str,
+        credential_id: &[u8],
+        prf_salt: [u8; 32],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, [u8; 32])> {
+        let device = open_device()?;
+        let cdj = client_data_json("webauthn.get", challenge_b64url, origin);
+        let client_data_hash = Sha256::digest(&cdj);
+        let args = GetAssertionArgsBuilder::new(rp_id, &client_data_hash)
+            .credential_id(credential_id)
+            .extensions(&[GetExtension::HmacSecret(Some(prf_salt))])
+            .without_pin_and_uv()
+            .build();
+        let assertions = device
+            .get_assertion_with_args(&args)
+            .map_err(|e| CryptoError::Backend(format!("webauthn: get assertion: {e}")))?;
+        let assertion = assertions
+            .into_iter()
+            .next()
+            .ok_or_else(|| CryptoError::Backend("webauthn: no assertion returned".into()))?;
+        let prf_output = assertion
+            .extensions
+            .iter()
+            .find_map(|e| match e {
+                GetExtension::HmacSecret(Some(o)) => Some(*o),
+                _ => None,
+            })
+            .ok_or_else(|| CryptoError::Backend("webauthn: no hmac-secret output".into()))?;
+        Ok((assertion.auth_data, cdj, assertion.signature, prf_output))
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +623,38 @@ mod tests {
         assert_eq!(rec.sign_count, 5);
         assert_eq!(rec.cose_public_key, cose);
         // the extracted COSE key really parses to a usable Ed25519 key
+        cose_ed25519_public_key(&rec.cose_public_key).expect("usable key");
+    }
+
+    #[test]
+    fn build_attestation_object_round_trips_through_parse_attestation() {
+        // Mirrors the CLI path: an authenticator hands back raw `authData`
+        // (what ctap-hid-fido2's `Attestation::auth_data` carries), and the
+        // CLI wraps it with `build_attestation_object` — the SAME encoder a
+        // browser's simulated ceremony fixture builds by hand (see
+        // `make_registration` above) — before POSTing to the RP's
+        // `/webauthn/register/finish`. Prove the two are the identical wire
+        // shape by round-tripping through the real RP parser.
+        let (public, _secret) =
+            signing_keypair_from_seed(&Seed::from_bytes(b"cli-authenticator".to_vec()))
+                .expect("keygen");
+        let cose = ed25519_public_key_to_cose(&public).expect("cose");
+        let credential_id = b"cli-cred-1";
+        let sign_count: u32 = 3;
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&[0u8; 32]); // rpIdHash
+        auth_data.push(AUTH_FLAG_AT | 0x01); // AT + UP
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]); // aaguid
+        auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        auth_data.extend_from_slice(&cose);
+
+        let attestation_object = build_attestation_object("none", &auth_data);
+        let rec = parse_attestation(&attestation_object).expect("CLI attestation object parses");
+        assert_eq!(rec.credential_id, credential_id);
+        assert_eq!(rec.sign_count, sign_count);
+        assert_eq!(rec.cose_public_key, cose);
         cose_ed25519_public_key(&rec.cose_public_key).expect("usable key");
     }
 

@@ -41,6 +41,7 @@ pub mod session_cli;
 pub mod stream_cli;
 pub mod topology_cli;
 pub mod web_serve;
+pub mod webauthn_cli;
 
 use std::collections::BTreeMap;
 use std::fmt;

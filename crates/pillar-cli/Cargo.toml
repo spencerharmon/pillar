@@ -43,7 +43,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # the flake builds `-p pillar-cli --features hsm`, so every shipped `pillar`
 # binary carries every popular hardware custody backend.
 default = []
-hsm = ["pillar-crypto/hsm"]
+hsm = ["pillar-crypto/hsm", "passkey"]
+# CLI-driven CTAP2 WebAuthn ceremonies (registration/assertion) over ctap-hid
+# against a locally attached hardware authenticator — `pillar webauthn
+# register|login`. Folded into `hsm` (every deployed node build) and
+# available standalone for a WebAuthn-only build.
+passkey = ["pillar-crypto/passkey"]
 
 [dev-dependencies]
 tempfile = "3"
