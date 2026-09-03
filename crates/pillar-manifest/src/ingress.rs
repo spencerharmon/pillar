@@ -327,9 +327,10 @@ impl LoadBalancerPolicy {
 /// stable across calls, so the same `key` against the same candidate count
 /// always yields the same index (the exclusive-consistency guarantee).
 fn consistent_hash(key: &str, len: usize) -> usize {
-    use std::collections::hash_map::DefaultHasher;
+    // non-security: LB hash, not a security primitive
+    use std::collections::hash_map::DefaultHasher; // non-security: LB hash, not a security primitive
     use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
+    let mut h = DefaultHasher::new(); // non-security: LB hash, not a security primitive
     key.hash(&mut h);
     (h.finish() as usize) % len
 }
