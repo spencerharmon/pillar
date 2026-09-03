@@ -28,6 +28,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `Cells.tla` | `TypeOK`, `VisibilitySound`, `ForwardSecrecyOnLeave`, `AtomicRotation`, `GrantScopeRespected`, `NamePtrResolves` | cells & confidentiality (conceptually extends `WoTAuthority.tla` + `KeyDistribution.tla`): public/cell-encrypted/recipient-sealed (per-node/per-cell/per-user) visibility classes, offer-system cell membership, cross-cell user-access grants (read-only/read-write, all-or-tags), group-key rotation with forward secrecy on member-leave atomic against writers, IPNS-format cell naming pointer | ROI P1 cells & confidentiality |
 | `TrustArtifacts.tla` | `VerificationTerminates`, `CapacityHeldAtSigning`, `RevocationHonorsEpoch`, `QuotaNeverDoubleSpent`, `TypeOK` | trust artifacts: certify / trust / attest / revoke (extends `WoTAuthority.tla` + `GlobalIdentity.tla`): four separate content-addressed signed artifact types (never one overloaded sign), capacity always explicit (self or role@scope), owner-anchored bounded-depth capacity walk gated at issuance (CapacityHeldAtSigning, not deferred to a later verifier), epoch-stamped fail-closed revocation, quota-as-budget with a CP-fenced reservation ledger | ROI P1 trust artifacts: certify / trust / attest / revoke |
 | `PillarUDP.tla` | `TypeOK`, `ExactlyOnceProcessing`, `BoundedTotalDatagrams`, `NoForwardingLoops`, `AntiAmplificationBound`, + liveness `Reachability` (`<>`) | pillar-UDP transport (multipath spray/forward over a lossy-link graph covering non-node client<->cell, intra-cell node<->node, and inter-cell cell<->cell) | ROI P2 load balancing, ingress & the pillar-UDP protocol |
+| `VersioningCompat.tla` | `TypeOK`, `N1WindowHonored`, `NoOrphanedMember`, `NegotiationRefusesIncompatible`, + liveness `IndependentVersioning`, `RollingCoexistence`, `SwarmNeverPartitioned` (`<>`) | version-stamp seams (event-envelope, materialized-view, pillar message, HTTP ingest API, pillar-UDP protocol, trust-artifact/attestation, sealed-artifact envelope, manifest/declared-object schema), the compat-negotiation contract + N-1+ window, and cell-aware/swarm-aware migration; gates `version-stamps-impl`, `sealed-artifact-self-describing-impl`, `compat-negotiation-impl`, `cell-aware-migration-impl` | ROI P1 versioning, compatibility & safe rollout |
 
 ## Running the checker
 
@@ -145,3 +146,30 @@ pinned release into `./.tools/` (the path CI uses).
   (stable membership, no pending write/rotation) is expected idle, not a fault.
   The per-node-vs-per-cell cost/security posture is spelled out in
   `docs/cells-confidentiality.md`.
+- `VersioningCompat` abstracts the eight real independently-versioned seams
+  (event-envelope, materialized-view, pillar message, HTTP ingest API,
+  pillar-UDP protocol, trust-artifact/attestation, sealed-artifact envelope,
+  manifest/declared-object schema) as a generic `Surfaces` set of >= 2 seams,
+  so `IndependentVersioning` proves no forced lockstep between distinct
+  seams without eight near-identical copies of the same state machine. Peers
+  are partitioned into two cells (a federation of one multi-member cell plus
+  one single-member cell, enough to exercise both intra-cell and cross-cell
+  negotiation); each peer catches up ONE (peer, surface) version at a time
+  (rolling, never a stop-the-world jump), a release (`Bump`) is guarded so it
+  never pushes an already-lagging peer outside the N-version compat window
+  (`N1WindowHonored`), same-cell members are proven to stay within 2N of each
+  other as a direct corollary (`NoOrphanedMember`), and a negotiation attempt
+  between two peers is proven to link iff they are truly within the window
+  and refuse iff they are truly not (`NegotiationRefusesIncompatible`,
+  checked at the exact moment of every attempt via a scalar "last outcome"
+  record rather than a growing ledger, to keep the state space finite).
+  Liveness: a cell transiently holds members at different versions of the
+  same surface is reachable (`RollingCoexistence` -- rolling upgrades can
+  never all land in the same atomic step) and a cross-cell/federation pair
+  that was refused eventually re-negotiates successfully once both sides
+  catch up (`SwarmNeverPartitioned`), under weak fairness of `Bump`,
+  `RollingUpgrade`, and `Negotiate`. No `-deadlock` flag: `Negotiate` is
+  always enabled for every pair, so the model never deadlocks. Spec only --
+  gates `version-stamps-impl`, `sealed-artifact-self-describing-impl`,
+  `compat-negotiation-impl`, and `cell-aware-migration-impl` before any Rust
+  for this line lands.
