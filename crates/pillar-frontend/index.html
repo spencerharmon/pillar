@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!--
+  trunk entrypoint for the pillar portal. `trunk build` compiles the
+  pillar-frontend crate to wasm, runs wasm-bindgen, injects the wasm/js hashed
+  asset links here, and bundles the stylist-emitted CSS — all with NO npm/Node.
+  The `data-trunk rel="rust"` link makes this crate the wasm bundle source.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pillar portal</title>
+    <link data-trunk rel="css" href="portal.css" />
+    <link data-trunk rel="rust" data-wasm-opt="s" />
+  </head>
+  <body></body>
+</html>

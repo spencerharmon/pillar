@@ -32,6 +32,66 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        # ---------------------------------------------------------------------
+        # Stage 1 of the two-stage build: compile the Yew + WebAssembly portal
+        # (crate pillar-frontend, EXCLUDED from the native workspace) to
+        # `wasm32-unknown-unknown` with `trunk`, producing the static asset
+        # bundle (wasm/js/css). NO npm/Node is used anywhere — trunk drives
+        # cargo + wasm-bindgen, and stylist emits the CSS from Rust. Stage 2
+        # (`pillar`, below) embeds `${pillar-frontend}` into the ONE binary via
+        # include_bytes! (see crates/pillar-cli/src/web_serve.rs).
+        pillar-frontend = pkgs.rustPlatform.buildRustPackage {
+          pname = "pillar-frontend";
+          version = "0.0.0";
+          # Only the frontend crate — its OWN Cargo.lock (own dep closure).
+          src = ./crates/pillar-frontend;
+
+          cargoLock = {
+            lockFile = ./crates/pillar-frontend/Cargo.lock;
+          };
+
+          # trunk (Node-free wasm bundler) + a wasm-bindgen-cli whose version
+          # MUST equal the crate's `wasm-bindgen` (0.2.127, pinned in the
+          # frontend Cargo.lock) or wasm-bindgen refuses the module.
+          nativeBuildInputs = [
+            pkgs.trunk
+            pkgs.wasm-bindgen-cli
+            pkgs.binaryen
+            pkgs.lld
+          ];
+
+          # nixpkgs rustc ships the wasm32-unknown-unknown std; add the target
+          # so cargo (invoked by trunk) can compile to it.
+          buildPhase = ''
+            runHook preBuild
+            export CARGO_HOME=$PWD/.cargo-home
+            # Trunk must NOT fetch its own wasm-bindgen/wasm-opt — use the ones
+            # from nativeBuildInputs (offline, reproducible).
+            trunk build \
+              --release \
+              --offline \
+              --dist $PWD/dist \
+              index.html
+            runHook postBuild
+          '';
+
+          # There is no cargo-test surface for a wasm bundle; the frontend's
+          # logic is exercised by the workspace crates that consume its assets.
+          doCheck = false;
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r dist/* $out/
+            runHook postInstall
+          '';
+
+          meta = {
+            description = "pillar web portal — Yew + WebAssembly static bundle";
+            license = pkgs.lib.licenses.gpl3Plus;
+          };
+        };
+
         # Build the workspace `pillar` binary (crate pillar-cli) reproducibly
         # from the vendored Cargo.lock. No network at build time.
         pillar = pkgs.rustPlatform.buildRustPackage {
@@ -105,6 +165,7 @@
       {
         packages = {
           inherit pillar pillar-oci-image;
+          inherit pillar-frontend;
           default = pillar-oci-image;
         };
 
