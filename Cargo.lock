@@ -2585,6 +2585,7 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-key-distribution",
+ "pillar-streamdb",
 ]
 
 [[package]]

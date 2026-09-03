@@ -55,6 +55,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use pillar_core::NodeId;
 use pillar_key_distribution::{CellId, UserId};
 
+pub mod migration;
+pub use migration::{MigrationCoordinator, MigrationError, ViewChoice};
+
 /// The recipient granularity of a [`VisClass::RecipientSealed`] object —
 /// mirrors `specs/Cells.tla`'s `Scopes` (`PerNode`/`PerCell`/`PerUser`).
 ///

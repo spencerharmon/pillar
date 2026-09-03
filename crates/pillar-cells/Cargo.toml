@@ -11,6 +11,7 @@ description = "Cells & confidentiality: per-object visibility classes (public / 
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-key-distribution = { path = "../pillar-key-distribution" }
+pillar-streamdb = { path = "../pillar-streamdb" }
 
 [lints]
 workspace = true
