@@ -47,7 +47,9 @@ use pillar_streamdb::{content_address, OpLog};
 use serde::{Deserialize, Serialize};
 
 pub mod antientropy;
+pub mod audit;
 pub use antientropy::LogDigest;
+pub use audit::{AuditEntry, AuditRecord};
 
 /// The fingerprint of an event author's OpenPGP identity. An event is authored
 /// by exactly one author (the `auth` field of `EventDAG.tla`).
@@ -604,6 +606,36 @@ impl EventLog {
     #[must_use]
     pub fn happens_before(&self, a: &EventId, b: &EventId) -> bool {
         self.ancestors(b).contains(a)
+    }
+
+    /// The authors that have published at least one event — the chains this log
+    /// holds. Used by the audit view to enumerate the log deterministically.
+    pub(crate) fn chain_authors(&self) -> Vec<Author> {
+        self.height.keys().cloned().collect()
+    }
+
+    /// The contiguous chain height (next unheld seq) held for `author`; 0 if the
+    /// author has no events. Because `NoGaps` holds, the author's events are
+    /// exactly seq `0 .. chain_height`.
+    pub(crate) fn chain_height(&self, author: &Author) -> u64 {
+        self.height.get(author).copied().unwrap_or(0)
+    }
+
+    /// Insert a fully-formed event into the store WITHOUT running ingest's
+    /// integrity checks — used ONLY by tests to model a forged/tampered event
+    /// that slipped into a replica's store, so the audit view can be shown to
+    /// still refuse to render it as legitimate.
+    #[cfg(test)]
+    pub(crate) fn insert_unchecked_for_test(&mut self, event: Event) {
+        let id = event.content.id();
+        let author = event.content.author.clone();
+        let seq = event.content.seq;
+        // Advance chain bookkeeping so the audit-view enumeration visits it,
+        // without asserting any of ingest's invariants.
+        let next = self.height.get(&author).copied().unwrap_or(0).max(seq + 1);
+        self.height.insert(author.clone(), next);
+        self.by_seq.insert((author, seq), id.clone());
+        self.events.insert(id, event);
     }
 }
 
