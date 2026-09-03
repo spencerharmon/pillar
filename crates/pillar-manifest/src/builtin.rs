@@ -152,6 +152,17 @@ pub trait ControllerHook {
     /// invocation path regardless of whether `crd`'s kind is built-in or
     /// third-party.
     fn reconcile(&self, crd: &Crd) -> ReconcileOutcome;
+
+    /// Retire (prune) `crd` from the cell — the delete half of the apply path,
+    /// invoked when a GitOps reconcile finds a previously-applied manifest gone
+    /// from its source repo (see [`crate::gitops`]). Reached through the SAME
+    /// `(apiVersion, kind)` dispatch as [`ControllerHook::reconcile`]; there is
+    /// no per-kind prune fork. Defaults to a successful no-op so a hook that
+    /// only ever applies need not implement it; a real hook overrides it to
+    /// actually delete the backing object.
+    fn delete(&self, _crd: &Crd) -> ReconcileOutcome {
+        ReconcileOutcome::Reconciled
+    }
 }
 
 /// A no-op-but-real reconcile hook: it accepts the CRD and reports success
@@ -219,6 +230,28 @@ impl ControllerRegistry {
         self.hooks
             .get(&(crd.api_version.clone(), crd.kind.clone()))
             .map(|hook| hook.reconcile(crd))
+    }
+
+    /// Retire `crd` through its registered controller hook's
+    /// [`ControllerHook::delete`] — the prune half of the apply path, reached
+    /// by the SAME `(apiVersion, kind)` lookup as [`dispatch`]. Returns a
+    /// [`ReconcileOutcome::Failed`] if no hook is registered for the kind (a
+    /// GitOps prune only ever targets a previously-applied manifest, whose hook
+    /// was present when it was applied, so this is a should-not-happen guard).
+    ///
+    /// [`dispatch`]: ControllerRegistry::dispatch
+    #[must_use]
+    pub fn delete(&self, crd: &Crd) -> ReconcileOutcome {
+        match self
+            .hooks
+            .get(&(crd.api_version.clone(), crd.kind.clone()))
+        {
+            Some(hook) => hook.delete(crd),
+            None => ReconcileOutcome::Failed(format!(
+                "no controller registered to prune {}/{}",
+                crd.api_version, crd.kind
+            )),
+        }
     }
 }
 
