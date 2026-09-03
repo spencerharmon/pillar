@@ -29,14 +29,14 @@
 //! change them later. What is fixed is the **contract**: the behaviors the
 //! module-level unit tests assert.
 //!
-//! ## Every operation is `NotImplemented` — on purpose
+//! ## The contract is enforced by tests
 //!
-//! Each function returns [`CryptoError::NotImplemented`] today. The unit tests
-//! feed contrived fixtures through the real signatures and assert the contract
-//! (a signature verifies and rejects tampering; a non-recipient cannot unseal;
-//! a wrong password yields a different key; a content address is deterministic,
-//! distinct, and wide). They are RED until a real implementation lands, which
-//! is the whole point: the tests — not a source grep — force compliance.
+//! Each operation is implemented and pinned by the module-level unit tests,
+//! which feed contrived fixtures through the real signatures and assert the
+//! contract (a signature verifies and rejects tampering; a non-recipient
+//! cannot unseal; a wrong password yields a different key; a content address
+//! is deterministic, distinct, and wide). The tests — not a source grep —
+//! are what force compliance.
 
 mod error;
 mod types;

@@ -2,8 +2,8 @@
 //!
 //! This is the executable definition of "the crypto works": every combination
 //! the operator enumerated, walked through the public `pillar-crypto` API using
-//! the shared principal infrastructure. Every case is RED until the primitives
-//! are implemented; when they are green, the persistence story (pin the sealed
+//! the shared principal infrastructure. The primitives are implemented, so
+//! these cases pass green; the persistence story (pin the sealed
 //! cell key to IPFS; never the private key) can build on top.
 
 use pillar_crypto::cell::{
