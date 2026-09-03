@@ -13,21 +13,119 @@
 //! ([`TokenIssuer::forward_and_mint`]) which is the sole minter. Tokens are
 //! bound to `(user, domain, expiry)`, never honored past expiry or revocation.
 //!
-//! No real crypto (codebase convention): the token value is a deterministic
-//! stand-in bearer string; the PROTOCOL — mint only on a forwarded valid
-//! credential, fail-closed on expiry/revocation, bound to one user+domain — is
-//! modelled precisely.
+//! Real crypto: the bearer value is a self-describing ed25519-signed record
+//! (serial + expiry + user + domain, hex-encoded, followed by the issuer's
+//! signature over that payload). Verification recomputes the signature
+//! against the issuer's own `pillar-crypto` keypair, so a token cannot be
+//! minted — nor a captured one tampered with — without holding the issuer's
+//! real signing key; a forged or altered token fails `verify` closed. Serial-
+//! keyed revocation and the embedded expiry give the same fail-closed
+//! expiry/replay behavior as before, now backed by a real signature instead
+//! of an opaque hash.
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
+use std::collections::HashSet;
 
-fn digest(parts: &[&str]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for part in parts {
-        part.hash(&mut hasher);
+use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify as crypto_verify};
+use pillar_crypto::{Seed, Signature, SigningPublicKey, SigningSecretKey};
+
+/// Hex-encode `bytes` (lowercase, no separators).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
     }
-    hasher.finish()
+    out
+}
+
+/// Hex-decode `s`; `None` on any malformed input (odd length, non-hex digit).
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// The fields bound into a minted token, encoded as a flat, length-prefixed
+/// byte payload so the signature covers exactly these values.
+struct TokenPayload {
+    serial: u64,
+    expiry: u64,
+    user: String,
+    domain: String,
+}
+
+impl TokenPayload {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.serial.to_be_bytes());
+        out.extend_from_slice(&self.expiry.to_be_bytes());
+        let user_bytes = self.user.as_bytes();
+        out.extend_from_slice(&(user_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(user_bytes);
+        let domain_bytes = self.domain.as_bytes();
+        out.extend_from_slice(&(domain_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(domain_bytes);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 8 + 8 + 4 {
+            return None;
+        }
+        let mut pos = 0usize;
+        let serial = u64::from_be_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let expiry = u64::from_be_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let user_len = u32::from_be_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        let user = String::from_utf8(bytes.get(pos..pos + user_len)?.to_vec()).ok()?;
+        pos += user_len;
+        let domain_len = u32::from_be_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        let domain = String::from_utf8(bytes.get(pos..pos + domain_len)?.to_vec()).ok()?;
+        pos += domain_len;
+        if pos != bytes.len() {
+            return None;
+        }
+        Some(TokenPayload {
+            serial,
+            expiry,
+            user,
+            domain,
+        })
+    }
+}
+
+/// Encode a signed token as `pt2.<hex payload>.<hex signature>`.
+fn encode_token(payload: &TokenPayload, sig: &Signature) -> String {
+    format!(
+        "pt2.{}.{}",
+        hex_encode(&payload.encode()),
+        hex_encode(sig.as_bytes())
+    )
+}
+
+/// Decode + verify a `pt2.…` token against `public`. `None` on any malformed
+/// token OR a signature that does not verify — a forged/tampered token is
+/// indistinguishable from garbage, and both are rejected identically.
+fn decode_and_verify_token(token: &str, public: &SigningPublicKey) -> Option<TokenPayload> {
+    let rest = token.strip_prefix("pt2.")?;
+    let (payload_hex, sig_hex) = rest.split_once('.')?;
+    let payload_bytes = hex_decode(payload_hex)?;
+    let sig_bytes = hex_decode(sig_hex)?;
+    let payload = TokenPayload::decode(&payload_bytes)?;
+    let signature = Signature::from_bytes(sig_bytes);
+    crypto_verify(public, &payload_bytes, &signature).ok()?;
+    Some(payload)
 }
 
 /// The env var carrying the logged-in cell domain.
@@ -100,32 +198,51 @@ impl std::fmt::Display for LoginTokenError {
 
 impl std::error::Error for LoginTokenError {}
 
-#[derive(Clone, Debug)]
-struct MintedRecord {
-    user: String,
-    domain: String,
-    expiry: u64,
-    revoked: bool,
-}
-
 /// The key-distribution server: the SOLE minter and verifier of login tokens.
 ///
 /// It holds each user's registered login credential (a stand-in for the
 /// server-side unlock check), mints a token only after valid credentials are
 /// forwarded, and verifies presented tokens fail-closed on expiry/revocation.
-#[derive(Clone, Debug, Default)]
+/// Minting SIGNS the token payload with a real ed25519 key generated fresh
+/// for this issuer (from OS entropy, via `pillar_crypto`); verification
+/// checks that signature against the issuer's own public key, so a token
+/// cannot be minted, nor a captured one altered, without holding the real
+/// signing key.
+#[derive(Clone, Debug)]
 pub struct TokenIssuer {
     credentials: HashMap<String, String>,
-    minted: HashMap<String, MintedRecord>,
-    revoked: HashSet<String>,
+    /// Revoked serials (each minted token embeds a unique serial).
+    revoked: HashSet<u64>,
     serial: u64,
+    signing_key: SigningSecretKey,
+    verifying_key: SigningPublicKey,
+}
+
+impl Default for TokenIssuer {
+    fn default() -> Self {
+        TokenIssuer::new()
+    }
 }
 
 impl TokenIssuer {
-    /// A server with no users registered.
+    /// A server with no users registered, holding a freshly generated
+    /// ed25519 signing keypair (seeded from OS entropy).
     #[must_use]
     pub fn new() -> Self {
-        TokenIssuer::default()
+        use rand_core::{OsRng, RngCore};
+
+        let mut seed_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut seed_bytes);
+        let seed = Seed::from_bytes(seed_bytes.to_vec());
+        let (verifying_key, signing_key) =
+            signing_keypair_from_seed(&seed).expect("ed25519 keygen from a 32-byte seed");
+        TokenIssuer {
+            credentials: HashMap::new(),
+            revoked: HashSet::new(),
+            serial: 0,
+            signing_key,
+            verifying_key,
+        }
     }
 
     /// Register a user's login credential (the factor the server verifies a
@@ -163,25 +280,16 @@ impl TokenIssuer {
         }
         self.serial += 1;
         let expiry = now + ttl;
-        let value = format!(
-            "pt_{:016x}",
-            digest(&[
-                "pillar-login-token-v1",
-                user,
-                domain,
-                &expiry.to_string(),
-                &self.serial.to_string(),
-            ])
-        );
-        self.minted.insert(
-            value.clone(),
-            MintedRecord {
-                user: user.to_owned(),
-                domain: domain.to_owned(),
-                expiry,
-                revoked: false,
-            },
-        );
+        let payload = TokenPayload {
+            serial: self.serial,
+            expiry,
+            user: user.to_owned(),
+            domain: domain.to_owned(),
+        };
+        let payload_bytes = payload.encode();
+        let sig = sign(&self.signing_key, &payload_bytes)
+            .expect("signing with our own freshly generated key never fails");
+        let value = encode_token(&payload, &sig);
         Ok(LoginToken {
             value,
             user: user.to_owned(),
@@ -191,34 +299,39 @@ impl TokenIssuer {
     }
 
     /// Verify a presented token for `domain` at time `now`, returning the
-    /// authenticated user on success. Fail-closed on unknown/expired/revoked
-    /// tokens and on a domain mismatch.
+    /// authenticated user on success. Fail-closed on unknown/forged/expired/
+    /// revoked tokens and on a domain mismatch.
+    ///
+    /// A token is authenticated ONLY by its ed25519 signature against this
+    /// issuer's own key ([`decode_and_verify_token`]): a malformed token, one
+    /// signed by a different key, or one whose payload was tampered with all
+    /// fail identically as [`LoginTokenError::UnknownToken`] — this server
+    /// never minted it.
     ///
     /// # Errors
     ///
     /// The matching [`LoginTokenError`] for the first failing check.
     pub fn verify(&self, token: &str, domain: &str, now: u64) -> Result<String, LoginTokenError> {
-        let record = self
-            .minted
-            .get(token)
+        let payload = decode_and_verify_token(token, &self.verifying_key)
             .ok_or(LoginTokenError::UnknownToken)?;
-        if record.revoked || self.revoked.contains(token) {
+        if self.revoked.contains(&payload.serial) {
             return Err(LoginTokenError::Revoked);
         }
-        if now >= record.expiry {
+        if now >= payload.expiry {
             return Err(LoginTokenError::Expired);
         }
-        if record.domain != domain {
+        if payload.domain != domain {
             return Err(LoginTokenError::WrongDomain);
         }
-        Ok(record.user.clone())
+        Ok(payload.user)
     }
 
-    /// Revoke a minted token; it can no longer authenticate.
+    /// Revoke a minted token; it can no longer authenticate. A token that does
+    /// not verify against this issuer (forged, or minted by a different
+    /// issuer) is silently ignored — there is no real serial to revoke.
     pub fn revoke(&mut self, token: &str) {
-        self.revoked.insert(token.to_owned());
-        if let Some(record) = self.minted.get_mut(token) {
-            record.revoked = true;
+        if let Some(payload) = decode_and_verify_token(token, &self.verifying_key) {
+            self.revoked.insert(payload.serial);
         }
     }
 }
@@ -379,6 +492,80 @@ mod tests {
         assert_eq!(
             i.verify(token.value(), "some-other-cell", 5),
             Err(LoginTokenError::WrongDomain)
+        );
+    }
+
+    #[test]
+    fn a_tampered_token_is_rejected() {
+        let mut i = issuer();
+        let token = i
+            .forward_and_mint(
+                "spencer@pillar",
+                "spencer-cell",
+                "correct horse battery staple",
+                0,
+                10,
+            )
+            .unwrap();
+        // Flip a hex digit in the payload (e.g. change the bound user/domain
+        // bytes) — the signature no longer matches the mutated payload.
+        let mutated = {
+            let mut chars: Vec<char> = token.value().chars().collect();
+            let flip_at = chars
+                .iter()
+                .position(|c| *c == '.')
+                .expect("has a separator")
+                + 1;
+            chars[flip_at] = if chars[flip_at] == '0' { '1' } else { '0' };
+            chars.into_iter().collect::<String>()
+        };
+        assert_eq!(
+            i.verify(&mutated, "spencer-cell", 5),
+            Err(LoginTokenError::UnknownToken),
+            "a tampered payload must fail signature verification"
+        );
+    }
+
+    #[test]
+    fn a_forged_token_from_another_issuer_is_rejected() {
+        let victim = issuer();
+        let mut attacker = TokenIssuer::new();
+        attacker.register_user("spencer@pillar", "correct horse battery staple");
+        // The attacker runs their OWN issuer (their own signing key) and mints
+        // a token for the same user/domain — this must not authenticate
+        // against the victim issuer, which never minted it and does not hold
+        // the attacker's signing key.
+        let forged = attacker
+            .forward_and_mint(
+                "spencer@pillar",
+                "spencer-cell",
+                "correct horse battery staple",
+                0,
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            victim.verify(forged.value(), "spencer-cell", 5),
+            Err(LoginTokenError::UnknownToken),
+            "a token minted by a different issuer's key must never verify"
+        );
+        // Sanity: the same forged token DOES verify against its own issuer.
+        assert_eq!(
+            attacker.verify(forged.value(), "spencer-cell", 5),
+            Ok("spencer@pillar".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_garbage_string_is_never_mistaken_for_a_token() {
+        let i = issuer();
+        assert_eq!(
+            i.verify("not-a-real-token", "spencer-cell", 0),
+            Err(LoginTokenError::UnknownToken)
+        );
+        assert_eq!(
+            i.verify("pt2.deadbeef.deadbeef", "spencer-cell", 0),
+            Err(LoginTokenError::UnknownToken)
         );
     }
 

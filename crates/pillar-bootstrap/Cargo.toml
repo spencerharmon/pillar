@@ -13,6 +13,7 @@ pillar-core = { path = "../pillar-core" }
 pillar-identity = { path = "../pillar-identity" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-rbac = { path = "../pillar-rbac" }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lints]
 workspace = true
