@@ -65,6 +65,9 @@ use std::fmt;
 use pillar_core::NodeId;
 use pillar_wot_authority::WotAuthority;
 
+pub mod sealed_secret_store;
+pub use sealed_secret_store::{SecretId, SecretRequestError, SecretStore};
+
 /// One specific, named action the decider may allow or deny.
 ///
 /// Opaque from this crate's point of view, matching
