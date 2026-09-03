@@ -421,6 +421,13 @@ pub enum BootError {
         /// A human-readable reason.
         reason: String,
     },
+    /// This build's own compatibility self-check failed (ROI P1
+    /// "Compatibility contract: check, negotiate, N-1+"): it would drop
+    /// support for a surface version still legitimately inside the N-1+
+    /// backward-compat window, orphaning any peer still running it. Boot is
+    /// refused rather than shipping a release that strands an in-window
+    /// peer — see [`run_startup_self_checks`].
+    CompatSelfCheck(pillar_crypto::StartupSelfCheckFailed),
 }
 
 impl std::fmt::Display for BootError {
@@ -436,11 +443,51 @@ impl std::fmt::Display for BootError {
             BootError::StreamDb { path, reason } => {
                 write!(f, "streaming DB {}: {reason}", path.display())
             }
+            BootError::CompatSelfCheck(e) => write!(f, "compatibility self-check: {e}"),
         }
     }
 }
 
 impl std::error::Error for BootError {}
+
+/// Runs this build's compatibility startup self-checks (ROI P1
+/// "Compatibility contract: check, negotiate, N-1+") over every wire surface
+/// this binary negotiates on, failing closed the instant ANY of them would
+/// drop support for a version still inside its N-1+ compat window — refusing
+/// to boot a release that would silently orphan an already-in-window peer.
+///
+/// Each check names: the surface, the current running/released version this
+/// build assumes for it, the OLDEST version this build still supports (its
+/// `min`), and the compat window in force. A future release that widens a
+/// surface's version without widening (or explicitly retiring, by lowering
+/// the window) its own `min` accordingly fails here BEFORE any transport
+/// comes up.
+///
+/// # Errors
+/// Returns the FIRST [`pillar_crypto::StartupSelfCheckFailed`] encountered.
+pub fn run_startup_self_checks() -> Result<(), pillar_crypto::StartupSelfCheckFailed> {
+    pillar_crypto::startup_self_check(
+        pillar_net::pillar_udp::PROTOCOL_SURFACE,
+        pillar_net::pillar_udp::PROTOCOL_VERSION,
+        pillar_net::pillar_udp::MIN_PROTOCOL_VERSION,
+        pillar_net::pillar_udp::PROTOCOL_COMPAT_WINDOW,
+    )?;
+    pillar_crypto::startup_self_check(
+        pillar_net::MESSAGE_SURFACE,
+        pillar_net::MESSAGE_VERSION,
+        pillar_net::MIN_MESSAGE_VERSION,
+        pillar_net::MESSAGE_COMPAT_WINDOW,
+    )?;
+    pillar_crypto::startup_self_check(
+        "http-ingest-api",
+        crate::web_serve::API_VERSION,
+        crate::web_serve::MIN_API_VERSION,
+        pillar_crypto::CompatWindow(
+            crate::web_serve::API_VERSION.0 - crate::web_serve::MIN_API_VERSION.0,
+        ),
+    )?;
+    Ok(())
+}
 
 /// Ensures `data_dir` exists (creating it and any parents), returning it back
 /// for chaining.
@@ -507,6 +554,11 @@ pub fn load_or_create_identity(path: &Path) -> Result<Keypair, BootError> {
 pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     use futures::StreamExt;
     use libp2p::swarm::SwarmEvent;
+
+    // Compatibility self-check FIRST, before any state is touched or
+    // transport brought up: a build that would drop support for a still
+    // in-window surface version refuses to boot at all.
+    run_startup_self_checks().map_err(BootError::CompatSelfCheck)?;
 
     prepare_data_dir(&config.data_dir)?;
     let keypair = load_or_create_identity(&config.identity_key)?;
@@ -718,6 +770,17 @@ mod tests {
 
     fn s(v: &str) -> String {
         v.to_owned()
+    }
+
+    // --- startup compat self-check (ROI P1 "Compatibility contract: check,
+    // negotiate, N-1+") ---
+
+    #[test]
+    fn startup_self_checks_pass_for_the_current_build() {
+        // The currently-shipped [min, max] windows for every negotiated
+        // surface must never fail their own self-check — this is the
+        // regression a future release-time regression would trip.
+        run_startup_self_checks().expect("current build's own compat windows are self-consistent");
     }
 
     #[test]

@@ -43,6 +43,7 @@ mod types;
 
 pub mod aead;
 pub mod cell;
+pub mod compat;
 pub mod content;
 pub mod custody;
 pub mod kdf;
@@ -53,6 +54,11 @@ pub mod sign;
 pub mod user;
 pub mod version;
 
+pub use compat::{
+    negotiate_all, negotiate_surface, require_supported_and_in_window, startup_self_check,
+    CompatWindow, DeclaredVersions, NegotiationError, NegotiationRefused, StartupSelfCheckFailed,
+    SurfaceNotDeclared,
+};
 pub use error::{CryptoError, Result};
 pub use version::{SurfaceVersion, VersionError};
 pub use principal::{PrincipalPublic, PrincipalSecret};

@@ -50,6 +50,65 @@ pub const PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::Surfa
 /// newer peer as negotiable rather than as corruption.
 pub const MIN_PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
 
+/// The pillar-UDP N-1+ backward-compat window (ROI P1 "Compatibility
+/// contract: check, negotiate, N-1+"): the max tolerated absolute difference
+/// between two peers' DECLARED [`PROTOCOL_VERSION`]s for a session to be
+/// admitted. Distinct from `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` (which
+/// bounds a single shard's stamp against what THIS build can decode at all):
+/// the window additionally requires the PEER's declared running version stay
+/// close enough to negotiate, mirroring `specs/VersioningCompat.tla`'s
+/// `Negotiate` guard (`Diff(peerVer[p][s], peerVer[q][s]) <= N`).
+pub const PROTOCOL_COMPAT_WINDOW: pillar_crypto::CompatWindow = pillar_crypto::CompatWindow(0);
+
+/// The stable surface name pillar-UDP negotiates under (a
+/// [`pillar_crypto::DeclaredVersions`] key).
+pub const PROTOCOL_SURFACE: &str = "pillar-udp";
+
+/// A pillar-UDP peer's declared handshake: the [`PROTOCOL_VERSION`] it is
+/// currently running, exchanged BEFORE a session's shards are processed (the
+/// ROI's "parties exchange declared per-surface version sets before
+/// interoperating" clause, applied to the pillar-UDP transport).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerHandshake {
+    /// The peer's declared running [`PROTOCOL_VERSION`].
+    pub protocol_version: pillar_crypto::SurfaceVersion,
+}
+
+impl PeerHandshake {
+    /// This build's own handshake: declares the current [`PROTOCOL_VERSION`].
+    #[must_use]
+    pub fn local() -> Self {
+        PeerHandshake {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+}
+
+/// Negotiate a pillar-UDP session with a peer that declared `remote` via
+/// [`PeerHandshake`], BEFORE any of its shards are decoded.
+///
+/// Compatible (declared versions within [`PROTOCOL_COMPAT_WINDOW`] of each
+/// other) admits the session; an incompatible pair is cleanly refused via
+/// [`pillar_crypto::NegotiationRefused`] — never a silent mis-negotiation and
+/// never confused with [`ShardError::MalformedVersionStamp`] /
+/// [`ShardError::UnsupportedProtocolVersion`] (those gate a single shard's
+/// on-wire stamp; this gates the SESSION before any shard is even read).
+///
+/// # Errors
+/// Returns [`pillar_crypto::NegotiationRefused`] when `local` and `remote`
+/// disagree by more than [`PROTOCOL_COMPAT_WINDOW`].
+pub fn negotiate_session(
+    local: PeerHandshake,
+    remote: PeerHandshake,
+) -> Result<(), pillar_crypto::NegotiationRefused> {
+    pillar_crypto::negotiate_surface(
+        PROTOCOL_SURFACE,
+        local.protocol_version,
+        remote.protocol_version,
+        PROTOCOL_COMPAT_WINDOW,
+    )
+}
+
 /// A content identifier: the canonical content address of a message's bytes.
 ///
 /// This is exactly [`pillar_streamdb::content_address`], so a CID computed here
@@ -836,6 +895,42 @@ mod tests {
         );
         // And it is emphatically NOT the malformed/parse variant.
         assert_ne!(err, ShardError::MalformedVersionStamp);
+    }
+
+    // --- pillar-UDP SESSION negotiation (two-sided handshake, ROI P1
+    // "Compatibility contract: check, negotiate, N-1+") ---
+
+    #[test]
+    fn session_negotiation_links_when_peer_matches_current_version() {
+        let local = PeerHandshake::local();
+        let remote = PeerHandshake::local();
+        assert!(negotiate_session(local, remote).is_ok());
+    }
+
+    #[test]
+    fn session_negotiation_links_within_the_compat_window() {
+        let local = PeerHandshake::local();
+        let remote = PeerHandshake {
+            protocol_version: pillar_crypto::SurfaceVersion(
+                PROTOCOL_VERSION.0.saturating_sub(PROTOCOL_COMPAT_WINDOW.0),
+            ),
+        };
+        assert!(negotiate_session(local, remote).is_ok());
+    }
+
+    #[test]
+    fn session_negotiation_refuses_a_peer_outside_the_compat_window() {
+        let local = PeerHandshake::local();
+        let remote = PeerHandshake {
+            protocol_version: pillar_crypto::SurfaceVersion(
+                PROTOCOL_VERSION.0 + PROTOCOL_COMPAT_WINDOW.0 + 1,
+            ),
+        };
+        let err = negotiate_session(local, remote).unwrap_err();
+        assert_eq!(err.surface, PROTOCOL_SURFACE);
+        assert_eq!(err.local, PROTOCOL_VERSION);
+        assert_eq!(err.remote, remote.protocol_version);
+        assert_eq!(err.window, PROTOCOL_COMPAT_WINDOW);
     }
 
     #[test]

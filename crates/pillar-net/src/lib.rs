@@ -71,6 +71,41 @@ pub const MESSAGE_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::Surfac
 /// negotiate a newer peer rather than treat it as corruption.
 pub const MIN_MESSAGE_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
 
+/// The pillar-message N-1+ backward-compat window (ROI P1 "Compatibility
+/// contract: check, negotiate, N-1+"): the max tolerated absolute difference
+/// between two libp2p peers' DECLARED [`MESSAGE_VERSION`]s for their overlay
+/// mesh exchange to be admitted, mirroring `specs/VersioningCompat.tla`'s
+/// `Negotiate` guard.
+pub const MESSAGE_COMPAT_WINDOW: pillar_crypto::CompatWindow = pillar_crypto::CompatWindow(0);
+
+/// The stable surface name the pillar-message format negotiates under (a
+/// [`pillar_crypto::DeclaredVersions`] key).
+pub const MESSAGE_SURFACE: &str = "pillar-message";
+
+/// Negotiate compatibility for the pillar-message surface between this
+/// build's [`MESSAGE_VERSION`] and a libp2p peer's declared running version —
+/// exchanged (e.g. via `identify`'s protocol/agent metadata or a dedicated
+/// handshake payload) BEFORE the peer's [`overlay::MeshPeerRecord`]s are
+/// trusted. Compatible pairs (within [`MESSAGE_COMPAT_WINDOW`]) link; an
+/// incompatible pair is cleanly refused — distinct from
+/// [`overlay::DecodeError::UnsupportedMessageVersion`], which gates a single
+/// ALREADY-RECEIVED message's leading stamp rather than the peer relationship
+/// itself.
+///
+/// # Errors
+/// Returns [`pillar_crypto::NegotiationRefused`] when the two declared
+/// versions differ by more than [`MESSAGE_COMPAT_WINDOW`].
+pub fn negotiate_message_peer(
+    remote_version: pillar_crypto::SurfaceVersion,
+) -> Result<(), pillar_crypto::NegotiationRefused> {
+    pillar_crypto::negotiate_surface(
+        MESSAGE_SURFACE,
+        MESSAGE_VERSION,
+        remote_version,
+        MESSAGE_COMPAT_WINDOW,
+    )
+}
+
 /// Protocol name used for the Kademlia DHT instance run by Pillar nodes.
 pub const KAD_PROTOCOL_NAME: &str = "/pillar/kad/1.0.0";
 
@@ -1126,6 +1161,32 @@ mod tests {
             !matches!(err, DecodeError::UnsupportedMessageVersion(_)),
             "a garbage version line is a parse error, not an unknown version"
         );
+    }
+
+    // --- pillar-message SESSION negotiation (two-sided peer handshake, ROI P1
+    // "Compatibility contract: check, negotiate, N-1+") ---
+
+    #[test]
+    fn message_peer_negotiation_links_a_matching_peer() {
+        assert!(negotiate_message_peer(MESSAGE_VERSION).is_ok());
+    }
+
+    #[test]
+    fn message_peer_negotiation_links_within_the_compat_window() {
+        let remote = pillar_crypto::SurfaceVersion(
+            MESSAGE_VERSION.0.saturating_sub(MESSAGE_COMPAT_WINDOW.0),
+        );
+        assert!(negotiate_message_peer(remote).is_ok());
+    }
+
+    #[test]
+    fn message_peer_negotiation_refuses_a_peer_outside_the_compat_window() {
+        let remote = pillar_crypto::SurfaceVersion(MESSAGE_VERSION.0 + MESSAGE_COMPAT_WINDOW.0 + 1);
+        let err = negotiate_message_peer(remote).unwrap_err();
+        assert_eq!(err.surface, MESSAGE_SURFACE);
+        assert_eq!(err.local, MESSAGE_VERSION);
+        assert_eq!(err.remote, remote);
+        assert_eq!(err.window, MESSAGE_COMPAT_WINDOW);
     }
 
     /// Pillar's Kademlia runs its OWN protocol, not the public IPFS DHT's, and

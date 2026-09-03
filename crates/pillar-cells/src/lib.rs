@@ -166,6 +166,18 @@ pub enum CellError {
     /// `SetNamePtr`/`PublishRoot` precondition: the root is not published
     /// (or is already published for `PublishRoot`).
     RootPrecondition(Root),
+    /// [`Cell::admit_versioned`] refused a joining node whose declared
+    /// per-surface version(s) fall outside the compat negotiation window
+    /// with this cell's own running versions (ROI P1 "Compatibility
+    /// contract: check, negotiate, N-1+") — a clean refusal, never a silent
+    /// admission of an incompatible member.
+    CompatRefused(pillar_crypto::NegotiationError),
+}
+
+impl From<pillar_crypto::NegotiationError> for CellError {
+    fn from(e: pillar_crypto::NegotiationError) -> Self {
+        CellError::CompatRefused(e)
+    }
 }
 
 /// A single cell: the unit of confidentiality, refining `specs/Cells.tla`.
@@ -228,6 +240,36 @@ impl Cell {
         self.epoch_members
             .insert(self.key_epoch, self.members.clone());
         Ok(())
+    }
+
+    /// Admit a node as a member EXACTLY like [`Cell::admit`], but ONLY after
+    /// negotiating compatibility (ROI P1 "Compatibility contract: check,
+    /// negotiate, N-1+") between this cell's own declared per-surface running
+    /// versions (`local`) and the joining node's declared versions (`remote`)
+    /// over every surface in `required` — the "cell members exchange +
+    /// check versions" clause of the ROI, applied to cell admission. A
+    /// required surface neither side declared, or one where the two parties'
+    /// declared versions fall outside `window`, is [`CellError::CompatRefused`]
+    /// — the join never happens on an incompatible or under-declared node,
+    /// mirroring [`Cell::admit`]'s existing preconditions rather than
+    /// replacing them (a compat refusal is checked FIRST, before any
+    /// membership-precondition / rotation-fence check runs, so an
+    /// incompatible node is refused before its other preconditions are even
+    /// considered).
+    ///
+    /// # Errors
+    /// Returns [`CellError::CompatRefused`] on a negotiation failure, or
+    /// whatever [`Cell::admit`] itself would return once negotiation passes.
+    pub fn admit_versioned(
+        &mut self,
+        node: NodeId,
+        local: &pillar_crypto::DeclaredVersions,
+        remote: &pillar_crypto::DeclaredVersions,
+        required: &[&'static str],
+        window: pillar_crypto::CompatWindow,
+    ) -> Result<(), CellError> {
+        pillar_crypto::negotiate_all(local, remote, required, window)?;
+        self.admit(node)
     }
 
     /// A member LEAVES (`Leave`). The group key ROTATES in the SAME call:
@@ -677,5 +719,94 @@ mod tests {
         cell.place_object(ObjectId::from("o"), VisClass::CellEncrypted, tags(&[]))
             .unwrap();
         assert!(cell.node_can_decrypt(&NodeId::from("n1"), &ObjectId::from("o")));
+    }
+
+    // --- admit_versioned: cell-member compat negotiation (ROI P1
+    // "Compatibility contract: check, negotiate, N-1+") ---
+
+    fn declare(surface: &'static str, v: u16) -> pillar_crypto::DeclaredVersions {
+        let mut d = pillar_crypto::DeclaredVersions::new();
+        d.declare(surface, pillar_crypto::SurfaceVersion(v));
+        d
+    }
+
+    #[test]
+    fn admit_versioned_admits_a_compatible_joining_node() {
+        let mut cell = Cell::new();
+        let local = declare("cell-membership", 5);
+        let remote = declare("cell-membership", 4);
+        assert!(cell
+            .admit_versioned(
+                NodeId::from("n1"),
+                &local,
+                &remote,
+                &["cell-membership"],
+                pillar_crypto::CompatWindow(1),
+            )
+            .is_ok());
+        assert!(cell.members.contains(&NodeId::from("n1")));
+    }
+
+    #[test]
+    fn admit_versioned_refuses_an_incompatible_joining_node_without_admitting_it() {
+        let mut cell = Cell::new();
+        let local = declare("cell-membership", 10);
+        let remote = declare("cell-membership", 0);
+        let err = cell
+            .admit_versioned(
+                NodeId::from("n1"),
+                &local,
+                &remote,
+                &["cell-membership"],
+                pillar_crypto::CompatWindow(1),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CellError::CompatRefused(_)));
+        assert!(
+            !cell.members.contains(&NodeId::from("n1")),
+            "an incompatible node must never be admitted"
+        );
+    }
+
+    #[test]
+    fn admit_versioned_refuses_a_node_missing_a_required_surface_declaration() {
+        let mut cell = Cell::new();
+        let local = declare("cell-membership", 1);
+        let remote = pillar_crypto::DeclaredVersions::new(); // never declared
+        let err = cell
+            .admit_versioned(
+                NodeId::from("n1"),
+                &local,
+                &remote,
+                &["cell-membership"],
+                pillar_crypto::CompatWindow(2),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CellError::CompatRefused(pillar_crypto::NegotiationError::NotDeclared(_))
+        ));
+        assert!(!cell.members.contains(&NodeId::from("n1")));
+    }
+
+    #[test]
+    fn admit_versioned_still_honors_the_existing_membership_precondition() {
+        // A compatible re-admit of an already-present member is refused by
+        // the underlying `admit` precondition, exactly as a bare `admit`
+        // call would be — negotiation success does not bypass it.
+        let mut cell = Cell::new();
+        cell.admit(NodeId::from("n1")).unwrap();
+        let local = declare("cell-membership", 1);
+        let remote = declare("cell-membership", 1);
+        let err = cell
+            .admit_versioned(
+                NodeId::from("n1"),
+                &local,
+                &remote,
+                &["cell-membership"],
+                pillar_crypto::CompatWindow(0),
+            )
+            .unwrap_err();
+        assert_eq!(err, CellError::MembershipPrecondition);
     }
 }
