@@ -33,6 +33,11 @@ pub enum CryptoError {
     /// A custody or hardware backend (TPM, passkey authenticator, …) reported an
     /// error.
     Backend(String),
+    /// A sealed artifact's inline algorithm tag does not name any
+    /// previously-shipped [`crate::types::AeadAlgorithm`] variant. Fails
+    /// closed: the byte is rejected outright, never silently treated as the
+    /// binary's current default.
+    UnsupportedAlgorithm(u8),
 }
 
 impl fmt::Display for CryptoError {
@@ -50,6 +55,9 @@ impl fmt::Display for CryptoError {
             }
             CryptoError::UnsupportedCustody(k) => write!(f, "unsupported custody backend: {k:?}"),
             CryptoError::Backend(msg) => write!(f, "custody/hardware backend error: {msg}"),
+            CryptoError::UnsupportedAlgorithm(tag) => {
+                write!(f, "unsupported sealed-artifact algorithm tag: {tag}")
+            }
         }
     }
 }

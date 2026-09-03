@@ -55,7 +55,7 @@ pub mod user;
 pub use error::{CryptoError, Result};
 pub use principal::{PrincipalPublic, PrincipalSecret};
 pub use types::{
-    CellId, Ciphertext, ContentId, CustodyKind, KdfParams, Password, Salt, SealedEnvelope,
-    SealingPublicKey, SealingSecretKey, Seed, Signature, SigningPublicKey, SigningSecretKey,
-    SymmetricKey,
+    AeadAlgorithm, CellId, Ciphertext, ContentId, CustodyKind, KdfParams, Password, Salt,
+    SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed, Signature, SigningPublicKey,
+    SigningSecretKey, SymmetricKey,
 };

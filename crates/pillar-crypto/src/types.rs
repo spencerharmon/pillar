@@ -122,6 +122,64 @@ impl Default for KdfParams {
     }
 }
 
+/// Which AEAD cipher sealed a [`crate::aead`] envelope.
+///
+/// This is the "algorithm tag" half of the self-describing sealed-artifact
+/// contract: [`crate::aead::seal_symmetric`] stamps the producing algorithm's
+/// tag as the first byte of the resulting [`Ciphertext`], and
+/// [`crate::aead::open_symmetric`] reads that byte back and dispatches to the
+/// matching code path — it never assumes the binary's *current* default.
+/// Every variant that has ever sealed a real artifact is retained FOREVER
+/// (never deleted/renumbered); only [`AeadAlgorithm::current_default`] may
+/// change across releases, so an old artifact keeps decrypting under its
+/// original algorithm while a newly-sealed one picks up the new default —
+/// both are supported simultaneously. An unrecognized tag is rejected
+/// ([`crate::error::CryptoError::UnsupportedAlgorithm`]), never silently
+/// treated as the current default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AeadAlgorithm {
+    /// ChaCha20-Poly1305 with a 12-byte random nonce. The original algorithm;
+    /// retained forever for artifacts sealed before the default flipped.
+    ChaCha20Poly1305V1,
+    /// XChaCha20-Poly1305 with a 24-byte random nonce. Current default: the
+    /// extended nonce removes the birthday-bound collision concern of
+    /// randomly-generated 96-bit nonces under high-volume sealing.
+    XChaCha20Poly1305V1,
+}
+
+impl AeadAlgorithm {
+    /// The algorithm newly-sealed artifacts use unless a caller pins an
+    /// explicit older one (e.g. a test proving old-artifact compatibility).
+    /// Bumping this NEVER breaks an artifact sealed under a prior default —
+    /// that artifact's own inline tag still routes it to its original code
+    /// path.
+    pub fn current_default() -> Self {
+        AeadAlgorithm::XChaCha20Poly1305V1
+    }
+
+    /// The stable on-the-wire tag byte for this algorithm. Never renumbered.
+    pub fn tag(self) -> u8 {
+        match self {
+            AeadAlgorithm::ChaCha20Poly1305V1 => 1,
+            AeadAlgorithm::XChaCha20Poly1305V1 => 2,
+        }
+    }
+
+    /// Recover the algorithm from an inline tag byte.
+    ///
+    /// Contract: fails closed (never falls back to
+    /// [`AeadAlgorithm::current_default`]) on any byte that is not a
+    /// previously-shipped tag.
+    pub fn from_tag(tag: u8) -> core::result::Result<Self, crate::error::CryptoError> {
+        match tag {
+            1 => Ok(AeadAlgorithm::ChaCha20Poly1305V1),
+            2 => Ok(AeadAlgorithm::XChaCha20Poly1305V1),
+            other => Err(crate::error::CryptoError::UnsupportedAlgorithm(other)),
+        }
+    }
+}
+
 /// Which at-rest custody backend protects a node's sealing secret key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CustodyKind {
