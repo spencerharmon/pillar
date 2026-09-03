@@ -1,0 +1,55 @@
+# pillar-web-frontend — the pillar web portal's design system + component
+# library.
+#
+# This crate is the canonical portal-frontend package (`cargo test -p
+# pillar-web-frontend` is the definition-of-done for every Yew-foundation
+# task). It is DELIBERATELY host-testable: the design system is expressed as
+# pure Rust that builds `stylist` (CSS-in-Rust) `Style` values from a set of
+# design tokens, so the emitted, scoped CSS can be asserted on the native
+# target with a plain `cargo test` — no browser, no wasm runner, no npm/Node.
+#
+# The Yew (client-side-rendered) components that consume these styles compile on
+# both the native host (behind the default `yew` feature, so they typecheck in
+# CI) and `wasm32-unknown-unknown` (where `trunk`/`wasm-bindgen` bundle them for
+# the actual portal — that bundling lives in the separate, workspace-excluded
+# `pillar-frontend` crate). Nothing here embeds an infrastructure identifier.
+[package]
+name = "pillar-web-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "pillar web portal design system + Yew component library"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["yew"]
+# The Yew component wrappers around the design-system styles. On by default so
+# `cargo test -p pillar-web-frontend` typechecks the components on the host; the
+# wasm bundle build turns them into real DOM.
+yew = ["dep:yew", "dep:web-sys", "dep:wasm-bindgen"]
+
+[dependencies]
+# stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
+# `parser` feature lets us build a `Style` from a raw CSS &str on the NATIVE
+# target (host `cargo test`), which is what makes the design system host-
+# testable; `yew` wires the styling into Yew components.
+stylist = { version = "0.13", features = ["parser", "yew"] }
+yew = { version = "0.21", features = ["csr"], optional = true }
+# web-sys + wasm-bindgen back the Card's mouse-tracking spotlight (reading the
+# element rect and writing the `--spot-x/--spot-y` custom properties). Optional,
+# pulled in only with the `yew` feature; the design-system tests do not need
+# them. wasm-bindgen is pinned to the flake's `wasm-bindgen-cli` version.
+web-sys = { version = "0.3", optional = true, features = [
+    "DomRect",
+    "CssStyleDeclaration",
+    "HtmlElement",
+] }
+wasm-bindgen = { version = "=0.2.121", optional = true }
+
+[lints]
+workspace = true
