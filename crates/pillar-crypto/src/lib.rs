@@ -55,6 +55,7 @@ pub mod seal;
 pub mod sign;
 pub mod user;
 pub mod version;
+pub mod webauthn;
 
 pub use compat::{
     negotiate_all, negotiate_surface, require_supported_and_in_window, startup_self_check,
