@@ -1577,6 +1577,52 @@ pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
 /// identifier is embedded in this public source.
 const LANDING_PAGE: &str = include_str!("web_login.html");
 
+/// The Yew + WebAssembly portal's static asset bundle, EMBEDDED into this one
+/// `pillar` binary at compile time (`include_bytes!`) — the SECOND stage of the
+/// two-stage frontend build. Stage 1 (`nix build .#pillar-frontend`, flake.nix)
+/// compiles crate `pillar-frontend` with `trunk` into wasm/js/css; `build.rs`
+/// resolves that bundle's directory into the `PILLAR_FRONTEND_DIST` compile-time
+/// env var (the nix `pillar` build points it at stage 1's store path; a plain
+/// `cargo build`/`cargo test` falls back to the committed `src/frontend_dist/`).
+/// The running node serves these from memory — no filesystem dependency, and
+/// NO npm/Node anywhere in the build.
+const FRONTEND_WASM: &[u8] = include_bytes!(concat!(
+    env!("PILLAR_FRONTEND_DIST"),
+    "/pillar-frontend_bg.wasm"
+));
+const FRONTEND_JS: &[u8] =
+    include_bytes!(concat!(env!("PILLAR_FRONTEND_DIST"), "/pillar-frontend.js"));
+const FRONTEND_CSS: &[u8] = include_bytes!(concat!(env!("PILLAR_FRONTEND_DIST"), "/portal.css"));
+
+/// The correct `Content-Type` for a served static frontend asset, keyed by the
+/// request path's file extension. The three asset kinds the two-stage bundle
+/// ships each get their PROPER MIME type: `application/wasm` (the module a
+/// browser streaming-compiles — a wrong type here makes the browser refuse the
+/// wasm), `text/javascript` (the wasm-bindgen JS glue), and `text/css` (the
+/// portal base stylesheet). Returns `None` for an unmapped path so the router
+/// can 404 rather than serve an asset under a guessed type.
+fn frontend_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
+    match path {
+        "/assets/pillar-frontend_bg.wasm" => Some((FRONTEND_WASM, "application/wasm")),
+        "/assets/pillar-frontend.js" => Some((FRONTEND_JS, "text/javascript")),
+        "/assets/portal.css" => Some((FRONTEND_CSS, "text/css")),
+        _ => None,
+    }
+}
+
+/// Build a static-asset response: the embedded bytes served verbatim under the
+/// correct MIME `content_type`, with no session token.
+fn asset_response(bytes: &'static [u8], content_type: &'static str) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type,
+        session_token: None,
+        body: String::new(),
+        bytes: Some(bytes.to_vec()),
+    }
+}
+
 /// A parsed HTTP request: method, path, body, and the OPTIONAL asserted HTTP
 /// ingest API version ([`API_VERSION_HEADER`]).
 struct HttpRequest {
@@ -1652,16 +1698,26 @@ struct HttpResponse {
     content_type: &'static str,
     session_token: Option<String>,
     body: String,
+    /// A BINARY response body (e.g. the embedded `pillar-frontend_bg.wasm`
+    /// static asset), served verbatim instead of `body` when present. Text
+    /// responses leave this `None` and use the UTF-8 `body`; a static-asset
+    /// route serving non-UTF-8 bytes (wasm) sets this so the bytes are written
+    /// unaltered. Exactly one of the two carries the payload.
+    bytes: Option<Vec<u8>>,
 }
 
 impl HttpResponse {
     fn write_to(&self, stream: &mut TcpStream) -> std::io::Result<()> {
+        let body_bytes: &[u8] = match &self.bytes {
+            Some(b) => b.as_slice(),
+            None => self.body.as_bytes(),
+        };
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}: {}\r\nConnection: close\r\n",
             self.status,
             self.reason,
             self.content_type,
-            self.body.len(),
+            body_bytes.len(),
             API_VERSION_HEADER,
             API_VERSION,
         );
@@ -1670,7 +1726,7 @@ impl HttpResponse {
         }
         head.push_str("\r\n");
         stream.write_all(head.as_bytes())?;
-        stream.write_all(self.body.as_bytes())?;
+        stream.write_all(body_bytes)?;
         stream.flush()
     }
 }
@@ -1713,6 +1769,7 @@ fn dispatch_http(
             content_type: "text/html; charset=utf-8",
             session_token: None,
             body: LANDING_PAGE.to_owned(),
+            bytes: None,
         },
         ("GET", "/bootstrap/status") => {
             // BOOTSTRAPPED only once the first USER exists — not merely the
@@ -1877,6 +1934,12 @@ fn dispatch_http(
         ("GET", p) if p.starts_with("/portal/obs/explore") => dispatch_obs_explore(ctx, request),
         ("GET", p) if p.starts_with("/portal/obs/query") => dispatch_obs_query(ctx, request),
         ("POST", "/portal/obs/dashboard") => dispatch_obs_dashboard(ctx, request),
+        // The Yew + WebAssembly portal's embedded static assets (wasm/js/css),
+        // each served under its correct MIME type (see `frontend_asset`).
+        ("GET", p) => match frontend_asset(p) {
+            Some((bytes, content_type)) => asset_response(bytes, content_type),
+            None => text_response(404, "Not Found", "not found".to_owned()),
+        },
         _ => text_response(404, "Not Found", "not found".to_owned()),
     }
 }
@@ -2877,6 +2940,7 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
                 content_type: "text/plain; charset=utf-8",
                 session_token: Some(token),
                 body: format!("OK {handle}\n"),
+                bytes: None,
             }
         }
         Err(e) => {
@@ -3073,6 +3137,7 @@ fn text_response(status: u16, reason: &'static str, mut body: String) -> HttpRes
         content_type: "text/plain; charset=utf-8",
         session_token: None,
         body,
+        bytes: None,
     }
 }
 
@@ -3150,6 +3215,56 @@ mod tests {
                 api_version: Some(version.into()),
             },
         )
+    }
+
+    // The two-stage frontend build's static-asset surface: each embedded Yew
+    // + WebAssembly bundle asset is served at its `/assets/...` path under its
+    // CORRECT MIME type with a non-empty body. This FAILS without the
+    // static-asset route + MIME map wired into `dispatch_http`.
+    #[test]
+    fn frontend_wasm_asset_serves_correct_mime_and_non_empty_body() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+
+        let wasm = get(&mut ctx, "/assets/pillar-frontend_bg.wasm");
+        assert_eq!(wasm.status, 200, "wasm asset must be served");
+        assert_eq!(
+            wasm.content_type, "application/wasm",
+            "wasm asset must carry the application/wasm MIME type"
+        );
+        let wasm_bytes = wasm.bytes.expect("wasm served as binary bytes");
+        assert!(!wasm_bytes.is_empty(), "wasm asset body must be non-empty");
+        // A real WebAssembly module starts with the `\0asm` magic.
+        assert_eq!(
+            &wasm_bytes[0..4],
+            b"\0asm",
+            "served wasm asset must be a real WebAssembly module"
+        );
+
+        let js = get(&mut ctx, "/assets/pillar-frontend.js");
+        assert_eq!(js.status, 200);
+        assert_eq!(js.content_type, "text/javascript");
+        assert!(
+            !js.bytes.expect("js served as bytes").is_empty(),
+            "js glue asset body must be non-empty"
+        );
+
+        let css = get(&mut ctx, "/assets/portal.css");
+        assert_eq!(css.status, 200);
+        assert_eq!(css.content_type, "text/css");
+        assert!(
+            !css.bytes.expect("css served as bytes").is_empty(),
+            "css asset body must be non-empty"
+        );
+
+        // An unmapped asset path 404s rather than serving under a guessed type.
+        let missing = get(&mut ctx, "/assets/does-not-exist.bin");
+        assert_eq!(missing.status, 404);
     }
 
     #[test]

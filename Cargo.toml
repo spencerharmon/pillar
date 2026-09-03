@@ -25,6 +25,12 @@ members = [
     "crates/pillar-topology",
     "crates/pillar-upgrade-gate",
 ]
+# pillar-frontend targets wasm32-unknown-unknown and carries the yew/stylist/
+# wasm-bindgen closure with its OWN Cargo.lock; excluding it keeps the wasm
+# toolchain surface out of the native `pillar` binary's lockfile and build.
+exclude = [
+    "crates/pillar-frontend",
+]
 
 [workspace.package]
 version = "0.0.0"
