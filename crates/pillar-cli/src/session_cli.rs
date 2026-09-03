@@ -44,9 +44,127 @@
 //! ([`SessionCliError::Unauthorized`]) and, for the acts, emits NOTHING.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
+use pillar_core::SideEffect;
 use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_identity::session_registry::{RevokeError, Session, SessionRegistry};
+use pillar_streamdb::{PersistError, PersistentStream};
+
+/// Durable, content-addressed materialization of the `session` decider's
+/// admin-grant set — the real store `session-registry-impl` proves out
+/// (`pillar_streamdb::PersistentStream`, the SAME durable, content-addressed
+/// op backend every other persisted Pillar surface uses), replacing the
+/// prior "in a real deployment, derived from the WoT-authorized grant
+/// events" placeholder comment with an actual on-disk store.
+///
+/// Each grant/revoke is appended as one durably-persisted op whose payload
+/// carries a monotonic sequence number (`kind\tprincipal\tseq`); because the
+/// underlying `OpLog` materializes its order by content address (not
+/// insertion order — see [`pillar_streamdb::OpLog::order`]), the admin set is
+/// recomputed by replaying every persisted op sorted by ITS OWN embedded
+/// `seq`, never by on-disk/content-address order. Re-[`AdminGrantStore::open`]ing
+/// the same `root_dir` after a process restart reloads every persisted op and
+/// recomputes the identical materialized set — no in-memory-only grant is
+/// ever observed after a restart, because a grant that was never durably
+/// appended never exists in the reopened store.
+#[derive(Debug)]
+pub struct AdminGrantStore {
+    store: PersistentStream,
+}
+
+/// One decoded grant/revoke op: `(seq, is_grant, principal)`.
+fn decode_admin_op(payload: &[u8]) -> Option<(u64, bool, String)> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let mut parts = text.splitn(3, '\t');
+    let kind = parts.next()?;
+    let principal = parts.next()?;
+    let seq: u64 = parts.next()?.parse().ok()?;
+    match kind {
+        "grant" => Some((seq, true, principal.to_owned())),
+        "revoke" => Some((seq, false, principal.to_owned())),
+        _ => None,
+    }
+}
+
+impl AdminGrantStore {
+    /// Open (creating if absent) the durable admin-grant store rooted at
+    /// `root_dir`, reloading every previously-persisted grant/revoke op so the
+    /// materialized set survives a process restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if the directory cannot be created/read, or a
+    /// persisted op is corrupt (content address mismatch).
+    pub fn open(root_dir: impl Into<PathBuf>) -> Result<Self, PersistError> {
+        let store = PersistentStream::open(root_dir)?;
+        Ok(AdminGrantStore { store })
+    }
+
+    /// The store's root directory.
+    #[must_use]
+    pub fn root_dir(&self) -> &Path {
+        self.store.root_dir()
+    }
+
+    /// Recompute the materialized set of principals currently holding an
+    /// admin grant, by replaying every persisted op in ascending `seq` order
+    /// (never content-address/on-disk order).
+    #[must_use]
+    pub fn admins(&self) -> HashSet<String> {
+        let mut ops: Vec<(u64, bool, String)> = self
+            .store
+            .stream()
+            .log()
+            .order()
+            .iter()
+            .filter_map(|op| decode_admin_op(op.payload()))
+            .collect();
+        ops.sort_by_key(|(seq, _, _)| *seq);
+        let mut admins = HashSet::new();
+        for (_, is_grant, principal) in ops {
+            if is_grant {
+                admins.insert(principal);
+            } else {
+                admins.remove(&principal);
+            }
+        }
+        admins
+    }
+
+    /// Whether `principal` currently holds an admin grant, per the
+    /// materialized (durably-persisted) state.
+    #[must_use]
+    pub fn is_admin(&self, principal: &str) -> bool {
+        self.admins().contains(principal)
+    }
+
+    /// Durably persist an admin grant for `principal`. The grant is admitted
+    /// (idempotent/convergent — re-granting an already-admin principal is a
+    /// no-op on the materialized set) before this call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if the op cannot be durably written.
+    pub fn grant(&mut self, principal: impl Into<String>) -> Result<(), PersistError> {
+        let seq = self.store.stream().log().len() as u64;
+        let payload = format!("grant\t{}\t{seq}", principal.into());
+        self.store.append(payload, SideEffect::Convergent)?;
+        Ok(())
+    }
+
+    /// Durably persist an admin revoke for `principal`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if the op cannot be durably written.
+    pub fn revoke(&mut self, principal: impl Into<String>) -> Result<(), PersistError> {
+        let seq = self.store.stream().log().len() as u64;
+        let payload = format!("revoke\t{}\t{seq}", principal.into());
+        self.store.append(payload, SideEffect::Convergent)?;
+        Ok(())
+    }
+}
 
 /// The decision authority for the `session` act family — the CLI-side refinement
 /// of `docs/cli-surface.md`'s decider for this command family: it answers the
@@ -55,31 +173,93 @@ use pillar_identity::session_registry::{RevokeError, Session, SessionRegistry};
 ///
 /// The rule is: a caller may always reach its OWN sessions; it may reach
 /// ANOTHER principal's sessions only if it holds an explicit admin grant. The
-/// grant set is the materialized admin-grant state (in a real deployment,
-/// derived from the WoT-authorized grant events); this type models the
-/// resulting decision.
-#[derive(Clone, Debug, Default)]
+/// grant set is the materialized admin-grant state: EITHER an in-memory-only
+/// cache (via [`SessionDecider::grant_admin`], for a decider with no backing
+/// store — e.g. a test double, or a caller not wired to durable storage) OR,
+/// when opened against a real [`AdminGrantStore`] (see
+/// [`SessionDecider::open_persisted`]), a durable materialization that a
+/// process restart reloads unchanged — never a stale in-memory-only grant.
+#[derive(Debug, Default)]
 pub struct SessionDecider {
-    /// Principals holding an explicit platform admin grant (may reach any
-    /// principal's sessions).
+    /// Materialized set of principals holding an explicit platform admin
+    /// grant (may reach any principal's sessions) — the current in-memory
+    /// cache of whichever backing (none, or a durable [`AdminGrantStore`])
+    /// this decider was constructed with.
     admins: HashSet<String>,
+    /// The durable backing store, if this decider is wired to real
+    /// materialized admin-grant state. `None` for an in-memory-only decider
+    /// (e.g. [`SessionDecider::new`]).
+    store: Option<AdminGrantStore>,
 }
 
 impl SessionDecider {
-    /// A decider with no admin grants: every caller may reach only its own
-    /// sessions.
+    /// A decider with no admin grants and no durable backing: every caller
+    /// may reach only its own sessions. Grants recorded via
+    /// [`SessionDecider::grant_admin`] on such a decider are in-memory only
+    /// and are NEVER observed by a fresh decider opened later (there is
+    /// nothing to reload — no placeholder pretends otherwise).
     #[must_use]
     pub fn new() -> Self {
         SessionDecider::default()
     }
 
-    /// Record an explicit admin grant for `principal` (models the effect of a
-    /// WoT-authorized admin-grant event having been materialized).
-    pub fn grant_admin(&mut self, principal: impl Into<String>) {
-        self.admins.insert(principal.into());
+    /// Open a decider backed by the REAL, durable [`AdminGrantStore`] rooted
+    /// at `root_dir`: the materialized admin set is loaded from every
+    /// previously-persisted grant/revoke op, so a decider opened against the
+    /// same `root_dir` after a process restart observes exactly the same
+    /// admins — the deliverable of `session-grant-state-real`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if the store cannot be opened/read.
+    pub fn open_persisted(root_dir: impl Into<PathBuf>) -> Result<Self, PersistError> {
+        let store = AdminGrantStore::open(root_dir)?;
+        let admins = store.admins();
+        Ok(SessionDecider {
+            admins,
+            store: Some(store),
+        })
     }
 
-    /// Whether `principal` holds an explicit admin grant.
+    /// Record an explicit admin grant for `principal`.
+    ///
+    /// If this decider was opened against a durable [`AdminGrantStore`] (via
+    /// [`SessionDecider::open_persisted`]), the grant is durably persisted
+    /// FIRST — so it survives a process restart — before the in-memory cache
+    /// is updated to match. If this decider has no backing store, the grant
+    /// is recorded in memory only (never observed after a restart).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if a backed decider's durable write fails (the
+    /// in-memory cache is left unchanged so it never diverges from disk).
+    pub fn grant_admin(&mut self, principal: impl Into<String>) -> Result<(), PersistError> {
+        let principal = principal.into();
+        if let Some(store) = self.store.as_mut() {
+            store.grant(principal.clone())?;
+        }
+        self.admins.insert(principal);
+        Ok(())
+    }
+
+    /// Durably revoke `principal`'s admin grant (a no-op if it holds none).
+    /// As with [`SessionDecider::grant_admin`], a backed decider persists the
+    /// revoke FIRST, so it is never lost to a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if a backed decider's durable write fails.
+    pub fn revoke_admin(&mut self, principal: impl Into<String>) -> Result<(), PersistError> {
+        let principal = principal.into();
+        if let Some(store) = self.store.as_mut() {
+            store.revoke(principal.clone())?;
+        }
+        self.admins.remove(&principal);
+        Ok(())
+    }
+
+    /// Whether `principal` holds an explicit admin grant, per this decider's
+    /// current materialized state.
     #[must_use]
     pub fn is_admin(&self, principal: &str) -> bool {
         self.admins.contains(principal)
@@ -165,15 +345,43 @@ pub struct SessionCli {
 
 impl SessionCli {
     /// A fresh session engine: empty registry, no admin grants, empty log.
+    /// Its decider has NO durable backing — a grant recorded via
+    /// [`SessionDecider::grant_admin`] on this engine is in-memory only and is
+    /// never observed by a later [`SessionCli::open_persisted`] against any
+    /// store.
     #[must_use]
     pub fn new() -> Self {
         SessionCli::default()
     }
 
-    /// Mutable access to the decider, to record admin grants (models a
-    /// materialized WoT-authorized admin-grant event).
+    /// A session engine whose decider is backed by the REAL, durable
+    /// [`AdminGrantStore`] rooted at `data_dir`: every previously-persisted
+    /// admin grant/revoke is reloaded, so admin state survives a process
+    /// restart. `grant_admin`/`revoke_admin` on the returned engine's decider
+    /// durably persist under `data_dir` before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError`] if the admin-grant store cannot be opened.
+    pub fn open_persisted(data_dir: impl Into<PathBuf>) -> Result<Self, PersistError> {
+        Ok(SessionCli {
+            registry: SessionRegistry::new(),
+            decider: SessionDecider::open_persisted(data_dir)?,
+            log: EventLog::new(),
+        })
+    }
+
+    /// Mutable access to the decider, to record admin grants/revokes. Durably
+    /// persisted if this engine was constructed via
+    /// [`SessionCli::open_persisted`]; in-memory only otherwise.
     pub fn decider_mut(&mut self) -> &mut SessionDecider {
         &mut self.decider
+    }
+
+    /// Shared access to the decider, to inspect its materialized admin state.
+    #[must_use]
+    pub fn decider(&self) -> &SessionDecider {
+        &self.decider
     }
 
     /// Shared access to the underlying event log — so a test (or a view) can
@@ -498,7 +706,7 @@ mod tests {
 
         // Grant mallory admin: now the cross-principal revoke is authorized and
         // emits one signed event.
-        cli.decider_mut().grant_admin("mallory");
+        cli.decider_mut().grant_admin("mallory").unwrap();
         let event = cli.revoke("mallory", "bob", "s1").unwrap();
         assert_eq!(cli.log().len(), 1);
         assert_eq!(
@@ -519,7 +727,7 @@ mod tests {
         let mut decider = SessionDecider::new();
         assert!(decider.may_reach("alice", "alice"));
         assert!(!decider.may_reach("alice", "bob"));
-        decider.grant_admin("root");
+        decider.grant_admin("root").unwrap();
         assert!(decider.may_reach("root", "bob"));
         assert!(decider.may_reach("root", "root"));
     }
@@ -551,5 +759,113 @@ mod tests {
         // registry.
         assert_eq!(cli.log().len(), 0);
         assert!(cli.registry().ls("anyone", 0).is_empty());
+    }
+
+    // ---- session-grant-state-real: real materialized admin-grant state ----
+
+    /// An admin grant persisted via [`SessionCli::open_persisted`] survives a
+    /// simulated process restart — reopening a FRESH engine (a fresh
+    /// registry/log/decider, exactly as a real restart produces) against the
+    /// SAME `data_dir` observes the grant, because it was durably written to
+    /// the real [`AdminGrantStore`], never held only in memory. FAILS against
+    /// the prior "in a real deployment…" in-memory-only model, whose grant
+    /// set existed nowhere on disk and could not survive any restart.
+    #[test]
+    fn admin_grant_persists_across_a_process_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut cli = SessionCli::open_persisted(dir.path()).unwrap();
+            assert!(!cli.decider_mut().is_admin("mallory"));
+            cli.decider_mut().grant_admin("mallory").unwrap();
+            assert!(cli.decider_mut().is_admin("mallory"));
+            // `cli` drops here — nothing is flushed on drop; the grant was
+            // already durably persisted by `grant_admin` itself.
+        }
+
+        // Simulated restart: a BRAND NEW engine, opened fresh against the
+        // same data_dir, with no in-memory state carried over.
+        let restarted = SessionCli::open_persisted(dir.path()).unwrap();
+        assert!(
+            restarted.decider().is_admin("mallory"),
+            "a durably-persisted admin grant must survive a process restart"
+        );
+
+        // The materialized grant actually authorizes cross-principal reach,
+        // not merely `is_admin` bookkeeping.
+        let mut restarted = restarted;
+        restarted.mint("bob", "s1", 0, 1000);
+        assert!(restarted.ls("mallory", "bob", 10, None).is_ok());
+    }
+
+    /// A revoke, like a grant, is durably persisted and its removal survives
+    /// a restart: granting then revoking leaves NO admin grant observable by
+    /// a freshly re-opened engine.
+    #[test]
+    fn admin_revoke_persists_across_a_process_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut cli = SessionCli::open_persisted(dir.path()).unwrap();
+            cli.decider_mut().grant_admin("mallory").unwrap();
+            cli.decider_mut().revoke_admin("mallory").unwrap();
+            assert!(!cli.decider_mut().is_admin("mallory"));
+        }
+
+        let restarted = SessionCli::open_persisted(dir.path()).unwrap();
+        assert!(
+            !restarted.decider().is_admin("mallory"),
+            "a durably-persisted revoke must survive a process restart, \
+             never leaving a stale admin grant observable"
+        );
+    }
+
+    /// A grant recorded on an in-memory-only decider ([`SessionCli::new`], no
+    /// backing store) is NEVER observed by a decider opened against a real
+    /// store afterwards — there is nothing on disk to reload. This is the
+    /// direct converse of the two tests above: it proves the durable path is
+    /// what actually carries the grant, not some process-global side effect.
+    #[test]
+    fn stale_in_memory_only_grant_is_never_observed_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // An in-memory-only decider: grants here go nowhere durable.
+        let mut memory_only = SessionCli::new();
+        memory_only.decider_mut().grant_admin("mallory").unwrap();
+        assert!(memory_only.decider_mut().is_admin("mallory"));
+
+        // A decider freshly opened against a real (but so-far-empty) store at
+        // `dir` must NOT see the in-memory-only grant: nothing was ever
+        // persisted under `dir`.
+        let persisted = SessionCli::open_persisted(dir.path()).unwrap();
+        assert!(
+            !persisted.decider().is_admin("mallory"),
+            "an in-memory-only grant must never be observed via a real store \
+             it was never durably written to"
+        );
+    }
+
+    /// Two [`AdminGrantStore`]s opened against the same `root_dir` observe
+    /// the SAME materialized admin set once a grant is durably persisted —
+    /// the store, not any particular in-memory decider, is the source of
+    /// truth.
+    #[test]
+    fn admin_grant_store_materializes_identically_from_a_reopened_root_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = AdminGrantStore::open(dir.path()).unwrap();
+            assert!(!store.is_admin("root"));
+            store.grant("root").unwrap();
+            assert!(store.is_admin("root"));
+        }
+
+        let reopened = AdminGrantStore::open(dir.path()).unwrap();
+        assert!(reopened.is_admin("root"));
+        assert_eq!(reopened.admins(), {
+            let mut s = HashSet::new();
+            s.insert("root".to_string());
+            s
+        });
     }
 }
