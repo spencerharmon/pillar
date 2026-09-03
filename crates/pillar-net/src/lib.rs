@@ -57,6 +57,20 @@ pub use antientropy::{
 /// Gossipsub topic carrying Pillar's append-only event log.
 pub const EVENT_LOG_TOPIC: &str = "/pillar/event-log/1.0.0";
 
+/// The pillar-message format version this build EMITS on every encoded
+/// [`overlay::MeshPeerRecord`] (ROI P1 "Versioning, compatibility & safe
+/// rollout"). This surface's version space is INDEPENDENT of every other
+/// stamped surface — notably the pillar-UDP wire version
+/// ([`pillar_udp::PROTOCOL_VERSION`]) — and advances on its own schedule.
+pub const MESSAGE_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+/// The OLDEST pillar-message format version this build can still decode. A
+/// decoded leading version line outside `[MIN_MESSAGE_VERSION, MESSAGE_VERSION]`
+/// is a distinct [`overlay::DecodeError::UnsupportedMessageVersion`] — set apart
+/// from a malformed/garbage message so the future compatibility layer can
+/// negotiate a newer peer rather than treat it as corruption.
+pub const MIN_MESSAGE_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
 /// Protocol name used for the Kademlia DHT instance run by Pillar nodes.
 pub const KAD_PROTOCOL_NAME: &str = "/pillar/kad/1.0.0";
 
@@ -534,27 +548,52 @@ pub mod overlay {
 
         /// Encode this record to bytes suitable as a `pillar_streamdb::Op`
         /// payload: a simple length-prefixed, dependency-free wire format
-        /// (newline-delimited UTF-8 strings — the peer id then each
-        /// multiaddr), so the metadata can ride any content-addressed op
-        /// log without requiring `pillar-streamdb` (or any serde crate) as a
-        /// runtime dependency of this crate.
+        /// (newline-delimited UTF-8 strings). The FIRST line is a
+        /// [`crate::MESSAGE_VERSION`] stamp (its `Display`, e.g. `v1`),
+        /// followed by the peer id then each multiaddr, so the metadata can
+        /// ride any content-addressed op log without requiring
+        /// `pillar-streamdb` (or any serde crate) as a runtime dependency of
+        /// this crate. [`Self::decode`] parses and version-checks that leading
+        /// stamp.
         #[must_use]
         pub fn encode(&self) -> Vec<u8> {
-            let mut lines = vec![self.peer_id.to_base58()];
+            // Leading pillar-message version stamp (`v1`), then the payload
+            // lines. The stamp is validated at the head of `decode`.
+            let mut lines = vec![crate::MESSAGE_VERSION.to_string(), self.peer_id.to_base58()];
             lines.extend(self.addresses.iter().map(std::string::ToString::to_string));
             lines.join("\n").into_bytes()
         }
 
         /// Decode a record previously produced by [`Self::encode`].
         ///
+        /// The leading version line is validated first: a missing/garbage first
+        /// line is the existing malformed [`DecodeError`] (`Empty` /
+        /// `MalformedVersion`), while a legible-but-unknown FUTURE version is
+        /// the distinct [`DecodeError::UnsupportedMessageVersion`] (via
+        /// [`pillar_crypto::SurfaceVersion::check_supported`]).
+        ///
         /// # Errors
         ///
-        /// Returns [`DecodeError`] if `bytes` is not valid UTF-8, is empty, or
-        /// its first line is not a valid [`PeerId`], or any subsequent line is
-        /// not a valid [`Multiaddr`].
+        /// Returns [`DecodeError`] if `bytes` is not valid UTF-8, is empty, its
+        /// leading version line is malformed or an unsupported version, its peer
+        /// id line is not a valid [`PeerId`], or any subsequent line is not a
+        /// valid [`Multiaddr`].
         pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
             let text = std::str::from_utf8(bytes).map_err(|_| DecodeError::NotUtf8)?;
             let mut lines = text.lines();
+            // Head-of-decode version gate. The stamp is `vN` (Display); accept
+            // both that and a bare decimal `N` for robustness. A first line that
+            // parses to no version at all is malformed; a legible-but-unknown
+            // FUTURE version is the distinct unsupported-version reject.
+            let version_line = lines.next().ok_or(DecodeError::Empty)?;
+            let raw = version_line.strip_prefix('v').unwrap_or(version_line);
+            let version = raw
+                .parse::<u16>()
+                .map(pillar_crypto::SurfaceVersion)
+                .map_err(|_| DecodeError::MalformedVersion)?;
+            version
+                .check_supported(crate::MIN_MESSAGE_VERSION, crate::MESSAGE_VERSION)
+                .map_err(DecodeError::UnsupportedMessageVersion)?;
             let peer_id_line = lines.next().ok_or(DecodeError::Empty)?;
             let peer_id = PeerId::from_str(peer_id_line).map_err(|_| DecodeError::InvalidPeerId)?;
             let addresses = lines
@@ -569,9 +608,18 @@ pub mod overlay {
     pub enum DecodeError {
         /// The payload was not valid UTF-8.
         NotUtf8,
-        /// The payload was empty (no peer id line).
+        /// The payload was empty (no version / peer id line).
         Empty,
-        /// The first line was not a valid [`PeerId`].
+        /// The leading version line was not a well-formed version stamp at all
+        /// (not `vN` / decimal `N`): a parse error, NOT an unknown version.
+        MalformedVersion,
+        /// The leading version line parsed cleanly but carries a pillar-message
+        /// version outside `[MIN_MESSAGE_VERSION, MESSAGE_VERSION]` — most
+        /// importantly a version NEWER than this build understands. Reported
+        /// distinctly from the malformed variants so the future compatibility
+        /// layer can negotiate a newer peer rather than treat it as corruption.
+        UnsupportedMessageVersion(pillar_crypto::VersionError),
+        /// The peer id line was not a valid [`PeerId`].
         InvalidPeerId,
         /// A subsequent line was not a valid [`Multiaddr`].
         InvalidAddress,
@@ -582,6 +630,12 @@ pub mod overlay {
             let msg = match self {
                 DecodeError::NotUtf8 => "mesh peer record payload was not valid UTF-8",
                 DecodeError::Empty => "mesh peer record payload was empty",
+                DecodeError::MalformedVersion => {
+                    "mesh peer record's leading version line was malformed"
+                }
+                DecodeError::UnsupportedMessageVersion(e) => {
+                    return write!(f, "mesh peer record carried an unsupported message version: {e}")
+                }
                 DecodeError::InvalidPeerId => {
                     "mesh peer record's first line was not a valid PeerId"
                 }
@@ -995,6 +1049,83 @@ mod tests {
         let decoded = MeshPeerRecord::decode(stored_op.payload())
             .expect("a record encoded by MeshPeerRecord::encode always decodes");
         assert_eq!(decoded, record);
+    }
+
+    /// A [`overlay::MeshPeerRecord`] round-trips carrying the current
+    /// [`MESSAGE_VERSION`] stamp: the encoded form leads with the `v1` version
+    /// line and decodes back to the identical record.
+    #[test]
+    fn mesh_record_round_trips_carrying_current_message_version() {
+        use overlay::MeshPeerRecord;
+
+        let peer_id = PeerId::random();
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let record = MeshPeerRecord::new(peer_id, vec![addr]);
+
+        let encoded = record.encode();
+        let first_line = std::str::from_utf8(&encoded).unwrap().lines().next().unwrap();
+        assert_eq!(
+            first_line,
+            MESSAGE_VERSION.to_string(),
+            "the encoded message leads with the current version stamp"
+        );
+        assert_eq!(MeshPeerRecord::decode(&encoded).unwrap(), record);
+    }
+
+    /// A message whose leading version line names a FUTURE pillar-message
+    /// version is rejected distinctly as
+    /// [`overlay::DecodeError::UnsupportedMessageVersion`] — NOT a malformed
+    /// error. This is the case that lets the future compatibility layer treat a
+    /// newer peer as negotiable rather than as corruption.
+    #[test]
+    fn mesh_record_future_message_version_is_rejected_distinctly() {
+        use overlay::{DecodeError, MeshPeerRecord};
+
+        let peer_id = PeerId::random();
+        let record = MeshPeerRecord::new(peer_id, vec![]);
+        let encoded = record.encode();
+
+        // Replace the leading `v1` stamp with a FUTURE version, leaving the rest
+        // of the (legible) message intact.
+        let future = pillar_crypto::SurfaceVersion(MESSAGE_VERSION.0 + 1);
+        let text = std::str::from_utf8(&encoded).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        let future_line = future.to_string();
+        lines[0] = &future_line;
+        let bumped = lines.join("\n").into_bytes();
+
+        let err = MeshPeerRecord::decode(&bumped).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::UnsupportedMessageVersion(pillar_crypto::VersionError::Unsupported {
+                found: future,
+                min: MIN_MESSAGE_VERSION,
+                max: MESSAGE_VERSION,
+            }),
+        );
+        assert_ne!(err, DecodeError::MalformedVersion);
+    }
+
+    /// A malformed / empty message is the parse error, NOT the
+    /// unsupported-version error: an empty buffer is `Empty`, and a garbage
+    /// leading version line is `MalformedVersion` — neither is
+    /// `UnsupportedMessageVersion`.
+    #[test]
+    fn mesh_record_malformed_message_is_a_parse_error_not_unsupported() {
+        use overlay::{DecodeError, MeshPeerRecord};
+
+        // Empty payload: no version line at all.
+        assert_eq!(MeshPeerRecord::decode(b"").unwrap_err(), DecodeError::Empty);
+
+        // A garbage (non-`vN`) leading line is a malformed version, never an
+        // unsupported version.
+        let garbage = b"not-a-version\nsome-peer-id-line";
+        let err = MeshPeerRecord::decode(garbage).unwrap_err();
+        assert_eq!(err, DecodeError::MalformedVersion);
+        assert!(
+            !matches!(err, DecodeError::UnsupportedMessageVersion(_)),
+            "a garbage version line is a parse error, not an unknown version"
+        );
     }
 
     /// Pillar's Kademlia runs its OWN protocol, not the public IPFS DHT's, and

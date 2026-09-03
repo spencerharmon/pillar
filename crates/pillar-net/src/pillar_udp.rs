@@ -36,6 +36,20 @@ use pillar_core::{NodeId, SideEffect};
 use pillar_ipam::TopologyScopedIpam;
 use pillar_streamdb::content_address;
 
+/// The pillar-UDP protocol wire version this build EMITS on every shard it
+/// encodes (ROI P1 "Versioning, compatibility & safe rollout"). This surface's
+/// version space is independent of every other stamped surface (the message
+/// format's [`crate::MESSAGE_VERSION`], the event envelope, the manifest
+/// schema, …): they advance separately.
+pub const PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+/// The OLDEST pillar-UDP protocol wire version this build can still decode.
+/// A decoded stamp outside `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` is a
+/// [`ShardError::UnsupportedProtocolVersion`] — distinct from a malformed
+/// (truncated / garbage) buffer, so the future compatibility layer can treat a
+/// newer peer as negotiable rather than as corruption.
+pub const MIN_PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
 /// A content identifier: the canonical content address of a message's bytes.
 ///
 /// This is exactly [`pillar_streamdb::content_address`], so a CID computed here
@@ -329,26 +343,49 @@ impl AntiAmplificationGate {
 /// The message is split into `k` data shards; `m` parity shards are the XOR of
 /// the data shards (all shards are equal length, the message being zero-padded
 /// to a multiple of `k`). Each shard is CID-verified: `cid` is the content
-/// address of `bytes`, so a corrupted shard is detected on receipt.
+/// address of the shard's PAYLOAD, so a corrupted shard is detected on receipt.
+///
+/// # Wire versioning
+/// The on-wire byte form of a shard ([`Shard::bytes`]) carries a leading 2-byte
+/// big-endian [`PROTOCOL_VERSION`] stamp: [`encode`] prepends it and the decode
+/// path ([`reconstruct`]) reads+validates it against
+/// `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`. The stamp is deliberately kept
+/// OUT of the content-address computation — `cid` is the address of the payload
+/// bytes ONLY, not the stamped wire bytes — so bumping the protocol version
+/// never changes a payload's CID and CIDs stay canonical across every layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shard {
     /// Position of this shard: `0..k` are data shards, `k..k+m` are parity.
     pub index: usize,
-    /// The shard's payload bytes (all shards share one length).
+    /// The shard's on-wire bytes: a leading 2-byte big-endian
+    /// [`PROTOCOL_VERSION`] stamp followed by the payload (all shards' payloads
+    /// share one length). The CID addresses the payload, NOT this stamped form.
     pub bytes: Vec<u8>,
-    /// Content address of `bytes`, for on-receipt integrity verification.
+    /// Content address of the shard's PAYLOAD (the bytes after the version
+    /// stamp), for on-receipt integrity verification.
     pub cid: Cid,
 }
 
 impl Shard {
-    /// Whether the shard's bytes still hash to its claimed CID (integrity).
+    /// The shard's payload bytes: [`Shard::bytes`] with the leading 2-byte
+    /// version stamp stripped. Returns `None` if the wire bytes are too short
+    /// to even carry the stamp (a malformed shard).
+    #[must_use]
+    fn payload(&self) -> Option<&[u8]> {
+        self.bytes.get(2..)
+    }
+
+    /// Whether the shard's PAYLOAD still hashes to its claimed CID (integrity).
+    ///
+    /// The version stamp is excluded from this check, exactly as it is excluded
+    /// from the CID computation in [`encode`].
     #[must_use]
     pub fn verify(&self) -> bool {
-        Cid::of(&self.bytes) == self.cid
+        self.payload().is_some_and(|p| Cid::of(p) == self.cid)
     }
 }
 
-/// An erasure-coding error.
+/// An erasure-coding / pillar-UDP wire error.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShardError {
     /// `k` or the shard length was zero — nothing to encode.
@@ -362,15 +399,30 @@ pub enum ShardError {
     },
     /// The original byte length is required to strip zero-padding.
     MissingLength,
+    /// A shard's on-wire bytes were too short to carry the leading 2-byte
+    /// [`PROTOCOL_VERSION`] stamp: a truncated / malformed buffer (a parse
+    /// error), NOT an unknown version.
+    MalformedVersionStamp,
+    /// A shard's leading stamp parsed cleanly but carries a pillar-UDP protocol
+    /// version outside `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` — most
+    /// importantly a version NEWER than this build understands. Reported
+    /// distinctly from [`ShardError::MalformedVersionStamp`] so the future
+    /// compatibility layer can negotiate a newer peer rather than treat it as
+    /// corruption.
+    UnsupportedProtocolVersion(pillar_crypto::VersionError),
 }
 
 /// Split `message` into `k` data shards plus `m` XOR-parity shards.
 ///
-/// Every shard is equal length (the message is zero-padded to a multiple of
-/// `k`), and every shard is CID-stamped so corruption is detectable. The first
-/// `k` shards are the data; the next `m` are parity (each the running XOR of
-/// the data shards — a simple systematic code sufficient to reconstruct a
-/// contiguous data shard from parity).
+/// Every shard's PAYLOAD is equal length (the message is zero-padded to a
+/// multiple of `k`), and every shard is CID-stamped over its payload so
+/// corruption is detectable. The first `k` shards are the data; the next `m`
+/// are parity (each the running XOR of the data shards — a simple systematic
+/// code sufficient to reconstruct a contiguous data shard from parity).
+///
+/// Each shard's on-wire [`Shard::bytes`] is a leading 2-byte big-endian
+/// [`PROTOCOL_VERSION`] stamp followed by the payload; the CID addresses the
+/// PAYLOAD only, so the stamp never perturbs a payload's content address.
 ///
 /// # Errors
 /// Returns [`ShardError::Empty`] if `k == 0` or the message is empty.
@@ -378,6 +430,17 @@ pub fn encode(message: &[u8], k: usize, m: usize) -> Result<Vec<Shard>, ShardErr
     if k == 0 || message.is_empty() {
         return Err(ShardError::Empty);
     }
+    // The leading pillar-UDP protocol version stamp prepended to every shard's
+    // on-wire bytes. It is intentionally NOT fed into `Cid::of` below.
+    let stamp = PROTOCOL_VERSION.to_be_bytes();
+    // Prepend the version stamp to a payload to form a shard's on-wire bytes,
+    // leaving the CID (computed over the payload) untouched by the stamp.
+    let on_wire = |payload: &[u8]| -> Vec<u8> {
+        let mut b = Vec::with_capacity(2 + payload.len());
+        b.extend_from_slice(&stamp);
+        b.extend_from_slice(payload);
+        b
+    };
     // Pad to a multiple of k, split into k equal data shards.
     let shard_len = message.len().div_ceil(k);
     let mut data: Vec<Vec<u8>> = Vec::with_capacity(k);
@@ -393,10 +456,10 @@ pub fn encode(message: &[u8], k: usize, m: usize) -> Result<Vec<Shard>, ShardErr
     let mut shards: Vec<Shard> = data
         .iter()
         .enumerate()
-        .map(|(index, bytes)| Shard {
+        .map(|(index, payload)| Shard {
             index,
-            cid: Cid::of(bytes),
-            bytes: bytes.clone(),
+            cid: Cid::of(payload),
+            bytes: on_wire(payload),
         })
         .collect();
     // m parity shards, each the XOR of all data shards (identical parity is
@@ -411,7 +474,7 @@ pub fn encode(message: &[u8], k: usize, m: usize) -> Result<Vec<Shard>, ShardErr
         shards.push(Shard {
             index: k + j,
             cid: Cid::of(&parity),
-            bytes: parity.clone(),
+            bytes: on_wire(&parity),
         });
     }
     Ok(shards)
@@ -419,16 +482,26 @@ pub fn encode(message: &[u8], k: usize, m: usize) -> Result<Vec<Shard>, ShardErr
 
 /// Reconstruct the original `orig_len`-byte message from received shards.
 ///
-/// Only shards that VERIFY (bytes hash to their claimed CID) are used; a shard
-/// with a bad CID is rejected outright. Reconstruction needs the `k` data
+/// Each shard's on-wire bytes are first version-checked at the HEAD of the
+/// decode path: a buffer too short for the leading 2-byte stamp is a
+/// [`ShardError::MalformedVersionStamp`] (a parse error), while a legible stamp
+/// outside `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` is a distinct
+/// [`ShardError::UnsupportedProtocolVersion`] (via
+/// [`pillar_crypto::SurfaceVersion::check_supported`]). Only then are payloads
+/// (stamp stripped) used.
+///
+/// Only shards that VERIFY (payload hashes to their claimed CID) are used; a
+/// shard with a bad CID is rejected outright. Reconstruction needs the `k` data
 /// shards; a single missing data shard is recovered from a verified parity
 /// shard (XOR of the surviving data shards). Requires at least `k` verified
 /// shards total covering the data positions.
 ///
 /// # Errors
-/// Returns [`ShardError::Empty`] if `k == 0`, [`ShardError::MissingLength`] if
-/// `orig_len` is zero, or [`ShardError::InsufficientShards`] if fewer than `k`
-/// data positions can be recovered from the verified shards.
+/// Returns [`ShardError::MalformedVersionStamp`] / [`ShardError::UnsupportedProtocolVersion`]
+/// on a bad version stamp, [`ShardError::Empty`] if `k == 0`,
+/// [`ShardError::MissingLength`] if `orig_len` is zero, or
+/// [`ShardError::InsufficientShards`] if fewer than `k` data positions can be
+/// recovered from the verified shards.
 pub fn reconstruct(shards: &[Shard], k: usize, orig_len: usize) -> Result<Vec<u8>, ShardError> {
     if k == 0 {
         return Err(ShardError::Empty);
@@ -436,18 +509,30 @@ pub fn reconstruct(shards: &[Shard], k: usize, orig_len: usize) -> Result<Vec<u8
     if orig_len == 0 {
         return Err(ShardError::MissingLength);
     }
+    // Head-of-decode-path version gate: validate every shard's leading stamp
+    // BEFORE any payload is interpreted. A buffer too short for the stamp is a
+    // parse error; a legible-but-out-of-window version is a DISTINCT reject.
+    for s in shards {
+        let stamp = pillar_crypto::SurfaceVersion::from_be_bytes(&s.bytes)
+            .map_err(|_| ShardError::MalformedVersionStamp)?;
+        stamp
+            .check_supported(MIN_PROTOCOL_VERSION, PROTOCOL_VERSION)
+            .map_err(ShardError::UnsupportedProtocolVersion)?;
+    }
     // Keep only integrity-verified shards; a bad-CID shard is rejected.
     let good: Vec<&Shard> = shards.iter().filter(|s| s.verify()).collect();
     if good.is_empty() {
         return Err(ShardError::InsufficientShards { need: k, have: 0 });
     }
-    let shard_len = good[0].bytes.len();
+    // Work over PAYLOADS (stamp stripped); every good shard has a payload since
+    // it passed both the version gate and `verify`.
+    let shard_len = good[0].payload().expect("verified shard has a payload").len();
 
     // Collect available data shards by position.
     let mut data: Vec<Option<Vec<u8>>> = vec![None; k];
     for s in &good {
         if s.index < k {
-            data[s.index] = Some(s.bytes.clone());
+            data[s.index] = Some(s.payload().expect("verified shard has a payload").to_vec());
         }
     }
     let present = data.iter().filter(|d| d.is_some()).count();
@@ -458,7 +543,8 @@ pub fn reconstruct(shards: &[Shard], k: usize, orig_len: usize) -> Result<Vec<u8
         let missing: Vec<usize> = (0..k).filter(|&i| data[i].is_none()).collect();
         if missing.len() == 1 {
             if let Some(parity) = good.iter().find(|s| s.index >= k) {
-                let mut recovered = parity.bytes.clone();
+                let mut recovered =
+                    parity.payload().expect("verified shard has a payload").to_vec();
                 for d in data.iter().flatten() {
                     for (r, b) in recovered.iter_mut().zip(d) {
                         *r ^= *b;
@@ -678,9 +764,11 @@ mod tests {
         let (k, m) = (4usize, 2usize);
         let mut shards = encode(&message, k, m).unwrap();
 
-        // Corrupt one data shard's bytes WITHOUT updating its CID: it must be
-        // rejected on verify, and reconstruction falls back to a parity shard.
-        shards[1].bytes[0] ^= 0xFF;
+        // Corrupt one data shard's PAYLOAD bytes WITHOUT updating its CID: it
+        // must be rejected on verify, and reconstruction falls back to a parity
+        // shard. Byte index 2 is the first PAYLOAD byte (0..2 is the version
+        // stamp, which is excluded from the CID).
+        shards[1].bytes[2] ^= 0xFF;
         assert!(
             !shards[1].verify(),
             "corrupted shard fails CID verification"
@@ -703,5 +791,68 @@ mod tests {
         shards.retain(|s| s.index != 0 && s.index != 1 && s.index < k);
         let err = reconstruct(&shards, k, message.len()).unwrap_err();
         assert!(matches!(err, ShardError::InsufficientShards { need, .. } if need == k));
+    }
+
+    // --- pillar-UDP protocol wire version stamp (ROI P1 versioning) ---
+
+    #[test]
+    fn shard_round_trips_carrying_current_protocol_version() {
+        let message = b"a versioned bulk payload over pillar-UDP".to_vec();
+        let (k, m) = (4usize, 2usize);
+        let shards = encode(&message, k, m).unwrap();
+
+        // Every shard's on-wire bytes lead with the current PROTOCOL_VERSION
+        // stamp, and the CID addresses the payload (NOT the stamped bytes).
+        for s in &shards {
+            assert_eq!(&s.bytes[..2], &PROTOCOL_VERSION.to_be_bytes());
+            assert!(s.verify(), "payload hashes to its CID with the stamp excluded");
+        }
+
+        let recovered = reconstruct(&shards, k, message.len()).unwrap();
+        assert_eq!(recovered, message, "round-trips through the version-stamped wire form");
+    }
+
+    #[test]
+    fn shard_with_future_protocol_version_is_rejected_distinctly() {
+        let message = b"a payload stamped from a newer peer".to_vec();
+        let (k, m) = (4usize, 2usize);
+        let mut shards = encode(&message, k, m).unwrap();
+
+        // Bump the leading stamp on one shard to a FUTURE version. The CID is
+        // untouched (it addresses the payload), so this is a legible-but-unknown
+        // version, NOT corruption.
+        let future = pillar_crypto::SurfaceVersion(PROTOCOL_VERSION.0 + 1);
+        shards[0].bytes[..2].copy_from_slice(&future.to_be_bytes());
+
+        let err = reconstruct(&shards, k, message.len()).unwrap_err();
+        assert_eq!(
+            err,
+            ShardError::UnsupportedProtocolVersion(pillar_crypto::VersionError::Unsupported {
+                found: future,
+                min: MIN_PROTOCOL_VERSION,
+                max: PROTOCOL_VERSION,
+            }),
+            "a future version is the distinct unsupported-version reject"
+        );
+        // And it is emphatically NOT the malformed/parse variant.
+        assert_ne!(err, ShardError::MalformedVersionStamp);
+    }
+
+    #[test]
+    fn shard_truncated_below_version_stamp_is_a_parse_error() {
+        let message = b"a payload whose wire buffer is truncated".to_vec();
+        let (k, m) = (4usize, 2usize);
+        let mut shards = encode(&message, k, m).unwrap();
+
+        // Truncate one shard's on-wire bytes below the 2-byte stamp: a parse
+        // error (MalformedVersionStamp), NEVER an unsupported version.
+        shards[0].bytes.truncate(1);
+
+        let err = reconstruct(&shards, k, message.len()).unwrap_err();
+        assert_eq!(err, ShardError::MalformedVersionStamp);
+        assert!(
+            !matches!(err, ShardError::UnsupportedProtocolVersion(_)),
+            "truncation is a parse error, not an unknown version"
+        );
     }
 }

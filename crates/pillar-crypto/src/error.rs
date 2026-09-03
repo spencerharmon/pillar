@@ -38,6 +38,12 @@ pub enum CryptoError {
     /// closed: the byte is rejected outright, never silently treated as the
     /// binary's current default.
     UnsupportedAlgorithm(u8),
+    /// A sealed-artifact envelope carried a version stamp this build does not
+    /// understand (an unknown FUTURE envelope format, or a retired past one).
+    /// Distinct from a malformed/truncated envelope ([`CryptoError::InvalidLength`])
+    /// and from a decryption failure: the envelope parsed to a legible version
+    /// that simply falls outside the supported window.
+    UnsupportedEnvelopeVersion(crate::version::VersionError),
 }
 
 impl fmt::Display for CryptoError {
@@ -57,6 +63,9 @@ impl fmt::Display for CryptoError {
             CryptoError::Backend(msg) => write!(f, "custody/hardware backend error: {msg}"),
             CryptoError::UnsupportedAlgorithm(tag) => {
                 write!(f, "unsupported sealed-artifact algorithm tag: {tag}")
+            }
+            CryptoError::UnsupportedEnvelopeVersion(e) => {
+                write!(f, "unsupported sealed-envelope version: {e}")
             }
         }
     }

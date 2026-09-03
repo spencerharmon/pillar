@@ -2657,6 +2657,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "rand_core 0.6.4",
+ "serde",
  "sha2",
  "tss-esapi",
  "x25519-dalek",

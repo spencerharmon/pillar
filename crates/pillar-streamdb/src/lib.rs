@@ -23,6 +23,23 @@ use std::fmt;
 
 use pillar_core::{SideEffect, ViewPolicy};
 
+/// The current schema version of the durable materialized-view surface — the
+/// serializable [`Snapshot`] that carries a compacted op-log's materialized
+/// view (Merkle root + op set) to a bootstrapping peer.
+///
+/// This is its OWN independent version line, unrelated to the event-envelope,
+/// manifest, or any other surface's `v1`: it advances only when the
+/// `Snapshot`/materialized-view schema itself changes shape (per ROI P1
+/// "Versioning, compatibility & safe rollout" / the `IndependentVersioning`
+/// property in `specs/VersioningCompat.tla`).
+pub const SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+/// The lowest materialized-view schema version this build can still read. Kept
+/// as its own constant (currently == [`SCHEMA_VERSION`]) so a future build can
+/// widen the accepted window (`MIN_SCHEMA_VERSION..=SCHEMA_VERSION`) without
+/// touching the stamping side.
+pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
 mod persist;
 pub use persist::{PersistError, PersistentStream};
 
@@ -248,10 +265,7 @@ impl OpLog {
     /// ends up with exactly this set.
     #[must_use]
     pub fn compact(&self) -> Snapshot {
-        Snapshot {
-            root: self.root(),
-            ops: self.ops.clone(),
-        }
+        Snapshot::new(self.root(), self.ops.clone())
     }
 
     /// Bootstrap a fresh log from a [`Snapshot`] plus the tail of ops
@@ -269,7 +283,58 @@ impl OpLog {
         }
         log
     }
+
+    /// Bootstrap from a [`Snapshot`] plus tail, but FIRST reject a snapshot
+    /// stamped with a materialized-view schema version this build does not
+    /// understand.
+    ///
+    /// This is the fallible loading path: it distinguishes a
+    /// stamped-but-unknown-FUTURE view-schema ([`BootstrapError::Unsupported`],
+    /// carrying the underlying [`pillar_crypto::VersionError::Unsupported`])
+    /// from the Merkle-root corruption path — the two failure modes the ROI
+    /// requires be kept apart. On an accepted version it is identical to
+    /// [`OpLog::bootstrap`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BootstrapError::Unsupported`] if the snapshot's
+    /// [`Snapshot::schema_version`] falls outside
+    /// `MIN_SCHEMA_VERSION..=SCHEMA_VERSION`.
+    pub fn bootstrap_checked(snapshot: &Snapshot, tail: &[Op]) -> Result<Self, BootstrapError> {
+        snapshot
+            .check_schema_version()
+            .map_err(BootstrapError::Unsupported)?;
+        Ok(OpLog::bootstrap(snapshot, tail))
+    }
 }
+
+/// A failure reconstructing an [`OpLog`] from a [`Snapshot`] via
+/// [`OpLog::bootstrap_checked`].
+///
+/// Deliberately keeps an unknown-FUTURE materialized-view schema version
+/// ([`BootstrapError::Unsupported`]) as its OWN variant, distinct from any
+/// corrupt/mismatched-Merkle-root failure: a newer-peer snapshot is a
+/// negotiable compatibility signal, not corruption (ROI P1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootstrapError {
+    /// The snapshot parsed cleanly but carries a materialized-view schema
+    /// version outside `MIN_SCHEMA_VERSION..=SCHEMA_VERSION` — most importantly
+    /// a version NEWER than this build understands. Wraps the shared
+    /// [`pillar_crypto::VersionError`] (always its `Unsupported` case here).
+    Unsupported(pillar_crypto::VersionError),
+}
+
+impl fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BootstrapError::Unsupported(e) => {
+                write!(f, "snapshot has an unsupported materialized-view schema: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BootstrapError {}
 
 /// A cryptographic Merkle root: a collision-resistant commitment to an op
 /// *set*, produced by [`OpLog::root`].
@@ -338,13 +403,63 @@ fn fold_root(ops: &[&Op]) -> MerkleRoot {
 pub struct Snapshot {
     root: MerkleRoot,
     ops: BTreeMap<OpId, Op>,
+    /// The materialized-view schema version this snapshot was produced under.
+    ///
+    /// Deliberately NOT folded into `root` / the content address: the Merkle
+    /// root is a commitment to the op *set* (`Root`/`FoldRoot` in the spec),
+    /// and the whole convergence contract (`DeterministicMerkleRoot`,
+    /// `bootstrap_from_snapshot_and_tail_matches_full_history`) is that two
+    /// peers holding the same op set compute the same root regardless of how
+    /// they packaged it. Mixing the packaging-format version into that
+    /// commitment would make a snapshot's root differ from the live log's root
+    /// for the identical set, breaking that equality. The schema version is a
+    /// property of the CARRIER, not of the summarized state, so it is checked
+    /// separately ([`Snapshot::check_schema_version`]) rather than being made
+    /// tamper-evident through the set commitment.
+    schema_version: pillar_crypto::SurfaceVersion,
 }
 
 impl Snapshot {
+    /// Construct a snapshot over `root` + `ops`, stamping it with the current
+    /// [`SCHEMA_VERSION`] of the materialized-view surface. The single
+    /// construction helper so every production and test call site stamps
+    /// identically.
+    #[must_use]
+    fn new(root: MerkleRoot, ops: BTreeMap<OpId, Op>) -> Self {
+        Snapshot {
+            root,
+            ops,
+            schema_version: SCHEMA_VERSION,
+        }
+    }
+
     /// The Merkle root this snapshot was taken at.
     #[must_use]
     pub fn root(&self) -> MerkleRoot {
         self.root.clone()
+    }
+
+    /// The materialized-view schema version stamped on this snapshot.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        self.schema_version
+    }
+
+    /// Verify this snapshot's materialized-view schema version is one this
+    /// build can interpret (`MIN_SCHEMA_VERSION..=SCHEMA_VERSION`).
+    ///
+    /// A stamped-but-unknown FUTURE version yields
+    /// [`pillar_crypto::VersionError::Unsupported`] — distinct from any
+    /// corruption / Merkle-root-mismatch failure, so a newer-peer snapshot is
+    /// treated as a negotiable compatibility signal, not corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`pillar_crypto::VersionError::Unsupported`] if the stamp falls
+    /// outside `MIN_SCHEMA_VERSION..=SCHEMA_VERSION`.
+    pub fn check_schema_version(&self) -> Result<(), pillar_crypto::VersionError> {
+        self.schema_version
+            .check_supported(MIN_SCHEMA_VERSION, SCHEMA_VERSION)
     }
 
     /// Number of ops summarized by this snapshot.
@@ -508,6 +623,13 @@ impl View<'_> {
     #[must_use]
     pub fn root(&self) -> MerkleRoot {
         self.log.root()
+    }
+
+    /// The materialized-view schema version this live view advertises — the
+    /// same [`SCHEMA_VERSION`] a [`Snapshot`] materialized from it would carry.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        SCHEMA_VERSION
     }
 }
 
@@ -786,6 +908,73 @@ mod tests {
         assert_eq!(snapshot.len(), log.len());
         assert_eq!(snapshot.root(), log.root());
         assert!(!snapshot.is_empty());
+    }
+
+    /// A normally-produced snapshot carries the current materialized-view
+    /// schema version, and validates as supported.
+    #[test]
+    fn snapshot_carries_current_schema_version_and_validates() {
+        let mut log = OpLog::new();
+        log.append(b"v".to_vec());
+        let snapshot = log.compact();
+        assert_eq!(snapshot.schema_version(), SCHEMA_VERSION);
+        assert_eq!(snapshot.check_schema_version(), Ok(()));
+    }
+
+    /// A live view advertises the same materialized-view schema version a
+    /// snapshot materialized from it would carry.
+    #[test]
+    fn view_advertises_current_schema_version() {
+        let stream = Stream::new();
+        assert_eq!(stream.view().schema_version(), SCHEMA_VERSION);
+    }
+
+    /// A snapshot re-stamped to a FUTURE materialized-view schema version is
+    /// rejected as `Unsupported` — NOT `Malformed` — keeping a newer-peer
+    /// snapshot distinct from corruption (ROI P1), both by
+    /// [`Snapshot::check_schema_version`] and the fallible bootstrap path.
+    #[test]
+    fn snapshot_stamped_with_future_schema_version_is_rejected_distinctly() {
+        let mut log = OpLog::new();
+        log.append(b"a".to_vec());
+        let mut snapshot = log.compact();
+        // Re-stamp to a version newer than this build understands.
+        snapshot.schema_version = pillar_crypto::SurfaceVersion(SCHEMA_VERSION.0 + 1);
+
+        let err = snapshot.check_schema_version().unwrap_err();
+        assert_eq!(
+            err,
+            pillar_crypto::VersionError::Unsupported {
+                found: pillar_crypto::SurfaceVersion(SCHEMA_VERSION.0 + 1),
+                min: MIN_SCHEMA_VERSION,
+                max: SCHEMA_VERSION,
+            }
+        );
+        // Provably a different variant than a parse error.
+        assert_ne!(err, pillar_crypto::VersionError::Malformed);
+
+        // The fallible loading path surfaces it as its own distinct variant.
+        assert_eq!(
+            OpLog::bootstrap_checked(&snapshot, &[]),
+            Err(BootstrapError::Unsupported(err))
+        );
+    }
+
+    /// The current schema version validates Ok, and the checked bootstrap path
+    /// accepts a normally-produced snapshot (behaving like plain bootstrap).
+    #[test]
+    fn current_schema_version_validates_and_bootstraps() {
+        let mut source = OpLog::new();
+        source.append(b"pre".to_vec());
+        let snapshot = source.compact();
+        assert_eq!(snapshot.check_schema_version(), Ok(()));
+
+        let restored = OpLog::bootstrap_checked(&snapshot, &[]).expect("current version accepted");
+        assert_eq!(restored.root(), source.root());
+        assert_eq!(
+            restored.ids().collect::<Vec<_>>(),
+            source.ids().collect::<Vec<_>>()
+        );
     }
 
     /// An empty log's snapshot bootstraps back to an empty, converged log.
