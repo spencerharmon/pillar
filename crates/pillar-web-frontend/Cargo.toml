@@ -31,7 +31,7 @@ default = ["yew"]
 # The Yew component wrappers around the design-system styles. On by default so
 # `cargo test -p pillar-web-frontend` typechecks the components on the host; the
 # wasm bundle build turns them into real DOM.
-yew = ["dep:yew", "dep:web-sys", "dep:wasm-bindgen"]
+yew = ["dep:yew", "dep:yew-router", "dep:web-sys", "dep:wasm-bindgen"]
 
 [dependencies]
 # stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
@@ -40,6 +40,11 @@ yew = ["dep:yew", "dep:web-sys", "dep:wasm-bindgen"]
 # testable; `yew` wires the styling into Yew components.
 stylist = { version = "0.13", features = ["parser", "yew"] }
 yew = { version = "0.21", features = ["csr"], optional = true }
+# yew-router provides the client-side router (BrowserRouter/Switch) the app
+# shell uses to dispatch between panels; the auth guard sits in front of its
+# Switch to redirect an unauthenticated request for a protected route to the
+# login screen.
+yew-router = { version = "0.18", optional = true }
 # web-sys + wasm-bindgen back the Card's mouse-tracking spotlight (reading the
 # element rect and writing the `--spot-x/--spot-y` custom properties). Optional,
 # pulled in only with the `yew` feature; the design-system tests do not need

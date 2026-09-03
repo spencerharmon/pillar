@@ -15,14 +15,23 @@
 //! [`components`] (behind the default `yew` feature) simply attach those
 //! classes, so the visual language is defined exactly once.
 
+pub mod auth;
+pub mod router;
 pub mod styles;
 pub mod theme;
 
 #[cfg(feature = "yew")]
 pub mod components;
 
+pub use auth::{AuthAction, AuthSession};
+pub use router::Route;
 pub use styles::ButtonVariant;
 pub use theme::{Motion, Theme};
+
+#[cfg(feature = "yew")]
+pub use auth::{use_auth, AuthContext, AuthProvider};
+#[cfg(feature = "yew")]
+pub use router::Shell;
 
 #[cfg(test)]
 mod tests {
