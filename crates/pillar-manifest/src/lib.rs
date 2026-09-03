@@ -38,6 +38,7 @@ pub mod admission;
 pub mod bgp_lb;
 pub mod builtin;
 pub mod ingress;
+pub mod tls_cert;
 
 /// The content-address of a manifest body — a real collision-resistant
 /// cryptographic multihash (SHA2-256, self-describing `<code><len><digest>`
