@@ -352,6 +352,29 @@ pub struct CustodyRecord {
     pub generation: u64,
 }
 
+/// The HTTP INGEST API surface's own EXPLICIT version stamp (ROI P1
+/// "Versioning, compatibility & safe rollout") — versioned INDEPENDENTLY of
+/// any event/message/body it carries. This is the distinct wire surface a
+/// browser/`curl`/k8s Ingress speaks to this portal; it advances on its OWN
+/// line (`v1`, `v2`, …) as request/response framing changes, unrelated to the
+/// event-envelope or pillar-message version numbers. Every response advertises
+/// it via [`API_VERSION_HEADER`], and a request MAY assert the version it
+/// speaks; the server checks that assertion against `[MIN_API_VERSION,
+/// API_VERSION]` with the shared [`pillar_crypto::SurfaceVersion`] primitive.
+pub const API_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+/// The OLDEST HTTP ingest API version this build still accepts on a request —
+/// the low bound of the supported window (a version below it is
+/// [`pillar_crypto::VersionError::Unsupported`], a retired surface). Currently
+/// equal to [`API_VERSION`] (a single-version window), it moves independently
+/// as old framings are retired.
+pub const MIN_API_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+/// The response/request header carrying the HTTP ingest API [`SurfaceVersion`]
+/// stamp (rendered `vN` via its `Display`). Emitted on EVERY response so any
+/// client can see the version it was served at; OPTIONALLY sent by a request
+/// to assert the version it speaks (a request without it is served backward-
+/// compatibly at [`API_VERSION`]).
+const API_VERSION_HEADER: &str = "X-Pillar-Api-Version";
+
 /// The `apiVersion` every resource-plane kind on the web UI shares.
 const RESOURCE_API: &str = "pillar.dev/v1";
 /// The capability every resource act is gated on, per the shared RBAC
@@ -1554,11 +1577,18 @@ pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
 /// identifier is embedded in this public source.
 const LANDING_PAGE: &str = include_str!("web_login.html");
 
-/// A parsed HTTP request: method, path, and body.
+/// A parsed HTTP request: method, path, body, and the OPTIONAL asserted HTTP
+/// ingest API version ([`API_VERSION_HEADER`]).
 struct HttpRequest {
     method: String,
     path: String,
     body: String,
+    /// The raw `X-Pillar-Api-Version` header value the client sent, if any.
+    /// `None` means the request asserted no version — served backward-
+    /// compatibly at [`API_VERSION`]. `Some` is validated by
+    /// [`dispatch_http`] (parsed, then bounds-checked against
+    /// `[MIN_API_VERSION, API_VERSION]`).
+    api_version: Option<String>,
 }
 
 /// Read and parse one HTTP/1.1 request from `reader`. Returns `None` on a
@@ -1574,6 +1604,7 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
     let path = parts.next()?.to_owned();
 
     let mut content_length = 0usize;
+    let mut api_version = None;
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
@@ -1587,6 +1618,13 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.trim().eq_ignore_ascii_case(API_VERSION_HEADER) {
+                // Retain the raw value verbatim; legibility (parse) and
+                // supported-window checks are `dispatch_http`'s job so it can
+                // distinguish a malformed value (400) from a stamped-but-
+                // unknown FUTURE version (505) — the two failure modes the
+                // shared `pillar_crypto::VersionError` keeps distinct.
+                api_version = Some(value.trim().to_owned());
             }
         }
     }
@@ -1599,7 +1637,12 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
         }
     }
 
-    Some(HttpRequest { method, path, body })
+    Some(HttpRequest {
+        method,
+        path,
+        body,
+        api_version,
+    })
 }
 
 /// An HTTP response to write back.
@@ -1614,11 +1657,13 @@ struct HttpResponse {
 impl HttpResponse {
     fn write_to(&self, stream: &mut TcpStream) -> std::io::Result<()> {
         let mut head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}: {}\r\nConnection: close\r\n",
             self.status,
             self.reason,
             self.content_type,
             self.body.len(),
+            API_VERSION_HEADER,
+            API_VERSION,
         );
         if let Some(token) = &self.session_token {
             head.push_str(&format!("X-Pillar-Session: {token}\r\n"));
@@ -1650,6 +1695,17 @@ fn dispatch_http(
     request: &HttpRequest,
 ) -> HttpResponse {
     let path = request.path.split('?').next().unwrap_or(&request.path);
+    // Validate the OPTIONAL request-side API-version assertion BEFORE routing.
+    // A request without the header is accepted (backward compatible) and served
+    // at `API_VERSION`. A present header is checked with the shared
+    // `pillar_crypto` primitive, which keeps the two failure modes distinct:
+    //   * a malformed (illegible) value  → 400 Bad Request (a parse error),
+    //   * a legible-but-unknown FUTURE (or retired) version → 505 HTTP Version
+    //     Not Supported — a DISTINCT status from a 404/parse/malformed path so
+    //     a newer client is told precisely which API version was rejected.
+    if let Some(err) = check_request_api_version(request) {
+        return err;
+    }
     match (request.method.as_str(), path) {
         ("GET", "/") => HttpResponse {
             status: 200,
@@ -2964,6 +3020,46 @@ fn login_reason(e: &NodeCustodyError) -> &'static str {
     }
 }
 
+/// Validate a request's OPTIONAL [`API_VERSION_HEADER`] assertion, returning
+/// the DISTINCT error response to short-circuit on when it is unacceptable, or
+/// `None` when the request may proceed (no header, or a supported version).
+///
+/// The two rejections are deliberately different HTTP statuses so a client can
+/// tell them apart — mirroring the [`pillar_crypto::VersionError`] split:
+///
+/// * an illegible value (`VersionError::Malformed`, or not a `vN`/`N` number)
+///   → `400 Bad Request`, a PARSE error, the same family as any other
+///   malformed-request refusal; and
+/// * a legible but out-of-window version (`VersionError::Unsupported`, e.g. a
+///   FUTURE `v2` this build does not know, or a retired one) → `505 HTTP
+///   Version Not Supported`, NAMING the unsupported version — distinct from a
+///   404/parse/normal-response path.
+fn check_request_api_version(request: &HttpRequest) -> Option<HttpResponse> {
+    let raw = request.api_version.as_deref()?;
+    // Accept both the `Display` form (`v1`) and a bare number (`1`), so a
+    // client may echo back exactly what a response advertised.
+    let digits = raw.strip_prefix('v').or_else(|| raw.strip_prefix('V')).unwrap_or(raw);
+    let Ok(n) = digits.parse::<u16>() else {
+        // Illegible: a parse error (400), NOT the unsupported-version case.
+        return Some(text_response(
+            400,
+            "Bad Request",
+            format!("MALFORMED api version header {raw:?}"),
+        ));
+    };
+    let found = pillar_crypto::SurfaceVersion(n);
+    match found.check_supported(MIN_API_VERSION, API_VERSION) {
+        Ok(()) => None,
+        Err(_) => Some(text_response(
+            505,
+            "HTTP Version Not Supported",
+            format!(
+                "UNSUPPORTED api version {found} (this build supports {MIN_API_VERSION}..={API_VERSION})"
+            ),
+        )),
+    }
+}
+
 fn text_response(status: u16, reason: &'static str, mut body: String) -> HttpResponse {
     if !body.ends_with('\n') {
         body.push('\n');
@@ -3021,6 +3117,7 @@ mod tests {
                 method: "GET".into(),
                 path: path.into(),
                 body: String::new(),
+                api_version: None,
             },
         )
     }
@@ -3033,6 +3130,21 @@ mod tests {
                 method: "POST".into(),
                 path: path.into(),
                 body: body.into(),
+                api_version: None,
+            },
+        )
+    }
+
+    // A GET carrying an explicit `X-Pillar-Api-Version` assertion.
+    fn get_with_api_version(ctx: &mut WebAuthContext, path: &str, version: &str) -> HttpResponse {
+        dispatch_http(
+            ctx,
+            &remote_peer(),
+            &HttpRequest {
+                method: "GET".into(),
+                path: path.into(),
+                body: String::new(),
+                api_version: Some(version.into()),
             },
         )
     }
@@ -3187,6 +3299,114 @@ mod tests {
         );
         let (_, body) = raw.split_once("\r\n\r\n").expect("a header/body separator");
         assert!(!body.is_empty(), "expected a non-empty response body");
+    }
+
+    #[test]
+    fn every_response_carries_the_current_api_version_header() {
+        // The HTTP ingest API's OWN version stamp is advertised on EVERY
+        // response — asserted against served raw response bytes, so a client
+        // (or Ingress) always learns the API version it was served at. This is
+        // independent of any message/event version the body carries.
+        use std::io::Read as _;
+
+        let listener = bind(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0).expect("bind non-loopback");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let handle = std::thread::spawn(move || {
+            let (mut ctx, _subkey) = provisioned_ctx();
+            let stream = listener
+                .incoming()
+                .next()
+                .expect("one connection")
+                .expect("accept");
+            super::handle_connection(stream, &mut ctx);
+        });
+
+        let connect = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
+        let mut client = TcpStream::connect(connect).expect("connect");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: pillar.example.com\r\n\r\n")
+            .expect("write request");
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).expect("read response");
+        handle.join().expect("server thread");
+
+        let expected = format!("{API_VERSION_HEADER}: {API_VERSION}");
+        assert_eq!(
+            expected, "X-Pillar-Api-Version: v1",
+            "the advertised header line is the stable v1 stamp"
+        );
+        assert!(
+            raw.lines().any(|l| l.trim_end() == expected),
+            "every response must carry `{expected}`, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn a_request_without_the_api_version_header_is_served_normally() {
+        // Backward compatibility: a request that asserts NO API version is
+        // accepted and served at the current version (the `get`/`post` helpers
+        // send `api_version: None`).
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get(&mut ctx, "/bootstrap/status");
+        assert_eq!(
+            resp.status, 200,
+            "a header-less request is served backward-compatibly"
+        );
+    }
+
+    #[test]
+    fn a_future_api_version_is_rejected_distinctly_from_a_404_or_parse_path() {
+        // A legible-but-unknown FUTURE version (`v2`) is Unsupported — a
+        // DISTINCT 505, NAMING the version — never confused with a 404
+        // (unknown route) or a 400 (malformed request/parse) path.
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get_with_api_version(&mut ctx, "/bootstrap/status", "v2");
+        assert_eq!(
+            resp.status, 505,
+            "a future API version yields the distinct unsupported-version status"
+        );
+        assert!(
+            resp.body.contains("UNSUPPORTED") && resp.body.contains("v2"),
+            "the body must name the unsupported API version, got: {}",
+            resp.body
+        );
+        // Distinct from an unknown-route 404 …
+        let not_found = get(&mut ctx, "/no-such-route");
+        assert_eq!(not_found.status, 404);
+        assert_ne!(
+            resp.status, not_found.status,
+            "unsupported-version must NOT be the 404 path"
+        );
+        // … and distinct from a normal (accepted) served response.
+        let ok = get_with_api_version(&mut ctx, "/bootstrap/status", "v1");
+        assert_eq!(ok.status, 200, "the CURRENT version is accepted");
+        assert_ne!(resp.status, ok.status);
+    }
+
+    #[test]
+    fn a_malformed_api_version_header_is_a_parse_error_not_the_unsupported_case() {
+        // A garbage header value is a PARSE error (400) — the malformed
+        // family — deliberately distinct from the stamped-but-unknown-future
+        // (505) case above.
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get_with_api_version(&mut ctx, "/bootstrap/status", "not-a-version");
+        assert_eq!(
+            resp.status, 400,
+            "an illegible API version header is a parse error (400)"
+        );
+        assert!(
+            resp.body.contains("MALFORMED"),
+            "the body must flag the malformed header, got: {}",
+            resp.body
+        );
+        // And it is NOT the 505 unsupported-version status.
+        let future = get_with_api_version(&mut ctx, "/bootstrap/status", "v2");
+        assert_eq!(future.status, 505);
+        assert_ne!(
+            resp.status, future.status,
+            "malformed (400) and unsupported-version (505) must be distinct"
+        );
     }
 
     #[test]

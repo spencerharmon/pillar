@@ -8,6 +8,17 @@
 
 use crate::error::{CryptoError, Result};
 use crate::types::{SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed};
+use crate::version::SurfaceVersion;
+
+/// The sealed-artifact envelope format version this build writes and reads.
+/// Its own independent per-surface version line (ROI P1). A leading 2-byte
+/// big-endian stamp on the envelope bytes lets a reader reject an unknown
+/// FUTURE envelope format distinctly from a truncated/garbage envelope, and is
+/// the anchor the later self-describing `{salt, KdfParams, algorithm}` format
+/// (`sealed-artifact-self-describing-impl`) increments.
+pub const ENVELOPE_VERSION: SurfaceVersion = SurfaceVersion(1);
+/// The lowest sealed-envelope format version this build still accepts.
+pub const MIN_ENVELOPE_VERSION: SurfaceVersion = SurfaceVersion(1);
 
 /// Derive the 32-byte X25519 static secret scalar from arbitrary seed material
 /// via a domain-separated SHA-256 (independent of the signing derivation).
@@ -93,6 +104,8 @@ pub fn seal_to_recipients(
     let ephemeral_pub = PublicKey::from(&ephemeral).to_bytes();
 
     let mut out = Vec::new();
+    // Leading independent envelope-format version stamp.
+    out.extend_from_slice(&ENVELOPE_VERSION.to_be_bytes());
     out.extend_from_slice(&ephemeral_pub);
     out.extend_from_slice(&u32_bytes(recipients.len())?);
 
@@ -142,6 +155,15 @@ pub fn unseal(envelope: &SealedEnvelope, secret: &SealingSecretKey) -> Result<Ve
         let b = take(buf, pos, 4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
+
+    // Leading envelope-format version stamp: a short buffer is a parse error
+    // (InvalidLength); a legible but out-of-window version is rejected
+    // distinctly as UnsupportedEnvelopeVersion (e.g. a newer node's format).
+    let version_bytes = take(buf, &mut pos, 2)?;
+    SurfaceVersion::from_be_bytes(&version_bytes)
+        .map_err(|_| CryptoError::InvalidLength)?
+        .check_supported(MIN_ENVELOPE_VERSION, ENVELOPE_VERSION)
+        .map_err(CryptoError::UnsupportedEnvelopeVersion)?;
 
     let ephemeral_pub: [u8; 32] = take(buf, &mut pos, 32)?
         .try_into()
@@ -232,5 +254,43 @@ mod tests {
         let env = seal_to_recipients(b"cell group key", &[pk]).expect("seal");
         assert_eq!(unseal(&env, &sk).as_deref(), Ok(b"cell group key".as_ref()));
         assert_eq!(unseal(&env, &other_sk), Err(CryptoError::NotARecipient));
+    }
+
+    #[test]
+    fn envelope_carries_current_version_stamp() {
+        let (pk, _sk) = sealing_keypair_from_seed(&seed("stamp")).expect("keygen");
+        let env = seal_to_recipients(b"x", &[pk]).expect("seal");
+        assert_eq!(
+            &env.as_bytes()[..2],
+            &ENVELOPE_VERSION.to_be_bytes(),
+            "the sealed envelope must lead with its format version stamp"
+        );
+    }
+
+    #[test]
+    fn unknown_future_envelope_version_is_rejected_distinctly() {
+        let (pk, sk) = sealing_keypair_from_seed(&seed("future")).expect("keygen");
+        let env = seal_to_recipients(b"secret", &[pk]).expect("seal");
+        // Rewrite ONLY the leading version stamp to a future version; the rest
+        // of the envelope is a genuine, decryptable envelope.
+        let mut bytes = env.into_bytes();
+        let future = SurfaceVersion(ENVELOPE_VERSION.0 + 1);
+        bytes[..2].copy_from_slice(&future.to_be_bytes());
+        let bumped = SealedEnvelope::from_bytes(bytes);
+        match unseal(&bumped, &sk) {
+            Err(CryptoError::UnsupportedEnvelopeVersion(
+                crate::version::VersionError::Unsupported { found, .. },
+            )) => assert_eq!(found, future),
+            other => panic!("expected UnsupportedEnvelopeVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_envelope_is_a_parse_error_not_an_unknown_version() {
+        let (_pk, sk) = sealing_keypair_from_seed(&seed("short")).expect("keygen");
+        // One byte cannot even hold the 2-byte version stamp → InvalidLength,
+        // never UnsupportedEnvelopeVersion.
+        let stub = SealedEnvelope::from_bytes(vec![0x00]);
+        assert_eq!(unseal(&stub, &sk), Err(CryptoError::InvalidLength));
     }
 }

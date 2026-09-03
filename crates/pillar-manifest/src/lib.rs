@@ -454,15 +454,34 @@ pub struct Envelope {
     causal_parents: BTreeSet<ContentHash>,
     content_hash: ContentHash,
     capability_scope: BTreeSet<Capability>,
+    schema_version: pillar_crypto::SurfaceVersion,
     body: Crd,
     signature: ManifestSignature,
 }
 
 impl Envelope {
-    /// Compute the **binding message** the signature covers: content-hash +
-    /// signer + sorted causal-parents + sorted capability-scope. Pure and
-    /// canonical — the exact bytes fed to ed25519 sign/verify.
+    /// The current manifest-envelope SCHEMA version this build produces and is
+    /// the newest it can interpret. This is the manifest surface's OWN
+    /// independent version line — distinct from `Crd::api_version`, which is
+    /// the Kubernetes `apiVersion` of the DECLARED object, not the pillar
+    /// envelope's schema stamp. It advances independently of every other
+    /// surface's stamp (the `IndependentVersioning` property).
+    pub const SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+    /// The oldest manifest-envelope SCHEMA version this build still accepts.
+    /// Envelopes stamped below this — or above [`Envelope::SCHEMA_VERSION`] —
+    /// are rejected by [`Envelope::check_schema_version`] as
+    /// [`pillar_crypto::VersionError::Unsupported`], distinct from a malformed
+    /// or bad-signature failure.
+    pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+    /// Compute the **binding message** the signature covers: schema-version +
+    /// content-hash + signer + sorted causal-parents + sorted capability-scope.
+    /// Pure and canonical — the exact bytes fed to ed25519 sign/verify. The
+    /// schema-version stamp is folded in so it is signature-covered: rewriting
+    /// the stamp after signing breaks verification.
     fn binding_message(
+        schema_version: pillar_crypto::SurfaceVersion,
         content_hash: &ContentHash,
         signer: &str,
         parents: &BTreeSet<ContentHash>,
@@ -470,6 +489,7 @@ impl Envelope {
     ) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(b"pillar-manifest/envelope-binding-v1");
+        b.extend_from_slice(&schema_version.to_be_bytes());
         b.extend_from_slice(&(content_hash.0.len() as u64).to_le_bytes());
         b.extend_from_slice(&content_hash.0);
         push_str(&mut b, signer);
@@ -517,8 +537,13 @@ impl Envelope {
         let content_hash = body.content_hash();
         let causal_parents: BTreeSet<ContentHash> = causal_parents.into_iter().collect();
         let capability_scope: BTreeSet<Capability> = capability_scope.into_iter().collect();
-        let message =
-            Self::binding_message(&content_hash, &signer, &causal_parents, &capability_scope);
+        let message = Self::binding_message(
+            Self::SCHEMA_VERSION,
+            &content_hash,
+            &signer,
+            &causal_parents,
+            &capability_scope,
+        );
         let (verifying_key, secret) = Self::keypair_for_signer(&signer);
         let signature = sign(&secret, &message).expect("ed25519 signing cannot fail");
         Envelope {
@@ -526,6 +551,7 @@ impl Envelope {
             causal_parents,
             content_hash,
             capability_scope,
+            schema_version: Self::SCHEMA_VERSION,
             body,
             signature: ManifestSignature {
                 signer,
@@ -573,6 +599,27 @@ impl Envelope {
         &self.capability_scope
     }
 
+    /// The manifest-envelope SCHEMA version this envelope is stamped with —
+    /// the pillar surface's own version line, NOT the CRD body's Kubernetes
+    /// `apiVersion`.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        self.schema_version
+    }
+
+    /// Verify the stamped schema-version is one this build can interpret, i.e.
+    /// within `[MIN_SCHEMA_VERSION, SCHEMA_VERSION]`.
+    ///
+    /// # Errors
+    /// [`pillar_crypto::VersionError::Unsupported`] if the stamp is older or
+    /// newer than this build supports — distinct from a malformed or
+    /// bad-signature failure so a newer-peer envelope is a negotiable
+    /// version mismatch rather than corruption.
+    pub fn check_schema_version(&self) -> Result<(), pillar_crypto::VersionError> {
+        self.schema_version
+            .check_supported(Self::MIN_SCHEMA_VERSION, Self::SCHEMA_VERSION)
+    }
+
     /// The signature over this manifest's binding.
     #[must_use]
     pub fn signature(&self) -> &ManifestSignature {
@@ -585,9 +632,15 @@ impl Envelope {
     ///    content address (the body was not rewritten after sealing), and
     /// 2. the verifying key is the one bound to the recorded signer, AND the
     ///    real ed25519 signature verifies over the envelope's recomputed
-    ///    binding message (no field — body, signer, parents, or scope — was
-    ///    tampered after signing). Verification is asymmetric: it uses only the
-    ///    public key, so a forged signature is cryptographically infeasible.
+    ///    binding message (no field — schema-version, body, signer, parents,
+    ///    or scope — was tampered after signing). Verification is asymmetric:
+    ///    it uses only the public key, so a forged signature is
+    ///    cryptographically infeasible.
+    ///
+    /// Note this is authenticity/integrity only; it does NOT gate on whether
+    /// the stamped schema-version is one this build supports — that is
+    /// [`Envelope::check_schema_version`], a distinct decision so an unknown
+    /// version is rejected separately from a bad signature.
     #[must_use]
     pub fn verify(&self) -> bool {
         if self.body.content_hash() != self.content_hash {
@@ -604,6 +657,7 @@ impl Envelope {
             return false;
         }
         let message = Self::binding_message(
+            self.schema_version,
             &self.content_hash,
             &self.signer,
             &self.causal_parents,
@@ -818,6 +872,7 @@ mod tests {
         assert!(env.verify());
 
         let message = Envelope::binding_message(
+            env.schema_version,
             &env.content_hash,
             &env.signer,
             &env.causal_parents,
@@ -862,5 +917,58 @@ mod tests {
         let a = route_crd();
         let b = route_crd().with_spec("metric", Value::Integer(200));
         assert_ne!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn an_imported_envelope_is_stamped_with_the_current_schema_version() {
+        let env = Envelope::import(route_crd(), "AAAA-FPR", [], []);
+        assert_eq!(env.schema_version(), Envelope::SCHEMA_VERSION);
+        // The current version is one this build supports.
+        assert_eq!(env.check_schema_version(), Ok(()));
+    }
+
+    #[test]
+    fn a_stamped_but_unknown_future_schema_version_is_rejected_distinctly() {
+        // A cleanly-constructed envelope carrying a FUTURE schema version is
+        // Unsupported — NOT Malformed — so the compatibility layer treats a
+        // newer peer as negotiable rather than as corruption.
+        let mut env = Envelope::import(route_crd(), "AAAA-FPR", [], []);
+        let future = pillar_crypto::SurfaceVersion(Envelope::SCHEMA_VERSION.0 + 1);
+        env.schema_version = future;
+        let err = env.check_schema_version().unwrap_err();
+        assert_eq!(
+            err,
+            pillar_crypto::VersionError::Unsupported {
+                found: future,
+                min: Envelope::MIN_SCHEMA_VERSION,
+                max: Envelope::SCHEMA_VERSION,
+            }
+        );
+        assert_ne!(err, pillar_crypto::VersionError::Malformed);
+    }
+
+    #[test]
+    fn tampering_the_schema_version_breaks_the_signature() {
+        // The stamp is folded into the binding message, so rewriting it after
+        // signing invalidates the ed25519 signature — it is signature-covered.
+        let env = Envelope::import(route_crd(), "AAAA-FPR", [], []);
+        assert!(env.verify());
+        let mut tampered = env.clone();
+        tampered.schema_version = pillar_crypto::SurfaceVersion(Envelope::SCHEMA_VERSION.0 + 1);
+        assert!(!tampered.verify());
+    }
+
+    #[test]
+    fn a_normally_imported_envelope_still_verifies_after_the_stamp_fold() {
+        // Regression: folding the schema-version stamp into binding_message
+        // must not break the ordinary sign/verify path.
+        let env = Envelope::import(
+            route_crd(),
+            "AAAA-FPR",
+            [ch(1), ch(2)],
+            [Capability::from("net/route")],
+        );
+        assert!(env.verify());
+        assert_eq!(env.check_schema_version(), Ok(()));
     }
 }

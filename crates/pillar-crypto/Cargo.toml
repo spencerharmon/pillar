@@ -16,6 +16,8 @@ sha2 = "0.10"
 hkdf = "0.12"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
 tss-esapi = { version = "7.5", optional = true }
 cryptoki = { version = "0.7", optional = true }
 ctap-hid-fido2 = { version = "3", optional = true }
@@ -32,6 +34,10 @@ ctap-hid-fido2 = { version = "3", optional = true }
 # compiled unconditionally; only the on-device call path is behind a feature,
 # and a backend whose feature is off fails closed with `CryptoError::Backend`.
 default = []
+# Derive serde Serialize/Deserialize for the surface-version stamp so a serde-
+# serialized surface (event envelope, pillar-net messages) can carry it. Kept
+# opt-in so the crate's core has no serde dependency.
+serde = ["dep:serde"]
 # TPM 2.0 sealed-object custody via tss-esapi / tpm2-tss.
 tpm = ["dep:tss-esapi"]
 # FIDO2 / WebAuthn-PRF (hmac-secret) custody via ctap-hid-fido2.

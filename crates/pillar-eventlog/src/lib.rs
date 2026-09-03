@@ -239,14 +239,57 @@ impl Signature {
     }
 }
 
-/// A fully-formed, signed event: its content plus its author's PGP signature.
+/// A fully-formed, signed event: its content plus its author's PGP signature,
+/// carrying an explicit event-envelope schema version stamp
+/// ([`Event::SCHEMA_VERSION`]).
+///
+/// The stamp lives on the ENVELOPE, deliberately OUTSIDE the hashed
+/// [`EventContent`], so an envelope-schema revision never perturbs any existing
+/// [`EventId`] (content addresses are unchanged) while still letting a reader
+/// reject an envelope stamped with a version it does not understand — distinctly
+/// from a parse/tamper failure. This is the event-envelope surface of ROI P1's
+/// independent per-surface versioning; it advances independently of every other
+/// surface's stamp.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
+    /// The event-envelope schema version this event is stamped with.
+    #[serde(default = "Event::default_schema_version")]
+    schema_version: pillar_crypto::SurfaceVersion,
     content: EventContent,
     signature: Signature,
 }
 
 impl Event {
+    /// The event-envelope schema version this build authors and understands.
+    /// The event-envelope surface's own independent version line.
+    pub const SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+    /// The lowest event-envelope schema version this build still accepts on
+    /// ingest.
+    pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion =
+        pillar_crypto::SurfaceVersion(1);
+
+    fn default_schema_version() -> pillar_crypto::SurfaceVersion {
+        Event::SCHEMA_VERSION
+    }
+
+    /// The event-envelope schema version stamped on this event.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        self.schema_version
+    }
+
+    /// Assemble an event from already-signed content, stamped with the current
+    /// envelope schema version. Used by the local-authoring path and by tests
+    /// exercising ingest.
+    fn stamped(content: EventContent, signature: Signature) -> Self {
+        Event {
+            schema_version: Event::SCHEMA_VERSION,
+            content,
+            signature,
+        }
+    }
+
     /// The signed content of this event.
     #[must_use]
     pub fn content(&self) -> &EventContent {
@@ -293,6 +336,13 @@ pub enum EventError {
     /// event that is not present — a dangling / non-cross-author causal edge
     /// (`ParentsCrossAuthorAndExist`).
     DanglingParent,
+    /// The event's envelope carries a schema version this build does not
+    /// understand (below [`Event::MIN_SCHEMA_VERSION`] or above
+    /// [`Event::SCHEMA_VERSION`]). Distinct from [`EventError::TamperedSignature`]/
+    /// [`EventError::IdMismatch`] (a corrupt/forged event): here the envelope
+    /// parsed cleanly but is stamped for a version — typically a newer peer's —
+    /// that this build cannot interpret.
+    UnsupportedSchemaVersion(pillar_crypto::VersionError),
 }
 
 /// The append-only, content-addressed event DAG: the grow-only set of
@@ -377,7 +427,7 @@ impl EventLog {
             payload: payload.into(),
         };
         let signature = Signature::sign(author, &content);
-        let event = Event { content, signature };
+        let event = Event::stamped(content, signature);
         // ingest cannot fail for a locally-authored, correctly-linked event.
         self.ingest(event)
             .expect("locally authored event is always valid")
@@ -399,6 +449,13 @@ impl EventLog {
     /// Returns the event's [`EventId`] on success, or the specific
     /// [`EventError`] that refused it.
     pub fn ingest(&mut self, event: Event) -> Result<EventId, EventError> {
+        // Envelope-schema gate: reject a stamped-but-unknown envelope version
+        // (e.g. a newer peer's) distinctly from a corrupt/tampered event.
+        event
+            .schema_version
+            .check_supported(Event::MIN_SCHEMA_VERSION, Event::SCHEMA_VERSION)
+            .map_err(EventError::UnsupportedSchemaVersion)?;
+
         let id = event.content.id();
 
         // Dedup: an already-held event is idempotent (re-broadcast is a no-op).
@@ -568,7 +625,7 @@ mod tests {
             payload: b"seq2".to_vec(),
         };
         let signature = Signature::sign(&alice, &content);
-        let gapped = Event { content, signature };
+        let gapped = Event::stamped(content, signature);
 
         assert_eq!(log.ingest(gapped), Err(EventError::GapOrBrokenPrev));
         assert_eq!(log.len(), 1, "a gapped event must not be admitted");
@@ -584,10 +641,7 @@ mod tests {
         };
         let sig2 = Signature::sign(&alice, &c2);
         assert!(log
-            .ingest(Event {
-                content: c2,
-                signature: sig2
-            })
+            .ingest(Event::stamped(c2, sig2))
             .is_ok());
     }
 
@@ -635,7 +689,7 @@ mod tests {
         };
         let signature = Signature::sign(&alice, &content);
         assert_eq!(
-            log.ingest(Event { content, signature }),
+            log.ingest(Event::stamped(content, signature)),
             Err(EventError::DanglingParent)
         );
 
@@ -651,7 +705,7 @@ mod tests {
         };
         let signature = Signature::sign(&alice, &content);
         assert_eq!(
-            log.ingest(Event { content, signature }),
+            log.ingest(Event::stamped(content, signature)),
             Err(EventError::DanglingParent)
         );
     }
@@ -715,6 +769,46 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Event-envelope version stamp: a locally-authored event carries the
+    /// current schema version, and an envelope stamped with an unknown FUTURE
+    /// version is refused by ingest — distinctly from a tamper/parse failure —
+    /// while the CID of the wrapped content is unchanged by the envelope stamp.
+    #[test]
+    fn unknown_future_envelope_version_is_rejected_distinctly() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+        let g = log.append(&alice, b"seq0".to_vec());
+        // The locally-authored event is stamped with the current version.
+        assert_eq!(log.get(&g).unwrap().schema_version(), Event::SCHEMA_VERSION);
+
+        // Author a valid seq-1 event, then re-stamp its envelope to a future
+        // version. Its content (and thus its CID) is untouched.
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 1,
+            prev: Some(g.clone()),
+            parents: BTreeSet::new(),
+            payload: b"seq1".to_vec(),
+        };
+        let signature = Signature::sign(&alice, &content);
+        let expected_id = content.id();
+        let mut future = Event::stamped(content, signature);
+        future.schema_version = pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1);
+
+        // The envelope stamp did not perturb the content address.
+        assert_eq!(future.id(), expected_id, "envelope stamp must not change CID");
+        // The signature still verifies (the stamp is outside the signed content).
+        assert!(future.is_authentic());
+
+        // Ingest refuses it as an unsupported version, NOT as tamper/gap.
+        match log.ingest(future) {
+            Err(EventError::UnsupportedSchemaVersion(
+                pillar_crypto::VersionError::Unsupported { found, .. },
+            )) => assert_eq!(found, pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1)),
+            other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
         }
     }
 }

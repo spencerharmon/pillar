@@ -197,6 +197,41 @@ fn content_address(parts: &[&str]) -> Cid {
     Cid(format!("trust:{}", hex(addr.as_bytes())))
 }
 
+/// The current, explicit schema version of the trust-artifact / attestation
+/// surface — the one wire/storage shape all four artifact types
+/// ([`Certify`]/[`Trust`]/[`Attest`]/[`Revoke`]) share. Per ROI P1
+/// "Versioning, compatibility & safe rollout", this stamp is
+/// independently-incrementable from every other surface's version and is
+/// folded into each artifact's content address (and therefore its signed
+/// material), so a version bump changes every affected [`Cid`] and is covered
+/// by the signature. Bump this (and, when a floor retires, [`MIN_ARTIFACT_SCHEMA_VERSION`])
+/// when the artifact field layout changes.
+pub const ARTIFACT_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+/// The lowest trust-artifact schema version THIS build still interprets. A
+/// stamp below this floor (a retired version) or above [`ARTIFACT_SCHEMA_VERSION`]
+/// (a stamped-but-unknown FUTURE version) is rejected distinctly via
+/// [`check_artifact_schema_version`] — a [`pillar_crypto::VersionError::Unsupported`],
+/// never a [`pillar_crypto::VersionError::Malformed`].
+pub const MIN_ARTIFACT_SCHEMA_VERSION: pillar_crypto::SurfaceVersion =
+    pillar_crypto::SurfaceVersion(1);
+
+/// Validate an ARBITRARY claimed trust-artifact schema version against the
+/// range `[MIN_ARTIFACT_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION]` this build
+/// supports. A version outside the window — most importantly one NEWER than
+/// [`ARTIFACT_SCHEMA_VERSION`] — is a [`pillar_crypto::VersionError::Unsupported`],
+/// reported distinctly from a parse error so the later compatibility layer can
+/// treat a newer peer as negotiable rather than as corruption.
+///
+/// # Errors
+/// [`pillar_crypto::VersionError::Unsupported`] if `v` is below the floor or
+/// above the current version.
+pub fn check_artifact_schema_version(
+    v: pillar_crypto::SurfaceVersion,
+) -> Result<(), pillar_crypto::VersionError> {
+    v.check_supported(MIN_ARTIFACT_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION)
+}
+
 /// Lowercase hex rendering of raw bytes (for a stable, readable [`Cid`]).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -285,7 +320,12 @@ impl Certify {
     /// This artifact's content address.
     #[must_use]
     pub fn cid(&self) -> Cid {
-        content_address(&["certify", self.identity.0.as_str(), self.subkey.0.as_str()])
+        content_address(&[
+            "certify",
+            ARTIFACT_SCHEMA_VERSION.0.to_string().as_str(),
+            self.identity.0.as_str(),
+            self.subkey.0.as_str(),
+        ])
     }
 
     /// The canonical bytes this artifact's signature covers — its content
@@ -296,12 +336,32 @@ impl Certify {
         self.cid().0.into_bytes()
     }
 
+    /// The trust-artifact schema version this artifact is stamped at.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        ARTIFACT_SCHEMA_VERSION
+    }
+
+    /// Validate this artifact's [`schema_version`](Certify::schema_version)
+    /// against the range this build supports.
+    ///
+    /// # Errors
+    /// [`pillar_crypto::VersionError::Unsupported`] if the stamp is out of range.
+    pub fn check_schema_version(&self) -> Result<(), pillar_crypto::VersionError> {
+        check_artifact_schema_version(self.schema_version())
+    }
+
     /// Produce a real, signed `Certify` from `identity` over its own fields.
     #[must_use]
     pub fn signed(identity: impl Into<NodeId>, subkey: impl Into<NodeId>) -> Self {
         let identity = identity.into();
         let subkey = subkey.into();
-        let msg = content_address(&["certify", identity.0.as_str(), subkey.0.as_str()])
+        let msg = content_address(&[
+            "certify",
+            ARTIFACT_SCHEMA_VERSION.0.to_string().as_str(),
+            identity.0.as_str(),
+            subkey.0.as_str(),
+        ])
             .0
             .into_bytes();
         Certify {
@@ -332,6 +392,7 @@ impl Trust {
     pub fn cid(&self) -> Cid {
         content_address(&[
             "trust",
+            ARTIFACT_SCHEMA_VERSION.0.to_string().as_str(),
             self.truster.0.as_str(),
             self.trustee.0.as_str(),
             self.depth.to_string().as_str(),
@@ -345,6 +406,21 @@ impl Trust {
         self.cid().0.into_bytes()
     }
 
+    /// The trust-artifact schema version this artifact is stamped at.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        ARTIFACT_SCHEMA_VERSION
+    }
+
+    /// Validate this artifact's [`schema_version`](Trust::schema_version)
+    /// against the range this build supports.
+    ///
+    /// # Errors
+    /// [`pillar_crypto::VersionError::Unsupported`] if the stamp is out of range.
+    pub fn check_schema_version(&self) -> Result<(), pillar_crypto::VersionError> {
+        check_artifact_schema_version(self.schema_version())
+    }
+
     /// Produce a real, signed `Trust` from `truster` over its own fields.
     #[must_use]
     pub fn signed(
@@ -356,6 +432,7 @@ impl Trust {
         let trustee = trustee.into();
         let msg = content_address(&[
             "trust",
+            ARTIFACT_SCHEMA_VERSION.0.to_string().as_str(),
             truster.0.as_str(),
             trustee.0.as_str(),
             depth.to_string().as_str(),
@@ -406,6 +483,7 @@ impl Attest {
     pub fn cid(&self) -> Cid {
         content_address(&[
             "attest",
+            ARTIFACT_SCHEMA_VERSION.0.to_string().as_str(),
             self.issuer.0.as_str(),
             self.capacity.tag().as_str(),
             self.authority.as_ref().map(|c| c.0.as_str()).unwrap_or(""),
@@ -429,6 +507,21 @@ impl Attest {
     #[must_use]
     pub fn signed_message(&self) -> Vec<u8> {
         self.cid().0.into_bytes()
+    }
+
+    /// The trust-artifact schema version this artifact is stamped at.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        ARTIFACT_SCHEMA_VERSION
+    }
+
+    /// Validate this artifact's [`schema_version`](Attest::schema_version)
+    /// against the range this build supports.
+    ///
+    /// # Errors
+    /// [`pillar_crypto::VersionError::Unsupported`] if the stamp is out of range.
+    pub fn check_schema_version(&self) -> Result<(), pillar_crypto::VersionError> {
+        check_artifact_schema_version(self.schema_version())
     }
 
     /// Re-sign this attest as its declared `issuer`, producing a real ed25519
@@ -461,8 +554,25 @@ impl Revoke {
     pub fn signed_message(target: &Cid) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(b"pillar-trust-artifact-revoke-v1:");
+        m.extend_from_slice(ARTIFACT_SCHEMA_VERSION.0.to_string().as_bytes());
+        m.push(b':');
         m.extend_from_slice(target.0.as_bytes());
         m
+    }
+
+    /// The trust-artifact schema version this revocation is stamped at.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        ARTIFACT_SCHEMA_VERSION
+    }
+
+    /// Validate this revocation's [`schema_version`](Revoke::schema_version)
+    /// against the range this build supports.
+    ///
+    /// # Errors
+    /// [`pillar_crypto::VersionError::Unsupported`] if the stamp is out of range.
+    pub fn check_schema_version(&self) -> Result<(), pillar_crypto::VersionError> {
+        check_artifact_schema_version(self.schema_version())
     }
 
     /// Produce a real, signed `Revoke` of `target` by `signer`.
@@ -1651,8 +1761,85 @@ mod tests {
     #[test]
     fn length_prefixing_prevents_field_concatenation_collisions() {
         // Without length prefixes, ("ab","c") and ("a","bc") would collide.
-        let x = content_address(&["ab", "c"]);
+                let x = content_address(&["ab", "c"]);
         let y = content_address(&["a", "bc"]);
         assert_ne!(x, y, "ambiguous concatenation must not collide");
+    }
+
+    // --- explicit schema-version stamp: content-addressed & signature-covered
+
+    #[test]
+    fn the_current_artifact_schema_version_is_supported() {
+        // The stamp this build bakes into every artifact is, by construction,
+        // in the supported window.
+        assert_eq!(check_artifact_schema_version(ARTIFACT_SCHEMA_VERSION), Ok(()));
+    }
+
+    #[test]
+    fn a_stamped_but_unknown_future_schema_version_is_rejected_distinctly() {
+        // A cleanly-parsed but FUTURE version is Unsupported — never Malformed —
+        // so the later compatibility layer can treat a newer peer as negotiable
+        // rather than as corruption.
+        let future = pillar_crypto::SurfaceVersion(ARTIFACT_SCHEMA_VERSION.0 + 1);
+        let err = check_artifact_schema_version(future).unwrap_err();
+        assert_eq!(
+            err,
+            pillar_crypto::VersionError::Unsupported {
+                found: future,
+                min: MIN_ARTIFACT_SCHEMA_VERSION,
+                max: ARTIFACT_SCHEMA_VERSION,
+            }
+        );
+        assert_ne!(err, pillar_crypto::VersionError::Malformed);
+    }
+
+    #[test]
+    fn every_artifact_still_verifies_after_the_version_was_folded_into_signed_material() {
+        // The schema version is now part of each artifact's content address and
+        // therefore its signed message; a genuinely-signed artifact must still
+        // verify against its own signed_message()/cid.
+        let certify = signed_certify(Certify {
+            identity: n("alice"),
+            subkey: n("alice-sub"),
+            sig: placeholder_sig(),
+        });
+        assert!(certify
+            .sig
+            .verifies_as(&certify.identity, &certify.signed_message()));
+        assert_eq!(certify.schema_version(), ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(certify.check_schema_version(), Ok(()));
+
+        let trust = signed_trust(Trust {
+            truster: n("alice"),
+            trustee: n("bob"),
+            depth: 2,
+            sig: placeholder_sig(),
+        });
+        assert!(trust.sig.verifies_as(&trust.truster, &trust.signed_message()));
+        assert_eq!(trust.schema_version(), ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(trust.check_schema_version(), Ok(()));
+
+        let attest = (Attest {
+            issuer: n("owner"),
+            capacity: role("operator", "cell-b"),
+            authority: None,
+            subject: n("alice"),
+            predicate: Predicate::new("stream:append", "cell-b/*"),
+            scope: "cell-b".to_owned(),
+            epoch: 0,
+            sig: placeholder_sig(),
+        })
+        .signed_by_issuer();
+        assert!(attest.sig.verifies_as(&attest.issuer, &attest.signed_message()));
+        assert_eq!(attest.schema_version(), ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(attest.check_schema_version(), Ok(()));
+
+        let revoke = signed_revoke(attest.cid(), n("owner"));
+        assert!(revoke.sig.verifies_as(
+            &n("owner"),
+            &Revoke::signed_message(&attest.cid())
+        ));
+        assert_eq!(revoke.schema_version(), ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(revoke.check_schema_version(), Ok(()));
     }
 }

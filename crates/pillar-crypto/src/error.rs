@@ -33,6 +33,12 @@ pub enum CryptoError {
     /// A custody or hardware backend (TPM, passkey authenticator, …) reported an
     /// error.
     Backend(String),
+    /// A sealed-artifact envelope carried a version stamp this build does not
+    /// understand (an unknown FUTURE envelope format, or a retired past one).
+    /// Distinct from a malformed/truncated envelope ([`CryptoError::InvalidLength`])
+    /// and from a decryption failure: the envelope parsed to a legible version
+    /// that simply falls outside the supported window.
+    UnsupportedEnvelopeVersion(crate::version::VersionError),
 }
 
 impl fmt::Display for CryptoError {
@@ -50,6 +56,9 @@ impl fmt::Display for CryptoError {
             }
             CryptoError::UnsupportedCustody(k) => write!(f, "unsupported custody backend: {k:?}"),
             CryptoError::Backend(msg) => write!(f, "custody/hardware backend error: {msg}"),
+            CryptoError::UnsupportedEnvelopeVersion(e) => {
+                write!(f, "unsupported sealed-envelope version: {e}")
+            }
         }
     }
 }
