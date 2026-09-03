@@ -672,11 +672,7 @@ mod tests {
             sig: Sig {
                 signer: KeyId::from("primary:0"),
                 issuer_public: forger.public().clone(),
-                sig: sign(
-                    &forger.secret,
-                    &rotation_message(&KeyId::from("primary:1")),
-                )
-                .unwrap(),
+                sig: sign(&forger.secret, &rotation_message(&KeyId::from("primary:1"))).unwrap(),
             },
         };
         let err = log.rotate(forged).unwrap_err();

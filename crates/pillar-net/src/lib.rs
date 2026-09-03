@@ -669,7 +669,10 @@ pub mod overlay {
                     "mesh peer record's leading version line was malformed"
                 }
                 DecodeError::UnsupportedMessageVersion(e) => {
-                    return write!(f, "mesh peer record carried an unsupported message version: {e}")
+                    return write!(
+                        f,
+                        "mesh peer record carried an unsupported message version: {e}"
+                    )
                 }
                 DecodeError::InvalidPeerId => {
                     "mesh peer record's first line was not a valid PeerId"
@@ -1098,7 +1101,11 @@ mod tests {
         let record = MeshPeerRecord::new(peer_id, vec![addr]);
 
         let encoded = record.encode();
-        let first_line = std::str::from_utf8(&encoded).unwrap().lines().next().unwrap();
+        let first_line = std::str::from_utf8(&encoded)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
         assert_eq!(
             first_line,
             MESSAGE_VERSION.to_string(),

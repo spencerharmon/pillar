@@ -101,6 +101,21 @@ const ENV_WEB_PORT: &str = "PILLAR_WEB_PORT";
 /// port is given.
 pub const DEFAULT_WEB_PORT: u16 = 8642;
 
+/// `--health-bind` / `PILLAR_HEALTH_BIND`: the address the readiness/liveness
+/// health server listens on. Unlike the web UI, this defaults to ENABLED on
+/// all interfaces (`0.0.0.0`) so a k8s `readinessProbe` can always reach it —
+/// the whole point of the probe is that the orchestrator gates traffic on the
+/// node's REAL readiness. Set it to a specific IP to narrow the bind.
+const ENV_HEALTH_BIND: &str = "PILLAR_HEALTH_BIND";
+/// `--health-port` / `PILLAR_HEALTH_PORT`: the port the health server listens
+/// on. Defaults to [`crate::health::DEFAULT_HEALTH_PORT`].
+const ENV_HEALTH_PORT: &str = "PILLAR_HEALTH_PORT";
+
+/// The default address the health server binds when unconfigured: all
+/// interfaces, so the readinessProbe (from the kubelet, off-loopback) reaches
+/// it. Overridable via `--health-bind`/`PILLAR_HEALTH_BIND`.
+pub const DEFAULT_HEALTH_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
 /// Integration-rig-only: the value to publish once to the event-log
 /// gossipsub topic after boot settles. Unset in every production boot.
 const ENV_TEST_PUBLISH: &str = "PILLAR_TEST_PUBLISH";
@@ -148,6 +163,14 @@ pub struct NodeConfig {
     /// The port the web UI listens on; only consulted when `web_bind` is
     /// `Some`.
     pub web_port: u16,
+    /// The address the readiness/liveness health server binds. `None` here
+    /// means "use [`DEFAULT_HEALTH_BIND`]" — the health server is ENABLED by
+    /// default (unlike the web UI) because the k8s readinessProbe must always
+    /// be able to reach it. Present so a deployment can narrow the bind.
+    pub health_bind: Option<IpAddr>,
+    /// The port the health server listens on. `None` means
+    /// [`crate::health::DEFAULT_HEALTH_PORT`].
+    pub health_port: Option<u16>,
 }
 
 /// A failure resolving a [`NodeConfig`] from flags/env.
@@ -180,6 +203,22 @@ pub enum ConfigError {
         /// The parser's reason.
         reason: String,
     },
+    /// A `--health-bind` / `PILLAR_HEALTH_BIND` value did not parse as an IP
+    /// address.
+    BadHealthBind {
+        /// The offending value.
+        value: String,
+        /// The parser's reason.
+        reason: String,
+    },
+    /// A `--health-port` / `PILLAR_HEALTH_PORT` value did not parse as a port
+    /// number.
+    BadHealthPort {
+        /// The offending value.
+        value: String,
+        /// The parser's reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -196,10 +235,15 @@ impl std::fmt::Display for ConfigError {
             ConfigError::BadWebPort { value, reason } => {
                 write!(f, "invalid --web-port value `{value}`: {reason}")
             }
+            ConfigError::BadHealthBind { value, reason } => {
+                write!(f, "invalid --health-bind value `{value}`: {reason}")
+            }
+            ConfigError::BadHealthPort { value, reason } => {
+                write!(f, "invalid --health-port value `{value}`: {reason}")
+            }
         }
     }
 }
-
 impl std::error::Error for ConfigError {}
 
 impl NodeConfig {
@@ -226,6 +270,8 @@ impl NodeConfig {
         let mut network_root: Option<String> = None;
         let mut web_bind: Option<IpAddr> = None;
         let mut web_port: Option<u16> = None;
+        let mut health_bind: Option<IpAddr> = None;
+        let mut health_port: Option<u16> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -280,6 +326,20 @@ impl NodeConfig {
                         .get(i + 1)
                         .ok_or(ConfigError::MissingValue("--web-port"))?;
                     web_port = Some(parse_web_port(v)?);
+                    i += 2;
+                }
+                "--health-bind" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--health-bind"))?;
+                    health_bind = Some(parse_health_bind(v)?);
+                    i += 2;
+                }
+                "--health-port" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--health-port"))?;
+                    health_port = Some(parse_health_port(v)?);
                     i += 2;
                 }
                 other => return Err(ConfigError::Unknown(other.to_owned())),
@@ -352,6 +412,21 @@ impl NodeConfig {
             }
         }
 
+        // health_bind/health_port: explicit flag wins; else env; else the
+        // built-in default (enabled on all interfaces). Left as `None` here
+        // and resolved to the default at serve time so the struct records
+        // only an explicit override.
+        if health_bind.is_none() {
+            if let Some(v) = env(ENV_HEALTH_BIND) {
+                health_bind = Some(parse_health_bind(&v)?);
+            }
+        }
+        if health_port.is_none() {
+            if let Some(v) = env(ENV_HEALTH_PORT) {
+                health_port = Some(parse_health_port(&v)?);
+            }
+        }
+
         Ok(NodeConfig {
             identity_key,
             data_dir,
@@ -361,6 +436,8 @@ impl NodeConfig {
             network_root,
             web_bind,
             web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
+            health_bind,
+            health_port,
         })
     }
 
@@ -393,6 +470,24 @@ fn parse_web_port(value: &str) -> Result<u16, ConfigError> {
         value: value.to_owned(),
         reason: e.to_string(),
     })
+}
+
+fn parse_health_bind(value: &str) -> Result<IpAddr, ConfigError> {
+    value
+        .parse::<IpAddr>()
+        .map_err(|e| ConfigError::BadHealthBind {
+            value: value.to_owned(),
+            reason: e.to_string(),
+        })
+}
+
+fn parse_health_port(value: &str) -> Result<u16, ConfigError> {
+    value
+        .parse::<u16>()
+        .map_err(|e| ConfigError::BadHealthPort {
+            value: value.to_owned(),
+            reason: e.to_string(),
+        })
 }
 
 /// A failure booting the peer.
@@ -579,6 +674,45 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         ops = stream.stream().log().len(),
         "pillar streaming DB opened (durable, content-addressed)"
     );
+
+    // Readiness: at this point the identity keypair is loaded and the durable
+    // streaming DB has been opened and its materialized view rehydrated from
+    // the persisted op store (zero ops on a first boot IS the correct
+    // rehydrated state). The WoT root self-verifies iff this node's trust
+    // anchor vouches for itself — a fresh anchor rooted at this peer does.
+    // These three facts are exactly what the readinessProbe gates on; a bound
+    // port alone is NOT sufficient. We publish a live readiness snapshot and
+    // serve `GET /readyz` (200 ready / 503 with the failing condition) so a
+    // node that is not truly ready keeps its pod out of the Service and halts
+    // a rolling upgrade visibly instead of silently serving broken.
+    let wot_anchor = pillar_wot_authority::WotAuthority::new(
+        pillar_core::NodeId::from(format!("{peer_id}").as_str()),
+        16,
+    );
+    let readiness = crate::health::NodeReadiness {
+        identity_loaded: true,
+        views_rehydrated: true,
+        wot_root_verified: crate::health::wot_root_self_verifies(&wot_anchor),
+    };
+    let health_bind = config.health_bind.unwrap_or(DEFAULT_HEALTH_BIND);
+    let health_port = config
+        .health_port
+        .unwrap_or(crate::health::DEFAULT_HEALTH_PORT);
+    match crate::health::bind(health_bind, health_port) {
+        Ok(listener) => {
+            let bound = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| format!("{health_bind}:{health_port}"));
+            tracing::info!(bound = %bound, ready = readiness.is_ready(), "pillar readiness/liveness probe listening");
+            std::thread::spawn(move || {
+                crate::health::serve(listener, move || readiness);
+            });
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %health_bind, port = health_port, "pillar health probe failed to bind — readiness cannot be reported");
+        }
+    }
 
     // Transport: bring up the libp2p event swarm and subscribe to the log
     // topic. The configured network root (`None` == the public default)
@@ -1072,5 +1206,59 @@ mod tests {
     fn missing_network_root_value_errors() {
         let err = NodeConfig::from_args_env(&[s("--network-root")], no_env).unwrap_err();
         assert_eq!(err, ConfigError::MissingValue("--network-root"));
+    }
+
+    #[test]
+    fn health_bind_defaults_unset_meaning_the_all_interfaces_default() {
+        let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
+        // Unset in the struct → resolved to DEFAULT_HEALTH_BIND at serve
+        // time (enabled by default so the readinessProbe can reach it).
+        assert_eq!(cfg.health_bind, None);
+        assert_eq!(cfg.health_port, None);
+    }
+
+    #[test]
+    fn health_bind_and_port_flags_configure_the_probe() {
+        let args = vec![
+            s("--health-bind"),
+            s("127.0.0.1"),
+            s("--health-port"),
+            s("9100"),
+        ];
+        let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
+        assert_eq!(
+            cfg.health_bind,
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(cfg.health_port, Some(9100));
+    }
+
+    #[test]
+    fn health_env_fills_when_flags_absent() {
+        let env = |k: &str| match k {
+            "PILLAR_HEALTH_BIND" => Some(s("0.0.0.0")),
+            "PILLAR_HEALTH_PORT" => Some(s("9200")),
+            _ => None,
+        };
+        let cfg = NodeConfig::from_args_env(&[], env).unwrap();
+        assert_eq!(
+            cfg.health_bind,
+            Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(cfg.health_port, Some(9200));
+    }
+
+    #[test]
+    fn bad_health_bind_value_errors() {
+        let args = vec![s("--health-bind"), s("nope")];
+        let err = NodeConfig::from_args_env(&args, no_env).unwrap_err();
+        assert!(matches!(err, ConfigError::BadHealthBind { .. }));
+    }
+
+    #[test]
+    fn bad_health_port_value_errors() {
+        let args = vec![s("--health-port"), s("99999")];
+        let err = NodeConfig::from_args_env(&args, no_env).unwrap_err();
+        assert!(matches!(err, ConfigError::BadHealthPort { .. }));
     }
 }

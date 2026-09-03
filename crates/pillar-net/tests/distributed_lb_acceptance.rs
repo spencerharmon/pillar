@@ -34,9 +34,7 @@ use pillar_ipam::{Pool, TopologyScopedIpam};
 use pillar_manifest::ingress::{
     derive_routing_table, Backend, Frontend, Listener, Route, RouteKind, RouteStatus,
 };
-use pillar_net::pillar_udp::{
-    reply_node_set, Cid as UdpCid, DedupProcessor, ForwardGate,
-};
+use pillar_net::pillar_udp::{reply_node_set, Cid as UdpCid, DedupProcessor, ForwardGate};
 use pillar_streamdb::{ContentStore, IpfsPersistentStream, SignedSegment, Visibility};
 use pillar_topology::{Label, TierHierarchy, Topology};
 use pillar_trust_artifacts::{Attest, Capacity, Predicate, Sig, TrustStore};
@@ -110,7 +108,11 @@ fn dispersed_reply_set_agrees_bit_for_bit_across_independently_computing_nodes()
         set_a, set_b,
         "independently-computed reply-node sets over the same topology/membership view agree"
     );
-    assert_eq!(set_a.len(), 2, "one address per distinct failure domain (west, east)");
+    assert_eq!(
+        set_a.len(),
+        2,
+        "one address per distinct failure domain (west, east)"
+    );
     assert!(set_a.iter().any(|a| a.to_string().starts_with("10.1")));
     assert!(set_a.iter().any(|a| a.to_string().starts_with("10.2")));
 }
@@ -186,7 +188,10 @@ fn exactly_once_processing_with_bounded_redundancy_including_forwarded_pickup() 
         global_effects, 1,
         "exactly one application-level effect across every redundant + forwarded copy"
     );
-    assert_eq!(effects_applied, 1, "the first redundant delivery is admitted");
+    assert_eq!(
+        effects_applied, 1,
+        "the first redundant delivery is admitted"
+    );
     assert!(
         copies_delivered <= DECLARED_ALLOWANCE,
         "total delivered copies ({copies_delivered}) stay within the declared redundancy allowance ({DECLARED_ALLOWANCE})"
@@ -211,7 +216,10 @@ fn forwarding_terminates_within_the_bounded_ttl_never_amplifying_past_it() {
             None => break,
         }
     }
-    assert_eq!(hops, 3, "forwarding terminates exactly at the declared TTL bound");
+    assert_eq!(
+        hops, 3,
+        "forwarding terminates exactly at the declared TTL bound"
+    );
 }
 
 // --- (4) node-restart survival: routing + trust state rehydrates from IPFS ---
@@ -221,7 +229,8 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
     use pillar_crypto::sign::signing_keypair_from_seed;
     use pillar_crypto::Seed;
 
-    let seed = |label: &str| Seed::from_bytes(format!("distributed-lb-acceptance::{label}").into_bytes());
+    let seed =
+        |label: &str| Seed::from_bytes(format!("distributed-lb-acceptance::{label}").into_bytes());
     let (owner_pk, owner_sk) = signing_keypair_from_seed(&seed("lb-owner")).expect("keygen");
 
     // Node A: the continuously-running node backing the LB's streaming-DB
@@ -245,8 +254,13 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
         protocol: RouteKind::PillarNative,
         tls: None,
     });
-    let route = Route::new("lb-route", app.clone(), "lb-frontend", RouteKind::PillarNative)
-        .with_backend(Backend::new("backend-1"));
+    let route = Route::new(
+        "lb-route",
+        app.clone(),
+        "lb-frontend",
+        RouteKind::PillarNative,
+    )
+    .with_backend(Backend::new("backend-1"));
 
     let table_before = derive_routing_table(&[frontend.clone()], &[route.clone()], &trust_store);
     assert!(
@@ -258,7 +272,10 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
     // table is derived from the streaming-DB view whose durability rides
     // IPFS" property, exercised end to end).
     let op_id = node_a
-        .append(b"lb-route attached to lb-frontend".to_vec(), SideEffect::Exclusive)
+        .append(
+            b"lb-route attached to lb-frontend".to_vec(),
+            SideEffect::Exclusive,
+        )
         .expect("durable append of the routing decision");
 
     let root_before = node_a.stream().log().root();
@@ -293,7 +310,12 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
     // durable grant and re-deriving the routing table on the RESTARTED
     // node's view reconfirms the identical Attached status.
     let mut trust_store_after_restart = TrustStore::new(genesis.clone());
-    grant_attach(&mut trust_store_after_restart, &genesis, &app, "lb-frontend");
+    grant_attach(
+        &mut trust_store_after_restart,
+        &genesis,
+        &app,
+        "lb-frontend",
+    );
     let table_after = derive_routing_table(&[frontend], &[route], &trust_store_after_restart);
     assert_eq!(
         table_after.status_of("lb-route"),
@@ -325,8 +347,15 @@ fn distributed_lb_acceptance_end_to_end() {
     let request_cid = UdpCid::of(b"end-to-end distributed LB request");
     let reply_set_1 = reply_node_set(&ipam_node_1, &request_cid, 3, false, None);
     let reply_set_2 = reply_node_set(&ipam_node_2, &request_cid, 3, false, None);
-    assert_eq!(reply_set_1, reply_set_2, "reply-set selection agrees across nodes");
-    assert_eq!(reply_set_1.len(), 2, "dispersed across both failure domains");
+    assert_eq!(
+        reply_set_1, reply_set_2,
+        "reply-set selection agrees across nodes"
+    );
+    assert_eq!(
+        reply_set_1.len(),
+        2,
+        "dispersed across both failure domains"
+    );
 
     // --- WoT-gated Route attachment over a REAL (non-placeholder) attest ---
     let genesis = n("e2e-genesis");
@@ -336,9 +365,13 @@ fn distributed_lb_acceptance_end_to_end() {
     let unauthorized_app = n("e2e-intruder");
 
     let frontend = Frontend::new("e2e-frontend", "10.0.0.5");
-    let authorized_route =
-        Route::new("e2e-route", app.clone(), "e2e-frontend", RouteKind::PillarNative)
-            .with_backend(Backend::new("e2e-backend"));
+    let authorized_route = Route::new(
+        "e2e-route",
+        app.clone(),
+        "e2e-frontend",
+        RouteKind::PillarNative,
+    )
+    .with_backend(Backend::new("e2e-backend"));
     let unauthorized_route = Route::new(
         "e2e-route-intruder",
         unauthorized_app,
@@ -373,18 +406,31 @@ fn distributed_lb_acceptance_end_to_end() {
     if forward_gate.forward(&request_cid, 4).is_some() && effect_ledger.process(&request_cid) {
         effects += 1;
     }
-    assert_eq!(effects, 1, "exactly one effect across dispersed + forwarded delivery");
-    assert!(total_copies <= ALLOWANCE, "bounded redundancy respected end to end");
+    assert_eq!(
+        effects, 1,
+        "exactly one effect across dispersed + forwarded delivery"
+    );
+    assert!(
+        total_copies <= ALLOWANCE,
+        "bounded redundancy respected end to end"
+    );
 
     // --- durable persistence: the accepted routing decision survives a restart ---
     let seed = |label: &str| Seed::from_bytes(format!("e2e::{label}").into_bytes());
     let (owner_pk, owner_sk) = signing_keypair_from_seed(&seed("owner")).expect("keygen");
     let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
     let op_id = node_a
-        .append(b"e2e-route attached to e2e-frontend".to_vec(), SideEffect::Exclusive)
+        .append(
+            b"e2e-route attached to e2e-frontend".to_vec(),
+            SideEffect::Exclusive,
+        )
         .expect("durable append");
     let root_before = node_a.stream().log().root();
-    let head = node_a.store().resolve_head(&owner_pk).cloned().expect("head published");
+    let head = node_a
+        .store()
+        .resolve_head(&owner_pk)
+        .cloned()
+        .expect("head published");
 
     let source = source_from(node_a.store());
     let node_b = IpfsPersistentStream::rehydrate(owner_pk, &head, &source)

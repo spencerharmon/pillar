@@ -60,10 +60,10 @@ pub use compat::{
     SurfaceNotDeclared,
 };
 pub use error::{CryptoError, Result};
-pub use version::{SurfaceVersion, VersionError};
 pub use principal::{PrincipalPublic, PrincipalSecret};
 pub use types::{
     AeadAlgorithm, CellId, Ciphertext, ContentId, CustodyKind, KdfParams, Password, Salt,
     SealedEnvelope, SealingPublicKey, SealingSecretKey, Seed, Signature, SigningPublicKey,
     SigningSecretKey, SymmetricKey,
 };
+pub use version::{SurfaceVersion, VersionError};

@@ -31,6 +31,7 @@
 
 pub mod bootstrap;
 pub mod cluster;
+pub mod health;
 pub mod identity_trust_cli;
 pub mod observability_ui;
 pub mod onboard;

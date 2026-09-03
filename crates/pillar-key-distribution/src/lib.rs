@@ -836,12 +836,9 @@ impl Escrow {
         let mut salt_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut salt_bytes);
         let salt = pillar_crypto::Salt::from_bytes(salt_bytes.to_vec());
-        let key = pillar_crypto::kdf::derive_key(
-            password,
-            &salt,
-            &pillar_crypto::KdfParams::default(),
-        )
-        .map_err(|e| KeyDistributionError::Crypto(e.to_string()))?;
+        let key =
+            pillar_crypto::kdf::derive_key(password, &salt, &pillar_crypto::KdfParams::default())
+                .map_err(|e| KeyDistributionError::Crypto(e.to_string()))?;
         let ciphertext = pillar_crypto::aead::seal_symmetric(&key, plaintext, ESCROW_AEAD_AAD)
             .map_err(|e| KeyDistributionError::Crypto(e.to_string()))?;
         self.envelope
@@ -894,9 +891,8 @@ impl Escrow {
             &pillar_crypto::KdfParams::default(),
         )
         .map_err(|e| KeyDistributionError::Crypto(e.to_string()))?;
-        let plaintext =
-            pillar_crypto::aead::open_symmetric(&key, &env.ciphertext, ESCROW_AEAD_AAD)
-                .map_err(|e| KeyDistributionError::Crypto(e.to_string()))?;
+        let plaintext = pillar_crypto::aead::open_symmetric(&key, &env.ciphertext, ESCROW_AEAD_AAD)
+            .map_err(|e| KeyDistributionError::Crypto(e.to_string()))?;
         self.decrypted.insert(artifact.clone());
         Ok(plaintext)
     }
@@ -1006,7 +1002,10 @@ pub mod crypto_seal {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             match self {
                 CryptoSealError::UnknownRecipientKey(n) => {
-                    write!(f, "no sealing public key registered for recipient node {n:?}")
+                    write!(
+                        f,
+                        "no sealing public key registered for recipient node {n:?}"
+                    )
                 }
                 CryptoSealError::Crypto(e) => write!(f, "crypto error: {e:?}"),
             }
@@ -1333,7 +1332,9 @@ mod tests {
         let mut escrow = Escrow::new();
         let artifact = Artifact::new(ArtifactId::from("op-key-1"), ArtifactKind::Operational);
         let secret = b"the operational private key bytes";
-        escrow.store(&artifact, b"correct password", secret).unwrap();
+        escrow
+            .store(&artifact, b"correct password", secret)
+            .unwrap();
         escrow.server_compromise();
 
         // The attacker has the envelope but not the password: no plaintext.
@@ -1349,7 +1350,10 @@ mod tests {
         let recovered = escrow
             .recover_plaintext(artifact.id(), b"correct password")
             .unwrap();
-        assert_eq!(recovered, secret, "recovery must return the exact plaintext");
+        assert_eq!(
+            recovered, secret,
+            "recovery must return the exact plaintext"
+        );
         assert!(escrow.is_decrypted(artifact.id()));
     }
 
@@ -1374,7 +1378,9 @@ mod tests {
     fn signing_requires_step_up_token_and_consumes_it_once() {
         let mut escrow = Escrow::new();
         let artifact = Artifact::new(ArtifactId::from("op-key-1"), ArtifactKind::Operational);
-        escrow.store(&artifact, b"pw", b"signing key material").unwrap();
+        escrow
+            .store(&artifact, b"pw", b"signing key material")
+            .unwrap();
 
         let mut token = StepUpToken::fresh();
         let recovered = escrow

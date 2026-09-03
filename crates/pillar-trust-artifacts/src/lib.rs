@@ -362,8 +362,8 @@ impl Certify {
             identity.0.as_str(),
             subkey.0.as_str(),
         ])
-            .0
-            .into_bytes();
+        .0
+        .into_bytes();
         Certify {
             sig: Sig::sign_as(identity.clone(), &msg),
             identity,
@@ -423,11 +423,7 @@ impl Trust {
 
     /// Produce a real, signed `Trust` from `truster` over its own fields.
     #[must_use]
-    pub fn signed(
-        truster: impl Into<NodeId>,
-        trustee: impl Into<NodeId>,
-        depth: u8,
-    ) -> Self {
+    pub fn signed(truster: impl Into<NodeId>, trustee: impl Into<NodeId>, depth: u8) -> Self {
         let truster = truster.into();
         let trustee = trustee.into();
         let msg = content_address(&[
@@ -1146,7 +1142,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let expected_cid = a.cid();
         let cid = store.issue_attest(a).expect("attest accepted");
         assert_eq!(cid, expected_cid);
@@ -1166,7 +1163,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(a).unwrap();
         let r = signed_revoke(cid.clone(), n("owner"));
         store.revoke(&r).expect("revoke accepted");
@@ -1198,7 +1196,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         assert_eq!(
             store.issue_attest(a),
             Err(TrustError::CapacityNotHeld { issuer: n("alice") })
@@ -1217,7 +1216,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let alice_cid = store.issue_attest(grant_to_alice).unwrap();
 
         // alice now holds the role capacity and can sub-delegate, pointing
@@ -1231,7 +1231,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let bob_cid = store.issue_attest(sub_grant).expect("alice holds capacity");
         let proof = store.verify(&bob_cid).expect("verifies to genesis");
         assert_eq!(proof.chain, vec![bob_cid, alice_cid]);
@@ -1249,7 +1250,8 @@ mod tests {
             scope: "global".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store
             .issue_attest(a)
             .expect("self capacity is unconditional");
@@ -1281,7 +1283,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid_a = a.cid();
         let b = (Attest {
             issuer: n("owner"),
@@ -1292,7 +1295,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         // Force b's cid to equal the authority pointer a expects, by
         // directly inserting into the map under that fabricated cid.
         let fabricated_cid = Cid("trust:self-cycle-b".to_owned());
@@ -1314,7 +1318,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         let proof = store.verify(&cid).unwrap();
         assert_eq!(proof.chain.len(), 1);
@@ -1338,7 +1343,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let alice_cid = store.issue_attest(grant_to_alice).unwrap();
         let sub_grant = (Attest {
             issuer: n("alice"),
@@ -1349,7 +1355,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let bob_cid = store.issue_attest(sub_grant).unwrap();
         assert!(store.verify(&bob_cid).is_ok());
 
@@ -1375,11 +1382,10 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
-        store
-            .revoke(&signed_revoke(cid, n("owner")))
-            .unwrap();
+        store.revoke(&signed_revoke(cid, n("owner"))).unwrap();
         assert_eq!(store.epoch(), 1);
 
         // Attempt to issue at the now-stale epoch 0.
@@ -1392,7 +1398,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         assert_eq!(
             store.issue_attest(stale),
             Err(TrustError::StaleEpoch {
@@ -1416,7 +1423,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
 
         store.admit_quota(&cid, 400).expect("within budget");
@@ -1444,7 +1452,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         assert_eq!(
             store.admit_quota(&cid, 1),
@@ -1464,7 +1473,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
         store.admit_quota(&cid, 100).unwrap();
         store
@@ -1490,7 +1500,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         store.issue_attest(grant).unwrap();
 
         let grants = as_explicit_grants(&store);
@@ -1512,11 +1523,10 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(grant).unwrap();
-        store
-            .revoke(&signed_revoke(cid, n("owner")))
-            .unwrap();
+        store.revoke(&signed_revoke(cid, n("owner"))).unwrap();
         assert!(as_explicit_grants(&store).is_empty());
     }
 
@@ -1532,7 +1542,8 @@ mod tests {
             scope: "global".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         store.issue_attest(a).unwrap();
         assert!(as_explicit_grants(&store).is_empty());
     }
@@ -1551,7 +1562,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let previewed = store.decide_attest(&a).expect("owner may issue");
         assert_eq!(previewed, a.cid());
         // Nothing was recorded by the preview.
@@ -1578,7 +1590,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         assert_eq!(
             store.decide_attest(&a),
             Err(TrustError::CapacityNotHeld {
@@ -1610,7 +1623,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let grant_cid = store.issue_attest(grant).unwrap();
         // ...which alice then EXERCISES to attest bob may stream:append.
         let exercised = (Attest {
@@ -1622,7 +1636,8 @@ mod tests {
             scope: "cell-b".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(exercised).unwrap();
         let doc = store.describe(&cid).expect("stored artifact describes");
         assert!(doc.contains("Signer:      alice"));
@@ -1650,7 +1665,8 @@ mod tests {
             scope: "global".to_owned(),
             epoch: 0,
             sig: placeholder_sig(),
-        }).signed_by_issuer();
+        })
+        .signed_by_issuer();
         let cid = store.issue_attest(a).unwrap();
         let doc = store.describe(&cid).unwrap();
         assert!(doc.contains("Signer:      alice"));
@@ -1708,13 +1724,17 @@ mod tests {
             sig: placeholder_sig(),
         })
         .signed_by_issuer();
-        assert!(honest.sig.verifies_as(&n("owner"), &honest.signed_message()));
+        assert!(honest
+            .sig
+            .verifies_as(&n("owner"), &honest.signed_message()));
 
         let mut tampered = honest.clone();
         tampered.subject = n("mallory");
         // The signature was over the ORIGINAL subject; against the tampered
         // message it fails.
-        assert!(!tampered.sig.verifies_as(&n("owner"), &tampered.signed_message()));
+        assert!(!tampered
+            .sig
+            .verifies_as(&n("owner"), &tampered.signed_message()));
         let _ = &store;
     }
 
@@ -1761,7 +1781,7 @@ mod tests {
     #[test]
     fn length_prefixing_prevents_field_concatenation_collisions() {
         // Without length prefixes, ("ab","c") and ("a","bc") would collide.
-                let x = content_address(&["ab", "c"]);
+        let x = content_address(&["ab", "c"]);
         let y = content_address(&["a", "bc"]);
         assert_ne!(x, y, "ambiguous concatenation must not collide");
     }
@@ -1772,7 +1792,10 @@ mod tests {
     fn the_current_artifact_schema_version_is_supported() {
         // The stamp this build bakes into every artifact is, by construction,
         // in the supported window.
-        assert_eq!(check_artifact_schema_version(ARTIFACT_SCHEMA_VERSION), Ok(()));
+        assert_eq!(
+            check_artifact_schema_version(ARTIFACT_SCHEMA_VERSION),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1815,7 +1838,9 @@ mod tests {
             depth: 2,
             sig: placeholder_sig(),
         });
-        assert!(trust.sig.verifies_as(&trust.truster, &trust.signed_message()));
+        assert!(trust
+            .sig
+            .verifies_as(&trust.truster, &trust.signed_message()));
         assert_eq!(trust.schema_version(), ARTIFACT_SCHEMA_VERSION);
         assert_eq!(trust.check_schema_version(), Ok(()));
 
@@ -1830,15 +1855,16 @@ mod tests {
             sig: placeholder_sig(),
         })
         .signed_by_issuer();
-        assert!(attest.sig.verifies_as(&attest.issuer, &attest.signed_message()));
+        assert!(attest
+            .sig
+            .verifies_as(&attest.issuer, &attest.signed_message()));
         assert_eq!(attest.schema_version(), ARTIFACT_SCHEMA_VERSION);
         assert_eq!(attest.check_schema_version(), Ok(()));
 
         let revoke = signed_revoke(attest.cid(), n("owner"));
-        assert!(revoke.sig.verifies_as(
-            &n("owner"),
-            &Revoke::signed_message(&attest.cid())
-        ));
+        assert!(revoke
+            .sig
+            .verifies_as(&n("owner"), &Revoke::signed_message(&attest.cid())));
         assert_eq!(revoke.schema_version(), ARTIFACT_SCHEMA_VERSION);
         assert_eq!(revoke.check_schema_version(), Ok(()));
     }

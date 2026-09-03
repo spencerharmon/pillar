@@ -292,9 +292,8 @@ mod tests {
         let signed_material = b"cert: alice-primary certifies bob-subkey; hashed-area follows";
         let signature = sign(&signer_sk, signed_material).expect("sign");
 
-        let tsig =
-            verify_and_parse_trust_signature(&signer_pk, signed_material, &signature, &area)
-                .expect("genuine signature must verify and parse");
+        let tsig = verify_and_parse_trust_signature(&signer_pk, signed_material, &signature, &area)
+            .expect("genuine signature must verify and parse");
         assert_eq!(
             tsig,
             TrustSignature {
@@ -322,12 +321,7 @@ mod tests {
         let forged_signature = sign(&mallory_sk, signed_material).expect("sign");
 
         assert_eq!(
-            verify_and_parse_trust_signature(
-                &alice_pk,
-                signed_material,
-                &forged_signature,
-                &area
-            ),
+            verify_and_parse_trust_signature(&alice_pk, signed_material, &forged_signature, &area),
             Err(TsigError::SignatureVerificationFailed)
         );
     }

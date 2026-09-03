@@ -287,8 +287,14 @@ mod tests {
         let b = seal_symmetric_with(AeadAlgorithm::XChaCha20Poly1305V1, &key(), plaintext, aad)
             .expect("seal under B");
 
-        assert_eq!(open_symmetric(&key(), &a, aad).as_deref(), Ok(plaintext.as_ref()));
-        assert_eq!(open_symmetric(&key(), &b, aad).as_deref(), Ok(plaintext.as_ref()));
+        assert_eq!(
+            open_symmetric(&key(), &a, aad).as_deref(),
+            Ok(plaintext.as_ref())
+        );
+        assert_eq!(
+            open_symmetric(&key(), &b, aad).as_deref(),
+            Ok(plaintext.as_ref())
+        );
     }
 
     #[test]

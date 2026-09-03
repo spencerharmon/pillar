@@ -33,7 +33,7 @@ use pillar_crypto::{
 };
 
 use crate::store::{Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, Visibility};
-use crate::{PolicyViolation, Stream, StoreError};
+use crate::{PolicyViolation, StoreError, Stream};
 
 /// A durable-persistence fault: either a store fault or a policy refusal.
 #[derive(Debug)]
@@ -69,7 +69,10 @@ impl std::fmt::Display for IpfsPersistError {
             IpfsPersistError::Corrupt => write!(f, "corrupt segment chain link"),
             IpfsPersistError::WrongOwner => write!(f, "head record owner mismatch"),
             IpfsPersistError::ReadOnly => {
-                write!(f, "no segment-signing secret held — cannot author new segments")
+                write!(
+                    f,
+                    "no segment-signing secret held — cannot author new segments"
+                )
             }
         }
     }
@@ -137,7 +140,11 @@ impl IpfsPersistentStream {
     /// Start a brand-new (empty) IPFS-persisted stream, authored + signed by
     /// `owner`/`secret`, whose segments/head carry `visibility`.
     #[must_use]
-    pub fn genesis(owner: SigningPublicKey, secret: SigningSecretKey, visibility: Visibility) -> Self {
+    pub fn genesis(
+        owner: SigningPublicKey,
+        secret: SigningSecretKey,
+        visibility: Visibility,
+    ) -> Self {
         Self::genesis_with_policy(owner, secret, visibility, None)
     }
 
@@ -211,13 +218,16 @@ impl IpfsPersistentStream {
         let secret = self.secret.as_ref().ok_or(IpfsPersistError::ReadOnly)?;
         let policy = self.stream.policy();
         if !policy.admits(effect) {
-            return Err(IpfsPersistError::Policy(PolicyViolation::new(policy, effect)));
+            return Err(IpfsPersistError::Policy(PolicyViolation::new(
+                policy, effect,
+            )));
         }
         let payload = payload.into();
 
         let segment_bytes = encode_segment(self.head.as_ref(), &payload);
-        let segment = SignedSegment::author(segment_bytes, self.owner.clone(), secret, self.visibility)
-            .map_err(IpfsPersistError::Crypto)?;
+        let segment =
+            SignedSegment::author(segment_bytes, self.owner.clone(), secret, self.visibility)
+                .map_err(IpfsPersistError::Crypto)?;
         let cid = self.store.put(segment)?;
         self.store.pin(&cid)?;
         if self.visibility.may_reach_dht() {

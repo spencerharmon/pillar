@@ -691,9 +691,9 @@ mod tests {
     /// (nothing granted yet).
     fn admitted() -> (Registry, NodeSubkey, NodeSubkey) {
         let mut reg = Registry::new();
-        let primary = PrimaryKeypair::from_secret_seed(
-            &pillar_crypto::Seed::from_bytes(b"pillar-controller-test-op-primary".to_vec()),
-        );
+        let primary = PrimaryKeypair::from_secret_seed(&pillar_crypto::Seed::from_bytes(
+            b"pillar-controller-test-op-primary".to_vec(),
+        ));
         let controller = NodeSubkey::from("controller-node");
         let foreign = NodeSubkey::from("foreign-node");
         reg.register(primary.primary());
