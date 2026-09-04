@@ -48,6 +48,7 @@ pub mod query;
 pub mod retention;
 pub mod role;
 pub mod sampling;
+pub mod self_metrics;
 
 pub use block::{Signal, SignalId, SignalKind, TimeseriesBlock, TimeseriesStore, RETENTION_NOTE};
 pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
@@ -61,6 +62,9 @@ pub use retention::{
 };
 pub use role::{NodeRole, NodeRoleConfig, RoleError, SignedNodeRole};
 pub use sampling::{Occurrence, SampleError, SamplingPolicy};
+pub use self_metrics::{
+    read_process_cpu_mem, ingest_self_metrics, SelfMetric, SelfMetricsConfig, SelfMetricsSample,
+};
 
 use pillar_core::NodeId;
 use pillar_wot_authority::{ActError, FencedActor, WotAuthority};

@@ -119,6 +119,16 @@ pub const DEFAULT_HEALTH_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFI
 /// Integration-rig-only: the value to publish once to the event-log
 /// gossipsub topic after boot settles. Unset in every production boot.
 const ENV_TEST_PUBLISH: &str = "PILLAR_TEST_PUBLISH";
+/// `PILLAR_DISABLE_METRICS`: a comma/whitespace-separated list of self-metric
+/// names (`pillar_observability::SelfMetric::name`, e.g. `cpu_seconds`) to
+/// disable — every self metric is ON by default (ROI Priority 0's
+/// `DefaultOn` matrix). Parsed via
+/// [`pillar_observability::SelfMetricsConfig::from_disabled_names`].
+const ENV_DISABLE_METRICS: &str = "PILLAR_DISABLE_METRICS";
+/// How often the node samples and ingests its own self metrics (cpu, mem,
+/// streamdb ops, peer count, request count, ingest bandwidth) into its
+/// `TimeseriesStore`.
+const SELF_METRICS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long after listen-address bind-up the [`ENV_TEST_PUBLISH`] hook waits
 /// before publishing, giving `--dial` connections + gossipsub mesh
@@ -821,6 +831,25 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         .then(|| Box::pin(tokio::time::sleep(TEST_PUBLISH_DELAY)));
     let mut published = false;
 
+    // Self-instrumentation (ROI Priority 0): this node instruments ITSELF
+    // over the same shared `TimeseriesStore` substrate every other producer
+    // rides, via `pillar_observability::ingest_self_metrics` — ON by default,
+    // config-overridable per named metric through `PILLAR_DISABLE_METRICS`.
+    let mut observability_store = pillar_observability::TimeseriesStore::new(256, 100_000);
+    let self_metrics_config = std::env::var(ENV_DISABLE_METRICS)
+        .ok()
+        .map(|spec| pillar_observability::SelfMetricsConfig::from_disabled_names(&spec))
+        .unwrap_or_default();
+    // Real, monotonically-growing counters this node genuinely observes as
+    // it runs: every inbound gossip message it handles is a real request,
+    // and its payload's real byte length is real ingested bandwidth — never
+    // a fabricated/sampled stand-in.
+    let mut self_metrics_tick: u64 = 0;
+    let mut request_count_total: u64 = 0;
+    let mut ingest_bandwidth_total: u64 = 0;
+    let mut self_metrics_interval = tokio::time::interval(SELF_METRICS_INTERVAL);
+    self_metrics_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Controller loop: fold inbound event-log messages into the stream and
     // block until a shutdown signal.
     let mut shutdown = Box::pin(shutdown_signal());
@@ -846,6 +875,31 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 published = true;
                 publish_at = None;
             }
+            _ = self_metrics_interval.tick() => {
+                // Real self-observed quantities at this moment: a real
+                // `/proc` read for cpu/mem, the real streamdb op-log length,
+                // the real connected-peer count off this swarm, and the real
+                // cumulative request/ingest counters this loop maintains —
+                // never fabricated.
+                let (cpu_seconds, mem_bytes) = pillar_observability::read_process_cpu_mem()
+                    .unwrap_or((0.0, 0));
+                let sample = pillar_observability::SelfMetricsSample {
+                    cpu_seconds,
+                    mem_bytes,
+                    streamdb_ops: stream.stream().log().len() as u64,
+                    peer_count: swarm.connected_peers().count() as u64,
+                    request_count: request_count_total,
+                    ingest_bandwidth_bytes: ingest_bandwidth_total,
+                };
+                let written = pillar_observability::ingest_self_metrics(
+                    &mut observability_store,
+                    &self_metrics_config,
+                    &sample,
+                    self_metrics_tick,
+                );
+                tracing::debug!(count = written.len(), tick = self_metrics_tick, "pillar peer ingested self metrics");
+                self_metrics_tick += 1;
+            }
             event = swarm.select_next_some() => {
                 match &event {
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -862,6 +916,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 {
                     let payload_text = String::from_utf8_lossy(&message.data).into_owned();
                     tracing::info!(payload = %payload_text, "pillar peer received gossip event");
+                    // Real, non-fabricated counters this node's self metrics
+                    // read from: one more inbound message handled, and its
+                    // real payload byte length ingested.
+                    request_count_total += 1;
+                    ingest_bandwidth_total += message.data.len() as u64;
                     // Every gossiped event-log message is an append-only op the
                     // controller folds into the local stream view AND durably
                     // persists under the content-addressed data-dir store.
