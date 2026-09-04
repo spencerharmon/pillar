@@ -16,6 +16,7 @@
 //! classes, so the visual language is defined exactly once.
 
 pub mod auth;
+pub mod dashboard;
 pub mod drilldown;
 pub mod explore;
 pub mod panels;
@@ -28,6 +29,7 @@ pub mod webauthn;
 pub mod components;
 
 pub use auth::{AuthAction, AuthSession};
+pub use dashboard::{render_panel_persisted, CellId, Dashboard, Panel, PeerId};
 pub use explore::{
     build_metadata_query, build_metric_query, correlate_candidates, correlate_candidates_metadata,
     label_key_options, label_value_options, METADATA_KIND, METRIC_KIND,
