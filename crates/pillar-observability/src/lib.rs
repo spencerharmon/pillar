@@ -45,6 +45,8 @@ pub mod correlation;
 pub mod ingest;
 pub mod logs;
 pub mod metadata;
+pub mod metadata_index;
+pub mod metadata_ingest;
 pub mod otlp;
 pub mod profiling;
 pub mod query;
@@ -60,6 +62,10 @@ pub use ingest::{MetricKind, MetricSource, MetricsProducer, NodeCounters, NodeMe
 pub use logs::{LogEvent, LogLevel, LogProducer};
 pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
+};
+pub use metadata_index::{MetadataIndex, METRIC_NAME_LABEL};
+pub use metadata_ingest::{
+    MetadataProducer, MetadataSource, NodeMetadataSource, DEFAULT_METADATA_PERIOD,
 };
 pub use otlp::{Envelope, OtlpError, OtlpIngest};
 pub use profiling::{
