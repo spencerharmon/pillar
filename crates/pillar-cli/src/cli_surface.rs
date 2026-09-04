@@ -61,6 +61,8 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec { name: "apply", handler: live_platform_guidance },
     VerbSpec { name: "get", handler: live_platform_guidance },
     VerbSpec { name: "describe", handler: live_platform_guidance },
+    VerbSpec { name: "explain", handler: |_v, args| explain(args) },
+    VerbSpec { name: "completion", handler: |_v, args| completion(args) },
 ];
 
 /// The real, currently-dispatched CLI verb table — the exact data `main()`
@@ -102,6 +104,43 @@ fn live_platform_guidance(verb: &str, _args: &[String]) -> ExitCode {
     eprintln!("`pillar {verb}` operates over a live platform via the pillar_cli library API.");
     eprintln!("Use `pillar render …` to produce manifest text, and the library to apply it.");
     ExitCode::from(2)
+}
+
+/// `pillar explain <PSL query>`: parse the query with the real PSL parser and
+/// print both the parsed AST and the query engine's real execution plan.
+fn explain(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: pillar explain <PSL query>");
+        eprintln!("  prints the parsed AST and the real execution plan for a PSL query");
+        return ExitCode::from(2);
+    }
+    // Join the argv tail so an unquoted query still parses.
+    let query = args.join(" ");
+    match crate::polish::explain_psl(&query) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pillar explain: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `pillar completion <bash>`: emit a shell completion script generated from
+/// the real served verb table.
+fn completion(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("bash") => {
+            print!("{}", crate::polish::bash_completion());
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("usage: pillar completion bash");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `pillar onboard`: drive the keygen -> node-key signing -> cross-user
