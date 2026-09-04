@@ -31,9 +31,10 @@ pub mod components;
 pub use auth::{AuthAction, AuthSession};
 pub use dashboard::{render_panel_persisted, CellId, Dashboard, Panel, PeerId};
 pub use explore::{
-    build_metadata_query, build_metric_query, build_profile_query, correlate_candidates,
-    correlate_candidates_metadata, label_key_options, label_value_options,
-    profile_correlate_candidates, METADATA_KIND, METRIC_KIND, PROFILE_KIND,
+    build_log_query, build_metadata_query, build_metric_query, build_profile_query,
+    correlate_candidates, correlate_candidates_logs, correlate_candidates_metadata,
+    label_key_options, label_value_options, profile_correlate_candidates, LogFilter, LOG_KIND,
+    METADATA_KIND, METRIC_KIND, PROFILE_KIND,
 };
 pub use router::Route;
 pub use styles::ButtonVariant;
@@ -41,7 +42,7 @@ pub use theme::{Motion, Theme};
 pub use webauthn::{authenticate, register, CeremonyError, CredentialCeremony, RpTransport};
 
 #[cfg(feature = "yew")]
-pub use explore::{ExploreBuilder, ExploreBuilderProps, ExploreProfilesBuilder};
+pub use explore::{ExploreBuilder, ExploreBuilderProps, ExploreLogsBuilder, ExploreProfilesBuilder};
 
 #[cfg(feature = "yew")]
 pub use auth::{use_auth, AuthContext, AuthProvider};
