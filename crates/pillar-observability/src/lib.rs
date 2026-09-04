@@ -50,6 +50,7 @@ pub mod retention;
 pub mod role;
 pub mod sampling;
 pub mod signal_config;
+pub mod traces;
 
 pub use block::{Signal, SignalId, SignalKind, TimeseriesBlock, TimeseriesStore, RETENTION_NOTE};
 pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
@@ -68,6 +69,7 @@ pub use signal_config::{
     default_on, gated_ingest, signal_kind_from_source, signal_source_name, SignalConfigMatrix,
     SignalConfigSpec,
 };
+pub use traces::{SpanEvent, TraceProducer};
 
 use pillar_core::NodeId;
 use pillar_wot_authority::{ActError, FencedActor, WotAuthority};
