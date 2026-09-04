@@ -3124,6 +3124,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-e2e"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "libp2p",
+ "pillar-controller",
+ "pillar-coordination",
+ "pillar-core",
+ "pillar-crypto",
+ "pillar-identity",
+ "pillar-net",
+ "pillar-streamdb",
+ "tokio",
+]
+
+[[package]]
 name = "pillar-eventlog"
 version = "0.0.0"
 dependencies = [
