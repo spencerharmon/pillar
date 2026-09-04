@@ -42,13 +42,32 @@ impl fmt::Display for PslError {
 
 impl std::error::Error for PslError {}
 
-/// An equality predicate on a signal's label: `key = value`.
+/// The comparison a [`Predicate`] applies between a signal's field and its
+/// declared value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PredicateOp {
+    /// Exact equality (`key = value`).
+    Eq,
+    /// A regex search — the pattern occurs anywhere in the field's value
+    /// (`key =~ pattern`), the LOG-kind "message matches" predicate.
+    RegexMatch,
+}
+
+/// A predicate on a signal's field: either a label (every kind) or, for a
+/// LOG-kind selected signal, a field parsed out of the log's own payload —
+/// `level`, `message` (aliasing the payload's `msg=` field), or an arbitrary
+/// nested `field.<name>` payload field. `key = value` is an equality
+/// predicate; `key =~ pattern` is a regex-search predicate (currently only
+/// meaningful for `message`, but not restricted to it).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Predicate {
-    /// The label key to match.
+    /// The label/payload-field key to match.
     pub key: String,
-    /// The value the label must equal.
+    /// The value (or regex pattern, for [`PredicateOp::RegexMatch`]) the
+    /// field must satisfy.
     pub value: String,
+    /// The comparison this predicate applies.
+    pub op: PredicateOp,
 }
 
 impl Predicate {
@@ -58,11 +77,26 @@ impl Predicate {
         Predicate {
             key: key.into(),
             value: value.into(),
+            op: PredicateOp::Eq,
+        }
+    }
+
+    /// A `key =~ pattern` regex-search predicate: matches when `pattern`
+    /// occurs anywhere in the field's value.
+    #[must_use]
+    pub fn regex_match(key: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Predicate {
+            key: key.into(),
+            value: pattern.into(),
+            op: PredicateOp::RegexMatch,
         }
     }
 
     fn to_text(&self) -> String {
-        format!("{} = {}", self.key, self.value)
+        match self.op {
+            PredicateOp::Eq => format!("{} = {}", self.key, self.value),
+            PredicateOp::RegexMatch => format!("{} =~ {}", self.key, self.value),
+        }
     }
 }
 
@@ -374,6 +408,15 @@ fn parse_predicates(body: &str) -> Result<Vec<Predicate>, PslError> {
         if item.is_empty() {
             continue;
         }
+        if let Some(idx) = item.find("=~") {
+            let key = item[..idx].trim();
+            let value = item[idx + 2..].trim();
+            if key.is_empty() || value.is_empty() {
+                return Err(PslError(format!("predicate '{item}' is malformed")));
+            }
+            out.push(Predicate::regex_match(key, value));
+            continue;
+        }
         let mut parts = item.splitn(2, '=');
         let key = parts
             .next()
@@ -536,13 +579,117 @@ pub struct PslResult {
     pub groups: Vec<CorrelationGroup>,
 }
 
-fn signal_matches_predicates(
-    labels: &std::collections::BTreeMap<String, String>,
-    predicates: &[Predicate],
-) -> bool {
-    predicates
-        .iter()
-        .all(|p| labels.get(&p.key).is_some_and(|v| v == &p.value))
+/// Parse `key` out of a LOG signal's raw payload — the wire shape both
+/// [`crate::logs::LogProducer`] and the OTLP log decoder write:
+/// space-delimited `key=value` tokens, where a `msg=` token takes the REST of
+/// the line (a message may itself contain spaces) and is never itself split
+/// into further tokens. `message` is the PSL-facing alias for the payload's
+/// `msg` field; any other key (`level`, or a nested `field.<name>` the
+/// producer chose to stamp) is looked up verbatim. Returns `None` when the
+/// payload is not valid UTF-8 or the key is absent.
+fn log_field_value(payload: &[u8], key: &str) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let wire_key = if key == "message" { "msg" } else { key };
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(v) = rest.strip_prefix("msg=") {
+            // The `LogProducer` payload trails a synthetic " @<tick>" marker
+            // after the message; strip it so a `message` filter never
+            // accidentally matches against that bookkeeping suffix.
+            let v = match v.rfind(" @") {
+                Some(idx) if v[idx + 2..].chars().all(|c| c.is_ascii_digit()) => &v[..idx],
+                _ => v,
+            };
+            return if wire_key == "msg" { Some(v.to_string()) } else { None };
+        }
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        rest = rest[token_end..].trim_start();
+        if let Some((k, v)) = token.split_once('=') {
+            if k == wire_key {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A minimal (Kernighan-style) regex search: `.` matches any char, `*` is a
+/// zero-or-more quantifier on the preceding atom, `^`/`$` anchor start/end;
+/// every other character matches literally. Unanchored unless `^` leads the
+/// pattern — i.e. `pattern` may occur ANYWHERE in `text`, which is what a PSL
+/// `=~` message filter means (`message =~ "timeout"` matches a message that
+/// merely CONTAINS "timeout").
+fn regex_search(pattern: &str, text: &str) -> bool {
+    if let Some(anchored) = pattern.strip_prefix('^') {
+        return regex_match_here(anchored, text);
+    }
+    let mut t = text;
+    loop {
+        if regex_match_here(pattern, t) {
+            return true;
+        }
+        if t.is_empty() {
+            return false;
+        }
+        let next = t.char_indices().nth(1).map(|(i, _)| i).unwrap_or(t.len());
+        t = &t[next..];
+    }
+}
+
+fn regex_match_here(pattern: &str, text: &str) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    if pattern == "$" {
+        return text.is_empty();
+    }
+    let mut chars = pattern.chars();
+    let c = chars.next().expect("pattern is non-empty");
+    let rest = chars.as_str();
+    if let Some(after_star) = rest.strip_prefix('*') {
+        return regex_match_star(c, after_star, text);
+    }
+    match text.chars().next() {
+        Some(tc) if c == '.' || tc == c => regex_match_here(rest, &text[tc.len_utf8()..]),
+        _ => false,
+    }
+}
+
+fn regex_match_star(c: char, pattern: &str, text: &str) -> bool {
+    let mut t = text;
+    loop {
+        if regex_match_here(pattern, t) {
+            return true;
+        }
+        match t.chars().next() {
+            Some(tc) if c == '.' || tc == c => t = &t[tc.len_utf8()..],
+            _ => return false,
+        }
+    }
+}
+
+fn predicate_matches(signal: &crate::block::Signal, predicate: &Predicate) -> bool {
+    let value = signal
+        .labels()
+        .get(&predicate.key)
+        .cloned()
+        .or_else(|| {
+            if signal.kind() == SignalKind::Log {
+                log_field_value(signal.payload(), &predicate.key)
+            } else {
+                None
+            }
+        });
+    match (predicate.op, value) {
+        (PredicateOp::Eq, Some(v)) => v == predicate.value,
+        (PredicateOp::RegexMatch, Some(v)) => regex_search(&predicate.value, &v),
+        (_, None) => false,
+    }
+}
+
+fn signal_matches_predicates(signal: &crate::block::Signal, predicates: &[Predicate]) -> bool {
+    predicates.iter().all(|p| predicate_matches(signal, p))
 }
 
 /// Execute `query` against `store`/`index` as of logical time `now`.
@@ -576,10 +723,10 @@ pub fn execute(
         if tick < range_start || tick > now {
             continue;
         }
-        if !signal_matches_predicates(signal.labels(), kind_predicates) {
+        if !signal_matches_predicates(signal, kind_predicates) {
             continue;
         }
-        if !signal_matches_predicates(signal.labels(), &query.where_predicates) {
+        if !signal_matches_predicates(signal, &query.where_predicates) {
             continue;
         }
         matched.insert(signal.id());
@@ -876,5 +1023,112 @@ mod tests {
     fn builder_refuses_empty_select() {
         let err = PslQueryBuilder::new().range_relative(60).build();
         assert!(err.is_err());
+    }
+
+    /// A real log fixture: an error log whose message contains "timeout", an
+    /// info log that does not, and an error log with a different message —
+    /// so a `level = error, message =~ timeout` select-scoped filter proves
+    /// it is filtering on BOTH fields, not merely one.
+    fn log_level_message_fixture() -> (TimeseriesStore, CorrelationIndex, SignalId) {
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+
+        let timeout_error = store.write(
+            SignalKind::Log,
+            b"level=error msg=request timeout after 30s".to_vec(),
+            100,
+        );
+
+        // Same level, message does NOT contain "timeout" — must not match.
+        store.write(SignalKind::Log, b"level=error msg=disk full".to_vec(), 100);
+
+        // Message DOES contain "timeout", but level is info — must not match.
+        store.write(
+            SignalKind::Log,
+            b"level=info msg=retrying after timeout".to_vec(),
+            100,
+        );
+
+        (store, index, timeout_error)
+    }
+
+    /// A query filtering `level = error, message =~ timeout` against a real
+    /// log fixture returns ONLY the entry matching both the level equality
+    /// and the message regex-search — the ROI's LOG-kind select payload
+    /// filter, exercised end to end (parse -> execute over a real store).
+    #[test]
+    fn log_level_and_message_regex_filter_matches_only_the_real_entry() {
+        let (store, index, timeout_error) = log_level_message_fixture();
+        let query = parse("select: logs(level = error, message =~ timeout) range: now-1d")
+            .expect("well-formed LOG select-scoped filter query must parse");
+
+        let result = execute(&query, &store, &index, 100);
+
+        assert_eq!(
+            result.matched,
+            vec![timeout_error],
+            "only the error-level log whose message contains 'timeout' must match"
+        );
+    }
+
+    /// The structured builder produces the SAME `level =` / `message =~`
+    /// predicates as the text surface for the same LOG-kind query, and both
+    /// execute to the identical real-store result.
+    #[test]
+    fn structured_log_filter_matches_text_surface() {
+        let (store, index, timeout_error) = log_level_message_fixture();
+
+        let from_text = parse("select: logs(level = error, message =~ timeout) range: now-1d")
+            .expect("must parse");
+        let from_builder = PslQueryBuilder::new()
+            .select(
+                SignalKind::Log,
+                vec![
+                    Predicate::eq("level", "error"),
+                    Predicate::regex_match("message", "timeout"),
+                ],
+            )
+            .range_relative(86_400)
+            .build()
+            .expect("structured build of a valid LOG filter query must succeed");
+
+        assert_eq!(from_text, from_builder);
+
+        let result = execute(&from_builder, &store, &index, 100);
+        assert_eq!(result.matched, vec![timeout_error]);
+    }
+
+    /// A `field.<name> =` predicate matches a nested payload field the log
+    /// producer stamped ahead of its `msg=` — proving the filter reaches
+    /// beyond the fixed `level`/`message` fields into arbitrary structured
+    /// payload data.
+    #[test]
+    fn field_dot_predicate_matches_a_nested_payload_field() {
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+
+        let region_us = store.write(
+            SignalKind::Log,
+            b"level=warn field.region=us-east msg=elevated latency".to_vec(),
+            100,
+        );
+
+        // A different nested field value — must NOT match.
+        store.write(
+            SignalKind::Log,
+            b"level=warn field.region=eu-west msg=elevated latency".to_vec(),
+            100,
+        );
+
+        let query = parse("select: logs(field.region = us-east) range: now-1d")
+            .expect("well-formed nested field predicate query must parse");
+
+        let result = execute(&query, &store, &index, 100);
+
+        assert_eq!(
+            result.matched,
+            vec![region_us],
+            "only the log whose nested field.region equals 'us-east' must match"
+        );
     }
 }
