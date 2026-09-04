@@ -16,8 +16,10 @@ pillar-core = { path = "../pillar-core" }
 pillar-coordination = { path = "../pillar-coordination" }
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-identity = { path = "../pillar-identity" }
+pillar-ipam = { path = "../pillar-ipam" }
 pillar-net = { path = "../pillar-net" }
 pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-topology = { path = "../pillar-topology" }
 libp2p = { version = "0.56", features = [
     "noise",
     "yamux",

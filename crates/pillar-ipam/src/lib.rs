@@ -27,6 +27,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use pillar_coordination::{GrantError, LeaseRegister};
 use pillar_core::{Epoch, NodeId};
 
+pub mod operator;
+
 /// A contiguous, delegated block of addresses this authority may hand out.
 ///
 /// A pool is a base address plus a length (number of addresses). The pool is
@@ -210,6 +212,17 @@ impl DelegatedAllocator {
     pub fn allocator_of(&self, addr: IpAddr) -> Option<&NodeId> {
         let index = self.pool.index_of(addr)?;
         self.register.holder(Epoch(index))
+    }
+
+    /// Release `addr` from `holder`, returning the address's slot to the pool
+    /// so it can be re-granted to a different actor. Returns whether `holder`
+    /// actually held the slot (a no-op returning `false` for an out-of-pool
+    /// address or one not held by `holder`).
+    pub fn release(&mut self, holder: &NodeId, addr: IpAddr) -> bool {
+        match self.pool.index_of(addr) {
+            Some(index) => self.register.release(holder, Epoch(index)),
+            None => false,
+        }
     }
 }
 
