@@ -38,6 +38,11 @@ use crate::auth::{use_auth, AuthAction};
 /// Explore verticals ("metrics") the shared implementation establishes.
 pub const METRIC_KIND: SignalKind = SignalKind::Metric;
 
+/// The signal kind the `profiles` Explore vertical targets — the second of
+/// the five verticals, replicating the shared `metrics` builder above for
+/// [`SignalKind::ProfileSample`].
+pub const PROFILE_KIND: SignalKind = SignalKind::ProfileSample;
+
 /// Build the structured [`PslQuery`] for a `metrics` Explore selection:
 /// `select: metrics(<select_predicates>) where: <where_predicates> range:
 /// now-<range_seconds>s [correlate: { window: <w>, anchor: <a> }]` — the SAME
@@ -100,6 +105,53 @@ pub fn correlate_candidates() -> Vec<SignalKind> {
         SignalKind::Log,
         SignalKind::TraceSpan,
         SignalKind::ProfileSample,
+        SignalKind::MetadataSample,
+    ]
+}
+
+/// Build the structured [`PslQuery`] for a `profiles` Explore selection — the
+/// exact analogue of [`build_metric_query`] for [`PROFILE_KIND`]: `select:
+/// profiles(<select_predicates>) where: <where_predicates> range:
+/// now-<range_seconds>s [correlate: { window: <w>, anchor: <a> }]`, the SAME
+/// AST [`pillar_observability::parse_psl`] produces from the equivalent
+/// compact text, by construction (both surfaces build the one
+/// [`PslQueryBuilder`]/[`PslQuery`] model). The profiles vertical never forks
+/// a second query model; it only differs from `metrics` in the selected
+/// [`SignalKind`].
+///
+/// Fails only as [`PslQueryBuilder::build`] does (kept as a `Result` so a
+/// future field can fail honestly rather than panicking).
+pub fn build_profile_query(
+    select_predicates: &[(String, String)],
+    where_predicates: &[(String, String)],
+    range_seconds: u64,
+    correlate: Option<(u64, SignalKind)>,
+) -> Result<PslQuery, PslError> {
+    let select = select_predicates
+        .iter()
+        .map(|(k, v)| Predicate::eq(k.clone(), v.clone()))
+        .collect();
+    let mut builder = PslQueryBuilder::new()
+        .select(PROFILE_KIND, select)
+        .range_relative(range_seconds);
+    for (k, v) in where_predicates {
+        builder = builder.where_eq(k.clone(), v.clone());
+    }
+    if let Some((window_seconds, anchor)) = correlate {
+        builder = builder.correlate(window_seconds, anchor);
+    }
+    builder.build()
+}
+
+/// The `profiles` correlate panel's pivot-target candidates: every signal
+/// kind OTHER than the one this builder selects (`profiles`). Order is fixed
+/// so the panel renders deterministically.
+#[must_use]
+pub fn profile_correlate_candidates() -> Vec<SignalKind> {
+    vec![
+        SignalKind::Metric,
+        SignalKind::Log,
+        SignalKind::TraceSpan,
         SignalKind::MetadataSample,
     ]
 }
@@ -398,6 +450,178 @@ pub fn explore_builder(props: &ExploreBuilderProps) -> Html {
             <section data-panel="correlate">
                 <h3>{ "Correlate" }</h3>
                 { for correlate_candidates().into_iter().map(|kind| {
+                    let correlate_anchor = correlate_anchor.clone();
+                    let label = format!("{kind:?}");
+                    let onclick = Callback::from(move |_| correlate_anchor.set(Some(kind)));
+                    html! { <button data-role="correlate-kind" onclick={onclick}>{ label }</button> }
+                }) }
+            </section>
+            <button data-role="run-query" onclick={on_run}>{ "Run" }</button>
+            <ul data-role="results">
+                { for results.iter().map(|r| html! { <li>{ r.clone() }</li> }) }
+            </ul>
+        </section>
+    }
+}
+
+#[cfg(feature = "yew")]
+/// The guided PSL query builder for the `profiles` signal kind — the exact
+/// analogue of [`ExploreBuilder`] for [`PROFILE_KIND`], sharing the same
+/// autofill/correlate/submit wiring and differing only in the selected signal
+/// kind ([`build_profile_query`] / [`profile_correlate_candidates`]) and its
+/// `data-panel` marker. Submits the composed [`PslQuery::to_text`] to
+/// [`ExploreBuilderProps::query_path`] and renders the real matched series.
+#[function_component(ExploreProfilesBuilder)]
+pub fn explore_profiles_builder(props: &ExploreBuilderProps) -> Html {
+    let auth = use_auth();
+    let label_keys: UseStateHandle<Vec<String>> = use_state(Vec::new);
+    let where_key_input = use_state(String::new);
+    let where_value_input = use_state(String::new);
+    let label_values: UseStateHandle<Vec<String>> = use_state(Vec::new);
+    let where_rows: UseStateHandle<Vec<PredicateRow>> = use_state(Vec::new);
+    let range_seconds = use_state(|| 3600u64);
+    let correlate_anchor: UseStateHandle<Option<SignalKind>> = use_state(|| None);
+    let results: UseStateHandle<Vec<String>> = use_state(Vec::new);
+
+    // Load the real label-key typeahead on mount.
+    {
+        let label_keys = label_keys.clone();
+        let path = props.label_keys_path;
+        let token = auth.token.clone();
+        use_effect_with((path, token.clone()), move |_| {
+            let label_keys = label_keys.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(FetchOutcome::Ok(text)) = fetch_text(path, token.as_deref()).await {
+                    label_keys.set(crate::panels::parse_lines(&text, ""));
+                }
+            });
+            || ()
+        });
+    }
+
+    // Re-fetch the real label-value typeahead every time the user changes
+    // which key they are filling in — never a fabricated superset.
+    {
+        let label_values = label_values.clone();
+        let path = props.label_values_path;
+        let token = auth.token.clone();
+        let key = (*where_key_input).clone();
+        use_effect_with((path, key.clone(), token.clone()), move |_| {
+            let label_values = label_values.clone();
+            if key.is_empty() {
+                label_values.set(Vec::new());
+            } else {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let full = format!("{path}?key={key}");
+                    if let Ok(FetchOutcome::Ok(text)) = fetch_text(&full, token.as_deref()).await {
+                        label_values.set(crate::panels::parse_lines(&text, ""));
+                    }
+                });
+            }
+            || ()
+        });
+    }
+
+    let on_key_input = {
+        let where_key_input = where_key_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            where_key_input.set(value);
+        })
+    };
+
+    let on_value_input = {
+        let where_value_input = where_value_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            where_value_input.set(value);
+        })
+    };
+
+    let on_add_predicate = {
+        let where_rows = where_rows.clone();
+        let where_key_input = where_key_input.clone();
+        let where_value_input = where_value_input.clone();
+        Callback::from(move |_| {
+            let key = (*where_key_input).clone();
+            let value = (*where_value_input).clone();
+            if key.is_empty() || value.is_empty() {
+                return;
+            }
+            let mut rows = (*where_rows).clone();
+            rows.push(PredicateRow { key, value });
+            where_rows.set(rows);
+        })
+    };
+
+    let on_run = {
+        let where_rows = where_rows.clone();
+        let range_seconds = range_seconds.clone();
+        let correlate_anchor = correlate_anchor.clone();
+        let query_path = props.query_path;
+        let auth = auth.clone();
+        let results = results.clone();
+        Callback::from(move |_| {
+            let predicates: Vec<(String, String)> = (*where_rows)
+                .iter()
+                .map(|r| (r.key.clone(), r.value.clone()))
+                .collect();
+            let correlate = (*correlate_anchor).map(|anchor| (60u64, anchor));
+            let Ok(query) = build_profile_query(&[], &predicates, *range_seconds, correlate) else {
+                return;
+            };
+            let text = query.to_text();
+            let path = query_path;
+            let token = auth.token.clone();
+            let results = results.clone();
+            let auth = auth.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let full = format!("{path}?query={}", urlencode(&text));
+                match fetch_text(&full, token.as_deref()).await {
+                    Ok(FetchOutcome::Ok(text)) => results.set(crate::panels::parse_lines(&text, "")),
+                    Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
+                    Err(_) => {}
+                }
+            });
+        })
+    };
+
+    html! {
+        <section data-panel="explore-profiles">
+            <h2>{ "Explore — profiles" }</h2>
+            <div data-role="predicate-builder">
+                <input
+                    data-role="where-key"
+                    list="explore-profiles-label-keys"
+                    value={(*where_key_input).clone()}
+                    oninput={on_key_input}
+                />
+                <datalist id="explore-profiles-label-keys">
+                    { for label_keys.iter().map(|k| html! { <option value={k.clone()} /> }) }
+                </datalist>
+                <input
+                    data-role="where-value"
+                    list="explore-profiles-label-values"
+                    value={(*where_value_input).clone()}
+                    oninput={on_value_input}
+                />
+                <datalist id="explore-profiles-label-values">
+                    { for label_values.iter().map(|v| html! { <option value={v.clone()} /> }) }
+                </datalist>
+                <button data-role="add-predicate" onclick={on_add_predicate}>{ "Add" }</button>
+            </div>
+            <ul data-role="predicate-rows">
+                { for where_rows.iter().map(|r| html! { <li>{ format!("{} = {}", r.key, r.value) }</li> }) }
+            </ul>
+            <section data-panel="correlate">
+                <h3>{ "Correlate" }</h3>
+                { for profile_correlate_candidates().into_iter().map(|kind| {
                     let correlate_anchor = correlate_anchor.clone();
                     let label = format!("{kind:?}");
                     let onclick = Callback::from(move |_| correlate_anchor.set(Some(kind)));
@@ -729,6 +953,92 @@ mod tests {
         assert!(candidates.contains(&SignalKind::Metric));
         assert!(candidates.contains(&SignalKind::Log));
         assert!(candidates.contains(&SignalKind::ProfileSample));
+        assert!(candidates.contains(&SignalKind::MetadataSample));
+        assert_eq!(candidates.len(), 4);
+    }
+
+    /// The `profiles` structured builder produces the SAME AST `parse_psl`
+    /// parses from the equivalent compact text — the profiles analogue of
+    /// `structured_builder_matches_the_parsed_equivalent_text_query`. FAILS
+    /// without `build_profile_query` composing the real `PslQueryBuilder`/
+    /// `PslQuery` model against `SignalKind::ProfileSample`.
+    #[test]
+    fn structured_profile_builder_matches_the_parsed_equivalent_text_query() {
+        let text =
+            "select: profiles(cell = eu-1) where: node = n-1 range: now-1h correlate: { window: 30s, anchor: profiles }";
+        let parsed = parse_psl(text).expect("fixture text query parses");
+
+        let built = build_profile_query(
+            &[("cell".to_string(), "eu-1".to_string())],
+            &[("node".to_string(), "n-1".to_string())],
+            3600,
+            Some((30, SignalKind::ProfileSample)),
+        )
+        .expect("structured build succeeds");
+
+        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(built.to_text(), parsed.to_text());
+        assert_eq!(built.to_text(), text);
+    }
+
+    /// A `profiles` builder with no `where:`/correlate still matches its
+    /// minimal text equivalent.
+    #[test]
+    fn minimal_profile_selection_matches_its_text_equivalent() {
+        let text = "select: profiles range: now-5m";
+        let parsed = parse_psl(text).expect("fixture text query parses");
+        let built = build_profile_query(&[], &[], 300, None).expect("build succeeds");
+        assert_eq!(built, parsed);
+    }
+
+    /// The `profiles` autofill is populated from a REAL `MetadataIndex` built
+    /// from genuinely ingested PROFILE signals — never a fabricated list —
+    /// and an unknown key returns empty. FAILS without the shared
+    /// `label_key_options`/`label_value_options` delegating to the real index
+    /// over a real profile fixture.
+    #[test]
+    fn profile_autofill_options_come_from_a_real_metadata_index_fixture_never_fabricated() {
+        let mut store = TimeseriesStore::new(64, 10_000);
+        store.write_labeled(
+            SignalKind::ProfileSample,
+            b"stack=a;b;c".to_vec(),
+            [
+                ("cell".to_string(), "eu-1".to_string()),
+                ("service".to_string(), "ingest".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            0,
+        );
+        store.write_labeled(
+            SignalKind::ProfileSample,
+            b"stack=d;e".to_vec(),
+            [("cell".to_string(), "us-2".to_string())].into_iter().collect(),
+            0,
+        );
+
+        let index = MetadataIndex::from_store(&store);
+
+        let keys = label_key_options(&index);
+        assert!(keys.contains(&"cell".to_string()));
+        assert!(keys.contains(&"service".to_string()));
+
+        let values = label_value_options(&index, "cell");
+        assert_eq!(values, vec!["eu-1".to_string(), "us-2".to_string()]);
+        assert!(!values.contains(&"ap-9".to_string()));
+
+        assert!(label_value_options(&index, "nonexistent-key").is_empty());
+    }
+
+    /// The `profiles` correlate panel pivots to every OTHER signal kind —
+    /// never back to `profiles` itself.
+    #[test]
+    fn profile_correlate_candidates_pivot_to_other_kinds_never_profiles_itself() {
+        let candidates = profile_correlate_candidates();
+        assert!(!candidates.contains(&SignalKind::ProfileSample));
+        assert!(candidates.contains(&SignalKind::Metric));
+        assert!(candidates.contains(&SignalKind::Log));
+        assert!(candidates.contains(&SignalKind::TraceSpan));
         assert!(candidates.contains(&SignalKind::MetadataSample));
         assert_eq!(candidates.len(), 4);
     }
