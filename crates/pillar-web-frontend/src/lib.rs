@@ -28,7 +28,8 @@ pub mod components;
 
 pub use auth::{AuthAction, AuthSession};
 pub use explore::{
-    build_metric_query, correlate_candidates, label_key_options, label_value_options, METRIC_KIND,
+    build_metric_query, build_profile_query, correlate_candidates, label_key_options,
+    label_value_options, profile_correlate_candidates, METRIC_KIND, PROFILE_KIND,
 };
 pub use router::Route;
 pub use styles::ButtonVariant;
@@ -36,7 +37,7 @@ pub use theme::{Motion, Theme};
 pub use webauthn::{authenticate, register, CeremonyError, CredentialCeremony, RpTransport};
 
 #[cfg(feature = "yew")]
-pub use explore::{ExploreBuilder, ExploreBuilderProps};
+pub use explore::{ExploreBuilder, ExploreBuilderProps, ExploreProfilesBuilder};
 
 #[cfg(feature = "yew")]
 pub use auth::{use_auth, AuthContext, AuthProvider};
