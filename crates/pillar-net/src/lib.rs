@@ -36,6 +36,9 @@ use libp2p::{
 
 pub mod pillar_udp;
 
+pub mod udp_dataplane;
+pub use udp_dataplane::{UdpDataplane, HEALTH_PROBE};
+
 pub mod pillar_udp_transport;
 pub use pillar_udp_transport::{
     is_pillar_udp_addr, pillar_udp_multiaddr, pillar_udp_socket_addr, PillarUdpStream,
