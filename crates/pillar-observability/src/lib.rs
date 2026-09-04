@@ -42,6 +42,7 @@
 
 pub mod block;
 pub mod correlation;
+pub mod ingest;
 pub mod metadata;
 pub mod otlp;
 pub mod query;
@@ -52,6 +53,7 @@ pub mod signal_config;
 
 pub use block::{Signal, SignalId, SignalKind, TimeseriesBlock, TimeseriesStore, RETENTION_NOTE};
 pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
+pub use ingest::{MetricKind, MetricSource, MetricsProducer, NodeCounters, NodeMetricSource};
 pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };
