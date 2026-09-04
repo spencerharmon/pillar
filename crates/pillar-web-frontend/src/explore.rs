@@ -157,6 +157,58 @@ pub fn correlate_candidates_metadata() -> Vec<SignalKind> {
     ]
 }
 
+/// The signal kind the `traces` vertical's builder targets — the third of
+/// the five Explore verticals to replicate the shared
+/// [`build_metric_query`]/[`correlate_candidates`] pattern.
+pub const TRACE_KIND: SignalKind = SignalKind::TraceSpan;
+
+/// Build the structured [`PslQuery`] for a `traces` Explore selection:
+/// `select: traces(<select_predicates>) where: <where_predicates> range:
+/// now-<range_seconds>s [correlate: { window: <w>, anchor: <a> }]` — the SAME
+/// AST [`pillar_observability::parse_psl`] would produce from the equivalent
+/// compact text, by construction, mirroring [`build_metric_query`]/
+/// [`build_metadata_query`] for the `traces` signal kind.
+///
+/// Fails only as [`PslQueryBuilder::build`] does (no `select`, which cannot
+/// happen here since `traces` is always selected, or no `range`, which
+/// cannot happen either since `range_seconds` is always supplied) — the
+/// `Result` is kept so a future kind/field can fail honestly rather than
+/// panicking.
+pub fn build_trace_query(
+    select_predicates: &[(String, String)],
+    where_predicates: &[(String, String)],
+    range_seconds: u64,
+    correlate: Option<(u64, SignalKind)>,
+) -> Result<PslQuery, PslError> {
+    let select = select_predicates
+        .iter()
+        .map(|(k, v)| Predicate::eq(k.clone(), v.clone()))
+        .collect();
+    let mut builder = PslQueryBuilder::new()
+        .select(TRACE_KIND, select)
+        .range_relative(range_seconds);
+    for (k, v) in where_predicates {
+        builder = builder.where_eq(k.clone(), v.clone());
+    }
+    if let Some((window_seconds, anchor)) = correlate {
+        builder = builder.correlate(window_seconds, anchor);
+    }
+    builder.build()
+}
+
+/// The correlate panel's pivot-target candidates for the `traces` vertical:
+/// every signal kind OTHER than `traces` itself that a correlation window
+/// can group against. Order is fixed so the panel renders deterministically.
+#[must_use]
+pub fn correlate_candidates_traces() -> Vec<SignalKind> {
+    vec![
+        SignalKind::Metric,
+        SignalKind::Log,
+        SignalKind::ProfileSample,
+        SignalKind::MetadataSample,
+    ]
+}
+
 #[cfg(feature = "yew")]
 /// One `key = value` row the user has added to the `select:`/`where:`
 /// predicate list.
@@ -404,7 +456,9 @@ async fn fetch_text(path: &str, token: Option<&str>) -> Result<FetchOutcome, JsV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pillar_observability::{parse_psl, TimeseriesStore};
+    use pillar_observability::{
+        parse_psl, CorrelationIndex, LabelSet, SpanEvent, TimeseriesStore, TraceProducer,
+    };
 
     /// The structured builder produces the SAME AST `parse_psl` parses from
     /// the equivalent compact text — proving surface equivalence for the
@@ -578,6 +632,104 @@ mod tests {
         assert!(candidates.contains(&SignalKind::Log));
         assert!(candidates.contains(&SignalKind::TraceSpan));
         assert!(candidates.contains(&SignalKind::ProfileSample));
+        assert_eq!(candidates.len(), 4);
+    }
+
+    /// The `traces` builder produces the SAME AST `parse_psl` parses from
+    /// the equivalent compact text — proving surface equivalence for the
+    /// `traces` vertical, mirroring the `metrics`/`metadata`
+    /// structured-builder tests. FAILS without `build_trace_query` composing
+    /// the real `PslQueryBuilder`/`PslQuery` model.
+    #[test]
+    fn trace_structured_builder_matches_the_parsed_equivalent_text_query() {
+        let text = "select: traces(trace = t-1) where: node = n-1 range: now-1h correlate: { window: 30s, anchor: traces }";
+        let parsed = parse_psl(text).expect("fixture text query parses");
+
+        let built = build_trace_query(
+            &[("trace".to_string(), "t-1".to_string())],
+            &[("node".to_string(), "n-1".to_string())],
+            3600,
+            Some((30, SignalKind::TraceSpan)),
+        )
+        .expect("structured build succeeds");
+
+        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(built.to_text(), parsed.to_text());
+        assert_eq!(built.to_text(), text);
+    }
+
+    /// A `traces` builder with no `where:`/correlate still matches its
+    /// minimal text equivalent (covers the "just select + range" shape the
+    /// UI starts from before the user adds any predicate).
+    #[test]
+    fn trace_minimal_selection_matches_its_text_equivalent() {
+        let text = "select: traces range: now-5m";
+        let parsed = parse_psl(text).expect("fixture text query parses");
+        let built = build_trace_query(&[], &[], 300, None).expect("build succeeds");
+        assert_eq!(built, parsed);
+    }
+
+    /// The `traces` vertical's autofill dropdown is populated from a REAL
+    /// `MetadataIndex` built against a genuine trace fixture — real
+    /// `SpanEvent`s recorded through the actual `TraceProducer` onto the
+    /// shared store (never a hardcoded/fabricated list) — and an unknown key
+    /// returns empty, mirroring the `metrics`/`metadata` autofill-fixture
+    /// tests.
+    #[test]
+    fn trace_autofill_options_come_from_a_real_metadata_index_fixture_never_fabricated() {
+        let mut store = TimeseriesStore::new(64, 10_000);
+        let mut index_spine = CorrelationIndex::new();
+
+        let mut node_labels_a: LabelSet = LabelSet::new();
+        node_labels_a.insert("node".to_string(), "n-1".to_string());
+        let mut producer_a = TraceProducer::new(node_labels_a);
+        producer_a.set_enabled(true);
+        producer_a.record(
+            &mut store,
+            &mut index_spine,
+            &SpanEvent::root("t-1", "s-1", "handle_request"),
+            0,
+        );
+
+        let mut node_labels_b: LabelSet = LabelSet::new();
+        node_labels_b.insert("node".to_string(), "n-2".to_string());
+        let mut producer_b = TraceProducer::new(node_labels_b);
+        producer_b.set_enabled(true);
+        producer_b.record(
+            &mut store,
+            &mut index_spine,
+            &SpanEvent::child("t-2", "s-2", "s-1", "apply_op"),
+            1,
+        );
+
+        let index = MetadataIndex::from_store(&store);
+
+        let keys = label_key_options(&index);
+        assert!(keys.contains(&"node".to_string()));
+        assert!(keys.contains(&"trace".to_string()));
+
+        let values = label_value_options(&index, "node");
+        assert_eq!(values, vec!["n-1".to_string(), "n-2".to_string()]);
+        // Never a value that was never actually recorded.
+        assert!(!values.contains(&"n-9".to_string()));
+
+        let trace_values = label_value_options(&index, "trace");
+        assert_eq!(trace_values, vec!["t-1".to_string(), "t-2".to_string()]);
+
+        // An unknown key returns empty — never a placeholder list.
+        assert!(label_value_options(&index, "nonexistent-key").is_empty());
+    }
+
+    /// The `traces` correlate panel pivots to every OTHER signal kind
+    /// sharing labels — never back to `traces` itself.
+    #[test]
+    fn trace_correlate_candidates_pivot_to_other_kinds_never_traces_itself() {
+        let candidates = correlate_candidates_traces();
+        assert!(!candidates.contains(&SignalKind::TraceSpan));
+        assert!(candidates.contains(&SignalKind::Metric));
+        assert!(candidates.contains(&SignalKind::Log));
+        assert!(candidates.contains(&SignalKind::ProfileSample));
+        assert!(candidates.contains(&SignalKind::MetadataSample));
         assert_eq!(candidates.len(), 4);
     }
 }
