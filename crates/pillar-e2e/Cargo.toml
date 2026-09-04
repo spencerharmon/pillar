@@ -17,6 +17,7 @@ pillar-coordination = { path = "../pillar-coordination" }
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-identity = { path = "../pillar-identity" }
 pillar-ipam = { path = "../pillar-ipam" }
+pillar-manifest = { path = "../pillar-manifest" }
 pillar-net = { path = "../pillar-net" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-topology = { path = "../pillar-topology" }

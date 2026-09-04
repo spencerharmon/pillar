@@ -31,6 +31,11 @@ pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-eventlog = { path = "../pillar-eventlog" }
 pillar-core = { path = "../pillar-core" }
 pillar-ipam = { path = "../pillar-ipam" }
+# The live UDP ingress dataplane (udp_dataplane) rides the manifest LB policy
+# types (LoadBalancerPolicy/Algorithm/Affinity) so backend selection is the
+# manifest's own decision, not a parallel one. pillar-manifest does not depend
+# on pillar-net, so this is acyclic.
+pillar-manifest = { path = "../pillar-manifest" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -51,9 +56,8 @@ pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-topology = { path = "../pillar-topology" }
 # Dev-only: the distributed-lb-acceptance test composes the ingress/LB
 # manifest model (Route/Frontend/derive_routing_table) and the WoT trust
-# artifacts gating Route attachment. Neither is a runtime dep of the
-# transport substrate itself.
-pillar-manifest = { path = "../pillar-manifest" }
+# artifacts gating Route attachment. (pillar-manifest is now a runtime dep of
+# this crate for the UDP dataplane, above.)
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 
 [lints]
