@@ -19,14 +19,18 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Yew is the portal framework (operator-chosen); stylist provides the
-# CSS-in-Rust styling (operator-chosen) — no external stylesheet toolchain.
+# Yew is the portal framework (operator-chosen) — needed here only for
+# `yew::Renderer` at the wasm entrypoint below.
 yew = { version = "0.21", features = ["csr"] }
-stylist = { version = "0.13", features = ["yew"] }
 # wasm-bindgen is pinned EXACTLY to the version the flake's nixpkgs ships as
 # `wasm-bindgen-cli` (0.2.121): trunk runs that CLI over this crate's wasm and
 # refuses a version mismatch, so the two MUST agree for the offline nix build.
 wasm-bindgen = "=0.2.121"
+# The portal's design system + app shell (auth session, router, panels) —
+# this crate's job is only to mount `pillar_web_frontend::router::Shell` to
+# the wasm entrypoint; every panel/route/component lives in that crate so it
+# stays host-testable there (see that crate's docs).
+pillar-web-frontend = { path = "../pillar-web-frontend" }
 
 [profile.release]
 # Small, deterministic wasm: optimize for size and strip.

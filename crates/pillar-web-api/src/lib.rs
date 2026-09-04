@@ -36,6 +36,65 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod client;
+
+// ---------------------------------------------------------------------
+// Versioning — the ONE stamp the HTTP ingest API surface carries
+// ---------------------------------------------------------------------
+//
+// ROI P1 "Versioning, compatibility & safe rollout" requires every
+// independently-evolving wire surface to carry an explicit version stamp
+// (`pillar_crypto::version::SurfaceVersion`) and negotiate compatibility
+// through the shared `pillar_crypto::compat` primitives — never a parallel,
+// locally-invented versioning scheme. These constants are the SINGLE source
+// of truth for the HTTP ingest API's own version: `pillar-cli::web_serve`
+// (the server) and this crate's [`client::SdkClient`] (the generated SDK)
+// both import them from HERE, so the "published API version" and the
+// "running server's negotiated version" can never drift — they are, by
+// construction, the exact same constant.
+
+/// The stable name this surface negotiates under (`pillar_crypto::compat`'s
+/// `negotiate_surface`/`negotiate_all` take a surface name).
+pub const HTTP_API_SURFACE: &str = "http-ingest-api";
+
+/// The HTTP ingest API surface's own EXPLICIT version stamp — versioned
+/// INDEPENDENTLY of any event/message/body it carries. This is the distinct
+/// wire surface a browser/`curl`/k8s Ingress/SDK client speaks to the portal;
+/// it advances on its OWN line (`v1`, `v2`, …) as request/response framing
+/// changes, unrelated to the event-envelope or pillar-message version
+/// numbers. Every response advertises it via [`API_VERSION_HEADER`], and a
+/// request MAY assert the version it speaks; the server checks that
+/// assertion against `[MIN_API_VERSION, API_VERSION]` with the shared
+/// `pillar_crypto::version::SurfaceVersion` primitive.
+pub const API_VERSION: pillar_crypto::version::SurfaceVersion =
+    pillar_crypto::version::SurfaceVersion(1);
+
+/// The OLDEST HTTP ingest API version this build still accepts on a request —
+/// the low bound of the supported window (a version below it is
+/// `pillar_crypto::version::VersionError::Unsupported`, a retired surface).
+/// Currently equal to [`API_VERSION`] (a single-version window), it moves
+/// independently as old framings are retired.
+pub const MIN_API_VERSION: pillar_crypto::version::SurfaceVersion =
+    pillar_crypto::version::SurfaceVersion(1);
+
+/// The response/request header carrying the HTTP ingest API
+/// [`pillar_crypto::version::SurfaceVersion`] stamp (rendered `vN` via its
+/// `Display`). Emitted on EVERY response so any client can see the version it
+/// was served at; OPTIONALLY sent by a request to assert the version it
+/// speaks (a request without it is served backward-compatibly at
+/// [`API_VERSION`]).
+pub const API_VERSION_HEADER: &str = "X-Pillar-Api-Version";
+
+/// The N-1+ compat window an [`client::SdkClient`] negotiates the HTTP
+/// ingest API surface under (`pillar_crypto::compat::negotiate_surface`).
+/// Zero, matching the server's own currently single-version
+/// `[MIN_API_VERSION, API_VERSION]` window: today a client must match the
+/// server's advertised version EXACTLY to be accepted. Widening this (and the
+/// server's own window) together is how a future N>0 rollout is introduced —
+/// never by inventing a second, parallel negotiation scheme.
+pub const API_COMPAT_WINDOW: pillar_crypto::compat::CompatWindow =
+    pillar_crypto::compat::CompatWindow(0);
+
 // ---------------------------------------------------------------------
 // Login
 // ---------------------------------------------------------------------
@@ -708,5 +767,47 @@ mod tests {
             capability: Some("resource/act".to_owned()),
             event_cid: Some("cid-1".to_owned()),
         });
+    }
+
+    // --- version stamp: the published API version must match what a
+    // negotiating peer (the server, or an SDK client) actually checks against
+    // — reusing pillar_crypto::compat, never a parallel scheme. ---
+
+    #[test]
+    fn published_api_version_is_within_its_own_supported_window() {
+        assert!(API_VERSION.check_supported(MIN_API_VERSION, API_VERSION).is_ok());
+    }
+
+    #[test]
+    fn published_api_version_negotiates_with_itself_under_the_compat_window() {
+        // The server's advertised version (API_VERSION) and a freshly-built
+        // SDK client's declared version (also API_VERSION, by default) must
+        // negotiate successfully — this is exactly "the published API
+        // version stamp matches the running server's negotiated version".
+        assert!(pillar_crypto::compat::negotiate_surface(
+            HTTP_API_SURFACE,
+            API_VERSION,
+            API_VERSION,
+            API_COMPAT_WINDOW,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_version_outside_the_compat_window_is_refused_not_miscoded() {
+        // A client declaring a version outside the (zero-width) compat window
+        // is cleanly REFUSED by the shared negotiation primitive — never
+        // silently accepted or hand-rolled into a bespoke check.
+        let incompatible = pillar_crypto::version::SurfaceVersion(API_VERSION.0 + 1);
+        let err = pillar_crypto::compat::negotiate_surface(
+            HTTP_API_SURFACE,
+            incompatible,
+            API_VERSION,
+            API_COMPAT_WINDOW,
+        )
+        .unwrap_err();
+        assert_eq!(err.surface, HTTP_API_SURFACE);
+        assert_eq!(err.local, incompatible);
+        assert_eq!(err.remote, API_VERSION);
     }
 }
