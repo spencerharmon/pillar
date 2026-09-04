@@ -51,6 +51,7 @@ pub mod otlp;
 pub mod profiling;
 pub mod psl;
 pub mod query;
+pub mod recording;
 pub mod retention;
 pub mod role;
 pub mod sampling;
@@ -77,6 +78,10 @@ pub use psl::{
     PslError, PslQuery, PslQueryBuilder, PslResult, RelativeRange, SelectClause,
 };
 pub use query::{PersistedMaterializedView, Query, ViewCache, ViewPersistError};
+pub use recording::{
+    Evaluation, RecordingEngine, RecordingRule, RuleError, RuleKind, DERIVED_NAME_LABEL,
+    DERIVED_RULE_LABEL,
+};
 pub use retention::{
     EffectiveRetention, LabelSelector, RetentionPolicy, RetentionPolicySet, RetentionPolicySpec,
 };
