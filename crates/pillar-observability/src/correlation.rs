@@ -70,6 +70,10 @@ pub struct CorrelationIndex {
     by_correlation: BTreeMap<CorrelationId, BTreeSet<SignalId>>,
     by_label: BTreeMap<Label, BTreeSet<SignalId>>,
     kinds: BTreeMap<SignalId, SignalKind>,
+    /// The correlation id (if any) each registered signal was stamped with —
+    /// the inverse of `by_correlation`, letting a caller (e.g. `psl`) look up
+    /// a specific signal's correlation id to find its causal-thread peers.
+    correlation_of: BTreeMap<SignalId, CorrelationId>,
 }
 
 impl CorrelationIndex {
@@ -88,6 +92,7 @@ impl CorrelationIndex {
                 .entry(cid.clone())
                 .or_default()
                 .insert(signal.clone());
+            self.correlation_of.insert(signal.clone(), cid.clone());
         }
         for label in &spine.labels {
             self.by_label
@@ -112,6 +117,12 @@ impl CorrelationIndex {
     #[must_use]
     pub fn by_label(&self, label: &Label) -> BTreeSet<SignalId> {
         self.by_label.get(label).cloned().unwrap_or_default()
+    }
+
+    /// The correlation id `signal` was registered under, if any.
+    #[must_use]
+    pub fn correlation_of(&self, signal: &SignalId) -> Option<CorrelationId> {
+        self.correlation_of.get(signal).cloned()
     }
 
     /// The distinct signal *kinds* correlated to `correlation` — proves a

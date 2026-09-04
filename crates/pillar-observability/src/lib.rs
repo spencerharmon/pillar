@@ -49,6 +49,7 @@ pub mod metadata_index;
 pub mod metadata_ingest;
 pub mod otlp;
 pub mod profiling;
+pub mod psl;
 pub mod query;
 pub mod retention;
 pub mod role;
@@ -70,6 +71,10 @@ pub use metadata_ingest::{
 pub use otlp::{Envelope, OtlpError, OtlpIngest};
 pub use profiling::{
     NodeProfileSource, ProfileKind, ProfileReading, ProfileSource, ProfilingProducer,
+};
+pub use psl::{
+    parse as parse_psl, execute as execute_psl, CorrelateSpec, CorrelationGroup, Predicate,
+    PslError, PslQuery, PslQueryBuilder, PslResult, RelativeRange, SelectClause,
 };
 pub use query::{PersistedMaterializedView, Query, ViewCache, ViewPersistError};
 pub use retention::{

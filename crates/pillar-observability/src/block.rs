@@ -303,6 +303,11 @@ pub struct TimeseriesStore {
     /// Ghost, grow-only: every signal id ever written into this store — the
     /// spec's `written`. Used to prove `LogSubsetOfWritten`.
     written: BTreeMap<SignalId, u64>,
+    /// The logical write tick each signal id was admitted at — used by
+    /// `psl` range/correlate evaluation (time-window filtering/grouping),
+    /// distinct from `expiry` (which is `write_tick + effective retention
+    /// window`, not invertible in general once per-signal policies vary).
+    write_ticks: BTreeMap<SignalId, u64>,
     /// Downsample bookkeeping: per `(kind, downsample bucket key)` the tick of
     /// the last admitted representative, so a policy with a downsample interval
     /// admits at most one signal per bucket window (coarser aggregate).
@@ -325,6 +330,7 @@ impl TimeseriesStore {
             sealed: Vec::new(),
             open: TimeseriesBlock::new(block_capacity),
             written: BTreeMap::new(),
+            write_ticks: BTreeMap::new(),
             downsample_last: BTreeMap::new(),
         }
     }
@@ -420,6 +426,7 @@ impl TimeseriesStore {
         let id = signal.id.clone();
         let expiry = signal.expiry;
         self.written.entry(id.clone()).or_insert(expiry);
+        self.write_ticks.entry(id.clone()).or_insert(write_tick);
         if !self.open.admit(signal.clone()) {
             // Current block was sealed/full: retire it and open a fresh one.
             let full = std::mem::replace(&mut self.open, TimeseriesBlock::new(self.block_capacity));
@@ -484,6 +491,14 @@ impl TimeseriesStore {
     #[must_use]
     pub fn expiry_of(&self, id: &SignalId) -> Option<u64> {
         self.written.get(id).copied()
+    }
+
+    /// The logical write tick a held/written signal was admitted at, if
+    /// known — the timestamp `psl` range/correlate evaluation filters and
+    /// groups on.
+    #[must_use]
+    pub fn write_tick_of(&self, id: &SignalId) -> Option<u64> {
+        self.write_ticks.get(id).copied()
     }
 }
 
