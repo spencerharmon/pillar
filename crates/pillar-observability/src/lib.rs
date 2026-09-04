@@ -45,6 +45,7 @@ pub mod correlation;
 pub mod ingest;
 pub mod metadata;
 pub mod otlp;
+pub mod profiling;
 pub mod query;
 pub mod retention;
 pub mod role;
@@ -59,6 +60,9 @@ pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };
 pub use otlp::{Envelope, OtlpError, OtlpIngest};
+pub use profiling::{
+    NodeProfileSource, ProfileKind, ProfileReading, ProfileSource, ProfilingProducer,
+};
 pub use query::{PersistedMaterializedView, Query, ViewCache, ViewPersistError};
 pub use retention::{
     EffectiveRetention, LabelSelector, RetentionPolicy, RetentionPolicySet, RetentionPolicySpec,
