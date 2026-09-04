@@ -48,6 +48,12 @@ yew = [
 # the Explore query builders compose against — never a second, parallel query
 # model or a fabricated autofill list.
 pillar-observability = { path = "../pillar-observability" }
+# The built-in resource-definition schema registry (`pillar_manifest::builtin`)
+# a Dashboard resource validates against, and the `Crd`/`Metadata` body a
+# Dashboard renders to — a Dashboard is one of the natively-registered
+# `BuiltinKind`s, so it reuses the SAME schema/validation path a third-party
+# CRD does rather than inventing a parallel manifest model.
+pillar-manifest = { path = "../pillar-manifest" }
 # stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
 # `parser` feature lets us build a `Style` from a raw CSS &str on the NATIVE
 # target (host `cargo test`), which is what makes the design system host-

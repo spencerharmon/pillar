@@ -3357,6 +3357,7 @@ dependencies = [
  "base64 0.22.1",
  "gloo-net 0.4.0",
  "js-sys",
+ "pillar-manifest",
  "pillar-observability",
  "stylist",
  "wasm-bindgen",
