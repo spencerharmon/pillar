@@ -31,7 +31,16 @@ default = ["yew"]
 # The Yew component wrappers around the design-system styles. On by default so
 # `cargo test -p pillar-web-frontend` typechecks the components on the host; the
 # wasm bundle build turns them into real DOM.
-yew = ["dep:yew", "dep:yew-router", "dep:web-sys", "dep:wasm-bindgen"]
+yew = [
+    "dep:yew",
+    "dep:yew-router",
+    "dep:web-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:gloo-net",
+    "dep:base64",
+]
 
 [dependencies]
 # stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
@@ -46,15 +55,43 @@ yew = { version = "0.21", features = ["csr"], optional = true }
 # login screen.
 yew-router = { version = "0.18", optional = true }
 # web-sys + wasm-bindgen back the Card's mouse-tracking spotlight (reading the
-# element rect and writing the `--spot-x/--spot-y` custom properties). Optional,
-# pulled in only with the `yew` feature; the design-system tests do not need
-# them. wasm-bindgen is pinned to the flake's `wasm-bindgen-cli` version.
+# element rect and writing the `--spot-x/--spot-y` custom properties), and
+# (with the WebAuthn features below) the real `navigator.credentials`
+# register/sign-in ceremony. Optional, pulled in only with the `yew` feature;
+# the design-system tests do not need them. wasm-bindgen is pinned to the
+# flake's `wasm-bindgen-cli` version.
 web-sys = { version = "0.3", optional = true, features = [
     "DomRect",
     "CssStyleDeclaration",
     "HtmlElement",
+    "Window",
+    "Navigator",
+    "CredentialsContainer",
+    "Credential",
+    "CredentialCreationOptions",
+    "CredentialRequestOptions",
+    "PublicKeyCredential",
+    "PublicKeyCredentialCreationOptions",
+    "PublicKeyCredentialRequestOptions",
+    "PublicKeyCredentialRpEntity",
+    "PublicKeyCredentialUserEntity",
+    "PublicKeyCredentialParameters",
+    "PublicKeyCredentialType",
+    "AuthenticatorResponse",
+    "AuthenticatorAttestationResponse",
+    "AuthenticatorAssertionResponse",
+    "AuthenticationExtensionsClientOutputs",
 ] }
 wasm-bindgen = { version = "=0.2.121", optional = true }
+# Awaits the `Promise`s `navigator.credentials.create()/get()` return.
+wasm-bindgen-futures = { version = "0.4", optional = true }
+# `js_sys::{Array, Object, Reflect, Uint8Array}` build the WebAuthn options
+# objects and read back the attestation/assertion `ArrayBuffer` fields.
+js-sys = { version = "0.3", optional = true }
+# The real `POST /webauthn/*` transport (`BrowserTransport`).
+gloo-net = { version = "0.4", optional = true }
+# base64url encode/decode for the RP's wire challenge/credential fields.
+base64 = { version = "0.22", optional = true }
 
 [lints]
 workspace = true
