@@ -3088,6 +3088,7 @@ dependencies = [
  "pillar-identity",
  "pillar-net",
  "pillar-streamdb",
+ "pillar-topology",
  "tempfile",
  "tokio",
 ]
