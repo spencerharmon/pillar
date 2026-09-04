@@ -19,6 +19,8 @@ pillar-identity = { path = "../pillar-identity" }
 pillar-ipam = { path = "../pillar-ipam" }
 pillar-manifest = { path = "../pillar-manifest" }
 pillar-net = { path = "../pillar-net" }
+pillar-cli = { path = "../pillar-cli" }
+pillar-surface-inventory = { path = "../pillar-surface-inventory" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-topology = { path = "../pillar-topology" }
 libp2p = { version = "0.56", features = [

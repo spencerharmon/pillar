@@ -3133,6 +3133,7 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "libp2p",
+ "pillar-cli",
  "pillar-controller",
  "pillar-coordination",
  "pillar-core",
@@ -3142,6 +3143,7 @@ dependencies = [
  "pillar-manifest",
  "pillar-net",
  "pillar-streamdb",
+ "pillar-surface-inventory",
  "pillar-topology",
  "tokio",
 ]
@@ -3277,6 +3279,17 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "sha2",
+]
+
+[[package]]
+name = "pillar-surface-inventory"
+version = "0.0.0"
+dependencies = [
+ "pillar-cli",
+ "pillar-manifest",
+ "pillar-net",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

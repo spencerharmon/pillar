@@ -27,6 +27,7 @@ members = [
     "crates/pillar-topology",
     "crates/pillar-upgrade-gate",
     "crates/pillar-realness-gate",
+    "crates/pillar-surface-inventory",
     "crates/pillar-e2e",
 ]
 # pillar-frontend targets wasm32-unknown-unknown and carries the yew/stylist/

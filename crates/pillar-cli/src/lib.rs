@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod cli_surface;
 pub mod cluster;
 pub mod health;
 pub mod identity_trust_cli;

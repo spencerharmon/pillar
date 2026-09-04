@@ -1,0 +1,18 @@
+[package]
+name = "pillar-surface-inventory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Emits a machine-readable inventory (pillar-integration/v1 schema) of every external surface pillar actually serves: CLI verbs, HTTP routes, manifest kinds, and wire-protocol ops — read from the real, currently-served registries, never a hand-maintained catalog."
+
+[dependencies]
+pillar-cli = { path = "../pillar-cli" }
+pillar-manifest = { path = "../pillar-manifest" }
+pillar-net = { path = "../pillar-net" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

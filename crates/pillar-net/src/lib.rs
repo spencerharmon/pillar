@@ -36,6 +36,9 @@ use libp2p::{
 
 pub mod pillar_udp;
 
+pub mod wire_surface;
+pub use wire_surface::{registered_wire_ops, WireOp, WireOpRegistry};
+
 pub mod udp_dataplane;
 pub use udp_dataplane::{UdpDataplane, HEALTH_PROBE};
 
