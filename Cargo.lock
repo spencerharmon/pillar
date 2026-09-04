@@ -3027,6 +3027,8 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-identity",
+ "pillar-manifest",
+ "pillar-observability",
  "pillar-rbac",
  "pillar-wot-authority",
  "rand_core 0.6.4",

@@ -255,6 +255,55 @@ impl ControllerRegistry {
     }
 }
 
+/// The five observability signal sources a [`BuiltinKind::SignalConfig`]
+/// manifest names in its `source` field — the Rust-side mirror of
+/// `specs/ObsIngestionSubstrate.tla`'s `Kinds` constant
+/// (`{metrics, logs, traces, profiles, metadata}`).
+pub const SIGNAL_CONFIG_SOURCES: [&str; 5] =
+    ["metrics", "logs", "traces", "profiles", "metadata"];
+
+/// Whether `source` is one of [`SIGNAL_CONFIG_SOURCES`] that defaults ON at
+/// cell creation — the Rust-side mirror of `specs/ObsIngestionSubstrate.tla`'s
+/// proven `DefaultsMatchSpec` invariant: `DefaultOn = {metrics, logs,
+/// metadata}` (tracing and profiling default OFF). Exposed so any caller
+/// building a default `SignalConfig` set (or re-deriving a reset-to-default
+/// value) uses this ONE declared matrix rather than re-guessing it.
+#[must_use]
+pub fn signal_config_default_on(source: &str) -> bool {
+    matches!(source, "metrics" | "logs" | "metadata")
+}
+
+/// The DEFAULT set of `SignalConfig` manifests a freshly bootstrapped cell
+/// seeds — one ordinary in-cell resource per entry of
+/// [`SIGNAL_CONFIG_SOURCES`], each `enabled` per [`signal_config_default_on`]
+/// (metrics ON, info logging ON, tracing OFF, profiling OFF, basic periodic
+/// metadata ON — the exact default matrix `specs/ObsIngestionSubstrate.tla`'s
+/// `DefaultsMatchSpec` invariant proves). These are ORDINARY manifests: they
+/// validate against [`BuiltinKind::SignalConfig`]'s own schema, are
+/// applied/read/deleted through the exact same [`crate::apply::ManifestStore`]
+/// path as any other resource, and a user may view and MODIFY them like any
+/// other manifest — this is delivery-as-manifest, never a hardcoded flag the
+/// user cannot see or edit.
+#[must_use]
+pub fn default_signal_config_manifests() -> Vec<Crd> {
+    SIGNAL_CONFIG_SOURCES
+        .into_iter()
+        .map(|source| {
+            let name = format!("default-{source}");
+            Crd::new(
+                BUILTIN_API_VERSION,
+                BuiltinKind::SignalConfig.kind_str(),
+                crate::Metadata::new(name),
+            )
+            .with_spec("source", crate::Value::String(source.to_owned()))
+            .with_spec(
+                "enabled",
+                crate::Value::Boolean(signal_config_default_on(source)),
+            )
+        })
+        .collect()
+}
+
 /// Register a [`NoopControllerHook`] for every built-in kind into `registry`
 /// — the identical [`ControllerRegistry::register`] call a caller makes to
 /// wire up a third-party CRD's hook. A real deployment overrides these with
@@ -411,6 +460,43 @@ mod tests {
         assert_eq!(registry.dispatch(&unknown_third_party), None);
         assert!(!registry.contains(&unknown_builtin_shaped));
         assert!(!registry.contains(&unknown_third_party));
+    }
+
+    // DefaultsMatchSpec (Rust delivery side): the default SignalConfig set has
+    // exactly one manifest per declared source, each validating against the
+    // real schema, with `enabled` matching the declared default matrix
+    // (metrics/logs/metadata ON, traces/profiles OFF).
+    #[test]
+    fn default_signal_config_manifests_match_the_declared_defaults_matrix() {
+        let mut registry = SchemaRegistry::new();
+        register_builtin_schemas(&mut registry);
+
+        let manifests = default_signal_config_manifests();
+        assert_eq!(manifests.len(), SIGNAL_CONFIG_SOURCES.len());
+
+        for source in SIGNAL_CONFIG_SOURCES {
+            let crd = manifests
+                .iter()
+                .find(|c| c.spec.get("source") == Some(&Value::String(source.to_owned())))
+                .unwrap_or_else(|| panic!("missing default SignalConfig manifest for {source}"));
+            assert_eq!(crd.kind, BuiltinKind::SignalConfig.kind_str());
+            assert_eq!(crd.api_version, BUILTIN_API_VERSION);
+            assert_eq!(registry.validate(crd), Ok(()));
+            let expected_enabled = signal_config_default_on(source);
+            assert_eq!(
+                crd.spec.get("enabled"),
+                Some(&Value::Boolean(expected_enabled)),
+                "source {source} should default enabled={expected_enabled}"
+            );
+        }
+
+        // Exactly the declared DefaultOn matrix — tracing and profiling OFF,
+        // the other three ON.
+        assert!(signal_config_default_on("metrics"));
+        assert!(signal_config_default_on("logs"));
+        assert!(signal_config_default_on("metadata"));
+        assert!(!signal_config_default_on("traces"));
+        assert!(!signal_config_default_on("profiles"));
     }
 
     #[test]

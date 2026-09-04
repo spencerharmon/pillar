@@ -181,6 +181,15 @@ pub struct CellBootstrapOutcome {
     /// The genesis proof-of-possession signature the user key's REAL custody
     /// backend produced.
     pub user_genesis_signature: String,
+    /// The DEFAULT set of `SignalConfig` manifests this cell was seeded
+    /// with (ROI Priority 0 "synergy everywhere": metrics ON, info logging
+    /// ON, tracing OFF, profiling OFF, basic periodic metadata ON — see
+    /// [`pillar_manifest::builtin::default_signal_config_manifests`]). These
+    /// are ORDINARY in-cell resources: the caller applies them through its
+    /// normal `pillar_manifest::apply::ManifestStore` path (exactly like any
+    /// manifest a user later views/edits/deletes), never installed as a
+    /// hidden flag.
+    pub signal_config_manifests: Vec<pillar_manifest::Crd>,
 }
 
 impl CellBootstrapOutcome {
@@ -286,6 +295,7 @@ pub fn bootstrap_cell_and_user(
         user_custody: user_custody.kind(),
         cell_genesis_signature,
         user_genesis_signature,
+        signal_config_manifests: pillar_manifest::builtin::default_signal_config_manifests(),
     })
 }
 
@@ -509,5 +519,157 @@ mod tests {
         .expect("bootstrap");
         assert!(outcome.cell_genesis_signature.starts_with("file-keyring:"));
         assert!(outcome.user_genesis_signature.starts_with("password:"));
+    }
+
+    // ---- default SignalConfig manifests seeded at cell creation ----
+
+    // A freshly bootstrapped cell has the declared default SignalConfig
+    // manifests present and readable via the normal manifest-get path.
+    #[test]
+    fn fresh_cell_seeds_default_signal_config_manifests_readable_via_manifest_get() {
+        let registry = InMemoryCellNameRegistry::new();
+        let outcome = bootstrap_cell_and_user(
+            NodeId::from("cell-signals"),
+            "spencer",
+            &custody(),
+            &custody(),
+            &registry,
+            4,
+        )
+        .expect("bootstrap");
+
+        assert_eq!(
+            outcome.signal_config_manifests.len(),
+            pillar_manifest::builtin::SIGNAL_CONFIG_SOURCES.len()
+        );
+
+        let mut schema_registry = pillar_manifest::SchemaRegistry::new();
+        pillar_manifest::builtin::register_builtin_schemas(&mut schema_registry);
+        let mut store = pillar_manifest::apply::ManifestStore::new(schema_registry, "cell-signals");
+
+        for crd in &outcome.signal_config_manifests {
+            store.apply_crd(crd.clone()).expect("valid default manifest");
+        }
+
+        // Readable via the normal manifest-get path, one per declared source,
+        // with `enabled` matching the declared default matrix.
+        for source in pillar_manifest::builtin::SIGNAL_CONFIG_SOURCES {
+            let name = format!("default-{source}");
+            let key = pillar_manifest::apply::ManifestKey {
+                api_version: pillar_manifest::builtin::BUILTIN_API_VERSION.to_owned(),
+                kind: pillar_manifest::builtin::BuiltinKind::SignalConfig
+                    .kind_str()
+                    .to_owned(),
+                name,
+            };
+            let body = store.get_body(&key).expect("seeded manifest is readable");
+            assert_eq!(
+                body.spec.get("enabled"),
+                Some(&pillar_manifest::Value::Boolean(
+                    pillar_manifest::builtin::signal_config_default_on(source)
+                ))
+            );
+        }
+    }
+
+    // Editing a SignalConfig manifest (e.g. flipping tracing ON) actually
+    // changes live producer behavior, and deleting/resetting falls back to
+    // the declared defaults — end-to-end through the real manifest apply
+    // path plus pillar_observability's producer gate.
+    #[test]
+    fn editing_a_seeded_signal_config_manifest_changes_live_producer_behavior_and_resets_on_delete()
+    {
+        let registry = InMemoryCellNameRegistry::new();
+        let outcome = bootstrap_cell_and_user(
+            NodeId::from("cell-signals-live"),
+            "spencer",
+            &custody(),
+            &custody(),
+            &registry,
+            4,
+        )
+        .expect("bootstrap");
+
+        let mut schema_registry = pillar_manifest::SchemaRegistry::new();
+        pillar_manifest::builtin::register_builtin_schemas(&mut schema_registry);
+        let mut store =
+            pillar_manifest::apply::ManifestStore::new(schema_registry, "cell-signals-live");
+        for crd in &outcome.signal_config_manifests {
+            store.apply_crd(crd.clone()).expect("valid default manifest");
+        }
+
+        // Live producer matrix mirrors the seeded manifest set.
+        let mut config = pillar_observability::SignalConfigMatrix::default_matrix();
+        let mut ts_store = pillar_observability::TimeseriesStore::new(16, 1000);
+
+        // Tracing defaults OFF: refused by the live producer gate.
+        assert_eq!(
+            pillar_observability::gated_ingest(
+                &mut ts_store,
+                &config,
+                pillar_observability::SignalKind::TraceSpan,
+                b"span=1".to_vec(),
+                0,
+            ),
+            None
+        );
+
+        // The user edits the seeded `default-traces` manifest: flip enabled
+        // to true, re-apply through the SAME manifest path (an ordinary
+        // manifest edit, not a hidden flag).
+        let traces_key = pillar_manifest::apply::ManifestKey {
+            api_version: pillar_manifest::builtin::BUILTIN_API_VERSION.to_owned(),
+            kind: pillar_manifest::builtin::BuiltinKind::SignalConfig
+                .kind_str()
+                .to_owned(),
+            name: "default-traces".to_owned(),
+        };
+        let mut edited = store.get_body(&traces_key).expect("seeded manifest present");
+        edited.spec.insert(
+            "enabled".to_owned(),
+            pillar_manifest::Value::Boolean(true),
+        );
+        store.apply_crd(edited.clone()).expect("edit re-applies");
+
+        // Lower the edited manifest into the live producer matrix.
+        let source = match edited.spec.get("source") {
+            Some(pillar_manifest::Value::String(s)) => s.clone(),
+            _ => panic!("source is a string"),
+        };
+        let enabled = matches!(
+            edited.spec.get("enabled"),
+            Some(pillar_manifest::Value::Boolean(true))
+        );
+        let affected = config
+            .apply_spec(&pillar_observability::SignalConfigSpec { source, enabled })
+            .expect("recognized source");
+        assert_eq!(affected, pillar_observability::SignalKind::TraceSpan);
+
+        // Live behavior changed: the SAME producer path now actually writes.
+        let id = pillar_observability::gated_ingest(
+            &mut ts_store,
+            &config,
+            pillar_observability::SignalKind::TraceSpan,
+            b"span=1".to_vec(),
+            0,
+        )
+        .expect("tracing is now enabled by the edited manifest");
+        assert!(ts_store.contains(&id));
+
+        // Delete/reset the manifest — falls back to the declared default
+        // (tracing OFF again).
+        store.delete(&traces_key).expect("delete seeded manifest");
+        config.reset_to_default(pillar_observability::SignalKind::TraceSpan);
+        assert_eq!(
+            pillar_observability::gated_ingest(
+                &mut ts_store,
+                &config,
+                pillar_observability::SignalKind::TraceSpan,
+                b"span=2".to_vec(),
+                1,
+            ),
+            None,
+            "deleting the manifest must fall back to the declared default (OFF)"
+        );
     }
 }
