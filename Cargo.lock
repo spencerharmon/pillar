@@ -3300,6 +3300,7 @@ dependencies = [
 name = "pillar-web-api"
 version = "0.0.0"
 dependencies = [
+ "pillar-crypto",
  "serde",
  "serde_json",
 ]

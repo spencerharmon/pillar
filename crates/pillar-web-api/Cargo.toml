@@ -9,6 +9,7 @@ description = "Shared DTO crate for the pillar web portal: every request/respons
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+pillar-crypto = { path = "../pillar-crypto", default-features = false }
 
 [dev-dependencies]
 serde_json = "1"
