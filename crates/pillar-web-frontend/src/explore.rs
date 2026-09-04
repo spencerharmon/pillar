@@ -261,6 +261,79 @@ pub fn correlate_candidates_traces() -> Vec<SignalKind> {
     ]
 }
 
+/// The signal kind the `logs` vertical's builder targets — the fourth of
+/// the five Explore verticals to replicate the shared
+/// [`build_metric_query`]/[`correlate_candidates`] pattern. Unlike the other
+/// verticals, the `logs` select clause also carries the LOG payload filter
+/// fields (`level`, `message`, `field.x`) — see [`build_log_query`].
+pub const LOG_KIND: SignalKind = SignalKind::Log;
+
+/// Build the structured [`PslQuery`] for a `logs` Explore selection:
+/// `select: logs(<level/message/field predicates>) where: <where_predicates>
+/// range: now-<range_seconds>s [correlate: { window: <w>, anchor: <a> }]` —
+/// the SAME AST [`pillar_observability::parse_psl`] would produce from the
+/// equivalent compact text, by construction (both surfaces build the one
+/// [`PslQueryBuilder`]/[`PslQuery`] model).
+///
+/// `logs` differs from [`build_metric_query`]/[`build_profile_query`]/
+/// [`build_trace_query`] only in its select predicates, which are the LOG
+/// payload filter fields rather than plain label equalities:
+/// - `level`, given as `Some(level)`, becomes a `level = <level>` equality
+///   predicate.
+/// - `message_contains`, given as `Some(text)`, becomes a `message =~
+///   <text>` substring-match predicate (the LOG message/text match
+///   operator) — never an equality, since a log message is free text.
+/// - `field_predicates` are `field.x = value`-shaped equality predicates
+///   against the payload's nested `field.x` tokens; the caller supplies the
+///   full dotted key (e.g. `"field.x"`) as-is.
+///
+/// Fails only as [`PslQueryBuilder::build`] does (no `select`, which cannot
+/// happen here since `logs` is always selected, or no `range`, which cannot
+/// happen either since `range_seconds` is always supplied) — the `Result`
+/// is kept so a future field can fail honestly rather than panicking.
+pub fn build_log_query(
+    level: Option<&str>,
+    message_contains: Option<&str>,
+    field_predicates: &[(String, String)],
+    where_predicates: &[(String, String)],
+    range_seconds: u64,
+    correlate: Option<(u64, SignalKind)>,
+) -> Result<PslQuery, PslError> {
+    let mut select = Vec::new();
+    if let Some(level) = level {
+        select.push(Predicate::eq("level", level.to_string()));
+    }
+    if let Some(message) = message_contains {
+        select.push(Predicate::matches("message", message.to_string()));
+    }
+    for (k, v) in field_predicates {
+        select.push(Predicate::eq(k.clone(), v.clone()));
+    }
+    let mut builder = PslQueryBuilder::new()
+        .select(LOG_KIND, select)
+        .range_relative(range_seconds);
+    for (k, v) in where_predicates {
+        builder = builder.where_eq(k.clone(), v.clone());
+    }
+    if let Some((window_seconds, anchor)) = correlate {
+        builder = builder.correlate(window_seconds, anchor);
+    }
+    builder.build()
+}
+
+/// The correlate panel's pivot-target candidates for the `logs` vertical:
+/// every signal kind OTHER than `logs` itself that a correlation window can
+/// group against. Order is fixed so the panel renders deterministically.
+#[must_use]
+pub fn correlate_candidates_logs() -> Vec<SignalKind> {
+    vec![
+        SignalKind::Metric,
+        SignalKind::TraceSpan,
+        SignalKind::ProfileSample,
+        SignalKind::MetadataSample,
+    ]
+}
+
 #[cfg(feature = "yew")]
 /// One `key = value` row the user has added to the `select:`/`where:`
 /// predicate list.
@@ -622,6 +695,272 @@ pub fn explore_profiles_builder(props: &ExploreBuilderProps) -> Html {
             <section data-panel="correlate">
                 <h3>{ "Correlate" }</h3>
                 { for profile_correlate_candidates().into_iter().map(|kind| {
+                    let correlate_anchor = correlate_anchor.clone();
+                    let label = format!("{kind:?}");
+                    let onclick = Callback::from(move |_| correlate_anchor.set(Some(kind)));
+                    html! { <button data-role="correlate-kind" onclick={onclick}>{ label }</button> }
+                }) }
+            </section>
+            <button data-role="run-query" onclick={on_run}>{ "Run" }</button>
+            <ul data-role="results">
+                { for results.iter().map(|r| html! { <li>{ r.clone() }</li> }) }
+            </ul>
+        </section>
+    }
+}
+
+#[cfg(feature = "yew")]
+/// The guided PSL query builder for the `logs` signal kind — the same
+/// autofill/correlate/submit wiring as [`ExploreBuilder`]/
+/// [`ExploreProfilesBuilder`], plus the LOG-specific payload filter fields
+/// (`level`, `message`, `field.x`) composed via [`build_log_query`] /
+/// [`correlate_candidates_logs`]. Submits the composed [`PslQuery::to_text`]
+/// to [`ExploreBuilderProps::query_path`] and renders the real matched
+/// series.
+#[function_component(ExploreLogsBuilder)]
+pub fn explore_logs_builder(props: &ExploreBuilderProps) -> Html {
+    let auth = use_auth();
+    let label_keys: UseStateHandle<Vec<String>> = use_state(Vec::new);
+    let where_key_input = use_state(String::new);
+    let where_value_input = use_state(String::new);
+    let label_values: UseStateHandle<Vec<String>> = use_state(Vec::new);
+    let where_rows: UseStateHandle<Vec<PredicateRow>> = use_state(Vec::new);
+    let level_input = use_state(String::new);
+    let message_input = use_state(String::new);
+    let field_key_input = use_state(String::new);
+    let field_value_input = use_state(String::new);
+    let field_rows: UseStateHandle<Vec<PredicateRow>> = use_state(Vec::new);
+    let range_seconds = use_state(|| 3600u64);
+    let correlate_anchor: UseStateHandle<Option<SignalKind>> = use_state(|| None);
+    let results: UseStateHandle<Vec<String>> = use_state(Vec::new);
+
+    // Load the real label-key typeahead on mount.
+    {
+        let label_keys = label_keys.clone();
+        let path = props.label_keys_path;
+        let token = auth.token.clone();
+        use_effect_with((path, token.clone()), move |_| {
+            let label_keys = label_keys.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(FetchOutcome::Ok(text)) = fetch_text(path, token.as_deref()).await {
+                    label_keys.set(crate::panels::parse_lines(&text, ""));
+                }
+            });
+            || ()
+        });
+    }
+
+    // Re-fetch the real label-value typeahead every time the user changes
+    // which key they are filling in — never a fabricated superset.
+    {
+        let label_values = label_values.clone();
+        let path = props.label_values_path;
+        let token = auth.token.clone();
+        let key = (*where_key_input).clone();
+        use_effect_with((path, key.clone(), token.clone()), move |_| {
+            let label_values = label_values.clone();
+            if key.is_empty() {
+                label_values.set(Vec::new());
+            } else {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let full = format!("{path}?key={key}");
+                    if let Ok(FetchOutcome::Ok(text)) = fetch_text(&full, token.as_deref()).await {
+                        label_values.set(crate::panels::parse_lines(&text, ""));
+                    }
+                });
+            }
+            || ()
+        });
+    }
+
+    let on_key_input = {
+        let where_key_input = where_key_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            where_key_input.set(value);
+        })
+    };
+
+    let on_value_input = {
+        let where_value_input = where_value_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            where_value_input.set(value);
+        })
+    };
+
+    let on_add_predicate = {
+        let where_rows = where_rows.clone();
+        let where_key_input = where_key_input.clone();
+        let where_value_input = where_value_input.clone();
+        Callback::from(move |_| {
+            let key = (*where_key_input).clone();
+            let value = (*where_value_input).clone();
+            if key.is_empty() || value.is_empty() {
+                return;
+            }
+            let mut rows = (*where_rows).clone();
+            rows.push(PredicateRow { key, value });
+            where_rows.set(rows);
+        })
+    };
+
+    let on_level_input = {
+        let level_input = level_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            level_input.set(value);
+        })
+    };
+
+    let on_message_input = {
+        let message_input = message_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            message_input.set(value);
+        })
+    };
+
+    let on_field_key_input = {
+        let field_key_input = field_key_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            field_key_input.set(value);
+        })
+    };
+
+    let on_field_value_input = {
+        let field_value_input = field_value_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let value = e
+                .target_dyn_into::<web_sys::HtmlInputElement>()
+                .map(|el| el.value())
+                .unwrap_or_default();
+            field_value_input.set(value);
+        })
+    };
+
+    let on_add_field = {
+        let field_rows = field_rows.clone();
+        let field_key_input = field_key_input.clone();
+        let field_value_input = field_value_input.clone();
+        Callback::from(move |_| {
+            let key = (*field_key_input).clone();
+            let value = (*field_value_input).clone();
+            if key.is_empty() || value.is_empty() {
+                return;
+            }
+            let mut rows = (*field_rows).clone();
+            rows.push(PredicateRow { key, value });
+            field_rows.set(rows);
+        })
+    };
+
+    let on_run = {
+        let where_rows = where_rows.clone();
+        let field_rows = field_rows.clone();
+        let level_input = level_input.clone();
+        let message_input = message_input.clone();
+        let range_seconds = range_seconds.clone();
+        let correlate_anchor = correlate_anchor.clone();
+        let query_path = props.query_path;
+        let auth = auth.clone();
+        let results = results.clone();
+        Callback::from(move |_| {
+            let predicates: Vec<(String, String)> = (*where_rows)
+                .iter()
+                .map(|r| (r.key.clone(), r.value.clone()))
+                .collect();
+            let field_predicates: Vec<(String, String)> = (*field_rows)
+                .iter()
+                .map(|r| (r.key.clone(), r.value.clone()))
+                .collect();
+            let level = (*level_input).clone();
+            let level = if level.is_empty() { None } else { Some(level.as_str()) };
+            let message = (*message_input).clone();
+            let message = if message.is_empty() { None } else { Some(message.as_str()) };
+            let correlate = (*correlate_anchor).map(|anchor| (60u64, anchor));
+            let Ok(query) = build_log_query(
+                level,
+                message,
+                &field_predicates,
+                &predicates,
+                *range_seconds,
+                correlate,
+            ) else {
+                return;
+            };
+            let text = query.to_text();
+            let path = query_path;
+            let token = auth.token.clone();
+            let results = results.clone();
+            let auth = auth.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let full = format!("{path}?query={}", urlencode(&text));
+                match fetch_text(&full, token.as_deref()).await {
+                    Ok(FetchOutcome::Ok(text)) => results.set(crate::panels::parse_lines(&text, "")),
+                    Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
+                    Err(_) => {}
+                }
+            });
+        })
+    };
+
+    html! {
+        <section data-panel="explore-logs">
+            <h2>{ "Explore — logs" }</h2>
+            <div data-role="log-filter-builder">
+                <input data-role="level" value={(*level_input).clone()} oninput={on_level_input} />
+                <input data-role="message" value={(*message_input).clone()} oninput={on_message_input} />
+                <input data-role="field-key" value={(*field_key_input).clone()} oninput={on_field_key_input} />
+                <input data-role="field-value" value={(*field_value_input).clone()} oninput={on_field_value_input} />
+                <button data-role="add-field" onclick={on_add_field}>{ "Add field" }</button>
+            </div>
+            <ul data-role="field-rows">
+                { for field_rows.iter().map(|r| html! { <li>{ format!("{} = {}", r.key, r.value) }</li> }) }
+            </ul>
+            <div data-role="predicate-builder">
+                <input
+                    data-role="where-key"
+                    list="explore-logs-label-keys"
+                    value={(*where_key_input).clone()}
+                    oninput={on_key_input}
+                />
+                <datalist id="explore-logs-label-keys">
+                    { for label_keys.iter().map(|k| html! { <option value={k.clone()} /> }) }
+                </datalist>
+                <input
+                    data-role="where-value"
+                    list="explore-logs-label-values"
+                    value={(*where_value_input).clone()}
+                    oninput={on_value_input}
+                />
+                <datalist id="explore-logs-label-values">
+                    { for label_values.iter().map(|v| html! { <option value={v.clone()} /> }) }
+                </datalist>
+                <button data-role="add-predicate" onclick={on_add_predicate}>{ "Add" }</button>
+            </div>
+            <ul data-role="predicate-rows">
+                { for where_rows.iter().map(|r| html! { <li>{ format!("{} = {}", r.key, r.value) }</li> }) }
+            </ul>
+            <section data-panel="correlate">
+                <h3>{ "Correlate" }</h3>
+                { for correlate_candidates_logs().into_iter().map(|kind| {
                     let correlate_anchor = correlate_anchor.clone();
                     let label = format!("{kind:?}");
                     let onclick = Callback::from(move |_| correlate_anchor.set(Some(kind)));
@@ -1039,6 +1378,97 @@ mod tests {
         assert!(candidates.contains(&SignalKind::Metric));
         assert!(candidates.contains(&SignalKind::Log));
         assert!(candidates.contains(&SignalKind::TraceSpan));
+        assert!(candidates.contains(&SignalKind::MetadataSample));
+        assert_eq!(candidates.len(), 4);
+    }
+
+    /// The `logs` structured builder produces the SAME AST `parse_psl`
+    /// parses from the equivalent compact text — the logs analogue of
+    /// `structured_builder_matches_the_parsed_equivalent_text_query`, but
+    /// exercising the LOG-specific `level`/`message`/`field.x` payload
+    /// filters rather than plain label equalities. FAILS without
+    /// `build_log_query` composing `level = <l>` / `message =~ <m>` /
+    /// `field.x = <v>` predicates against `SignalKind::Log`.
+    #[test]
+    fn structured_log_builder_matches_the_parsed_equivalent_text_query() {
+        let text = r#"select: logs(level = error, message =~ "connection timeout", field.x = alpha) where: node = n-1 range: now-1h correlate: { window: 30s, anchor: logs }"#;
+        let parsed = parse_psl(text).expect("fixture text query parses");
+
+        let built = build_log_query(
+            Some("error"),
+            Some("connection timeout"),
+            &[("field.x".to_string(), "alpha".to_string())],
+            &[("node".to_string(), "n-1".to_string())],
+            3600,
+            Some((30, SignalKind::Log)),
+        )
+        .expect("structured build succeeds");
+
+        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(built.to_text(), parsed.to_text());
+        assert_eq!(built.to_text(), text);
+    }
+
+    /// A `logs` builder with no filters/`where:`/correlate still matches its
+    /// minimal text equivalent (covers the "just select + range" shape the
+    /// UI starts from before the user adds any predicate).
+    #[test]
+    fn log_minimal_selection_matches_its_text_equivalent() {
+        let text = "select: logs range: now-5m";
+        let parsed = parse_psl(text).expect("fixture text query parses");
+        let built = build_log_query(None, None, &[], &[], 300, None).expect("build succeeds");
+        assert_eq!(built, parsed);
+    }
+
+    /// A log-filter-specific query-correctness assertion: composing
+    /// `build_log_query` with `level`/`message` filters and actually
+    /// EXECUTING the resulting query against a real payload fixture selects
+    /// only the entries that are both error-level AND whose message
+    /// contains "timeout" — never a no-timeout error nor an info-level
+    /// timeout line. This proves the builder's composed query drives the
+    /// real LOG payload-filter engine (`pillar_observability::execute`), not
+    /// merely that the AST looks right.
+    #[test]
+    fn log_filter_query_selects_only_matching_payloads_when_executed() {
+        use pillar_observability::{execute_psl as execute, CorrelationIndex, TimeseriesStore};
+
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+
+        let err_timeout = store.write(
+            SignalKind::Log,
+            b"level=error field.x=alpha msg=connection timeout to peer".to_vec(),
+            10,
+        );
+        let err_other = store.write(
+            SignalKind::Log,
+            b"level=error field.x=gamma msg=disk full".to_vec(),
+            12,
+        );
+        let info_timeout = store.write(
+            SignalKind::Log,
+            b"level=info field.x=alpha msg=timeout warning suppressed".to_vec(),
+            13,
+        );
+
+        let built = build_log_query(Some("error"), Some("timeout"), &[], &[], 1000, None)
+            .expect("structured build succeeds");
+
+        let result = execute(&built, &store, &index, 100);
+        assert_eq!(result.matched, vec![err_timeout]);
+        assert!(!result.matched.contains(&err_other), "no-timeout error excluded");
+        assert!(!result.matched.contains(&info_timeout), "info-level excluded");
+    }
+
+    /// The `logs` correlate panel pivots to every OTHER signal kind — never
+    /// back to `logs` itself.
+    #[test]
+    fn log_correlate_candidates_pivot_to_other_kinds_never_logs_itself() {
+        let candidates = correlate_candidates_logs();
+        assert!(!candidates.contains(&SignalKind::Log));
+        assert!(candidates.contains(&SignalKind::Metric));
+        assert!(candidates.contains(&SignalKind::TraceSpan));
+        assert!(candidates.contains(&SignalKind::ProfileSample));
         assert!(candidates.contains(&SignalKind::MetadataSample));
         assert_eq!(candidates.len(), 4);
     }
