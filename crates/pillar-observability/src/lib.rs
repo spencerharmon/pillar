@@ -40,6 +40,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alerting;
 pub mod block;
 pub mod correlation;
 pub mod ingest;
