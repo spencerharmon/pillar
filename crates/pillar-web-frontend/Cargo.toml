@@ -31,7 +31,13 @@ default = ["yew"]
 # The Yew component wrappers around the design-system styles. On by default so
 # `cargo test -p pillar-web-frontend` typechecks the components on the host; the
 # wasm bundle build turns them into real DOM.
-yew = ["dep:yew", "dep:yew-router", "dep:web-sys", "dep:wasm-bindgen"]
+yew = [
+    "dep:yew",
+    "dep:yew-router",
+    "dep:web-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+]
 
 [dependencies]
 # stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
@@ -53,8 +59,17 @@ web-sys = { version = "0.3", optional = true, features = [
     "DomRect",
     "CssStyleDeclaration",
     "HtmlElement",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Window",
 ] }
 wasm-bindgen = { version = "=0.2.121", optional = true }
+# Bridges the JS `fetch` `Promise` to a Rust `Future` for the panels' list/
+# primary-action round trips (`crate::panels`).
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [lints]
 workspace = true

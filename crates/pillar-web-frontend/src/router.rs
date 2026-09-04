@@ -13,6 +13,8 @@ use crate::auth::AuthSession;
 #[cfg(feature = "yew")]
 use crate::auth::{use_auth, AuthProvider};
 #[cfg(feature = "yew")]
+use crate::panels::{Panel, ALL_PANELS};
+#[cfg(feature = "yew")]
 use yew::prelude::*;
 #[cfg(feature = "yew")]
 use yew_router::prelude::*;
@@ -77,7 +79,11 @@ fn guarded(props: &GuardedProps) -> Html {
     match guard(props.route.clone(), &session) {
         Route::Home => html! { <p>{ "pillar portal" }</p> },
         Route::Login => html! { <p>{ "log in" }</p> },
-        Route::Dashboard => html! { <p>{ "dashboard" }</p> },
+        Route::Dashboard => html! {
+            <div>
+                { for ALL_PANELS.iter().map(|spec| html! { <Panel spec={*spec} /> }) }
+            </div>
+        },
         Route::NotFound => html! { <p>{ "not found" }</p> },
     }
 }

@@ -3309,6 +3309,7 @@ version = "0.0.0"
 dependencies = [
  "stylist",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "yew",
  "yew-router",
