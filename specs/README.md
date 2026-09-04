@@ -29,6 +29,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `TrustArtifacts.tla` | `VerificationTerminates`, `CapacityHeldAtSigning`, `RevocationHonorsEpoch`, `QuotaNeverDoubleSpent`, `TypeOK` | trust artifacts: certify / trust / attest / revoke (extends `WoTAuthority.tla` + `GlobalIdentity.tla`): four separate content-addressed signed artifact types (never one overloaded sign), capacity always explicit (self or role@scope), owner-anchored bounded-depth capacity walk gated at issuance (CapacityHeldAtSigning, not deferred to a later verifier), epoch-stamped fail-closed revocation, quota-as-budget with a CP-fenced reservation ledger | ROI P1 trust artifacts: certify / trust / attest / revoke |
 | `PillarUDP.tla` | `TypeOK`, `ExactlyOnceProcessing`, `BoundedTotalDatagrams`, `NoForwardingLoops`, `AntiAmplificationBound`, + liveness `Reachability` (`<>`) | pillar-UDP transport (multipath spray/forward over a lossy-link graph covering non-node client<->cell, intra-cell node<->node, and inter-cell cell<->cell) | ROI P2 load balancing, ingress & the pillar-UDP protocol |
 | `VersioningCompat.tla` | `TypeOK`, `N1WindowHonored`, `NoOrphanedMember`, `NegotiationRefusesIncompatible`, + liveness `IndependentVersioning`, `RollingCoexistence`, `SwarmNeverPartitioned` (`<>`) | version-stamp seams (event-envelope, materialized-view, pillar message, HTTP ingest API, pillar-UDP protocol, trust-artifact/attestation, sealed-artifact envelope, manifest/declared-object schema), the compat-negotiation contract + N-1+ window, and cell-aware/swarm-aware migration; gates `version-stamps-impl`, `sealed-artifact-self-describing-impl`, `compat-negotiation-impl`, `cell-aware-migration-impl` | ROI P1 versioning, compatibility & safe rollout |
+| `PillarIntegration.tla` | `TypeOK`, `NoDoubleCountedClaim`, `NoStateSkipsTeardown`, `Gate1_NoOrphan`, `Gate2_CoveredIsProven`, `Gate3_NoExpiredSkip`, `NoSharedFixtureState`, `TeardownReleasesFixtures`, `NoResidueWhenSealed` (+ ASSUMEs `ClaimsTargetRealSurface`, `ScenarioNamesRealOracle`) | the integration-conformance RIG contract: scenario lifecycle (declared→running→oracleAsserted→tornDown), surface-inventory↔scenario-declaration relation, coverage Gates 1-3, fixture isolation + idempotent-teardown + leak detection. Paired with `schema_roundtrip_test.py` (schema parse/re-serialise round-trip). Gates every other `pillar-integration` task | ROI pillar-integration: the conformance rig that demands working code |
 
 ## Running the checker
 
@@ -39,6 +40,13 @@ invariants, model failures as actions, let TLC explore every reachable state.
 Requires a JVM (17+) and `tla2tools.jar`. `check.sh` locates the jar via, in
 order: `$TLA_TOOLS_JAR`, `~/.local/lib/tla/tla2tools.jar`, or downloads the
 pinned release into `./.tools/` (the path CI uses).
+
+After the TLA+ specs, `check.sh` also runs the `pillar-integration` rig's
+schema round-trip test (`python3 schema_roundtrip_test.py`, stdlib-only): it
+parses the fixture surface-inventory + scenario-declaration document
+(`fixtures/rig-schema.json`), re-serialises it through the canonical serialiser,
+and asserts equality — the executable half of the `PillarIntegration.tla`
+contract.
 
 ## Notes
 
@@ -173,3 +181,26 @@ pinned release into `./.tools/` (the path CI uses).
   gates `version-stamps-impl`, `sealed-artifact-self-describing-impl`,
   `compat-negotiation-impl`, and `cell-aware-migration-impl` before any Rust
   for this line lands.
+- `PillarIntegration` is the formal contract for the whole
+  integration-conformance RIG — the gate every OTHER `pillar-integration` task
+  builds against, so it lands first. It models the scenario lifecycle as a
+  strict state machine `declared -> running -> oracleAsserted -> tornDown`
+  (plus a `skipped` side-state with an un-skip edge). Teardown is
+  UNCONDITIONAL: both the pass path (`TearDownPass`, from `oracleAsserted`) and
+  the fail path (`TearDownFail`, straight from `running`) reach `tornDown`, and
+  `NoStateSkipsTeardown`/`TeardownReleasesFixtures`/`NoResidueWhenSealed` prove
+  no reachable state leaves a torn-down (or, at seal, any) scenario holding a
+  fixture — even the failed ones. A scenario's oracle claim is counted EXACTLY
+  once (`OracleAssert` is guarded `proven=FALSE`; `NoDoubleCountedClaim`). The
+  three coverage gates are invariants: Gate 1 no-orphan-surface
+  (`Gate1_NoOrphan`, evaluated at seal), Gate 2 DONE-requires-a-green-scenario
+  (`Gate2_CoveredIsProven` — a surface is `covered` only via a proven scenario
+  that claims it), Gate 3 no-skip-creep-past-a-deadline (`Gate3_NoExpiredSkip`
+  + a `Tick` guard that cannot advance the clock past a standing skip deadline).
+  Fixture isolation is enforced at `Start` and re-checked by
+  `NoSharedFixtureState` (no two running scenarios share a resource). The
+  surface-inventory↔scenario-declaration relation is pinned by the ASSUMEs
+  `ClaimsTargetRealSurface`/`ScenarioNamesRealOracle` and, executably, by
+  `schema_roundtrip_test.py`. Safety-only (`-deadlock`): the sealed terminal
+  state (all torn down, rig sealed) is expected quiescence. Spec + schema test
+  only — no rig code trusted until both are green.
