@@ -16,6 +16,7 @@
 //! classes, so the visual language is defined exactly once.
 
 pub mod auth;
+pub mod panels;
 pub mod router;
 pub mod styles;
 pub mod theme;

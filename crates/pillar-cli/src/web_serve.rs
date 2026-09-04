@@ -5845,25 +5845,71 @@ mod tests {
     // ---------------------------------------------------------------------
     // Per-feature UI CONFIRMATION suite (one test per banked `ui-*` task).
     //
-    // These assert the SURFACE the operator actually sees: the served `/`
-    // page (web_login.html, the client SPA) must WIRE each banked feature's
-    // endpoint(s) and render its controls. An endpoint that exists but is
-    // never fetched by the SPA is invisible to the user, so asserting the
-    // dispatch handler alone is not enough -- each test asserts the served
-    // page itself calls the feature's `/portal/*` endpoint. Not fakeable
-    // with a dead <div>: the fetch URL means the panel is really wired.
+    // Retargeted (yew-panel-migration) off the static `web_login.html`
+    // fixture onto the real Yew-served build: these assert the COMPILED
+    // `wasm32-unknown-unknown` binary of `pillar-frontend` (the crate that
+    // mounts `pillar_web_frontend::router::Shell`, which in turn renders one
+    // `Panel` per `pillar_web_frontend::panels::ALL_PANELS` entry) embeds
+    // every banked feature's endpoint(s) as a real string literal. An
+    // endpoint that exists server-side but is never fetched by a panel is
+    // invisible to the user, so asserting the dispatch handler alone is not
+    // enough -- each test asserts the ACTUAL Yew build's wasm binary
+    // contains the feature's `/portal/*`/`/bootstrap/*` endpoint path. Not
+    // fakeable with a dead `<div>`: the fetch URL literal only ends up in the
+    // compiled wasm if a `Panel`/`PanelAction` really wires it
+    // (`crates/pillar-web-frontend/src/panels.rs`).
     // ---------------------------------------------------------------------
 
-    // Assert the served "/" page contains every one of `needles`.
+    /// Builds `pillar-frontend` for `wasm32-unknown-unknown` exactly once
+    /// (subsequent calls reuse the cached binary contents) and returns its
+    /// wasm bytes, lossily decoded to UTF-8 -- string literals compiled into
+    /// wasm land verbatim in the binary's data section, so a plain substring
+    /// search over the lossy decode is a real, non-fakeable proof that the
+    /// literal is embedded (mirrors the old `assert_ui_wires`' substring
+    /// search over the served HTML page, just against the new build
+    /// artifact).
+    fn built_frontend_wasm() -> &'static str {
+        use std::sync::OnceLock;
+        static WASM_TEXT: OnceLock<String> = OnceLock::new();
+        WASM_TEXT.get_or_init(|| {
+            let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let frontend_dir = manifest_dir
+                .parent()
+                .expect("crates/ parent")
+                .join("pillar-frontend");
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--target", "wasm32-unknown-unknown"])
+                .current_dir(&frontend_dir)
+                .status()
+                .expect(
+                    "failed to invoke cargo to build pillar-frontend for \
+                     wasm32-unknown-unknown -- is the wasm32-unknown-unknown \
+                     target installed? `rustup target add \
+                     wasm32-unknown-unknown`",
+                );
+            assert!(
+                status.success(),
+                "pillar-frontend failed to build for wasm32-unknown-unknown"
+            );
+            let wasm_path =
+                frontend_dir.join("target/wasm32-unknown-unknown/debug/pillar_frontend.wasm");
+            let bytes = std::fs::read(&wasm_path).unwrap_or_else(|e| {
+                panic!("failed to read built wasm at {}: {e}", wasm_path.display())
+            });
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    }
+
+    // Assert the compiled Yew wasm build contains every one of `needles`.
     fn assert_ui_wires(feature: &str, needles: &[&str]) {
-        let (mut ctx, _subkey) = provisioned_ctx();
-        let page = get(&mut ctx, "/").body;
+        let wasm_text = built_frontend_wasm();
         for n in needles {
             assert!(
-                page.contains(n),
-                "the served portal UI is missing the {feature} feature: \
-                 web_login.html does not contain `{n}` -- the endpoint may \
-                 exist server-side but the SPA never surfaces it"
+                wasm_text.contains(n),
+                "the built Yew portal UI is missing the {feature} feature: \
+                 pillar-frontend's compiled wasm does not embed `{n}` -- the \
+                 endpoint may exist server-side but no panel ever fetches it \
+                 (see crates/pillar-web-frontend/src/panels.rs)"
             );
         }
     }
