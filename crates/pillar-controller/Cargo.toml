@@ -14,6 +14,12 @@ pillar-coordination = { path = "../pillar-coordination" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-net = { path = "../pillar-net" }
+# The OCI runtime layer (`crate::runtime`) supervises the workload's
+# digest-verified image as a REAL child process (spawn/stop/restart/health),
+# replacing the modeled `Running` state value with a live `tokio::process`
+# child bound to a real pid.
+tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "macros", "time", "io-util"] }
+tempfile = "3"
 
 [dev-dependencies]
 # The integration test drives the REAL libp2p blob request/response substrate

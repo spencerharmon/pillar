@@ -77,6 +77,9 @@ use pillar_identity::{NodeSubkey, Registry};
 use pillar_net::BlobDigest;
 use pillar_streamdb::View;
 
+pub mod runtime;
+pub use runtime::{RuntimeError, SupervisedWorkload};
+
 /// A declared resource a [`ResourceReconciler`] can reconcile: the plugin
 /// interface's extension point.
 ///
@@ -673,6 +676,23 @@ impl RunningWorkload {
     #[must_use]
     pub fn epoch(&self) -> Epoch {
         self.epoch
+    }
+
+    /// Execute this reconciled, digest-verified workload as a REAL
+    /// supervised OS process — the execute half of the workload vertical.
+    ///
+    /// This is the replacement for the modeled `Running` state value: the
+    /// returned [`SupervisedWorkload`] wraps an actual `tokio::process`
+    /// child running [`Self::image_bytes`] as its entrypoint (with `args`),
+    /// exposing a real pid and lifecycle (`stop`/`restart`/`is_alive`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RuntimeError`] if the verified image bytes cannot be
+    /// staged to disk as an executable, or if the OS refuses to schedule
+    /// the process.
+    pub fn spawn_process(&self, args: &[String]) -> Result<SupervisedWorkload, RuntimeError> {
+        SupervisedWorkload::spawn(&self.image_bytes, args)
     }
 }
 
