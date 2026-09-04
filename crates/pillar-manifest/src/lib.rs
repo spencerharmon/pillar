@@ -350,6 +350,17 @@ impl SchemaRegistry {
             .get(&(crd.api_version.clone(), crd.kind.clone()))
     }
 
+    /// Every `(apiVersion, kind)` currently registered — the real,
+    /// currently-served manifest-kind surface. A surface-inventory emitter
+    /// reads this (not a hand-maintained catalog), so a schema registered or
+    /// deregistered here is added or removed from the inventory by
+    /// construction.
+    pub fn kinds(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.schemas
+            .keys()
+            .map(|(api_version, kind)| (api_version.as_str(), kind.as_str()))
+    }
+
     /// Validate a CRD body against its registered schema.
     ///
     /// # Errors

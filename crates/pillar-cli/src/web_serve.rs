@@ -1753,6 +1753,258 @@ fn handle_connection(mut stream: TcpStream, ctx: &mut WebAuthContext) {
 }
 
 /// Map an HTTP request onto the portal action, preserving the auth gate.
+/// How a [`RouteSpec`]'s path matches an incoming request path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathMatch {
+    /// Matches only the exact path.
+    Exact(&'static str),
+    /// Matches any path starting with this prefix.
+    Prefix(&'static str),
+}
+
+impl PathMatch {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            PathMatch::Exact(p) => path == *p,
+            PathMatch::Prefix(p) => path.starts_with(p),
+        }
+    }
+
+    /// The literal path/prefix text this matcher was built from.
+    #[must_use]
+    pub fn text(&self) -> &'static str {
+        match self {
+            PathMatch::Exact(p) | PathMatch::Prefix(p) => p,
+        }
+    }
+}
+
+type RouteHandler = fn(&mut WebAuthContext, &SocketAddr, &HttpRequest) -> HttpResponse;
+
+/// One registered HTTP route: an (HTTP method, path matcher) pair plus the
+/// handler that serves it. [`ROUTES`] is the SINGLE source of truth the real
+/// router ([`dispatch_http`]) dispatches from AND that a surface-inventory
+/// emitter walks — there is no separate hand-maintained route catalog to
+/// drift out of sync with what is actually served.
+#[derive(Clone, Copy)]
+pub struct RouteSpec {
+    /// The HTTP method this route answers (`"GET"`, `"POST"`, ...).
+    pub method: &'static str,
+    /// How the request path must match.
+    pub path: PathMatch,
+    handler: RouteHandler,
+}
+
+impl RouteSpec {
+    /// This route's path/prefix text (see [`PathMatch::text`]).
+    #[must_use]
+    pub fn path_text(&self) -> &'static str {
+        self.path.text()
+    }
+}
+
+fn dispatch_landing(_ctx: &mut WebAuthContext, _peer: &SocketAddr, _req: &HttpRequest) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type: "text/html; charset=utf-8",
+        session_token: None,
+        body: LANDING_PAGE.to_owned(),
+        bytes: None,
+    }
+}
+
+fn dispatch_bootstrap_status_route(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
+    // BOOTSTRAPPED only once the first USER exists — not merely the
+    // cell. A cell-created-but-no-user node is still FRESH so the
+    // portal keeps showing the (atomic) bootstrap form; reporting
+    // BOOTSTRAPPED on a cell alone is exactly what stranded the
+    // operator (the login form showed but no user could log in).
+    let status = if ctx.bootstrap().initial_user().is_some() {
+        BootstrapStatus::Bootstrapped
+    } else {
+        BootstrapStatus::Fresh
+    };
+    text_response(200, "OK", status.to_wire().to_owned())
+}
+
+fn dispatch_bootstrap_create_cell(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let BootstrapCreateCellRequest { cell_id } = BootstrapCreateCellRequest::from_body(&request.body);
+    if cell_id.is_empty() {
+        return text_response(400, "Bad Request", "MISSING cell id".to_owned());
+    }
+    match ctx.create_cell(NodeId::from(cell_id.as_str())) {
+        Ok(()) => text_response(200, "OK", "CELL-CREATED".to_owned()),
+        Err(BootstrapError::CellNameInUse) => {
+            text_response(409, "Conflict", format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"))
+        }
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+    }
+}
+
+fn dispatch_bootstrap_name_check(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    // INLINE, live cell-name uniqueness for the web UI: resolve the
+    // proposed name through the SAME peer-sourced `name_registry` the
+    // create-cell step validates against, so the operator sees an "in
+    // use" hint BEFORE submit. Best-effort: an unreachable / free name
+    // reports FREE (never blocks a create on a network hiccup).
+    let name = query_value(&request.path, "name").unwrap_or("").trim();
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    match ctx.name_status(&NodeId::from(name)) {
+        CellNameStatus::Claimed => {
+            text_response(200, "OK", format!("IN-USE {CELL_NAME_IN_USE_MESSAGE}"))
+        }
+        CellNameStatus::Free => text_response(200, "OK", "FREE".to_owned()),
+    }
+}
+
+fn dispatch_bootstrap_create_user(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    // Body: the shared `BootstrapCreateUserRequest` wire framing
+    // "<handle>\n<password>" — the operator's chosen unlock factor
+    // for the new user, escrowed atomically (see
+    // `bootstrap_create_first_user`) so login works immediately.
+    let BootstrapCreateUserRequest { handle, password } =
+        BootstrapCreateUserRequest::from_body(&request.body);
+    if handle.is_empty() || password.is_empty() {
+        return text_response(400, "Bad Request", "MISSING handle-or-password".to_owned());
+    }
+    match ctx.bootstrap_create_first_user(&handle, &password) {
+        Ok(()) => text_response(200, "OK", format!("USER-CREATED {handle}")),
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+    }
+}
+
+fn dispatch_bootstrap_create(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    // Body: the shared `BootstrapCreateRequest` wire framing
+    // "<cell_id>\n<handle>\n<password>" — the ONE atomic bootstrap
+    // action the portal uses (cell + first user together, so a
+    // reload between steps can never strand a cell with no first
+    // user). See `bootstrap_cell_and_first_user`.
+    let BootstrapCreateRequest {
+        cell_id,
+        handle,
+        password,
+    } = BootstrapCreateRequest::from_body(&request.body);
+    if cell_id.is_empty() || handle.is_empty() || password.is_empty() {
+        return text_response(400, "Bad Request", "MISSING cell-handle-or-password".to_owned());
+    }
+    match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
+        Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
+        Err(BootstrapError::CellNameInUse) => {
+            text_response(409, "Conflict", format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"))
+        }
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+    }
+}
+
+fn dispatch_nonce(ctx: &mut WebAuthContext, _peer: &SocketAddr, _req: &HttpRequest) -> HttpResponse {
+    let nonce = ctx.verifier.issue_nonce(u64::MAX);
+    text_response(
+        200,
+        "OK",
+        NonceResponse {
+            id: nonce.id(),
+            expiry: nonce.expiry(),
+        }
+        .to_wire(),
+    )
+}
+
+/// Every HTTP route this portal actually serves — the real router
+/// ([`dispatch_http`]) dispatches from this exact table, so a route added or
+/// removed here is added or removed from what is served AND from what a
+/// surface-inventory emitter observes, by construction.
+pub static ROUTES: &[RouteSpec] = &[
+    RouteSpec { method: "GET", path: PathMatch::Exact("/"), handler: dispatch_landing },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/status"), handler: dispatch_bootstrap_status_route },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create-cell"), handler: dispatch_bootstrap_create_cell },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/name-check"), handler: dispatch_bootstrap_name_check },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create-user"), handler: dispatch_bootstrap_create_user },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create"), handler: dispatch_bootstrap_create },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/nonce"), handler: dispatch_nonce },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/login"), handler: |ctx, _peer, request| dispatch_login(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/register/begin"), handler: |ctx, _peer, request| dispatch_webauthn_register_begin(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/register/finish"), handler: |ctx, _peer, request| dispatch_webauthn_register_finish(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/authenticate/begin"), handler: |ctx, _peer, request| dispatch_webauthn_authenticate_begin(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/authenticate/finish"), handler: |ctx, _peer, request| dispatch_webauthn_authenticate_finish(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/node"), handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, true) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/user"), handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, false) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/request/list"), handler: |ctx, _peer, _request| dispatch_request_list(ctx) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/approve"), handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, true) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/reject"), handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, false) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/status"), handler: |ctx, _peer, request| dispatch_portal_status(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/layout"), handler: |ctx, _peer, request| dispatch_layout_store(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/layout"), handler: |ctx, _peer, request| dispatch_layout_get(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/identity"), handler: |ctx, _peer, request| dispatch_identity_view(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/enroll"), handler: |ctx, _peer, request| dispatch_identity_enroll(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/rotate"), handler: |ctx, _peer, request| dispatch_identity_rotate(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/recover"), handler: |ctx, _peer, request| dispatch_identity_recover(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/domains"), handler: |ctx, _peer, request| dispatch_domain_view(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/members"), handler: |ctx, _peer, request| dispatch_members_view(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/members/add"), handler: |ctx, peer, request| dispatch_members_add(ctx, peer, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/members/role"), handler: |ctx, _peer, request| dispatch_members_role(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/sessions"), handler: |ctx, _peer, request| dispatch_sessions_view(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/sessions/revoke"), handler: |ctx, _peer, request| dispatch_sessions_revoke(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/sessions/revoke-all"), handler: |ctx, _peer, request| dispatch_sessions_revoke_all(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/attestations/build"), handler: |ctx, _peer, request| dispatch_attestation_build(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/trust-graph"), handler: |ctx, _peer, request| dispatch_trust_graph_view(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/tree"), handler: |ctx, _peer, request| dispatch_topology_tree(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/mismatches"), handler: |ctx, _peer, request| dispatch_topology_mismatches(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/declare"), handler: |ctx, _peer, request| dispatch_topology_label_declare(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/attest"), handler: |ctx, _peer, request| dispatch_topology_label_attest(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/failure-domain"), handler: |ctx, _peer, request| dispatch_topology_failure_domain(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/facet"), handler: |ctx, _peer, request| dispatch_topology_facet(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/migrate"), handler: |ctx, _peer, request| dispatch_custody_migrate(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/rotate"), handler: |ctx, _peer, request| dispatch_custody_rotate(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/seal"), handler: |ctx, _peer, request| dispatch_custody_seal(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/revoke"), handler: |ctx, _peer, request| dispatch_custody_revoke(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/get"), handler: |ctx, _peer, request| dispatch_resource_get(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/describe"), handler: |ctx, _peer, request| dispatch_resource_describe(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/dry-run"), handler: |ctx, _peer, request| dispatch_resource_dry_run(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/logs"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Logs) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/exec"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Exec) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/forward"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Forward) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/apply"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Apply) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/edit"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Edit) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/scale"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Scale) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/rollout"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Rollout) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/explore"), handler: |ctx, _peer, request| dispatch_obs_explore(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/query"), handler: |ctx, _peer, request| dispatch_obs_query(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/dashboard"), handler: |ctx, _peer, request| dispatch_obs_dashboard(ctx, request) },
+];
+
+/// The real, currently-served HTTP route table — the exact data
+/// [`dispatch_http`] dispatches from. A surface-inventory emitter reads this
+/// (not a hand-maintained catalog) so an added/removed route is
+/// added/removed from the inventory automatically.
+#[must_use]
+pub fn http_routes() -> &'static [RouteSpec] {
+    ROUTES
+}
+
+/// Map an HTTP request onto the portal action, preserving the auth gate.
 fn dispatch_http(
     ctx: &mut WebAuthContext,
     peer: &SocketAddr,
@@ -1770,205 +2022,20 @@ fn dispatch_http(
     if let Some(err) = check_request_api_version(request) {
         return err;
     }
-    match (request.method.as_str(), path) {
-        ("GET", "/") => HttpResponse {
-            status: 200,
-            reason: "OK",
-            content_type: "text/html; charset=utf-8",
-            session_token: None,
-            body: LANDING_PAGE.to_owned(),
-            bytes: None,
-        },
-        ("GET", "/bootstrap/status") => {
-            // BOOTSTRAPPED only once the first USER exists — not merely the
-            // cell. A cell-created-but-no-user node is still FRESH so the
-            // portal keeps showing the (atomic) bootstrap form; reporting
-            // BOOTSTRAPPED on a cell alone is exactly what stranded the
-            // operator (the login form showed but no user could log in).
-            let status = if ctx.bootstrap().initial_user().is_some() {
-                BootstrapStatus::Bootstrapped
-            } else {
-                BootstrapStatus::Fresh
-            };
-            text_response(200, "OK", status.to_wire().to_owned())
+    for route in ROUTES {
+        if route.method == request.method && route.path.matches(path) {
+            return (route.handler)(ctx, peer, request);
         }
-        ("POST", "/bootstrap/create-cell") => {
-            let BootstrapCreateCellRequest { cell_id } =
-                BootstrapCreateCellRequest::from_body(&request.body);
-            if cell_id.is_empty() {
-                return text_response(400, "Bad Request", "MISSING cell id".to_owned());
-            }
-            match ctx.create_cell(NodeId::from(cell_id.as_str())) {
-                Ok(()) => text_response(200, "OK", "CELL-CREATED".to_owned()),
-                Err(BootstrapError::CellNameInUse) => text_response(
-                    409,
-                    "Conflict",
-                    format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
-                ),
-                Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
-            }
-        }
-        ("GET", "/bootstrap/name-check") => {
-            // INLINE, live cell-name uniqueness for the web UI: resolve the
-            // proposed name through the SAME peer-sourced `name_registry` the
-            // create-cell step validates against, so the operator sees an "in
-            // use" hint BEFORE submit. Best-effort: an unreachable / free name
-            // reports FREE (never blocks a create on a network hiccup).
-            let name = query_value(&request.path, "name").unwrap_or("").trim();
-            if name.is_empty() {
-                return text_response(400, "Bad Request", "MISSING name".to_owned());
-            }
-            match ctx.name_status(&NodeId::from(name)) {
-                CellNameStatus::Claimed => {
-                    text_response(200, "OK", format!("IN-USE {CELL_NAME_IN_USE_MESSAGE}"))
-                }
-                CellNameStatus::Free => text_response(200, "OK", "FREE".to_owned()),
-            }
-        }
-        ("POST", "/bootstrap/create-user") => {
-            // Body: the shared `BootstrapCreateUserRequest` wire framing
-            // "<handle>\n<password>" — the operator's chosen unlock factor
-            // for the new user, escrowed atomically (see
-            // `bootstrap_create_first_user`) so login works immediately.
-            let BootstrapCreateUserRequest { handle, password } =
-                BootstrapCreateUserRequest::from_body(&request.body);
-            if handle.is_empty() || password.is_empty() {
-                return text_response(400, "Bad Request", "MISSING handle-or-password".to_owned());
-            }
-            match ctx.bootstrap_create_first_user(&handle, &password) {
-                Ok(()) => text_response(200, "OK", format!("USER-CREATED {handle}")),
-                Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
-            }
-        }
-        ("POST", "/bootstrap/create") => {
-            // Body: the shared `BootstrapCreateRequest` wire framing
-            // "<cell_id>\n<handle>\n<password>" — the ONE atomic bootstrap
-            // action the portal uses (cell + first user together, so a
-            // reload between steps can never strand a cell with no first
-            // user). See `bootstrap_cell_and_first_user`.
-            let BootstrapCreateRequest {
-                cell_id,
-                handle,
-                password,
-            } = BootstrapCreateRequest::from_body(&request.body);
-            if cell_id.is_empty() || handle.is_empty() || password.is_empty() {
-                return text_response(
-                    400,
-                    "Bad Request",
-                    "MISSING cell-handle-or-password".to_owned(),
-                );
-            }
-            match ctx.bootstrap_cell_and_first_user(
-                NodeId::from(cell_id.as_str()),
-                &handle,
-                &password,
-            ) {
-                Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
-                Err(BootstrapError::CellNameInUse) => text_response(
-                    409,
-                    "Conflict",
-                    format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
-                ),
-                Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
-            }
-        }
-        ("GET", "/nonce") => {
-            let nonce = ctx.verifier.issue_nonce(u64::MAX);
-            text_response(
-                200,
-                "OK",
-                NonceResponse {
-                    id: nonce.id(),
-                    expiry: nonce.expiry(),
-                }
-                .to_wire(),
-            )
-        }
-        ("POST", "/login") => dispatch_login(ctx, request),
-        ("POST", "/webauthn/register/begin") => dispatch_webauthn_register_begin(ctx, request),
-        ("POST", "/webauthn/register/finish") => dispatch_webauthn_register_finish(ctx, request),
-        ("POST", "/webauthn/authenticate/begin") => {
-            dispatch_webauthn_authenticate_begin(ctx, request)
-        }
-        ("POST", "/webauthn/authenticate/finish") => {
-            dispatch_webauthn_authenticate_finish(ctx, request)
-        }
-        ("POST", "/bootstrap/request/node") => dispatch_request_submit(ctx, request, true),
-        ("POST", "/bootstrap/request/user") => dispatch_request_submit(ctx, request, false),
-        ("GET", "/bootstrap/request/list") => dispatch_request_list(ctx),
-        ("POST", "/bootstrap/request/approve") => dispatch_request_decide(ctx, request, true),
-        ("POST", "/bootstrap/request/reject") => dispatch_request_decide(ctx, request, false),
-        ("GET", "/portal/status") => dispatch_portal_status(ctx, request),
-        ("POST", "/portal/layout") => dispatch_layout_store(ctx, request),
-        ("GET", "/portal/layout") => dispatch_layout_get(ctx, request),
-        ("GET", "/portal/identity") => dispatch_identity_view(ctx, request),
-        ("POST", "/portal/identity/enroll") => dispatch_identity_enroll(ctx, request),
-        ("POST", "/portal/identity/rotate") => dispatch_identity_rotate(ctx, request),
-        ("POST", "/portal/identity/recover") => dispatch_identity_recover(ctx, request),
-        ("GET", "/portal/domains") => dispatch_domain_view(ctx, request),
-        ("GET", "/portal/members") => dispatch_members_view(ctx, request),
-        ("POST", "/portal/members/add") => dispatch_members_add(ctx, peer, request),
-        ("POST", "/portal/members/role") => dispatch_members_role(ctx, request),
-        ("GET", "/portal/sessions") => dispatch_sessions_view(ctx, request),
-        ("POST", "/portal/sessions/revoke") => dispatch_sessions_revoke(ctx, request),
-        ("POST", "/portal/sessions/revoke-all") => dispatch_sessions_revoke_all(ctx, request),
-        ("POST", "/portal/attestations/build") => dispatch_attestation_build(ctx, request),
-        ("GET", "/portal/trust-graph") => dispatch_trust_graph_view(ctx, request),
-        ("GET", p) if p.starts_with("/portal/topology/tree") => {
-            dispatch_topology_tree(ctx, request)
-        }
-        ("GET", p) if p.starts_with("/portal/topology/mismatches") => {
-            dispatch_topology_mismatches(ctx, request)
-        }
-        ("POST", "/portal/topology/label/declare") => dispatch_topology_label_declare(ctx, request),
-        ("POST", "/portal/topology/label/attest") => dispatch_topology_label_attest(ctx, request),
-        ("GET", p) if p.starts_with("/portal/topology/failure-domain") => {
-            dispatch_topology_failure_domain(ctx, request)
-        }
-        ("GET", p) if p.starts_with("/portal/topology/facet") => {
-            dispatch_topology_facet(ctx, request)
-        }
-        ("POST", "/portal/custody/migrate") => dispatch_custody_migrate(ctx, request),
-        ("POST", "/portal/custody/rotate") => dispatch_custody_rotate(ctx, request),
-        ("POST", "/portal/custody/seal") => dispatch_custody_seal(ctx, request),
-        ("POST", "/portal/custody/revoke") => dispatch_custody_revoke(ctx, request),
-        ("GET", p) if p.starts_with("/portal/resource/get") => dispatch_resource_get(ctx, request),
-        ("GET", p) if p.starts_with("/portal/resource/describe") => {
-            dispatch_resource_describe(ctx, request)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/dry-run") => {
-            dispatch_resource_dry_run(ctx, request)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/logs") => {
-            dispatch_resource_runtime(ctx, request, RuntimeReach::Logs)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/exec") => {
-            dispatch_resource_runtime(ctx, request, RuntimeReach::Exec)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/forward") => {
-            dispatch_resource_runtime(ctx, request, RuntimeReach::Forward)
-        }
-        ("POST", "/portal/resource/apply") => {
-            dispatch_resource_act(ctx, request, ResourceAct::Apply)
-        }
-        ("POST", "/portal/resource/edit") => dispatch_resource_act(ctx, request, ResourceAct::Edit),
-        ("POST", "/portal/resource/scale") => {
-            dispatch_resource_act(ctx, request, ResourceAct::Scale)
-        }
-        ("POST", "/portal/resource/rollout") => {
-            dispatch_resource_act(ctx, request, ResourceAct::Rollout)
-        }
-        ("GET", p) if p.starts_with("/portal/obs/explore") => dispatch_obs_explore(ctx, request),
-        ("GET", p) if p.starts_with("/portal/obs/query") => dispatch_obs_query(ctx, request),
-        ("POST", "/portal/obs/dashboard") => dispatch_obs_dashboard(ctx, request),
-        // The Yew + WebAssembly portal's embedded static assets (wasm/js/css),
-        // each served under its correct MIME type (see `frontend_asset`).
-        ("GET", p) => match frontend_asset(p) {
-            Some((bytes, content_type)) => asset_response(bytes, content_type),
-            None => text_response(404, "Not Found", "not found".to_owned()),
-        },
-        _ => text_response(404, "Not Found", "not found".to_owned()),
     }
+    // The Yew + WebAssembly portal's embedded static assets (wasm/js/css),
+    // each served under its correct MIME type (see `frontend_asset`) — a
+    // catch-all fallback, not an individually inventoried route.
+    if request.method == "GET" {
+        if let Some((bytes, content_type)) = frontend_asset(path) {
+            return asset_response(bytes, content_type);
+        }
+    }
+    text_response(404, "Not Found", "not found".to_owned())
 }
 
 /// Extract `key`'s value from `path`'s query string (`GET /x?a=1&b=2`), if
