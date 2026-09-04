@@ -77,7 +77,9 @@ use pillar_identity::{NodeSubkey, Registry};
 use pillar_net::BlobDigest;
 use pillar_streamdb::View;
 
+pub mod deployment;
 pub mod runtime;
+pub use deployment::{Deployment, DeploymentReplica, DeploymentSpec, RestartPolicy};
 pub use runtime::{RuntimeError, SupervisedWorkload};
 
 /// A declared resource a [`ResourceReconciler`] can reconcile: the plugin

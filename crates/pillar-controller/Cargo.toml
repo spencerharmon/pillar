@@ -14,6 +14,10 @@ pillar-coordination = { path = "../pillar-coordination" }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-net = { path = "../pillar-net" }
+# The Deployment kind (`crate::deployment`) places N replicas across N
+# distinct failure domains via the real topology-spread placement decision —
+# never a re-derived/in-crate spread heuristic.
+pillar-topology = { path = "../pillar-topology" }
 # The OCI runtime layer (`crate::runtime`) supervises the workload's
 # digest-verified image as a REAL child process (spawn/stop/restart/health),
 # replacing the modeled `Running` state value with a live `tokio::process`
