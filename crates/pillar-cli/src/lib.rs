@@ -36,6 +36,7 @@ pub mod health;
 pub mod identity_trust_cli;
 pub mod observability_ui;
 pub mod onboard;
+pub mod polish;
 pub mod resource;
 pub mod run;
 pub mod session_cli;
