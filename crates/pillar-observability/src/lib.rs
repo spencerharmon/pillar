@@ -43,6 +43,7 @@
 pub mod block;
 pub mod correlation;
 pub mod metadata;
+pub mod otlp;
 pub mod query;
 pub mod retention;
 pub mod role;
@@ -53,6 +54,7 @@ pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
 pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };
+pub use otlp::{Envelope, OtlpError, OtlpIngest};
 pub use query::{PersistedMaterializedView, Query, ViewCache, ViewPersistError};
 pub use retention::{
     EffectiveRetention, LabelSelector, RetentionPolicy, RetentionPolicySet, RetentionPolicySpec,
