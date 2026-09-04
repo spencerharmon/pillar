@@ -636,6 +636,144 @@ pub fn execute(
     }
 }
 
+/// A numeric aggregation over a matched signal set: the observability
+/// numeric primitives (`count`, `rate`, `sum`, `quantile`, `topk`) that
+/// compose over the same [`execute`] match set the select/where/correlate
+/// primitives produce — never a second, parallel query path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Aggregate {
+    /// The number of matched signals.
+    Count,
+    /// Matched-signal count divided by the query's range in seconds
+    /// (events per second over the window).
+    Rate,
+    /// The sum of every matched signal's numeric value.
+    Sum,
+    /// The value at quantile `q` (0.0..=1.0) of the matched signals' numeric
+    /// values, by the nearest-rank method on the sorted values.
+    Quantile(f64),
+    /// The `k` largest matched signals by numeric value (descending).
+    TopK(usize),
+}
+
+/// One aggregation output row: the group it belongs to (empty when the query
+/// carried no `by [labels]` grouping) and the produced value(s).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateRow {
+    /// The `(label-key, label-value)` pairs identifying this group, in label
+    /// order. Empty for an ungrouped aggregation (one row over the whole set).
+    pub group: Vec<(String, String)>,
+    /// The aggregate value(s). `Count`/`Rate`/`Sum`/`Quantile` produce one
+    /// value; `TopK` produces up to `k` values (descending).
+    pub values: Vec<f64>,
+}
+
+/// Extract a signal's numeric value: the LAST whitespace-separated token of
+/// its payload parsed as an `f64` (e.g. `ingest_bandwidth 42` -> `42.0`).
+/// A payload with no parseable trailing number contributes nothing.
+fn signal_value(signal: &crate::block::Signal) -> Option<f64> {
+    let text = std::str::from_utf8(signal.payload()).ok()?;
+    text.split_whitespace().last()?.parse::<f64>().ok()
+}
+
+/// Apply a numeric [`Aggregate`] to the signals `execute` matched for
+/// `query`, optionally partitioned by the `by` label keys.
+///
+/// `by` is the `by [labels]` grouping: an empty slice aggregates the whole
+/// matched set into a single ungrouped row; otherwise one row is produced per
+/// distinct tuple of those label values (a signal missing any `by` key is
+/// dropped from the grouped aggregation, exactly as a missing dimension is
+/// unselectable). Rows are returned in ascending group-key order so the
+/// output is deterministic regardless of store write order.
+#[must_use]
+pub fn aggregate(
+    query: &PslQuery,
+    store: &TimeseriesStore,
+    index: &CorrelationIndex,
+    now: u64,
+    agg: Aggregate,
+    by: &[String],
+) -> Vec<AggregateRow> {
+    use std::collections::BTreeMap;
+
+    let result = execute(query, store, index, now);
+    // Resolve each matched id back to its Signal (for labels + value).
+    let matched: Vec<&crate::block::Signal> = result
+        .matched
+        .iter()
+        .filter_map(|id| store.held_signals().find(|s| &s.id() == id))
+        .collect();
+
+    // Partition into groups keyed by the `by` label tuple (empty key = the
+    // single ungrouped bucket).
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<&crate::block::Signal>> = BTreeMap::new();
+    for signal in matched {
+        let mut key = Vec::with_capacity(by.len());
+        let mut complete = true;
+        for label in by {
+            match signal.labels().get(label) {
+                Some(v) => key.push((label.clone(), v.clone())),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue; // signal lacks a grouping dimension
+        }
+        groups.entry(key).or_default().push(signal);
+    }
+
+    // For an ungrouped aggregation over an EMPTY match set we still emit one
+    // zero row (count/sum/rate of nothing is 0), matching PromQL-style
+    // instant-vector semantics; a grouped aggregation over nothing is empty.
+    if by.is_empty() && groups.is_empty() {
+        groups.insert(Vec::new(), Vec::new());
+    }
+
+    groups
+        .into_iter()
+        .map(|(group, signals)| {
+            let values = apply_aggregate(agg, &signals, query.range.seconds);
+            AggregateRow { group, values }
+        })
+        .collect()
+}
+
+/// Compute one group's aggregate value(s) from its matched signals.
+fn apply_aggregate(agg: Aggregate, signals: &[&crate::block::Signal], range_seconds: u64) -> Vec<f64> {
+    match agg {
+        Aggregate::Count => vec![signals.len() as f64],
+        Aggregate::Rate => {
+            let denom = if range_seconds == 0 { 1.0 } else { range_seconds as f64 };
+            vec![signals.len() as f64 / denom]
+        }
+        Aggregate::Sum => {
+            let sum: f64 = signals.iter().filter_map(|s| signal_value(s)).sum();
+            vec![sum]
+        }
+        Aggregate::Quantile(q) => {
+            let mut vals: Vec<f64> = signals.iter().filter_map(|s| signal_value(s)).collect();
+            if vals.is_empty() {
+                return vec![f64::NAN];
+            }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let q = q.clamp(0.0, 1.0);
+            // Nearest-rank: rank = ceil(q * n), 1-based, clamped to [1, n].
+            let rank = (q * vals.len() as f64).ceil().max(1.0) as usize;
+            let idx = rank.min(vals.len()) - 1;
+            vec![vals[idx]]
+        }
+        Aggregate::TopK(k) => {
+            let mut vals: Vec<f64> = signals.iter().filter_map(|s| signal_value(s)).collect();
+            vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            vals.truncate(k);
+            vals
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,5 +1014,122 @@ mod tests {
     fn builder_refuses_empty_select() {
         let err = PslQueryBuilder::new().range_relative(60).build();
         assert!(err.is_err());
+    }
+
+    // ---- Numeric aggregation fixture & tests -----------------------------
+
+    /// A real store of five in-range metric points on the same cell, with
+    /// known numeric values (10, 20, 30, 40, 50) split across two `service`
+    /// groups — so count/rate/sum/quantile/topk and `by [service]` grouping
+    /// each have a single, hand-checkable correct answer. One out-of-range
+    /// point (value 9999) proves the aggregation composes over `execute`'s
+    /// range filter and is never counted.
+    fn numeric_fixture() -> (TimeseriesStore, CorrelationIndex, PslQuery, u64) {
+        let mut store = TimeseriesStore::new(64, 10_000_000);
+        let index = CorrelationIndex::new();
+        let now = 1_000_000;
+
+        let write = |store: &mut TimeseriesStore, value: i64, service: &str, tick: u64| {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert("cell".to_string(), "c".to_string());
+            labels.insert("service".to_string(), service.to_string());
+            store
+                .write_labeled(
+                    SignalKind::Metric,
+                    format!("latency {value}").into_bytes(),
+                    labels,
+                    tick,
+                )
+                .expect("metric write is never downsampled (no policy)");
+        };
+
+        // In-range points (now-range .. now). range = 100s below.
+        write(&mut store, 10, "a", now - 90);
+        write(&mut store, 20, "a", now - 80);
+        write(&mut store, 30, "b", now - 70);
+        write(&mut store, 40, "b", now - 60);
+        write(&mut store, 50, "b", now - 50);
+        // Out-of-range: far in the past, must never be aggregated.
+        write(&mut store, 9999, "a", 1);
+
+        let query = PslQueryBuilder::new()
+            .select(SignalKind::Metric, vec![Predicate::eq("cell", "c")])
+            .range_relative(100)
+            .build()
+            .expect("valid query");
+
+        (store, index, query, now)
+    }
+
+    /// `count` returns the number of in-range matched signals (5), never the
+    /// out-of-range noise point.
+    #[test]
+    fn count_returns_the_matched_signal_count() {
+        let (store, index, query, now) = numeric_fixture();
+        let rows = aggregate(&query, &store, &index, now, Aggregate::Count, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![5.0]);
+    }
+
+    /// `rate` is the matched count over the range in seconds (5 / 100s).
+    #[test]
+    fn rate_is_count_over_the_range_seconds() {
+        let (store, index, query, now) = numeric_fixture();
+        let rows = aggregate(&query, &store, &index, now, Aggregate::Rate, &[]);
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].values[0] - 0.05).abs() < 1e-12, "5/100 = 0.05, got {:?}", rows[0].values);
+    }
+
+    /// `sum` totals every matched signal's numeric payload value
+    /// (10+20+30+40+50 = 150), excluding the out-of-range 9999.
+    #[test]
+    fn sum_totals_the_matched_numeric_values() {
+        let (store, index, query, now) = numeric_fixture();
+        let rows = aggregate(&query, &store, &index, now, Aggregate::Sum, &[]);
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].values[0] - 150.0).abs() < 1e-9, "got {:?}", rows[0].values);
+    }
+
+    /// `quantile` uses nearest-rank on the sorted values [10,20,30,40,50]:
+    /// the median (q=0.5) is 30, and q=1.0 is the max (50), q=0.0 the min (10).
+    #[test]
+    fn quantile_returns_the_nearest_rank_value() {
+        let (store, index, query, now) = numeric_fixture();
+        let median = aggregate(&query, &store, &index, now, Aggregate::Quantile(0.5), &[]);
+        assert_eq!(median[0].values, vec![30.0]);
+        let p100 = aggregate(&query, &store, &index, now, Aggregate::Quantile(1.0), &[]);
+        assert_eq!(p100[0].values, vec![50.0]);
+        let p0 = aggregate(&query, &store, &index, now, Aggregate::Quantile(0.0), &[]);
+        assert_eq!(p0[0].values, vec![10.0]);
+    }
+
+    /// `topk` returns the k largest matched values in descending order
+    /// (top 3 of [10,20,30,40,50] = [50,40,30]).
+    #[test]
+    fn topk_returns_the_k_largest_values_descending() {
+        let (store, index, query, now) = numeric_fixture();
+        let rows = aggregate(&query, &store, &index, now, Aggregate::TopK(3), &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![50.0, 40.0, 30.0]);
+    }
+
+    /// `by [service]` groups the matched set: service `a` sums 10+20=30 (2
+    /// points), service `b` sums 30+40+50=120 (3 points); rows come back in
+    /// ascending group-key order regardless of write order.
+    #[test]
+    fn by_labels_groups_the_aggregation() {
+        let (store, index, query, now) = numeric_fixture();
+        let by = vec!["service".to_string()];
+
+        let sums = aggregate(&query, &store, &index, now, Aggregate::Sum, &by);
+        assert_eq!(sums.len(), 2, "one row per service group");
+        assert_eq!(sums[0].group, vec![("service".to_string(), "a".to_string())]);
+        assert!((sums[0].values[0] - 30.0).abs() < 1e-9);
+        assert_eq!(sums[1].group, vec![("service".to_string(), "b".to_string())]);
+        assert!((sums[1].values[0] - 120.0).abs() < 1e-9);
+
+        let counts = aggregate(&query, &store, &index, now, Aggregate::Count, &by);
+        assert_eq!(counts[0].values, vec![2.0]); // service a
+        assert_eq!(counts[1].values, vec![3.0]); // service b
     }
 }
