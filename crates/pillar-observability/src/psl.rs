@@ -42,13 +42,32 @@ impl fmt::Display for PslError {
 
 impl std::error::Error for PslError {}
 
-/// An equality predicate on a signal's label: `key = value`.
+/// The comparison a [`Predicate`] applies between its key and value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PredOp {
+    /// Exact string equality (`key = value`).
+    Eq,
+    /// Substring containment (`key =~ value`) — the LOG message/text match
+    /// operator. `value` matches when it appears anywhere in the field.
+    Match,
+}
+
+/// A predicate on a signal: `key <op> value`, matched first against the
+/// signal's labels and then (for the LOG select payload filters — `level`,
+/// `message`, `field.x`) against the signal's payload text.
+///
+/// The payload is the log producer's `level=<l> msg=<m> @<tick>` shape, read
+/// as whitespace-separated `field=value` tokens; the `message` key aliases the
+/// `msg` payload token. A `PredOp::Eq` requires the whole field to equal
+/// `value`; a `PredOp::Match` requires `value` to be a substring of it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Predicate {
-    /// The label key to match.
+    /// The label/payload-field key to match.
     pub key: String,
-    /// The value the label must equal.
+    /// The value the field must equal (`Eq`) or contain (`Match`).
     pub value: String,
+    /// How `key` and `value` are compared.
+    pub op: PredOp,
 }
 
 impl Predicate {
@@ -58,11 +77,50 @@ impl Predicate {
         Predicate {
             key: key.into(),
             value: value.into(),
+            op: PredOp::Eq,
+        }
+    }
+
+    /// A `key =~ value` substring-match predicate (the LOG message/text
+    /// match operator).
+    #[must_use]
+    pub fn matches(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Predicate {
+            key: key.into(),
+            value: value.into(),
+            op: PredOp::Match,
         }
     }
 
     fn to_text(&self) -> String {
-        format!("{} = {}", self.key, self.value)
+        let value = if self.value.chars().any(char::is_whitespace) {
+            format!("\"{}\"", self.value)
+        } else {
+            self.value.clone()
+        };
+        match self.op {
+            PredOp::Eq => format!("{} = {}", self.key, value),
+            PredOp::Match => format!("{} =~ {}", self.key, value),
+        }
+    }
+
+    /// The payload token key this predicate reads: `message` aliases the
+    /// `msg` token the log producer writes; every other key is itself.
+    fn payload_key(&self) -> &str {
+        if self.key == "message" {
+            "msg"
+        } else {
+            &self.key
+        }
+    }
+
+    /// Test this predicate against one field value (a label value or a
+    /// payload token value).
+    fn value_satisfied_by(&self, field: &str) -> bool {
+        match self.op {
+            PredOp::Eq => field == self.value,
+            PredOp::Match => field.contains(&self.value),
+        }
     }
 }
 
@@ -362,7 +420,9 @@ fn parse_selects(body: &str) -> Result<Vec<SelectClause>, PslError> {
     Ok(selects)
 }
 
-/// Parse a comma-separated `key = value` predicate list.
+/// Parse a comma-separated predicate list. Each item is `key = value`
+/// (equality) or `key =~ value` (the LOG substring-match operator). A value
+/// may be double-quoted (`message =~ "timeout"`) to carry whitespace.
 fn parse_predicates(body: &str) -> Result<Vec<Predicate>, PslError> {
     let body = body.trim();
     if body.is_empty() {
@@ -374,21 +434,33 @@ fn parse_predicates(body: &str) -> Result<Vec<Predicate>, PslError> {
         if item.is_empty() {
             continue;
         }
-        let mut parts = item.splitn(2, '=');
-        let key = parts
-            .next()
-            .ok_or_else(|| PslError(format!("predicate '{item}' missing '='")))?
-            .trim();
-        let value = parts
-            .next()
-            .ok_or_else(|| PslError(format!("predicate '{item}' missing value")))?
-            .trim();
+        // `=~` (substring match) takes precedence over `=` (equality); a
+        // bare `=` inside a `=~` is never split on, since we test `=~` first.
+        let (key, value, op) = if let Some(pos) = item.find("=~") {
+            (item[..pos].trim(), item[pos + 2..].trim(), PredOp::Match)
+        } else if let Some(pos) = item.find('=') {
+            (item[..pos].trim(), item[pos + 1..].trim(), PredOp::Eq)
+        } else {
+            return Err(PslError(format!("predicate '{item}' missing '=' or '=~'")));
+        };
+        let value = unquote(value);
         if key.is_empty() || value.is_empty() {
             return Err(PslError(format!("predicate '{item}' is malformed")));
         }
-        out.push(Predicate::eq(key, value));
+        out.push(Predicate {
+            key: key.to_string(),
+            value: value.to_string(),
+            op,
+        });
     }
     Ok(out)
+}
+
+/// Strip one pair of surrounding double quotes, if present.
+fn unquote(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(s)
 }
 
 /// Parse a `range:` body: `now-<duration>`.
@@ -536,13 +608,59 @@ pub struct PslResult {
     pub groups: Vec<CorrelationGroup>,
 }
 
+/// Parse a log signal's payload into its whitespace-separated `field=value`
+/// tokens (the log producer's `level=<l> msg=<m> @<tick>` shape). The `msg`
+/// token captures the REST of the line after `msg=` so a multi-word message
+/// (`msg=connection timeout to peer`) is one field, not several.
+fn payload_fields(payload: &[u8]) -> std::collections::BTreeMap<String, String> {
+    let mut fields = std::collections::BTreeMap::new();
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return fields;
+    };
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        // Take the next `key=` token; `msg=` consumes the remainder of the line.
+        let Some(eq) = rest.find('=') else { break };
+        let key = rest[..eq].trim();
+        let after = &rest[eq + 1..];
+        if key == "msg" {
+            fields.insert("msg".to_string(), after.trim().to_string());
+            break;
+        }
+        // Value runs up to the next whitespace.
+        let (value, tail) = match after.find(char::is_whitespace) {
+            Some(ws) => (&after[..ws], &after[ws..]),
+            None => (after, ""),
+        };
+        if !key.is_empty() {
+            fields.insert(key.to_string(), value.trim().to_string());
+        }
+        rest = tail.trim_start();
+    }
+    fields
+}
+
+/// A signal satisfies a predicate when it holds against the signal's labels
+/// OR — for the LOG select payload filters (`level`, `message`, `field.x`) —
+/// against the signal's payload token of the same key.
 fn signal_matches_predicates(
     labels: &std::collections::BTreeMap<String, String>,
+    payload: &[u8],
     predicates: &[Predicate],
 ) -> bool {
-    predicates
-        .iter()
-        .all(|p| labels.get(&p.key).is_some_and(|v| v == &p.value))
+    if predicates.is_empty() {
+        return true;
+    }
+    let fields = payload_fields(payload);
+    predicates.iter().all(|p| {
+        if let Some(v) = labels.get(&p.key) {
+            return p.value_satisfied_by(v);
+        }
+        if let Some(v) = fields.get(p.payload_key()) {
+            return p.value_satisfied_by(v);
+        }
+        false
+    })
 }
 
 /// Execute `query` against `store`/`index` as of logical time `now`.
@@ -576,10 +694,10 @@ pub fn execute(
         if tick < range_start || tick > now {
             continue;
         }
-        if !signal_matches_predicates(signal.labels(), kind_predicates) {
+        if !signal_matches_predicates(signal.labels(), signal.payload(), kind_predicates) {
             continue;
         }
-        if !signal_matches_predicates(signal.labels(), &query.where_predicates) {
+        if !signal_matches_predicates(signal.labels(), signal.payload(), &query.where_predicates) {
             continue;
         }
         matched.insert(signal.id());
@@ -1131,5 +1249,108 @@ mod tests {
         let counts = aggregate(&query, &store, &index, now, Aggregate::Count, &by);
         assert_eq!(counts[0].values, vec![2.0]); // service a
         assert_eq!(counts[1].values, vec![3.0]); // service b
+    }
+
+    /// Build a store of real LOG signals (the producer's
+    /// `level=<l> msg=<m> @<tick>` payload shape, plus an extra nested
+    /// `field.x=<v>` token) for the LOG-payload-filter tests. Returns the ids
+    /// of the two entries that the level+message filter must select and the
+    /// one that carries `field.x=alpha`.
+    fn log_payload_fixture() -> (TimeseriesStore, CorrelationIndex, [SignalId; 4]) {
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+
+        // An error log whose message contains "timeout" — MATCHES level=error
+        // AND message =~ timeout. `msg=` is written LAST (it greedily consumes
+        // the remainder of the line, matching the producer's real shape where
+        // the human message trails), with the structured `field.x` token
+        // ahead of it.
+        let err_timeout = store.write(
+            SignalKind::Log,
+            b"level=error field.x=alpha msg=connection timeout to peer".to_vec(),
+            10,
+        );
+        // A second error log, message contains "timeout" too — also matches.
+        let err_timeout_2 = store.write(
+            SignalKind::Log,
+            b"level=error field.x=beta msg=upstream timeout after retry".to_vec(),
+            11,
+        );
+        // An error log WITHOUT "timeout" — matches level but not the message.
+        let err_other = store.write(
+            SignalKind::Log,
+            b"level=error field.x=gamma msg=disk full".to_vec(),
+            12,
+        );
+        // An info log that DOES contain "timeout" — matches the message but
+        // not level=error.
+        let info_timeout = store.write(
+            SignalKind::Log,
+            b"level=info field.x=alpha msg=timeout warning suppressed".to_vec(),
+            13,
+        );
+
+        (
+            store,
+            index,
+            [err_timeout, err_timeout_2, err_other, info_timeout],
+        )
+    }
+
+    /// A LOG select filtering `level = error` AND `message =~ timeout`
+    /// scans the real log payloads and returns ONLY the entries that are BOTH
+    /// error-level AND whose message contains "timeout" — not the error
+    /// without "timeout", and not the info line that does contain it. FAILS
+    /// without the LOG payload-filter support (the old engine matched labels
+    /// only, so a payload-scoped `level`/`message` predicate matched nothing).
+    #[test]
+    fn log_select_filters_by_level_and_message_over_real_payloads() {
+        let (store, index, [err_timeout, err_timeout_2, err_other, info_timeout]) =
+            log_payload_fixture();
+
+        let query = parse(
+            r#"select: logs(level = error, message =~ "timeout") range: now-1000s"#,
+        )
+        .expect("log filter query must parse");
+
+        let result = execute(&query, &store, &index, 100);
+        let mut expected = vec![err_timeout.clone(), err_timeout_2.clone()];
+        expected.sort();
+        assert_eq!(result.matched, expected);
+        assert!(!result.matched.contains(&err_other), "no-timeout error excluded");
+        assert!(!result.matched.contains(&info_timeout), "info-level excluded");
+    }
+
+    /// A `field.x = <value>` LOG filter matches the nested payload field: only
+    /// the entries whose payload carries `field.x=alpha` are returned. FAILS
+    /// without the payload-field scan — `field.x` is neither a label nor a
+    /// numeric value the old engine could reach.
+    #[test]
+    fn log_select_filters_by_nested_payload_field() {
+        let (store, index, [err_timeout, _err_timeout_2, _err_other, info_timeout]) =
+            log_payload_fixture();
+
+        let query = parse("select: logs(field.x = alpha) range: now-1000s")
+            .expect("field filter query must parse");
+
+        let result = execute(&query, &store, &index, 100);
+        let mut expected = vec![err_timeout.clone(), info_timeout.clone()];
+        expected.sort();
+        assert_eq!(
+            result.matched, expected,
+            "only the two field.x=alpha logs match",
+        );
+    }
+
+    /// The LOG match/equality predicates round-trip through the canonical
+    /// text surface — a quoted multi-word `=~` value survives to_text→parse.
+    #[test]
+    fn log_filter_predicates_round_trip_through_text() {
+        let original = parse(
+            r#"select: logs(level = error, message =~ "connection timeout") range: now-1d"#,
+        )
+        .expect("must parse");
+        let reparsed = parse(&original.to_text()).expect("canonical text must re-parse");
+        assert_eq!(original, reparsed);
     }
 }
