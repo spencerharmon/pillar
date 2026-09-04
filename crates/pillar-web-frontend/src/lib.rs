@@ -20,6 +20,7 @@ pub mod panels;
 pub mod router;
 pub mod styles;
 pub mod theme;
+pub mod webauthn;
 
 #[cfg(feature = "yew")]
 pub mod components;
@@ -28,6 +29,7 @@ pub use auth::{AuthAction, AuthSession};
 pub use router::Route;
 pub use styles::ButtonVariant;
 pub use theme::{Motion, Theme};
+pub use webauthn::{authenticate, register, CeremonyError, CredentialCeremony, RpTransport};
 
 #[cfg(feature = "yew")]
 pub use auth::{use_auth, AuthContext, AuthProvider};

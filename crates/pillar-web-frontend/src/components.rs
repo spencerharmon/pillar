@@ -6,8 +6,11 @@
 //! `wasm32-unknown-unknown` (where they become real DOM in the portal bundle).
 //! The whole module is gated behind the `yew` feature.
 
+use crate::auth::use_auth;
 use crate::styles::{self, ButtonVariant};
 use crate::theme::{Motion, Theme};
+use crate::webauthn::{self, CeremonyError};
+use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 /// Read the ambient [`Theme`] from Yew context, falling back to the dark theme
@@ -188,6 +191,132 @@ pub fn combobox(props: &ComboboxProps) -> Html {
                     }) }
                 </ul>
             }
+        </div>
+    }
+}
+
+/// Props for [`SecurityKeyControls`].
+#[derive(Properties, PartialEq)]
+pub struct SecurityKeyControlsProps {
+    /// Invoked when the user clicks "Register a security key". The parent
+    /// runs the real registration ceremony ([`crate::webauthn::run_register`]
+    /// against `navigator.credentials.create()`) and, on failure, feeds the
+    /// resulting [`CeremonyError`] back in via `error`.
+    #[prop_or_default]
+    pub on_register: Callback<MouseEvent>,
+    /// Invoked when the user clicks "Sign in with a security key" — runs
+    /// [`crate::webauthn::run_authenticate`] against `navigator.credentials
+    /// .get()`.
+    #[prop_or_default]
+    pub on_signin: Callback<MouseEvent>,
+    /// Disables both buttons while a ceremony is in flight.
+    #[prop_or_default]
+    pub busy: bool,
+    /// The most recent ceremony error, if any, surfaced in-UI. `None` renders
+    /// no message.
+    #[prop_or_default]
+    pub error: Option<CeremonyError>,
+}
+
+/// The **security-key controls** that REPLACE the old fake "passkey" control
+/// (a `type=password` field mislabeled "passkey"): a "Register a security
+/// key" button (runs `navigator.credentials.create()`) and a "Sign in with a
+/// security key" button (runs `navigator.credentials.get()`).
+///
+/// Ceremony errors (no authenticator, user cancel, unsupported browser,
+/// network/protocol) surface through the `error` prop as the clear,
+/// UI-ready [`CeremonyError::message`] in an `aria-live` alert region.
+/// Password/passphrase custody remains a supported fallback the login screen
+/// renders alongside this control.
+#[function_component(SecurityKeyControls)]
+pub fn security_key_controls(props: &SecurityKeyControlsProps) -> Html {
+    html! {
+        <div class="pillar-security-key">
+            <Button
+                variant={ButtonVariant::Primary}
+                disabled={props.busy}
+                onclick={props.on_register.clone()}
+            >
+                { "Register a security key" }
+            </Button>
+            <Button
+                variant={ButtonVariant::Secondary}
+                disabled={props.busy}
+                onclick={props.on_signin.clone()}
+            >
+                { "Sign in with a security key" }
+            </Button>
+            if let Some(err) = &props.error {
+                <p class="pillar-security-key__error" role="alert" aria-live="assertive">
+                    { err.message() }
+                </p>
+            }
+        </div>
+    }
+}
+
+/// The login screen: [`SecurityKeyControls`] wired to the real browser
+/// ceremony ([`webauthn::run_register`]/[`webauthn::run_authenticate`],
+/// driving actual `navigator.credentials.create()/get()` calls) mounted
+/// alongside a password field, the supported custody fallback. This is the
+/// control that replaces the old fake "passkey" (`type=password`) field.
+#[function_component(LoginPanel)]
+pub fn login_panel() -> Html {
+    let auth = use_auth();
+    let busy = use_state(|| false);
+    let error = use_state(|| None::<CeremonyError>);
+
+    let on_register = {
+        let auth = auth.clone();
+        let busy = busy.clone();
+        let error = error.clone();
+        Callback::from(move |_: MouseEvent| {
+            let token = auth.token.clone().unwrap_or_default();
+            let user_handle = auth.user.clone().unwrap_or_default();
+            let busy = busy.clone();
+            let error = error.clone();
+            busy.set(true);
+            spawn_local(async move {
+                match webauthn::run_register(&token, &user_handle).await {
+                    Ok(_credential_id) => error.set(None),
+                    Err(e) => error.set(Some(e)),
+                }
+                busy.set(false);
+            });
+        })
+    };
+
+    let on_signin = {
+        let auth = auth.clone();
+        let busy = busy.clone();
+        let error = error.clone();
+        Callback::from(move |_: MouseEvent| {
+            let token = auth.token.clone().unwrap_or_default();
+            let busy = busy.clone();
+            let error = error.clone();
+            busy.set(true);
+            spawn_local(async move {
+                match webauthn::run_authenticate(&token).await {
+                    Ok(_unlock_secret) => error.set(None),
+                    Err(e) => error.set(Some(e)),
+                }
+                busy.set(false);
+            });
+        })
+    };
+
+    html! {
+        <div class="pillar-login">
+            <SecurityKeyControls
+                on_register={on_register}
+                on_signin={on_signin}
+                busy={*busy}
+                error={(*error).clone()}
+            />
+            <p class="pillar-login__fallback-hint">
+                { "You can also sign in with your password below." }
+            </p>
+            <Input placeholder="password" />
         </div>
     }
 }
