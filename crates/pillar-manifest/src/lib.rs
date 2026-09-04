@@ -39,6 +39,7 @@ pub mod bgp_lb;
 pub mod builtin;
 pub mod gitops;
 pub mod ingress;
+pub mod network_policy;
 pub mod service_route_dns;
 pub mod tls_cert;
 

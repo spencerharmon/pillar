@@ -3170,8 +3170,10 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-quota-ledger",
+ "pillar-rbac",
  "pillar-topology",
  "pillar-trust-artifacts",
+ "pillar-wot-authority",
 ]
 
 [[package]]

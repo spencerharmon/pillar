@@ -13,6 +13,8 @@ pillar-core = { path = "../pillar-core" }
 pillar-topology = { path = "../pillar-topology" }
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 pillar-quota-ledger = { path = "../pillar-quota-ledger" }
+pillar-rbac = { path = "../pillar-rbac" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
 
 [lints]
 workspace = true
