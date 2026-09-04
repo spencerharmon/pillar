@@ -104,6 +104,59 @@ pub fn correlate_candidates() -> Vec<SignalKind> {
     ]
 }
 
+/// The signal kind the `metadata` vertical's builder targets — the second
+/// of the five Explore verticals to replicate the shared
+/// [`build_metric_query`]/[`correlate_candidates`] pattern.
+pub const METADATA_KIND: SignalKind = SignalKind::MetadataSample;
+
+/// Build the structured [`PslQuery`] for a `metadata` Explore selection:
+/// `select: metadata(<select_predicates>) where: <where_predicates> range:
+/// now-<range_seconds>s [correlate: { window: <w>, anchor: <a> }]` — the SAME
+/// AST [`pillar_observability::parse_psl`] would produce from the equivalent
+/// compact text, by construction, mirroring [`build_metric_query`] for the
+/// `metadata` signal kind.
+///
+/// Fails only as [`PslQueryBuilder::build`] does (no `select`, which cannot
+/// happen here since `metadata` is always selected, or no `range`, which
+/// cannot happen either since `range_seconds` is always supplied) — the
+/// `Result` is kept so a future kind/field can fail honestly rather than
+/// panicking.
+pub fn build_metadata_query(
+    select_predicates: &[(String, String)],
+    where_predicates: &[(String, String)],
+    range_seconds: u64,
+    correlate: Option<(u64, SignalKind)>,
+) -> Result<PslQuery, PslError> {
+    let select = select_predicates
+        .iter()
+        .map(|(k, v)| Predicate::eq(k.clone(), v.clone()))
+        .collect();
+    let mut builder = PslQueryBuilder::new()
+        .select(METADATA_KIND, select)
+        .range_relative(range_seconds);
+    for (k, v) in where_predicates {
+        builder = builder.where_eq(k.clone(), v.clone());
+    }
+    if let Some((window_seconds, anchor)) = correlate {
+        builder = builder.correlate(window_seconds, anchor);
+    }
+    builder.build()
+}
+
+/// The correlate panel's pivot-target candidates for the `metadata`
+/// vertical: every signal kind OTHER than `metadata` itself that a
+/// correlation window can group against. Order is fixed so the panel
+/// renders deterministically.
+#[must_use]
+pub fn correlate_candidates_metadata() -> Vec<SignalKind> {
+    vec![
+        SignalKind::Metric,
+        SignalKind::Log,
+        SignalKind::TraceSpan,
+        SignalKind::ProfileSample,
+    ]
+}
+
 #[cfg(feature = "yew")]
 /// One `key = value` row the user has added to the `select:`/`where:`
 /// predicate list.
@@ -437,6 +490,94 @@ mod tests {
         assert!(candidates.contains(&SignalKind::TraceSpan));
         assert!(candidates.contains(&SignalKind::ProfileSample));
         assert!(candidates.contains(&SignalKind::MetadataSample));
+        assert_eq!(candidates.len(), 4);
+    }
+
+    /// The `metadata` builder produces the SAME AST `parse_psl` parses from
+    /// the equivalent compact text — proving surface equivalence for the
+    /// `metadata` vertical, mirroring the `metrics` structured-builder test.
+    /// FAILS without `build_metadata_query` composing the real
+    /// `PslQueryBuilder`/`PslQuery` model.
+    #[test]
+    fn metadata_structured_builder_matches_the_parsed_equivalent_text_query() {
+        let text = "select: metadata(source = node-1) where: env = prod range: now-1h correlate: { window: 30s, anchor: metadata }";
+        let parsed = parse_psl(text).expect("fixture text query parses");
+
+        let built = build_metadata_query(
+            &[("source".to_string(), "node-1".to_string())],
+            &[("env".to_string(), "prod".to_string())],
+            3600,
+            Some((30, SignalKind::MetadataSample)),
+        )
+        .expect("structured build succeeds");
+
+        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(built.to_text(), parsed.to_text());
+        assert_eq!(built.to_text(), text);
+    }
+
+    /// A `metadata` builder with no `where:`/correlate still matches its
+    /// minimal text equivalent (covers the "just select + range" shape the
+    /// UI starts from before the user adds any predicate).
+    #[test]
+    fn metadata_minimal_selection_matches_its_text_equivalent() {
+        let text = "select: metadata range: now-5m";
+        let parsed = parse_psl(text).expect("fixture text query parses");
+        let built = build_metadata_query(&[], &[], 300, None).expect("build succeeds");
+        assert_eq!(built, parsed);
+    }
+
+    /// The `metadata` vertical's autofill dropdown is populated from a REAL
+    /// `MetadataIndex` built from genuinely ingested `MetadataSample`
+    /// signals — never a fabricated list — and an unknown key returns
+    /// empty, mirroring the `metrics` autofill-fixture test against a real
+    /// metadata fixture.
+    #[test]
+    fn metadata_autofill_options_come_from_a_real_metadata_index_fixture_never_fabricated() {
+        let mut store = TimeseriesStore::new(64, 10_000);
+        store.write_labeled(
+            SignalKind::MetadataSample,
+            b"a".to_vec(),
+            [
+                ("source".to_string(), "node-1".to_string()),
+                ("env".to_string(), "prod".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            0,
+        );
+        store.write_labeled(
+            SignalKind::MetadataSample,
+            b"b".to_vec(),
+            [("source".to_string(), "node-2".to_string())].into_iter().collect(),
+            0,
+        );
+
+        let index = MetadataIndex::from_store(&store);
+
+        let keys = label_key_options(&index);
+        assert!(keys.contains(&"source".to_string()));
+        assert!(keys.contains(&"env".to_string()));
+
+        let values = label_value_options(&index, "source");
+        assert_eq!(values, vec!["node-1".to_string(), "node-2".to_string()]);
+        // Never a value that was never actually ingested.
+        assert!(!values.contains(&"node-9".to_string()));
+
+        // An unknown key returns empty — never a placeholder list.
+        assert!(label_value_options(&index, "nonexistent-key").is_empty());
+    }
+
+    /// The `metadata` correlate panel pivots to every OTHER signal kind
+    /// sharing labels — never back to `metadata` itself.
+    #[test]
+    fn metadata_correlate_candidates_pivot_to_other_kinds_never_metadata_itself() {
+        let candidates = correlate_candidates_metadata();
+        assert!(!candidates.contains(&SignalKind::MetadataSample));
+        assert!(candidates.contains(&SignalKind::Metric));
+        assert!(candidates.contains(&SignalKind::Log));
+        assert!(candidates.contains(&SignalKind::TraceSpan));
+        assert!(candidates.contains(&SignalKind::ProfileSample));
         assert_eq!(candidates.len(), 4);
     }
 }

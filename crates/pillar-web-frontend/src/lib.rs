@@ -28,7 +28,8 @@ pub mod components;
 
 pub use auth::{AuthAction, AuthSession};
 pub use explore::{
-    build_metric_query, correlate_candidates, label_key_options, label_value_options, METRIC_KIND,
+    build_metadata_query, build_metric_query, correlate_candidates, correlate_candidates_metadata,
+    label_key_options, label_value_options, METADATA_KIND, METRIC_KIND,
 };
 pub use router::Route;
 pub use styles::ButtonVariant;
