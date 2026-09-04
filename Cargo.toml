@@ -26,6 +26,7 @@ members = [
     "crates/pillar-quota-ledger",
     "crates/pillar-topology",
     "crates/pillar-upgrade-gate",
+    "crates/pillar-realness-gate",
 ]
 # pillar-frontend targets wasm32-unknown-unknown and carries the yew/stylist/
 # wasm-bindgen closure with its OWN Cargo.lock; excluding it keeps the wasm

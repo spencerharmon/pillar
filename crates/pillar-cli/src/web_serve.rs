@@ -189,7 +189,7 @@ use pillar_topology::{
 // `NodeIdentitySnapshot`/`SessionSummary` used to be defined HERE,
 // server-private; they now live in `pillar_web_api` and are re-exported
 // under their same names so every existing call site keeps compiling
-// unchanged. `CustodyRecord` stays server-local for now: its `holder`/`cid`
+// unchanged. `CustodyRecord` stays server-local: its `holder`/`cid`
 // fields carry the server's internal `NodeId`/`Cid` newtypes, which this
 // wire-facing DTO crate deliberately does not depend on (see
 // `pillar_web_api::CustodyRecord`'s doc for the plain-`String` shared

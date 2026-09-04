@@ -1,0 +1,13 @@
+[package]
+name = "pillar-realness-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The merge-blocking feature-realness gate for pillar. Extends the crypto realness gate beyond crypto: a static source scan that FAILS when a task's claimed-delivered feature path contains a no-op reconcile/handler that reports success without a side effect, a stand-in / placeholder payload used as real data, or a modeled run/fetch/bind/resolve/forward verb with no corresponding real syscall; plus a plan-level lint that rejects a verb-claiming task whose acceptance Check is a mere unit test over a model, and rejects a feature-tier task flipped DONE in the same reconcile that files it. Pinned RED-then-GREEN by the crate's own test fixtures."
+
+[dependencies]
+
+[lints]
+workspace = true

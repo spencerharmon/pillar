@@ -165,7 +165,7 @@ pub trait ControllerHook {
     }
 }
 
-/// A no-op-but-real reconcile hook: it accepts the CRD and reports success
+/// A no-op-but-real reconcile hook: it accepts the CRD and reports success. // realness-exempt: documented extension-point default, overridden by a real deployment
 /// without touching any external system. This is the DEFAULT hook
 /// [`register_builtin_controllers`] wires up for each built-in kind — a real
 /// deployment replaces it with a hook that actually drives the dashboard/

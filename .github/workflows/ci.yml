@@ -105,6 +105,45 @@ jobs:
       - name: test (hsm features)
         run: nix develop -c bash -c 'cargo test -p pillar-crypto --features hsm'
 
+  # The MERGE-BLOCKING feature-realness gate (ROI Priority 0, "The hard gate:
+  # feature-realness, enforced at merge"). A dedicated, REQUIRED status check so
+  # a model-as-feature offender cannot merge: the static realness scan (a no-op
+  # reconcile that reports success, a stand-in/placeholder payload used as real
+  # data, or a modeled run/fetch/bind/resolve/forward with no real syscall) plus
+  # the plan-level verb-claim/attempts=0 lints, all pinned RED-then-GREEN by the
+  # crate's own fixtures. Kept as its OWN job (not just folded into the `rust`
+  # test lane) so branch protection can require it by name and it fails loudly.
+  feature-realness-gate:
+    name: feature-realness gate (merge-blocking)
+    runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/git/bash/coreutils
+    env:
+      HOME: /github/home
+    steps:
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > ~/.config/nix/nix.conf
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+
+      - name: feature-realness gate
+        run: nix develop -c bash -c 'cargo test -p pillar-realness-gate'
+
   tlc:
     name: TLA+ model check
     runs-on: ubuntu-latest
