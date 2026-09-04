@@ -16,6 +16,7 @@
 //! classes, so the visual language is defined exactly once.
 
 pub mod auth;
+pub mod explore;
 pub mod panels;
 pub mod router;
 pub mod styles;
@@ -26,10 +27,16 @@ pub mod webauthn;
 pub mod components;
 
 pub use auth::{AuthAction, AuthSession};
+pub use explore::{
+    build_metric_query, correlate_candidates, label_key_options, label_value_options, METRIC_KIND,
+};
 pub use router::Route;
 pub use styles::ButtonVariant;
 pub use theme::{Motion, Theme};
 pub use webauthn::{authenticate, register, CeremonyError, CredentialCeremony, RpTransport};
+
+#[cfg(feature = "yew")]
+pub use explore::{ExploreBuilder, ExploreBuilderProps};
 
 #[cfg(feature = "yew")]
 pub use auth::{use_auth, AuthContext, AuthProvider};

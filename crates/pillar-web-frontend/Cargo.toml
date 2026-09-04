@@ -43,6 +43,11 @@ yew = [
 ]
 
 [dependencies]
+# The real PSL structured-AST builder/parser (`pillar_observability::psl`) and
+# the metadata-index typeahead source (`pillar_observability::metadata_index`)
+# the Explore query builders compose against — never a second, parallel query
+# model or a fabricated autofill list.
+pillar-observability = { path = "../pillar-observability" }
 # stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
 # `parser` feature lets us build a `Style` from a raw CSS &str on the NATIVE
 # target (host `cargo test`), which is what makes the design system host-
