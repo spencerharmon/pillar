@@ -35,12 +35,14 @@ use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
 use pillar_crypto::{Seed, Signature, SigningPublicKey, SigningSecretKey};
 
 pub mod admission;
+pub mod apply;
 pub mod bgp_lb;
 pub mod builtin;
 pub mod gitops;
 pub mod ingress;
 pub mod network_policy;
 pub mod scheduler;
+pub mod serialize;
 pub mod service_route_dns;
 pub mod tls_cert;
 
