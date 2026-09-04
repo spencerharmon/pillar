@@ -20,6 +20,7 @@ trusted. Each document below links to the specification that proves its claims.
 | [plugin-surface.md](plugin-surface.md) | The complete out-of-tree plugin surface and each plugin's interface contract |
 | [cli-surface.md](cli-surface.md) | The single coherent `pillar` CLI: views-vs-acts split, `kind/name` addressing, and the kubectl-parity resource plane |
 | [observability.md](observability.md) | Built-in distributed observability: signal event schema, retention/sampling policy, and RBAC-decider read authority (`specs/Observability.tla`) |
+| [query-languages/psl.md](query-languages/psl.md) | PSL — the compact-text/structured query surface over observability signals: grammar, correlation semantics, worked example (`specs/PSLCore.tla`) |
 | [readiness-probe.md](readiness-probe.md) | The node readiness/liveness health surface (`GET /readyz` + `/healthz`) — real readiness (identity + views + WoT root), not a bound port, and how the deployment manifest wires it |
 | [private-pillar.md](private-pillar.md) | Configuring a private network root + owned seeds to run an isolated, app-specific pillar deployment |
 
