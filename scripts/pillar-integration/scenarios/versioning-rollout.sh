@@ -50,6 +50,18 @@
 scenario_versioning-rollout() {
     local n="${PILLAR_IT_NODES:-3}"
 
+    # Ensure the image the scenario drives ACTUALLY serves the versioning/
+    # rollout CLI surface (`versioning-rollout`). If the published image lags
+    # the working tree — or cannot be pulled at all — this builds a
+    # reproducible image-under-test from the flake and repoints $PILLAR_IMAGE
+    # at it, so both `topology_boot` and the `oracle_versioning_rollout` CLI
+    # driver run against an image that really dispatches the verb (the exact
+    # gap trust-rbac.sh closes with `image_require_verb apply-authz`). Without
+    # this the scenario spuriously FAILs on the stale published image with
+    # "unknown verb `versioning-rollout`" (or "could not pull") — not because
+    # the surface is broken but because the published image is behind.
+    image_require_verb versioning-rollout
+
     # (1) real >=3-node topology on the real ghcr image.
     topology_boot "$n"
 
