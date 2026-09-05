@@ -54,6 +54,55 @@ topology_boot() {
     info "topology: ${#TOPO_NODES[@]} nodes up: ${TOPO_NODES[*]}"
 }
 
+# topology_boot_scheduler <n> <job-name> <period-secs> : boot an N-node
+# single-LAN topology of the real image, each node carrying the integration-rig
+# `PILLAR_TEST_CRONJOB=<job-name>|<period-secs>|/bin/pillar` hook so a REAL
+# CronJob is registered into the live node's scheduler runtime and fires on the
+# node's real wall clock. The staged image bytes are the real published
+# `/bin/pillar` binary (present in the distroless image) re-exec'd with no args
+# — it prints usage and exits 0, so each due fire is a REAL supervised process
+# (a real pid) that exits cleanly and is reaped back into the ONE scheduler
+# engine, surfaced on the node's stdout as `job-run: <name> <status> pid=<pid>`.
+# Populates TOPO_NODES / TOPO_PROBE_ADDRS exactly like topology_boot. All
+# resources are labelled into the fixture namespace for teardown/leak-check.
+#
+# A due workload fire STAGES the image bytes to a temp file under $TMPDIR and
+# execs it; the distroless image has no /tmp, so we point TMPDIR at the image's
+# writable data dir (/var/lib/pillar/data) — otherwise every spawn fails with
+# "failed to stage workload image as executable: No such file or directory".
+topology_boot_scheduler() {
+    local n="$1" job="$2" period="$3"
+    [ "$n" -ge 3 ] || fail "topology_boot_scheduler: the ROI requires >=3 real nodes (got $n)"
+    TOPO_NODES=()
+    TOPO_PROBE_ADDRS=()
+
+    info "topology: booting a real ${n}-node scheduler topology on image $PILLAR_IMAGE (CronJob '$job' period=${period}s)"
+    "$CONTAINER_RUNTIME" pull "$PILLAR_IMAGE" >/dev/null 2>&1 \
+        || fail "could not pull the real published image $PILLAR_IMAGE (is container-image-ghcr-publish landed?)"
+
+    local i name cid
+    for i in $(seq 0 $((n - 1))); do
+        name="pillar-it-${FIXTURE_SCENARIO}-node${i}"
+        cid=$("$CONTAINER_RUNTIME" run -d \
+            --name "$name" \
+            --label "$FIXTURE_LABEL" \
+            -e "TMPDIR=${PILLAR_IT_NODE_TMPDIR:-/var/lib/pillar/data}" \
+            -e "PILLAR_TEST_CRONJOB=${job}|${period}|/bin/pillar" \
+            -p "127.0.0.1::${PILLAR_PROBE_PORT}" \
+            "$PILLAR_IMAGE" 2>&1) \
+            || fail "node${i} failed to start: $cid"
+        TOPO_NODES+=("$name")
+    done
+
+    for name in "${TOPO_NODES[@]}"; do
+        local addr
+        addr=$("$CONTAINER_RUNTIME" port "$name" "$PILLAR_PROBE_PORT" 2>/dev/null | head -1)
+        [ -n "$addr" ] || fail "could not resolve published probe port for $name"
+        TOPO_PROBE_ADDRS+=("$addr")
+    done
+    info "topology: ${#TOPO_NODES[@]} scheduler nodes up: ${TOPO_NODES[*]}"
+}
+
 # topology_node_pid <name> : the real host PID of a node's container process
 # (the process oracle observes this).
 topology_node_pid() {

@@ -245,6 +245,81 @@ oracle_ciphertext_no_leak() {
     return 0
 }
 
+# oracle_scheduler_cronjob <node-name> <job-name> <period-secs> <min-runs> :
+# assert the real scheduler NODE RUNTIME fires a registered CronJob on the
+# node's REAL wall clock and spawns/exits a REAL process per its declared
+# schedule — the ROI's scheduler realness oracle (RED if a job silently no-ops
+# on schedule, GREEN when a real process is observed spawned/exited per the
+# CronJob's declared schedule). Observed SOLELY from OUTSIDE the node: the node
+# emits `job-run: <name> <status> pid=<pid>` on its stdout for every real run
+# through the ONE `pillar_manifest::scheduler` engine wired to the live node
+# (`pillar_controller::SchedulerRuntime`), which the harness greps from the
+# container's logs — never a return code, never linking a pillar crate.
+#
+# Proves three real effects a silent no-op could not produce:
+#   1. wall-clock firing — over ~(min-runs * period + slack) seconds, at least
+#      <min-runs> distinct `job-run: <job> running pid=<N>` lines appear, each
+#      with a REAL, positive pid, at least two of them DIFFERENT pids (a fresh
+#      OS process per due period, not one long-lived process re-logged);
+#   2. real spawn AND real exit — every fired run is reaped to a terminal
+#      `job-run: <job> succeeded pid=<N>` line for the SAME pid (the real child
+#      process actually exited and its real exit was reported back into the
+#      engine via succeed/fail), i.e. the full fire->spawn->reap loop ran, not
+#      just a modeled fire;
+#   3. the fires track the declared PERIOD — the count observed within the
+#      window is bounded above (a runaway busy-loop would blow past the ceiling)
+#      and below (>= min-runs) by the schedule.
+oracle_scheduler_cronjob() {
+    local name="$1" job="$2" period="$3" min_runs="$4"
+    # Window: enough wall clock for at least min_runs periods plus boot/settle
+    # slack, but bounded so a genuine no-op fails instead of hanging.
+    local window=$(( min_runs * period + period + 20 ))
+    info "scheduler oracle: watching node=$name for >= $min_runs real '$job' CronJob runs over ${window}s (period=${period}s)"
+
+    _saw_min_runs() {
+        local logs running_pids nrun
+        logs="$(topology_node_logs "$name")"
+        running_pids=$(printf '%s\n' "$logs" \
+            | sed -n "s/^job-run: ${job} running pid=\([0-9][0-9]*\)$/\1/p")
+        nrun=$(printf '%s\n' "$running_pids" | grep -c .)
+        [ "$nrun" -ge "$min_runs" ]
+    }
+    retry "$window" _saw_min_runs \
+        || fail "scheduler oracle: node $name emitted fewer than $min_runs real '$job' CronJob runs within ${window}s — the job SILENTLY NO-OPPED on schedule (RED)"
+
+    # Re-read the settled transcript and assert the full set of invariants.
+    local logs running_pids nrun distinct_pids ndistinct
+    logs="$(topology_node_logs "$name")"
+    running_pids=$(printf '%s\n' "$logs" \
+        | sed -n "s/^job-run: ${job} running pid=\([0-9][0-9]*\)$/\1/p")
+    nrun=$(printf '%s\n' "$running_pids" | grep -c .)
+
+    # (1) each run carries a real, positive pid.
+    local p
+    for p in $running_pids; do
+        [ "$p" -gt 0 ] 2>/dev/null \
+            || fail "scheduler oracle: node $name emitted a '$job' run with a non-real pid '$p'"
+    done
+    # ... and at least two DIFFERENT pids (a fresh OS process per due period).
+    distinct_pids=$(printf '%s\n' "$running_pids" | sort -u | grep -c .)
+    [ "$distinct_pids" -ge 2 ] \
+        || fail "scheduler oracle: node $name reused a single pid across '$job' runs (distinct=$distinct_pids) — no fresh process was spawned per schedule"
+    info "oracle-observed: scheduler-fire node=$name job=$job real runs=$nrun distinct-pids=$distinct_pids (a fresh real OS process spawned per declared period on the node's real wall clock)"
+
+    # (2) every fired run is reaped to a terminal succeeded line for its pid —
+    # the real child process actually exited and its real exit fed the engine.
+    local reaped_ok=0
+    for p in $(printf '%s\n' "$running_pids" | sort -u); do
+        if printf '%s\n' "$logs" | grep -q "^job-run: ${job} succeeded pid=${p}$"; then
+            reaped_ok=$((reaped_ok + 1))
+        fi
+    done
+    [ "$reaped_ok" -ge 1 ] \
+        || fail "scheduler oracle: node $name never reaped a real '$job' run to a terminal 'succeeded' line — a fire was modeled but no real process exit was observed"
+    info "oracle-observed: scheduler-reap node=$name job=$job reaped $reaped_ok run(s) to terminal 'succeeded' for their real pid(s) (real fire->spawn->exit->reap loop through the ONE engine)"
+    return 0
+}
+
 # oracle_ipam_operator : assert the real IPAM operator surface
 # (`pillar_ipam::operator::IpamOperator`, the ONLY operator surface over IPAM
 # that exists today — no `pillar ipam` CLI verb or manifest kind has been
