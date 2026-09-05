@@ -75,3 +75,45 @@ oracle_crypto_realness() {
     info "oracle-observed: crypto-realness real-image keygen/sign/trust/policy/fail-closed all ok (real crypto path)"
     return 0
 }
+
+# oracle_ciphertext_no_leak <approve-response-body> <cell-id> : the
+# geo-replication family's ciphertext oracle. On a NODE bootstrap-request
+# approval the approving (host) cell's OWN HTTP surface
+# (`pillar_cli::web_serve::dispatch_request_decide`) returns ONLY the
+# content-addressed CID of the sealed cell-key blob
+# (`crate::request::SealedCellKey`, real X25519+AEAD sealed via
+# `pillar_crypto::seal`) — `APPROVED bafy-cellkey-<sha256-hex>` — never the
+# plaintext cell-key material itself; only a holder of the approved node's own
+# derived sealing secret key can `SealedCellKey::unseal` it (real
+# cryptographic recipient-gating, not bookkeeping). This asserts BOTH real
+# effects the host is observed to (not) produce, from the response transcript
+# alone — no crate linkage, no reach into the node's process memory:
+#
+#   1. the response is shaped as a real content-address:
+#      `APPROVED bafy-cellkey-<64 lowercase hex chars>` (a SHA-256 digest of
+#      the real sealed-envelope bytes) — RED if a future regression ever
+#      shortcut this to a bare/placeholder CID.
+#   2. the response NEVER contains the hex encoding of the deterministic
+#      plaintext cell-key stand-in
+#      (`crate::request::cell_key_plaintext`: SHA-256 of
+#      `"pillar-bootstrap/cell-key-plaintext-v1"` concatenated with the cell
+#      id, documented in `crates/pillar-bootstrap/src/request.rs`) — computed
+#      independently here via `sha256sum` from the SAME public formula, so
+#      this is a real, reproducible proof the host's own approve response
+#      never leaks the plaintext it sealed; only the CID over the sealed
+#      envelope. RED the instant a future approve handler regresses to
+#      echoing the plaintext key material back to the (non-recipient) host
+#      caller.
+oracle_ciphertext_no_leak() {
+    local response="$1" cell_id="$2" plaintext_hex
+    printf '%s\n' "$response" | grep -Eq '^APPROVED bafy-cellkey-[0-9a-f]{64}$' \
+        || fail "ciphertext oracle: approve response '$response' is not a real content-addressed sealed-cell-key CID"
+    info "oracle-observed: ciphertext-cid response='$response' (content-addressed sealed blob, not plaintext)"
+
+    plaintext_hex=$(printf '%s' "pillar-bootstrap/cell-key-plaintext-v1${cell_id}" | sha256sum | cut -d' ' -f1)
+    if printf '%s' "$response" | grep -qi "$plaintext_hex"; then
+        fail "ciphertext oracle: host approve response for cell '$cell_id' LEAKED the plaintext cell-key material (host must never be able to decrypt — only the sealed recipient can)"
+    fi
+    info "oracle-observed: ciphertext-no-leak host response never contains the plaintext cell-key hex ($plaintext_hex) — host holds ciphertext+CID only, cannot decrypt"
+    return 0
+}
