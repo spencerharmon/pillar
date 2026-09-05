@@ -3145,6 +3145,7 @@ dependencies = [
  "pillar-streamdb",
  "pillar-surface-inventory",
  "pillar-topology",
+ "tempfile",
  "tokio",
 ]
 

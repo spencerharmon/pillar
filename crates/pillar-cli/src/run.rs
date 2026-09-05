@@ -119,6 +119,11 @@ pub const DEFAULT_HEALTH_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFI
 /// Integration-rig-only: the value to publish once to the event-log
 /// gossipsub topic after boot settles. Unset in every production boot.
 const ENV_TEST_PUBLISH: &str = "PILLAR_TEST_PUBLISH";
+/// Integration-rig-only: `<name>::<replicas>::<image-ref>` reconciled directly
+/// at boot through the real workload-runtime vertical (real fetch-by-CID +
+/// admit + supervised spawn), bypassing only the HTTP login ceremony. Unset in
+/// every production boot. See the reconcile hook in [`run`].
+const ENV_TEST_WORKLOAD: &str = "PILLAR_TEST_WORKLOAD";
 /// `PILLAR_DISABLE_METRICS`: when set (to any value), disables this node's
 /// self-metrics producer (`pillar_observability::MetricsProducer`) — every
 /// self metric is ON by default (ROI Priority 0's `DefaultOn` matrix), and
@@ -128,6 +133,11 @@ const ENV_DISABLE_METRICS: &str = "PILLAR_DISABLE_METRICS";
 /// streamdb ops, peer count, request count, ingest bandwidth) into its
 /// `TimeseriesStore`.
 const SELF_METRICS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How often the node sweeps reconciled workloads for dead replicas and
+/// re-spawns them (RestartPolicy::Always). Short so a killed replica comes
+/// back promptly and the black-box restart oracle observes the fresh pid.
+const WORKLOAD_RESTART_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long after listen-address bind-up the [`ENV_TEST_PUBLISH`] hook waits
 /// before publishing, giving `--dial` connections + gossipsub mesh
@@ -784,6 +794,72 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
 
     tracing::info!("pillar peer running; press Ctrl-C to stop");
 
+    // Workload-runtime reconcile bridge (ROI "pillar-integration" workload
+    // vertical): a real [`crate::workload_reconcile::WorkloadReconciler`] the
+    // web plane drives on every authorized Workload apply/scale, bringing the
+    // declared replicas up as REAL supervised OS processes (real pid + real
+    // bound socket) after a real fetch-by-CID over libp2p and a digest-verified
+    // controller admission. The node's own controller subject is derived from
+    // its stable identity peer id so the SAME subject reconciles across
+    // restarts, and this node is the sole placement candidate in dev-mode.
+    let reconciler: crate::workload_reconcile::SharedReconciler =
+        std::sync::Arc::new(std::sync::Mutex::new(
+            crate::workload_reconcile::WorkloadReconciler::new(
+                peer_id.to_bytes().as_slice(),
+                pillar_core::NodeId::from(format!("{peer_id}").as_str()),
+            ),
+        ));
+    tracing::info!("pillar workload-runtime reconciler wired into the node");
+
+    // Integration-rig-only hook (the SAME pattern as `PILLAR_TEST_PUBLISH`):
+    // `PILLAR_TEST_WORKLOAD=<name>::<replicas>::<image-ref>` drives the real
+    // workload-runtime vertical directly at boot — a real fetch-by-CID over
+    // libp2p, a digest-verified controller admission, and real supervised
+    // process spawns — WITHOUT requiring an operator to walk the HTTP
+    // login/create-cell ceremony first. `::` separates the fields (the image
+    // ref itself contains `|` and `/`, so `::` keeps it intact as the final,
+    // un-split field). It bypasses ONLY the auth ceremony, never the real
+    // fetch/admit/spawn path, so the resulting replicas are genuine OS
+    // processes on genuine sockets a black-box harness observes via the
+    // `/portal/resource/replicas` oracle. Absent the env var it does nothing on
+    // a production boot.
+    if let Ok(spec) = std::env::var(ENV_TEST_WORKLOAD) {
+        let parts: Vec<&str> = spec.splitn(3, "::").collect();
+        if parts.len() == 3 {
+            let name = parts[0].to_owned();
+            let replicas = parts[1].parse::<usize>().unwrap_or(1);
+            let image = parts[2].to_owned();
+            let hook_reconciler = reconciler.clone();
+            // Run on a dedicated thread so the (blocking) fetch+spawn does not
+            // stall the async boot loop; log the outcome for the harness.
+            std::thread::spawn(move || {
+                match hook_reconciler
+                    .lock()
+                    .map_err(|_| "reconciler mutex poisoned".to_owned())
+                    .and_then(|mut r| {
+                        r.reconcile(&name, &image, replicas)
+                            .map_err(|e| e.to_string())
+                    }) {
+                    Ok(obs) => tracing::info!(
+                        workload = %name,
+                        replicas = obs.len(),
+                        "pillar test-workload hook reconciled"
+                    ),
+                    Err(e) => tracing::error!(
+                        workload = %name,
+                        error = %e,
+                        "pillar test-workload hook failed to reconcile"
+                    ),
+                }
+            });
+        } else {
+            tracing::error!(
+                value = %spec,
+                "PILLAR_TEST_WORKLOAD must be <name>::<replicas>::<image-ref>"
+            );
+        }
+    }
+
     // Serve the web UI on a configurable, possibly non-loopback bind (see
     // `crate::web_serve` for the auth-gate contract) — only when
     // `--web-bind`/`PILLAR_WEB_BIND` was actually configured; unset, `node
@@ -810,7 +886,8 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     format!("pillar-node-key-{peer_id}"),
                     pillar_core::NodeId::from("pillar-node"),
                     16,
-                );
+                )
+                .with_workload_reconciler(reconciler.clone());
                 std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
             }
             Err(e) => {
@@ -848,6 +925,14 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let mut self_metrics_interval = tokio::time::interval(SELF_METRICS_INTERVAL);
     self_metrics_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // RestartPolicy::Always sweep: periodically re-check every reconciled
+    // workload's replicas and re-spawn any whose real OS process has died, so a
+    // killed replica comes back on a fresh pid — observable from outside via
+    // the `/portal/resource/replicas` oracle.
+    let mut restart_sweep = tokio::time::interval(WORKLOAD_RESTART_SWEEP_INTERVAL);
+    restart_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let restart_reconciler = reconciler.clone();
+
     // Controller loop: fold inbound event-log messages into the stream and
     // block until a shutdown signal.
     let mut shutdown = Box::pin(shutdown_signal());
@@ -872,6 +957,16 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 }
                 published = true;
                 publish_at = None;
+            }
+            _ = restart_sweep.tick() => {
+                // RestartPolicy::Always: bring back any replica whose real
+                // process has died, on a fresh pid.
+                if let Ok(mut r) = restart_reconciler.lock() {
+                    let restarted = r.reconcile_all_restarts();
+                    if !restarted.is_empty() {
+                        tracing::info!(nodes = ?restarted, "pillar workload replicas restarted (RestartPolicy::Always)");
+                    }
+                }
             }
             _ = self_metrics_interval.tick() => {
                 // Real self-observed quantities at this moment: the real

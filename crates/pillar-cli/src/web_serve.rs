@@ -342,6 +342,14 @@ pub struct WebAuthContext {
     /// No server-side database: the record store is in-process, exactly like
     /// every other portal substrate here.
     webauthn_rp: PillarRelyingParty,
+    /// The optional workload-runtime reconcile bridge. When the running node
+    /// has wired a [`crate::workload_reconcile::WorkloadReconciler`] into its
+    /// boot path, every authorized `apply`/`scale` of a `Workload` here is
+    /// forwarded to it, driving the REAL fetch-by-CID + digest-verified
+    /// admission + supervised-process spawn vertical. `None` in a bare
+    /// unit-test context (the resource plane still records the signed event
+    /// exactly as before; nothing runs).
+    workload_reconciler: Option<crate::workload_reconcile::SharedReconciler>,
 }
 
 /// One handle's custody record, as the key & offer UI renders/drives it: the
@@ -498,6 +506,50 @@ impl WebAuthContext {
             topology_nodes: BTreeMap::new(),
             observability: ObservabilityBuilders::new(),
             webauthn_rp: PillarRelyingParty::new(),
+            workload_reconciler: None,
+        }
+    }
+
+    /// Wire a workload-runtime reconcile bridge into this web plane. The
+    /// running node ([`crate::run::run`]) calls this so every authorized
+    /// `Workload` apply/scale over the portal drives the real fetch + admit +
+    /// spawn vertical against the shared reconciler.
+    #[must_use]
+    pub fn with_workload_reconciler(
+        mut self,
+        reconciler: crate::workload_reconcile::SharedReconciler,
+    ) -> Self {
+        self.workload_reconciler = Some(reconciler);
+        self
+    }
+
+    /// Reconcile `name`'s declared image+replicas into the shared reconciler,
+    /// if one is wired. Best-effort: a reconcile failure is logged but never
+    /// fails the (already-recorded) signed manifest act — the manifest log is
+    /// the source of truth; the runtime converges toward it.
+    fn drive_reconcile(&self, name: &str) {
+        let Some(shared) = &self.workload_reconciler else {
+            return;
+        };
+        // Read the current declared image + replicas from the resource plane.
+        let Some(crd) = self
+            .resource_platform
+            .get(&self.resource_api, WORKLOAD_KIND, name)
+        else {
+            return;
+        };
+        let image = match crd.spec.get("image") {
+            Some(CrdValue::String(s)) => s.clone(),
+            _ => return,
+        };
+        let replicas = match crd.spec.get("replicas") {
+            Some(CrdValue::Integer(n)) => (*n).max(0) as usize,
+            _ => 1,
+        };
+        if let Ok(mut reconciler) = shared.lock() {
+            if let Err(e) = reconciler.reconcile(name, &image, replicas) {
+                tracing::debug!(workload = name, error = %e, "workload reconcile did not converge yet");
+            }
         }
     }
 
@@ -1173,9 +1225,13 @@ impl WebAuthContext {
     ) -> Result<String, ResourceError> {
         let body = self.workload_body(name, image, replicas);
         let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
-        plane
+        let applied = plane
             .apply(actor, RESOURCE_CAP, body)
-            .map(|applied| format!("{}", applied.event.0))
+            .map(|applied| format!("{}", applied.event.0))?;
+        // Drive the real workload-runtime reconcile (fetch-by-CID + admit +
+        // supervised spawn) toward the just-declared manifest state.
+        self.drive_reconcile(name);
+        Ok(applied)
     }
 
     /// `edit` (ACT): apply an edited workload body (here, a new image) as one
@@ -1206,14 +1262,16 @@ impl WebAuthContext {
         replicas: i64,
     ) -> Result<String, ResourceError> {
         let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
-        plane
+        let applied = plane
             .scale(
                 actor,
                 RESOURCE_CAP,
                 &Address::new(WORKLOAD_KIND, name),
                 replicas,
             )
-            .map(|applied| format!("{}", applied.event.0))
+            .map(|applied| format!("{}", applied.event.0))?;
+        self.drive_reconcile(name);
+        Ok(applied)
     }
 
     /// `rollout restart` (ACT): bump the workload's `pillar.dev/restarted-at`
@@ -1272,10 +1330,46 @@ impl WebAuthContext {
             .get(&self.resource_api, WORKLOAD_KIND, name)
             .is_some()
         {
+            // When a real reconciler is wired, reach the workload's REAL live
+            // replicas (real pids + bound ports) rather than a stub formatter.
+            if let Some(shared) = &self.workload_reconciler {
+                if let Ok(mut reconciler) = shared.lock() {
+                    let replicas: Vec<_> = reconciler
+                        .observe_all()
+                        .into_iter()
+                        .filter(|r| r.workload == name)
+                        .collect();
+                    if !replicas.is_empty() {
+                        let lines: Vec<String> = replicas
+                            .iter()
+                            .map(|r| {
+                                format!(
+                                    "{what} {WORKLOAD_KIND}/{name} node={} pid={} port={} digest={}",
+                                    r.node, r.pid, r.port, r.image_digest
+                                )
+                            })
+                            .collect();
+                        return Ok(lines.join("\n"));
+                    }
+                }
+            }
             Ok(format!("{what} {WORKLOAD_KIND}/{name}"))
         } else {
             Err(ResourceError::NotFound(Address::new(WORKLOAD_KIND, name)))
         }
+    }
+
+    /// The black-box replica oracle body: one `REPLICA` line per live replica
+    /// across every reconciled workload (real pid + real bound port + the
+    /// content-addressed image digest), or `REPLICAS 0` when no reconciler is
+    /// wired / nothing is running. Served at `GET /portal/resource/replicas`.
+    pub fn resource_replicas(&self) -> String {
+        if let Some(shared) = &self.workload_reconciler {
+            if let Ok(mut reconciler) = shared.lock() {
+                return reconciler.render_oracle();
+            }
+        }
+        "REPLICAS 0".to_owned()
     }
 
     /// Test-only: admit `subject` into the LOGIN custody authority ONLY (so it
@@ -1986,6 +2080,7 @@ pub static ROUTES: &[RouteSpec] = &[
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/logs"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Logs) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/exec"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Exec) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/forward"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Forward) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/replicas"), handler: |ctx, _peer, _request| dispatch_resource_replicas(ctx) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/apply"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Apply) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/edit"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Edit) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/scale"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Scale) },
@@ -2164,6 +2259,15 @@ fn dispatch_resource_dry_run(ctx: &WebAuthContext, request: &HttpRequest) -> Htt
 /// `logs`/`exec`/`port-forward`: `GET
 /// /portal/resource/{logs,exec,forward}?token=<s>&name=<n>[&cmd=…|&port=…]`.
 /// Reaches a RUNNING workload's runtime — signs nothing.
+/// The black-box replica oracle: `GET /portal/resource/replicas`. Deliberately
+/// UNAUTHENTICATED (like the readiness probe) — it exposes only real pids,
+/// bound ports, and content-addressed image digests, no secrets — so an
+/// external harness can observe the running workload replicas without linking a
+/// pillar crate.
+fn dispatch_resource_replicas(ctx: &WebAuthContext) -> HttpResponse {
+    text_response(200, "OK", ctx.resource_replicas())
+}
+
 fn dispatch_resource_runtime(
     ctx: &WebAuthContext,
     request: &HttpRequest,
