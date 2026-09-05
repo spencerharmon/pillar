@@ -29,22 +29,22 @@
 #   - cli:node         (the real image node the topology boots)
 # proven by the `apply_authz` and `process` oracles respectively.
 
-# scenario_trust_rbac_claims : declare the surface-inventory entries this
+# scenario_trust-rbac_claims : declare the surface-inventory entries this
 # scenario CLAIMS (the PillarIntegration.tla ClaimsTargetRealSurface relation),
 # printed as greppable `inventory-claim:` lines so the conformance rig / a
 # reviewer can confirm every claim targets a real inventory entry and is proven
 # by a named real oracle.
-scenario_trust_rbac_claims() {
+scenario_trust-rbac_claims() {
     info "inventory-claim: cli:apply-authz proven-by=apply_authz (real WoT/RBAC decider denies unauthorized apply)"
     info "inventory-claim: cli:node proven-by=process (real image node process + bound socket)"
 }
 
-scenario_trust_rbac() {
+scenario_trust-rbac() {
     local n="${PILLAR_IT_NODES:-3}"
 
     # Declare the inventory entries this scenario claims BEFORE asserting, so
     # the claim is on record even if an oracle fails.
-    scenario_trust_rbac_claims
+    scenario_trust-rbac_claims
 
     # Ensure the image the scenario drives ACTUALLY serves the trust/RBAC
     # authorization CLI surface (`apply-authz`). If the published image lags
