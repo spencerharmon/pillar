@@ -899,6 +899,43 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         }
     }
 
+    // Scheduler node runtime (scheduler-node-runtime-wiring): the ONE shared
+    // `pillar_manifest::scheduler::Scheduler` engine, driven off a REAL
+    // wall-clock tick and composed with the real-process runtime
+    // (`pillar_controller::runtime::SupervisedWorkload`). A due
+    // `JobKind::Workload` fire actually spawns the job's verified image bytes
+    // as a real supervised OS process (a real pid); a co-scheduled
+    // observability eval runs in-process through the IDENTICAL dispatch path;
+    // and each real child's real exit is reported back into the engine on the
+    // reap tick. Every fire/exit emits the black-box-observable
+    // `job-run: <job> <status> pid=<pid>` line on stdout so an external harness
+    // can assert the REAL run without linking any pillar crate.
+    //
+    // Production route (scheduler-apply-admission-registration): a `CronJob`/
+    // `Job` manifest applied through `pillar apply` is admitted via
+    // `crate::web_serve::WebAuthContext::resource_apply_cronjob` — validated
+    // against the real built-in `CronJob`/`Job` schema
+    // (`pillar_manifest::builtin`) and registered into THIS SAME shared
+    // runtime (wired below via `with_scheduler_runtime`), so an applied
+    // manifest is scheduled/run for real, not merely recorded. Removing/
+    // replacing the manifest deregisters the job. The `PILLAR_TEST_CRONJOB`
+    // rig hook (`<name>|<period-secs>|<script-path>`) registers one CronJob
+    // directly from a verified on-disk executable so an integration harness
+    // can drive a real, due-soon job against a live node without walking the
+    // HTTP apply ceremony first.
+    let mut boot_scheduler_runtime = pillar_controller::SchedulerRuntime::new(
+        pillar_manifest::scheduler::Scheduler::new(pillar_topology::TierHierarchy::default()),
+    );
+    if let Ok(spec) = std::env::var("PILLAR_TEST_CRONJOB") {
+        register_test_cronjob(&mut boot_scheduler_runtime, &spec);
+    }
+    let scheduler_runtime = std::sync::Arc::new(std::sync::Mutex::new(boot_scheduler_runtime));
+    // A short tick so a due CronJob fires (and exited children are reaped)
+    // within the integration harness's few-second observation window.
+    const SCHEDULER_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+    let mut scheduler_interval = tokio::time::interval(SCHEDULER_TICK);
+    scheduler_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Serve the web UI on a configurable, possibly non-loopback bind (see
     // `crate::web_serve` for the auth-gate contract) — only when
     // `--web-bind`/`PILLAR_WEB_BIND` was actually configured; unset, `node
@@ -927,7 +964,8 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     16,
                 )
                 .with_live_observability(std::sync::Arc::clone(&live_obs))
-                .with_workload_reconciler(reconciler.clone());
+                .with_workload_reconciler(reconciler.clone())
+                .with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime));
                 std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
             }
             Err(e) => {
@@ -968,35 +1006,6 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let mut restart_sweep = tokio::time::interval(WORKLOAD_RESTART_SWEEP_INTERVAL);
     restart_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let restart_reconciler = reconciler.clone();
-
-    // Scheduler node runtime (scheduler-node-runtime-wiring): the ONE shared
-    // `pillar_manifest::scheduler::Scheduler` engine, driven off a REAL
-    // wall-clock tick and composed with the real-process runtime
-    // (`pillar_controller::runtime::SupervisedWorkload`). A due
-    // `JobKind::Workload` fire actually spawns the job's verified image bytes
-    // as a real supervised OS process (a real pid); a co-scheduled
-    // observability eval runs in-process through the IDENTICAL dispatch path;
-    // and each real child's real exit is reported back into the engine on the
-    // reap tick. Every fire/exit emits the black-box-observable
-    // `job-run: <job> <status> pid=<pid>` line on stdout so an external harness
-    // can assert the REAL run without linking any pillar crate.
-    //
-    // Production route: applied CronJob/Job manifests (the existing
-    // `pillar-manifest` admission/builtin path) register their job here. The
-    // `PILLAR_TEST_CRONJOB` rig hook (`<name>|<period-secs>|<script-path>`)
-    // registers one CronJob directly from a verified on-disk executable so the
-    // integration harness can drive a real, due-soon job against a live node.
-    let mut scheduler_runtime = pillar_controller::SchedulerRuntime::new(
-        pillar_manifest::scheduler::Scheduler::new(pillar_topology::TierHierarchy::default()),
-    );
-    if let Ok(spec) = std::env::var("PILLAR_TEST_CRONJOB") {
-        register_test_cronjob(&mut scheduler_runtime, &spec);
-    }
-    // A short tick so a due CronJob fires (and exited children are reaped)
-    // within the integration harness's few-second observation window.
-    const SCHEDULER_TICK: std::time::Duration = std::time::Duration::from_millis(500);
-    let mut scheduler_interval = tokio::time::interval(SCHEDULER_TICK);
-    scheduler_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Anti-entropy catch-up sync (ROI P1 "Event order & integrity";
     // pillar-integration chaos-fault RED/GREEN reconvergence): gossipsub is
@@ -1097,6 +1106,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // engine), then fire every due job — a due workload actually
                 // spawns a real supervised process. Each real terminal/started
                 // run is emitted as the black-box `job-run:` line on stdout.
+                // Locked for the duration of the tick: this is the SAME shared
+                // runtime a `CronJob`/`Job` manifest apply registers into over
+                // the web plane (`with_scheduler_runtime`), so a registration
+                // that lands mid-tick is picked up on the very next tick.
+                let mut scheduler_runtime = scheduler_runtime.lock().unwrap_or_else(|e| e.into_inner());
                 match scheduler_runtime.reap().await {
                     Ok(reaped) => {
                         for (job, _succeeded) in reaped {
