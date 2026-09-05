@@ -108,8 +108,9 @@ that supports a subset of its features:
 Because trust is carried by the signature on each message and not by its origin
 address, the node that \emph{replies} need not be the node that
 \emph{ingested}: a cell can answer from whichever dispersed nodes have the best
-paths to the client. End-to-end IPv6 addressing makes this native; IPv4 behind
-NAT degrades it.
+paths to the client. How many nodes can actually reply depends on the client's
+address family---end-to-end IPv6 addressing makes the dispersed reply mesh
+native, while IPv4 behind NAT constrains it (\S\ref{sec:replypath}).
 
 \begin{figure}[t]
 \centering
@@ -249,6 +250,43 @@ route to the coordination-core lease holder---is orthogonal to the transport and
 is modeled elsewhere; here every message is idempotent (CID dedup), so
 \code{ExactlyOnce} is exactly the property that opportunistic, redundant,
 multi-node delivery must not violate, and TLC confirms it does not.
+
+\section{Reply-path addressing: IPv6 versus IPv4/NAT}\label{sec:replypath}
+The dispersed-reply property of \S2---any well-placed node may answer, not only
+the one that ingested---requires that those nodes can actually \emph{reach} the
+client, and how many can is decided entirely by the client's address family. The
+connection itself is always client-initiated: on joining a cell the client
+receives the cell's node list and opens redundant connections to several
+reachable ingest nodes (a deployment is expected to keep some nodes' pillar-UDP
+port publicly reachable). Because the client dials outbound, each connection
+opens its own return path through any intervening NAT, so the \emph{base} case
+needs no hole punching, and a degrading connection is simply abandoned for the
+remaining ones. Reply-node \emph{diversity}---how many distinct nodes can send
+\emph{back} to the client---then splits into three tiers:
+\begin{itemize}\itemsep2pt
+  \item \textbf{IPv6 (GUA)---preferred, scales.} With a global address on the
+  client, any cell node sends to it directly with \emph{no} per-peer NAT state.
+  Reply-node diversity spans the full redundancy fan-out, so this is the only
+  tier in which the clustered congestion-avoidance advantage of \S2 is realised
+  end to end for a client, not just for the inter-cell mesh of
+  Fig.~\ref{fig:manytomany}.
+  \item \textbf{IPv4 $+$ DCUtR---partial.} Behind NAT, the publicly reachable
+  ingest node coordinates DCUtR (direct-connection-upgrade-through-relay) hole
+  punches so that \emph{additional} nodes obtain direct paths to the client,
+  widening diversity past the single ingest. But each punched peer consumes a
+  distinct port mapping on the client's NAT: DCUtR removes the single-node
+  bottleneck only to replace it with a \emph{port-exhaustion} one, so this tier
+  cannot scale to a large fan-out.
+  \item \textbf{IPv4, no DCUtR---floor.} Only the port-forwarded ingest node(s)
+  the client actually dialed can answer, over the client-initiated mappings.
+  Delivery is effectively single-path---the regime pillar-UDP's redundancy is
+  least able to improve.
+\end{itemize}
+IPv6 is therefore strictly preferred, for a structural reason rather than a
+performance heuristic: DCUtR trades one bottleneck for another, whereas a global
+address removes the bottleneck outright. The IPv6-native reply mesh is what lets
+a single client---not only an inter-cell mesh---enjoy the full dispersed-path
+redundancy the models prove.
 
 \section{Redundancy characteristics}\label{sec:redundancy}
 Redundancy is what buys loss tolerance. If a message rides in $W$ consecutive or
