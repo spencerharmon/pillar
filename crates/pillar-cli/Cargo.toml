@@ -36,6 +36,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [features]
 # Default keeps the everyday `cargo build -p pillar-cli` / `cargo test --all`

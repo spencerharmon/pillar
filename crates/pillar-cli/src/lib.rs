@@ -42,6 +42,7 @@ pub mod run;
 pub mod secrets_audit_rotation_mfa;
 pub mod session_cli;
 pub mod stream_cli;
+pub mod surface_inventory;
 pub mod topology_cli;
 pub mod web_serve;
 pub mod webauthn_cli;
