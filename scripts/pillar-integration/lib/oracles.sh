@@ -345,3 +345,55 @@ oracle_ipam_operator() {
     info "oracle-observed: ipam-operator double-allocation-rejected AND multi-site topology-scoped-selection both ok (real compiled operator surface)"
     return 0
 }
+
+# oracle_workload_runtime : assert the real workload-runtime vertical — a
+# running pillar node FETCHES a real CID image over LIVE libp2p, admits it
+# through the digest-verified controller gate, spawns it as a REAL supervised
+# OS process on a REAL bound socket, and RESTARTS it on a fresh pid when the
+# process dies — the ROI workload-runtime family's process oracle (real pid +
+# listening socket per replica) AND content-address oracle (fetched bytes match
+# the published digest).
+#
+# WHY an acceptance-test oracle and NOT a container-exec/HTTP driver: the fetch
+# side is a real `blob:<provider-multiaddr>|<digest>` request over libp2p, so
+# the harness must stand up a REAL libp2p BLOB PROVIDER serving the image bytes
+# by content address. The published container image ships NO blob-provider
+# surface (no `pillar` CLI verb, no manifest kind, no `PILLAR_TEST_*` hook
+# serves a blob — confirmed: `pillar-net::build_blob_swarm`/`BlobStore` are a
+# library API only; the sole bin in the workspace is the `udp_echo` test
+# image). So the ONLY way to drive the real fetch+exec+restart vertical today
+# is the crate's own black-box acceptance test
+# (`crates/pillar-e2e/tests/node_workload_runtime_wiring.rs`,
+# `--features acceptance`), which stands up the real libp2p provider in-process,
+# boots the REAL compiled `pillar` binary as a subprocess with the
+# `PILLAR_TEST_WORKLOAD` reconcile hook, and observes the effect SOLELY over the
+# node's external `/portal/resource/replicas` HTTP oracle + a real UDP
+# round-trip to the replica's socket + a real `kill -9` then restart. It links
+# NO pillar crate to DRIVE the node — same black-box boundary the harness
+# demands, same precedent `oracle_ipam_operator` set for an operator surface the
+# container image does not expose. When a future task lands a blob-provider
+# surface runnable as a topology container (a `pillar blob serve <path>` verb or
+# a `PILLAR_TEST_BLOB_PROVIDE` hook), this oracle can be re-expressed to spread
+# real replicas across the harness's own >=3 live container nodes; until then
+# the acceptance test is the real fetch+exec+restart proof available, and the
+# scenario still asserts the real >=3-node topology + process oracle around it.
+oracle_workload_runtime() {
+    local out repo_root
+    repo_root="$(cd "$HERE/../.." && pwd)"
+    # The acceptance test boots the REAL compiled `pillar` binary as a
+    # subprocess (it locates it next to the `udp_echo` test bin in the target
+    # dir). `cargo test -p pillar-e2e` does NOT build the `pillar-cli` bin (a
+    # different package), so build it FIRST — otherwise the test panics with
+    # "the compiled `pillar` binary must exist ... run `cargo build -p
+    # pillar-cli` first".
+    out=$(cd "$repo_root" && cargo build -p pillar-cli 2>&1) \
+        || fail "workload-runtime oracle: could not build the real pillar binary the acceptance test boots:\n$out"
+    out=$(cd "$repo_root" && cargo test -p pillar-e2e --test node_workload_runtime_wiring --features acceptance 2>&1) \
+        || fail "workload-runtime oracle: the real node-workload-runtime acceptance suite failed (real libp2p CID fetch / OCI exec / restart):\n$out"
+
+    printf '%s\n' "$out" | grep -q "test real_node_reconciles_a_workload_into_real_supervised_replicas ... ok" \
+        || fail "workload-runtime oracle: the real fetch+exec+restart assertion did not report ok:\n$out"
+
+    info "oracle-observed: workload-runtime real pillar node fetched a CID image over live libp2p, spawned a real supervised replica (real pid + bound socket, digest-verified), and restarted it on a fresh pid (real fetch/OCI-exec/restart vertical)"
+    return 0
+}
