@@ -20,6 +20,7 @@ pub mod dashboard;
 pub mod drilldown;
 pub mod explore;
 pub mod panels;
+pub mod portal_entry;
 pub mod router;
 pub mod styles;
 pub mod theme;

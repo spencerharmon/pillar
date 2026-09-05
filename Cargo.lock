@@ -3363,6 +3363,7 @@ dependencies = [
  "js-sys",
  "pillar-manifest",
  "pillar-observability",
+ "pillar-web-api",
  "stylist",
  "wasm-bindgen",
  "wasm-bindgen-futures",

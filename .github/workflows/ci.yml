@@ -144,6 +144,61 @@ jobs:
       - name: feature-realness gate
         run: nix develop -c bash -c 'cargo test -p pillar-realness-gate'
 
+  # Build the Yew + WebAssembly portal bundle (`.#pillar-frontend`, flake
+  # stage 1: trunk -> wasm/js/css). The frontend crate is DELIBERATELY excluded
+  # from the cargo workspace (own wasm dep closure + Cargo.lock), so the `rust`
+  # lane's `cargo test --all` never compiles it — which is exactly how a broken
+  # frontend build (a sibling path-dep the flake `src` omitted) and a stale
+  # embedded bundle shipped unnoticed. This job compiles the REAL bundle the
+  # deployed image embeds (`pillar` sets `PILLAR_FRONTEND_DIST=${pillar-frontend}`),
+  # so a frontend that does not build can no longer merge.
+  frontend-build:
+    name: frontend wasm bundle build
+    runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/git/bash/coreutils
+    env:
+      HOME: /github/home
+    steps:
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > ~/.config/nix/nix.conf
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+
+      - name: Build frontend bundle
+        run: |
+          set -euo pipefail
+          # Same /homeless-shelter purity retry the image build uses when nix
+          # runs unsandboxed in a single-container CI.
+          attempt=1; max_attempts=10
+          until rm -rf /homeless-shelter && nix build --max-jobs 1 .#pillar-frontend; do
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "FAIL: nix build .#pillar-frontend did not succeed after ${max_attempts} attempts" >&2
+              exit 1
+            fi
+            echo "nix build attempt ${attempt} failed; retrying..." >&2
+            attempt=$((attempt + 1))
+          done
+          # The bundle must carry the four assets build.rs embeds.
+          for a in index.html pillar-frontend_bg.wasm pillar-frontend.js portal.css; do
+            test -f "result/$a" || { echo "FAIL: bundle missing $a" >&2; exit 1; }
+          done
+
   tlc:
     name: TLA+ model check
     runs-on: ubuntu-latest

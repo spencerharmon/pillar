@@ -2362,6 +2362,14 @@ fn dispatch_landing(
     _peer: &SocketAddr,
     _req: &HttpRequest,
 ) -> HttpResponse {
+    // NOTE: `/` still serves the legacy `web_login.html` portal, which is at
+    // full feature parity (bootstrap, two-field login, every panel, plus the
+    // UX-hardening surface: live cell-name check, copy-to-clipboard,
+    // what-happens-next explainers, per-act pending). The migrated Yew shell
+    // (embedded `FRONTEND_INDEX` + `/assets` + root asset routes, served and
+    // guarded) is NOT yet the default here: it must first reach parity with
+    // that UX surface (the `/`-page tests below are the checklist). Flipping
+    // this body to `FRONTEND_INDEX` is the one-line cutover once parity lands.
     HttpResponse {
         status: 200,
         reason: "OK",

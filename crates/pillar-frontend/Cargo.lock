@@ -757,9 +757,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hermit-abi"
-version = "0.5.3"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
+checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hkdf"
@@ -1062,6 +1062,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-web-api"
+version = "0.0.0"
+dependencies = [
+ "pillar-crypto",
+ "serde",
+]
+
+[[package]]
 name = "pillar-web-frontend"
 version = "0.0.0"
 dependencies = [
@@ -1070,6 +1078,7 @@ dependencies = [
  "js-sys",
  "pillar-manifest",
  "pillar-observability",
+ "pillar-web-api",
  "stylist",
  "wasm-bindgen",
  "wasm-bindgen-futures",

@@ -43,6 +43,12 @@ yew = [
 ]
 
 [dependencies]
+# The shared client/server DTO crate: every request/response wire type that
+# crosses the portal boundary (login, nonce, bootstrap status/create) so the
+# Yew client and the pillar-cli server construct/parse the SAME framing and
+# cannot drift. This is exactly the crate's stated purpose (compiled into both
+# the Rust server and the Rust/WASM client).
+pillar-web-api = { path = "../pillar-web-api", default-features = false }
 # The real PSL structured-AST builder/parser (`pillar_observability::psl`) and
 # the metadata-index typeahead source (`pillar_observability::metadata_index`)
 # the Explore query builders compose against — never a second, parallel query
@@ -82,6 +88,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "Response",
     "Window",
     "Navigator",
+    "HtmlInputElement",
+    "HtmlSelectElement",
     "CredentialsContainer",
     "Credential",
     "CredentialCreationOptions",

@@ -132,6 +132,17 @@
           # `ci` workflow owns fmt/clippy/test.
           doCheck = false;
 
+          # Embed the REAL Yew + WebAssembly portal bundle (stage 1 above) into
+          # the one `pillar` binary. `crates/pillar-cli/build.rs` reads this env
+          # var and `include_bytes!`s `${pillar-frontend}`'s wasm/js/css/html;
+          # WITHOUT it, build.rs silently falls back to the committed
+          # `src/frontend_dist/` bundle (only meant for a plain `cargo build`),
+          # which is exactly how the deployed image shipped the pre-migration
+          # PLACEHOLDER portal instead of the built one. Point it at the
+          # freshly-built store path so the image can never embed a stale
+          # fallback again.
+          PILLAR_FRONTEND_DIST = pillar-frontend;
+
           # The `hsm` feature (above) links native libraries for the hardware
           # custody backends in pillar-crypto:
           #   * tpm2-tss      — TpmCustody via tss-esapi (+ tss-esapi-sys bindgen)

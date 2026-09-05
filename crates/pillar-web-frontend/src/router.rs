@@ -17,6 +17,8 @@ use crate::components::LoginPanel;
 #[cfg(feature = "yew")]
 use crate::panels::{Panel, ALL_PANELS};
 #[cfg(feature = "yew")]
+use crate::portal_entry::PortalEntry;
+#[cfg(feature = "yew")]
 use yew::prelude::*;
 #[cfg(feature = "yew")]
 use yew_router::prelude::*;
@@ -79,7 +81,7 @@ struct GuardedProps {
 fn guarded(props: &GuardedProps) -> Html {
     let session = use_auth();
     match guard(props.route.clone(), &session) {
-        Route::Home => html! { <p>{ "pillar portal" }</p> },
+        Route::Home => html! { <PortalEntry /> },
         Route::Login => html! { <LoginPanel /> },
         Route::Dashboard => html! {
             <div>
