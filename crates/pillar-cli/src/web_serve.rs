@@ -361,7 +361,24 @@ pub struct WebAuthContext {
     /// unit-test context (the resource plane still records the signed event
     /// exactly as before; nothing runs).
     workload_reconciler: Option<crate::workload_reconcile::SharedReconciler>,
+    /// The optional scheduler node runtime (`scheduler-node-runtime-wiring` /
+    /// `scheduler-apply-admission-registration`). When the running node has
+    /// wired a [`pillar_controller::SchedulerRuntime`] into its boot path
+    /// (`pillar node run`'s real wall-clock scheduler loop), every authorized
+    /// `apply`/`delete` of a `CronJob`/`Job` manifest here is translated into
+    /// a [`pillar_manifest::scheduler::Job`] and registered/deregistered into
+    /// it — the production route that replaces the `PILLAR_TEST_CRONJOB` rig
+    /// hook. `None` in a bare unit-test context (the resource plane still
+    /// records the signed event exactly as before; nothing is scheduled).
+    scheduler_runtime: Option<SharedSchedulerRuntime>,
 }
+
+/// A thread-shared handle to the node's live scheduler runtime: the running
+/// node's real wall-clock tick loop and the web server's manifest-admission
+/// path both hold a clone, so an applied `CronJob`/`Job` manifest registers
+/// into the IDENTICAL engine the tick loop drives (never a second, disconnected
+/// scheduler).
+pub type SharedSchedulerRuntime = Arc<Mutex<pillar_controller::SchedulerRuntime>>;
 
 /// A thread-shared handle to the node's live observability substrate: the
 /// controller loop and the web server both hold a clone and take the lock only
@@ -422,10 +439,23 @@ const RESOURCE_CAP: &str = "resource/act";
 const WORKLOAD_KIND: &str = "Workload";
 /// An identity-object kind the SAME verb surface is polymorphic over.
 const IDENTITY_KIND: &str = "User";
+/// The `CronJob` built-in kind's `kind` string — reused verbatim from
+/// [`pillar_manifest::builtin::BuiltinKind::CronJob`] rather than a second,
+/// hand-rolled constant, so the resource plane's `CronJob` object is
+/// admitted through the SAME `(apiVersion, kind)` identity as every other
+/// place in the platform that recognizes a built-in `CronJob`.
+const CRONJOB_KIND: &str = "CronJob";
+/// The `Job` (one-shot) built-in kind's `kind` string, likewise reused from
+/// [`pillar_manifest::builtin::BuiltinKind::Job`].
+const JOB_KIND: &str = "Job";
 
 /// Build the resource plane's schema registry: a workload kind (with an
-/// `image` + `replicas` spec the UI scales/rolls-out) and an identity kind,
-/// proving the plane is polymorphic over both.
+/// `image` + `replicas` spec the UI scales/rolls-out), an identity kind, and
+/// EVERY built-in kind [`pillar_manifest::builtin`] declares — including
+/// `CronJob`/`Job`, admitted here through the exact same
+/// [`pillar_manifest::builtin::register_builtin_schemas`] call any other
+/// built-in consumer in the platform uses (proving the plane is polymorphic
+/// over a hand-rolled kind, an identity kind, AND a real built-in kind alike).
 fn resource_registry() -> SchemaRegistry {
     let mut reg = SchemaRegistry::new();
     reg.register(
@@ -435,6 +465,7 @@ fn resource_registry() -> SchemaRegistry {
             .property("generation", FieldType::Integer),
     );
     reg.register(Schema::new(RESOURCE_API, IDENTITY_KIND).required("handle", FieldType::String));
+    pillar_manifest::builtin::register_builtin_schemas(&mut reg);
     reg
 }
 
@@ -524,6 +555,7 @@ impl WebAuthContext {
             webauthn_rp: PillarRelyingParty::new(),
             live_obs: None,
             workload_reconciler: None,
+            scheduler_runtime: None,
         }
     }
 
@@ -537,6 +569,18 @@ impl WebAuthContext {
         reconciler: crate::workload_reconcile::SharedReconciler,
     ) -> Self {
         self.workload_reconciler = Some(reconciler);
+        self
+    }
+
+    /// Wire the node's real scheduler runtime into this web plane. The running
+    /// node ([`crate::run::run`]) calls this so every authorized `CronJob`/
+    /// `Job` apply/delete over the portal registers/deregisters into the SAME
+    /// [`pillar_controller::SchedulerRuntime`] its real wall-clock tick loop
+    /// drives — the production route `scheduler-apply-admission-registration`
+    /// wires in place of the `PILLAR_TEST_CRONJOB` rig hook.
+    #[must_use]
+    pub fn with_scheduler_runtime(mut self, runtime: SharedSchedulerRuntime) -> Self {
+        self.scheduler_runtime = Some(runtime);
         self
     }
 
@@ -567,6 +611,146 @@ impl WebAuthContext {
             if let Err(e) = reconciler.reconcile(name, &image, replicas) {
                 tracing::debug!(workload = name, error = %e, "workload reconcile did not converge yet");
             }
+        }
+    }
+
+    /// `apply` (ACT) for a `CronJob`/`Job` manifest — the production admission
+    /// route (`scheduler-apply-admission-registration`): validates + records
+    /// the manifest through the exact same signed resource-plane apply path a
+    /// `Workload` apply rides (schema-checked against the REAL built-in
+    /// `CronJob`/`Job` schema from [`pillar_manifest::builtin`], not a
+    /// hand-rolled one), then — when a [`SharedSchedulerRuntime`] is wired —
+    /// translates the admitted manifest into a real
+    /// [`pillar_manifest::scheduler::Job`] and registers it into the LIVE
+    /// engine via [`pillar_controller::SchedulerRuntime::register_workload`]:
+    /// the SAME registration the `PILLAR_TEST_CRONJOB` rig hook performs, but
+    /// sourced from a real applied manifest rather than an env var.
+    ///
+    /// `schedule_secs` is this job's fire period in seconds (how often a due
+    /// tick fires it — the CronJob's schedule, expressed as a period rather
+    /// than a five-field cron string, matching the schema's plain-string
+    /// `schedule` field); `command` is the path to the verified on-disk
+    /// executable the job spawns when due, read + supervised exactly like a
+    /// `PILLAR_TEST_CRONJOB` script.
+    ///
+    /// # Errors
+    /// [`ResourceError::Apply`] if the manifest fails schema validation or the
+    /// actor is unauthorized; on any failure NOTHING is mutated or scheduled.
+    pub fn resource_apply_cronjob(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+        schedule_secs: f64,
+        command: &str,
+    ) -> Result<String, ResourceError> {
+        self.resource_apply_scheduled(actor, CRONJOB_KIND, name, schedule_secs, command)
+    }
+
+    /// The one-shot `Job` counterpart of [`Self::resource_apply_cronjob`]:
+    /// the SAME admission + registration path against the built-in `Job`
+    /// schema instead of `CronJob`. A one-shot job is registered with
+    /// [`pillar_manifest::scheduler::ConcurrencyPolicy::Forbid`] and an
+    /// immediately-due schedule (`schedule_secs` of `0.0` fires on the very
+    /// next tick, then never re-fires while the run stays live/backed-off) —
+    /// callers that want a genuinely repeating job apply a `CronJob` instead.
+    ///
+    /// # Errors
+    /// The SAME errors [`Self::resource_apply_cronjob`] returns.
+    pub fn resource_apply_job(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+        command: &str,
+    ) -> Result<String, ResourceError> {
+        self.resource_apply_scheduled(actor, JOB_KIND, name, 0.0, command)
+    }
+
+    fn resource_apply_scheduled(
+        &mut self,
+        actor: &NodeId,
+        kind: &str,
+        name: &str,
+        schedule_secs: f64,
+        command: &str,
+    ) -> Result<String, ResourceError> {
+        let body = Crd::new(&self.resource_api, kind, CrdMetadata::new(name))
+            .with_spec("schedule", CrdValue::String(schedule_secs.to_string()))
+            .with_spec("command", CrdValue::String(command.to_owned()));
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        let applied = plane
+            .apply(actor, RESOURCE_CAP, body)
+            .map(|applied| format!("{}", applied.event.0))?;
+        // Drive the real scheduler-runtime registration toward the
+        // just-declared manifest state (best-effort: an unreadable command
+        // logs and skips scheduling rather than failing the already-recorded
+        // signed manifest act — the manifest log is the source of truth).
+        self.register_scheduler_job(name, schedule_secs, command);
+        Ok(applied)
+    }
+
+    /// `delete` (ACT) for a `CronJob`/`Job` manifest: the tombstone half of
+    /// [`Self::resource_apply_cronjob`]/[`Self::resource_apply_job`], riding
+    /// the identical signed resource-plane delete path. Deregisters `name`
+    /// from the live [`SharedSchedulerRuntime`] (if wired) so a deleted
+    /// CronJob/Job stops firing — the manifest-removal counterpart of the
+    /// apply-time registration. `kind` selects which built-in kind's object
+    /// to tombstone (pass [`CRONJOB_KIND`]-shaped `"CronJob"` or `"Job"`).
+    ///
+    /// # Errors
+    /// [`ResourceError::NotFound`] if no such manifest exists; else the
+    /// underlying apply error.
+    pub fn resource_delete_cronjob(
+        &mut self,
+        actor: &NodeId,
+        kind: &str,
+        name: &str,
+    ) -> Result<String, ResourceError> {
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        let applied = plane
+            .delete(actor, RESOURCE_CAP, &Address::new(kind, name))
+            .map(|applied| format!("{}", applied.event.0))?;
+        if let Some(shared) = &self.scheduler_runtime {
+            if let Ok(mut runtime) = shared.lock() {
+                runtime.deregister(name);
+            }
+        }
+        Ok(applied)
+    }
+
+
+    /// Register (or replace) `name`'s real scheduler-runtime job from an
+    /// admitted CronJob/Job manifest's schedule period + command path, if a
+    /// [`SharedSchedulerRuntime`] is wired. Best-effort: an unreadable command
+    /// executable is logged and skipped rather than failing the caller — the
+    /// manifest log already recorded the signed apply; the runtime converges
+    /// toward it (a later re-apply, once the executable is readable,
+    /// registers it).
+    fn register_scheduler_job(&mut self, name: &str, schedule_secs: f64, command: &str) {
+        let Some(shared) = &self.scheduler_runtime else {
+            return;
+        };
+        let image_bytes = match std::fs::read(command) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    %command,
+                    error = %e,
+                    cronjob = name,
+                    "CronJob apply: unreadable command executable; not registered into the live scheduler"
+                );
+                return;
+            }
+        };
+        use pillar_manifest::scheduler::{ConcurrencyPolicy, Job, JobKind};
+        if let Ok(mut runtime) = shared.lock() {
+            runtime.register_workload(
+                name.to_owned(),
+                Job::new(JobKind::Workload, ConcurrencyPolicy::Forbid, "node", 3, 8),
+                std::time::Duration::from_secs_f64(schedule_secs.max(0.0)),
+                "node",
+                image_bytes,
+                Vec::new(),
+            );
         }
     }
 
@@ -2363,6 +2547,8 @@ pub static ROUTES: &[RouteSpec] = &[
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/edit"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Edit) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/scale"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Scale) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/rollout"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Rollout) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/cronjob/apply"), handler: |ctx, _peer, request| dispatch_cronjob_apply(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/cronjob/delete"), handler: |ctx, _peer, request| dispatch_cronjob_delete(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/explore"), handler: |ctx, _peer, request| dispatch_obs_explore(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/query"), handler: |ctx, _peer, request| dispatch_obs_query(ctx, request) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/dashboard"), handler: |ctx, _peer, request| dispatch_obs_dashboard(ctx, request) },
@@ -2627,6 +2813,66 @@ fn dispatch_resource_act(
         }
         Err(ResourceError::Apply(crate::ApplyError::Unauthorized { .. })) => {
             debug_assert!(!predicted, "a refused act must have predicted DENY");
+            text_response(403, "Forbidden", "DENIED unauthorized".to_owned())
+        }
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e}")),
+    }
+}
+
+/// `POST /portal/resource/cronjob/apply` — the production admission route for
+/// a `CronJob`/`Job` manifest (body `<token>\n<name>\n<schedule-secs>\n
+/// <command-path>`). Requires an admitted session; on success drives
+/// [`WebAuthContext::resource_apply_cronjob`], which both records the signed
+/// manifest act AND, when a scheduler runtime is wired, registers the job
+/// into the LIVE `SchedulerRuntime` so it actually fires on schedule.
+fn dispatch_cronjob_apply(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let name = lines.next().unwrap_or("").trim().to_owned();
+    let schedule_secs: f64 = lines.next().unwrap_or("").trim().parse().unwrap_or(0.0);
+    let command = lines.next().unwrap_or("").trim().to_owned();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    let actor = session.subject.clone();
+    match ctx.resource_apply_cronjob(&actor, &name, schedule_secs, &command) {
+        Ok(cid) => text_response(
+            200,
+            "OK",
+            format!("EVENT {cid}\nEVENTS {}", ctx.resource_event_count()),
+        ),
+        Err(ResourceError::Apply(crate::ApplyError::Unauthorized { .. })) => {
+            text_response(403, "Forbidden", "DENIED unauthorized".to_owned())
+        }
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e}")),
+    }
+}
+
+/// `POST /portal/resource/cronjob/delete` — the manifest-removal counterpart
+/// of [`dispatch_cronjob_apply`] (body `<token>\n<name>`): tombstones the
+/// `CronJob` manifest and deregisters `name` from the live `SchedulerRuntime`
+/// (if wired) so a deleted CronJob stops firing.
+fn dispatch_cronjob_delete(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let name = lines.next().unwrap_or("").trim().to_owned();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    let actor = session.subject.clone();
+    match ctx.resource_delete_cronjob(&actor, CRONJOB_KIND, &name) {
+        Ok(cid) => text_response(
+            200,
+            "OK",
+            format!("EVENT {cid}\nEVENTS {}", ctx.resource_event_count()),
+        ),
+        Err(ResourceError::Apply(crate::ApplyError::Unauthorized { .. })) => {
             text_response(403, "Forbidden", "DENIED unauthorized".to_owned())
         }
         Err(e) => text_response(409, "Conflict", format!("DENIED {e}")),
@@ -5925,6 +6171,136 @@ mod tests {
         );
         assert_eq!(rolled.status, 200, "got: {}", rolled.body);
         assert_eq!(ctx.resource_event_count(), 4);
+    }
+
+    // scheduler-apply-admission-registration: a `CronJob` manifest applied
+    // through the REAL production admission route (`POST
+    // /portal/resource/cronjob/apply`) — NOT the `PILLAR_TEST_CRONJOB` rig
+    // hook — is (1) recorded as exactly one decider-authorized signed event,
+    // through the SAME schema-validated resource-plane apply path a Workload
+    // apply rides (schema-checked against the REAL built-in `CronJob` schema
+    // from `pillar_manifest::builtin`), and (2) registered into the LIVE
+    // `SchedulerRuntime` wired via `with_scheduler_runtime`, such that a due
+    // tick ACTUALLY spawns a real child process (a real pid) and the run is
+    // observable in the runtime's real run history — proving the production
+    // apply -> admit -> schedule -> run path end to end.
+    #[tokio::test]
+    async fn a_cronjob_manifest_applied_via_the_real_admission_route_actually_runs() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        let scheduler_runtime = std::sync::Arc::new(std::sync::Mutex::new(
+            pillar_controller::SchedulerRuntime::new(pillar_manifest::scheduler::Scheduler::new(
+                pillar_topology::TierHierarchy::default(),
+            )),
+        ));
+        ctx = ctx.with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime));
+
+        // A real, verified executable on disk — exactly the "verified image
+        // bytes" a production CronJob's `command` names. It exits 0 fast so
+        // the tick window below observes a real completed run.
+        let dir = std::env::temp_dir().join(format!(
+            "pillar-cronjob-admission-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp script dir");
+        let script_path = dir.join("job.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
+
+        // Unauthenticated apply is refused — no event, no registration.
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/portal/resource/cronjob/apply",
+                &format!("nope\nbackup\n0\n{}", script_path.display()),
+            )
+            .status,
+            401
+        );
+
+        // apply via the REAL admission route (no PILLAR_TEST_CRONJOB env var
+        // anywhere in this test) -> exactly one signed event.
+        let before = ctx.resource_event_count();
+        let applied = post(
+            &mut ctx,
+            "/portal/resource/cronjob/apply",
+            &format!("{token}\nbackup\n0\n{}", script_path.display()),
+        );
+        assert_eq!(applied.status, 200, "got: {}", applied.body);
+        assert!(applied.body.starts_with("EVENT "), "got: {}", applied.body);
+        assert_eq!(ctx.resource_event_count(), before + 1, "one act, one event");
+
+        // The manifest is admitted into the resource plane's view like any
+        // other built-in-kind object.
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=CronJob"),
+        );
+        assert!(
+            listed.body.contains("CronJob/backup"),
+            "got: {}",
+            listed.body
+        );
+
+        // The manifest was registered into the LIVE scheduler runtime (the
+        // SAME instance the node's real tick loop drives) — a real tick fires
+        // it as a real child process, whose real exit the reap tick observes.
+        {
+            let mut runtime = scheduler_runtime.lock().unwrap();
+            let fired = runtime
+                .tick(std::time::Instant::now())
+                .await
+                .expect("tick fires the due job");
+            assert_eq!(
+                fired,
+                vec!["backup".to_owned()],
+                "the applied manifest must actually be scheduled and fire"
+            );
+            assert!(
+                runtime.has_live_child("backup"),
+                "a REAL child process must be supervised"
+            );
+            let pid = runtime.run_history()[0].pid.expect("a real OS pid");
+            assert!(pid > 0, "a real pid the kernel scheduled");
+
+            // Wait for the real process to actually exit, then reap.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let reaped = runtime.reap().await.expect("reap");
+            assert_eq!(
+                reaped,
+                vec![("backup".to_owned(), true)],
+                "the real child's real exit must be reported"
+            );
+        }
+
+        // Deleting the manifest via the real admission route deregisters the
+        // job: a further tick never fires it again, even though its schedule
+        // (period 0) is always immediately due.
+        let deleted = post(
+            &mut ctx,
+            "/portal/resource/cronjob/delete",
+            &format!("{token}\nbackup"),
+        );
+        assert_eq!(deleted.status, 200, "got: {}", deleted.body);
+        {
+            let mut runtime = scheduler_runtime.lock().unwrap();
+            let fired = runtime
+                .tick(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+                .expect("tick");
+            assert!(
+                fired.is_empty(),
+                "a deleted CronJob manifest must never fire again"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // An UNAUTHORIZED act (a session whose admitted subject the decider

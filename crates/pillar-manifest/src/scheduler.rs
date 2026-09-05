@@ -217,6 +217,16 @@ impl Scheduler {
         self.jobs.get(id)
     }
 
+    /// Unregister `id` — the manifest-delete counterpart of [`Self::register`].
+    /// Drops the job definition and its backoff budget so a removed CronJob/Job
+    /// manifest stops being considered due by [`Self::fire`]; already-recorded
+    /// run-history rows for `id` are left in place (deleting a job does not
+    /// rewrite history). Returns whether `id` was registered.
+    pub fn unregister(&mut self, id: &str) -> bool {
+        self.backoff.remove(id);
+        self.jobs.remove(id).is_some()
+    }
+
     /// The full run-history ledger, oldest first.
     #[must_use]
     pub fn runs(&self) -> &[Run] {
@@ -632,5 +642,28 @@ mod tests {
             sched.fire("ghost", "node"),
             Err(FireError::UnknownJob("ghost".to_owned()))
         );
+    }
+
+    /// `unregister` removes a job so it can no longer fire (the manifest-delete
+    /// path: a removed CronJob stops being scheduled) and reports whether the
+    /// job existed.
+    #[test]
+    fn unregister_stops_a_job_from_firing_and_reports_prior_existence() {
+        let mut sched = Scheduler::new(default_hierarchy());
+        sched.register(
+            "gone-soon",
+            Job::new(JobKind::Workload, ConcurrencyPolicy::Allow, "node", 3, 5),
+        );
+        assert!(sched.fire("gone-soon", "node").is_ok());
+
+        assert!(sched.unregister("gone-soon"));
+        assert_eq!(
+            sched.fire("gone-soon", "node"),
+            Err(FireError::UnknownJob("gone-soon".to_owned())),
+            "an unregistered job can no longer fire"
+        );
+        // Unregistering an already-absent id reports false rather than
+        // panicking.
+        assert!(!sched.unregister("gone-soon"));
     }
 }

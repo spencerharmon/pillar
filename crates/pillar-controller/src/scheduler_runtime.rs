@@ -178,6 +178,20 @@ impl SchedulerRuntime {
         &self.scheduler
     }
 
+    /// Deregister `id` — the manifest-delete/replace counterpart of
+    /// [`Self::register_workload`]/[`Self::register_observability`]: a removed
+    /// or replaced CronJob/Job manifest must stop being scheduled. Removes the
+    /// job from the engine (so [`Scheduler::fire`] no longer considers it due)
+    /// and drops its real-execution material; any REAL live child already
+    /// spawned for `id` is left running to a natural exit and reaped normally
+    /// (a deregister is not a kill — a caller that also wants the running
+    /// instance stopped immediately should do so before/around this call).
+    /// Returns whether `id` was registered.
+    pub fn deregister(&mut self, id: &str) -> bool {
+        self.jobs.remove(id);
+        self.scheduler.unregister(id)
+    }
+
     /// The externally observable run history: every recorded run row (real pid
     /// included). This is the black-box surface a harness reads to confirm a
     /// REAL run happened — not a modeled transition.
@@ -612,5 +626,33 @@ mod tests {
             job_run_log_line("rule", RunStatus::Succeeded, None),
             "job-run: rule succeeded pid=none"
         );
+    }
+
+    /// A deregistered job stops being scheduled: a manifest-delete of a
+    /// CronJob (translated by the caller into a `deregister` call) must never
+    /// fire again, even though its schedule is immediately due.
+    #[tokio::test]
+    async fn a_deregistered_job_never_fires_again() {
+        let mut rt = SchedulerRuntime::new(Scheduler::new(hierarchy()));
+        rt.register_workload(
+            "removable",
+            Job::new(JobKind::Workload, ConcurrencyPolicy::Allow, "node", 3, 5),
+            Duration::from_millis(0),
+            "node",
+            script(0.1, 0),
+            Vec::new(),
+        );
+        assert!(rt.deregister("removable"), "job was registered");
+        assert!(
+            !rt.deregister("removable"),
+            "deregistering twice reports absence the second time"
+        );
+
+        let fired = rt.tick(Instant::now()).await.unwrap();
+        assert!(
+            fired.is_empty(),
+            "a deregistered job's due schedule must never fire"
+        );
+        assert!(!rt.has_live_child("removable"));
     }
 }
