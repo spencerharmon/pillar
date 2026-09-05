@@ -1,5 +1,26 @@
 # pillar-integration — the VISIBLE Gitea Actions integration workflow.
 #
+# *** CURRENTLY NON-FUNCTIONAL — DOES NOT TRIGGER (2026-09-05) ***
+# Gitea Actions only evaluates a `.gitea/workflows/*.yml` file for a repo that
+# Gitea itself HOSTS. `pillar` is confirmed ABSENT from git.spencerharmon.com
+# under any owner (verified via the Gitea API this pass: 404 on
+# repos/spencerharmon/pillar, repos/spencer/pillar, and their actions/tasks
+# endpoints; empty repo listings for both users) — GitHub remains this repo's
+# sole home. So this file, though syntactically valid and merged, NEVER runs:
+# there is no Gitea-hosted `pillar` for any push/PR/dispatch event to reach.
+# Two remediations exist and BOTH terminate at an operator decision (see
+# `pillar-gitea-actions-workflow-location-fix` in PLAN.md / its change doc for
+# the full evidence and exact API queries):
+#   (a) mirror `pillar` into Gitea — contradicts the operator's recorded
+#       2026-07-22 "no public-repo mirroring to gitea, GitHub is sole source of
+#       truth" decision (flux PLAN.md `zuul-github-readonly-image-source`).
+#   (b) move this workflow into the consolidation `actions` repo — requires
+#       adding that repo as a tracked hive submodule, itself an
+#       operator/hive-layer decision flagged elsewhere.
+# Do NOT treat this file's presence as evidence the integration harness is
+# wired into a visible Gitea Actions run; it is not, until the operator picks
+# (a) or (b) above.
+#
 # ROI "pillar-integration" (operator-directed, 2026-08-31): give the operator a
 # workflow they can WATCH in pillar's own Gitea Actions view that stands up the
 # real, multi-node black-box integration harness against the real published
