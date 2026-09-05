@@ -836,10 +836,9 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // config-overridable via `PILLAR_DISABLE_METRICS`.
     let mut observability_store = pillar_observability::TimeseriesStore::new(256, 100_000);
     let node_counters = pillar_observability::NodeCounters::new();
-    let mut metrics_producer =
-        pillar_observability::MetricsProducer::new(pillar_observability::NodeMetricSource::new(
-            node_counters.clone(),
-        ));
+    let mut metrics_producer = pillar_observability::MetricsProducer::new(
+        pillar_observability::NodeMetricSource::new(node_counters.clone()),
+    );
     if std::env::var(ENV_DISABLE_METRICS).is_ok() {
         metrics_producer.set_enabled(false);
         tracing::info!("pillar peer self-metrics producer disabled via PILLAR_DISABLE_METRICS");
@@ -847,6 +846,35 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let mut self_metrics_tick: u64 = 0;
     let mut self_metrics_interval = tokio::time::interval(SELF_METRICS_INTERVAL);
     self_metrics_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Scheduler node runtime (scheduler-node-runtime-wiring): the ONE shared
+    // `pillar_manifest::scheduler::Scheduler` engine, driven off a REAL
+    // wall-clock tick and composed with the real-process runtime
+    // (`pillar_controller::runtime::SupervisedWorkload`). A due
+    // `JobKind::Workload` fire actually spawns the job's verified image bytes
+    // as a real supervised OS process (a real pid); a co-scheduled
+    // observability eval runs in-process through the IDENTICAL dispatch path;
+    // and each real child's real exit is reported back into the engine on the
+    // reap tick. Every fire/exit emits the black-box-observable
+    // `job-run: <job> <status> pid=<pid>` line on stdout so an external harness
+    // can assert the REAL run without linking any pillar crate.
+    //
+    // Production route: applied CronJob/Job manifests (the existing
+    // `pillar-manifest` admission/builtin path) register their job here. The
+    // `PILLAR_TEST_CRONJOB` rig hook (`<name>|<period-secs>|<script-path>`)
+    // registers one CronJob directly from a verified on-disk executable so the
+    // integration harness can drive a real, due-soon job against a live node.
+    let mut scheduler_runtime = pillar_controller::SchedulerRuntime::new(
+        pillar_manifest::scheduler::Scheduler::new(pillar_topology::TierHierarchy::default()),
+    );
+    if let Ok(spec) = std::env::var("PILLAR_TEST_CRONJOB") {
+        register_test_cronjob(&mut scheduler_runtime, &spec);
+    }
+    // A short tick so a due CronJob fires (and exited children are reaped)
+    // within the integration harness's few-second observation window.
+    const SCHEDULER_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+    let mut scheduler_interval = tokio::time::interval(SCHEDULER_TICK);
+    scheduler_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Controller loop: fold inbound event-log messages into the stream and
     // block until a shutdown signal.
@@ -884,6 +912,49 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 tracing::debug!(count = written, tick = self_metrics_tick, "pillar peer ingested self metrics");
                 self_metrics_tick += 1;
             }
+            _ = scheduler_interval.tick() => {
+                // One REAL wall-clock scheduler tick: reap any real child that
+                // has actually exited (reporting its real exit into the ONE
+                // engine), then fire every due job — a due workload actually
+                // spawns a real supervised process. Each real terminal/started
+                // run is emitted as the black-box `job-run:` line on stdout.
+                match scheduler_runtime.reap().await {
+                    Ok(reaped) => {
+                        for (job, _succeeded) in reaped {
+                            if let Some(rec) = scheduler_runtime
+                                .run_history()
+                                .iter()
+                                .rev()
+                                .find(|r| r.job == job)
+                            {
+                                println!(
+                                    "{}",
+                                    pillar_controller::job_run_log_line(&rec.job, rec.status, rec.pid)
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "scheduler reap failed"),
+                }
+                match scheduler_runtime.tick(std::time::Instant::now()).await {
+                    Ok(fired) => {
+                        for job in fired {
+                            if let Some(rec) = scheduler_runtime
+                                .run_history()
+                                .iter()
+                                .rev()
+                                .find(|r| r.job == job)
+                            {
+                                println!(
+                                    "{}",
+                                    pillar_controller::job_run_log_line(&rec.job, rec.status, rec.pid)
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "scheduler tick failed"),
+                }
+            }
             event = swarm.select_next_some() => {
                 match &event {
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -918,6 +989,45 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             }
         }
     }
+}
+
+/// Integration-rig-only: register a single CronJob into the scheduler node
+/// runtime from a `PILLAR_TEST_CRONJOB` spec of the form
+/// `<name>|<period-secs>|<script-path>`, reading the verified executable bytes
+/// off disk so the harness can drive a REAL, due-soon job against a live node.
+/// A malformed spec or unreadable script is logged and skipped — it never
+/// aborts boot. Production jobs are registered from applied CronJob/Job
+/// manifests via the admission path, not this hook.
+fn register_test_cronjob(runtime: &mut pillar_controller::SchedulerRuntime, spec: &str) {
+    let parts: Vec<&str> = spec.split('|').collect();
+    let [name, period, script] = parts.as_slice() else {
+        tracing::warn!(%spec, "ignoring malformed PILLAR_TEST_CRONJOB (want <name>|<period-secs>|<script-path>)");
+        return;
+    };
+    let period_secs: f64 = match period.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%period, error = %e, "ignoring PILLAR_TEST_CRONJOB with a bad period");
+            return;
+        }
+    };
+    let image_bytes = match std::fs::read(script) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(%script, error = %e, "ignoring PILLAR_TEST_CRONJOB with an unreadable script");
+            return;
+        }
+    };
+    use pillar_manifest::scheduler::{ConcurrencyPolicy, Job, JobKind};
+    runtime.register_workload(
+        (*name).to_owned(),
+        Job::new(JobKind::Workload, ConcurrencyPolicy::Forbid, "node", 3, 8),
+        std::time::Duration::from_secs_f64(period_secs),
+        "node",
+        image_bytes,
+        Vec::new(),
+    );
+    tracing::info!(%name, period_secs, "pillar peer registered test CronJob into the scheduler node runtime");
 }
 
 /// A future that resolves on the first SIGINT or (on Unix) SIGTERM.

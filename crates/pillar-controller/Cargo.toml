@@ -18,6 +18,12 @@ pillar-net = { path = "../pillar-net" }
 # distinct failure domains via the real topology-spread placement decision —
 # never a re-derived/in-crate spread heuristic.
 pillar-topology = { path = "../pillar-topology" }
+# The ONE shared scheduler engine (`pillar_manifest::scheduler::Scheduler`).
+# The scheduler node runtime (`crate::scheduler_runtime`) composes it with the
+# real-process runtime (`crate::runtime::SupervisedWorkload`) so a due
+# JobKind::Workload fire actually spawns a supervised OS process and reports
+# its real exit back into the ONE engine — no second scheduler.
+pillar-manifest = { path = "../pillar-manifest" }
 # The OCI runtime layer (`crate::runtime`) supervises the workload's
 # digest-verified image as a REAL child process (spawn/stop/restart/health),
 # replacing the modeled `Running` state value with a live `tokio::process`
