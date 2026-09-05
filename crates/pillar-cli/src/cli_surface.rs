@@ -57,6 +57,7 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec { name: "stream", handler: cluster_stream },
     VerbSpec { name: "render", handler: |_v, args| render(args) },
     VerbSpec { name: "onboard", handler: |_v, _args| onboard() },
+    VerbSpec { name: "rollout", handler: |_v, _args| rollout() },
     VerbSpec { name: "secrets-audit-rotation-mfa", handler: |_v, _args| secrets_audit_rotation_mfa() },
     VerbSpec { name: "obs", handler: |_v, _args| obs() },
     VerbSpec { name: "apply", handler: live_platform_guidance },
@@ -157,9 +158,22 @@ fn onboard() -> ExitCode {
     }
 }
 
+/// `pillar rollout`: drive the four safe-rollout invariants (mixed-version
+/// negotiation, no-data-loss migration, readiness-gated cutover, clean
+/// rollback, no-traffic-before-ready) end to end against the REAL versioning/
+/// migration/federation/readiness primitives (see [`crate::rollout`]).
+fn rollout() -> ExitCode {
+    match crate::rollout::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `pillar secrets-audit-rotation-mfa`: the sealed-secret-store/audit-log/
 /// key-rotation/step-up-MFA onboarding-style rig (see
-/// [`crate::secrets_audit_rotation_mfa`]).
 fn secrets_audit_rotation_mfa() -> ExitCode {
     match crate::secrets_audit_rotation_mfa::run() {
         Ok(()) => ExitCode::SUCCESS,

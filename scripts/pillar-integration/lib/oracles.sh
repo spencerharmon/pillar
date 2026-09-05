@@ -270,3 +270,33 @@ oracle_ipam_operator() {
     info "oracle-observed: ipam-operator double-allocation-rejected AND multi-site topology-scoped-selection both ok (real compiled operator surface)"
     return 0
 }
+
+# oracle_rollout : assert the real image's `pillar rollout` CLI verb drives the
+# four safe-rollout invariants end to end and reports every step ok — a real
+# compat-window negotiation over a mixed-version cell (in-window links, an
+# out-of-window peer refused), a no-data-loss rolling migration (the new
+# materialized view's content-addressed Merkle root equals the old view's over
+# the same op log, no op dropped across cutover), a readiness-GATED cutover (an
+# un-upgraded live member blocks cutover and is never served the new view
+# early), a clean rollback (the prior declared version is restored exactly and
+# the content-addressed exchange log is uncorrupted), and no-traffic-before-
+# ready (the real `/readyz` readiness decision holds a not-yet-healthy node out
+# of service). The verb fails CLOSED (non-zero, no `ok:` line for the violated
+# step) the instant any invariant is breached — data loss or a bypassed gate —
+# so observing all five `ok:` lines from the REAL published image is observing
+# the real safe-rollout effect end to end, never a stubbed return code.
+oracle_rollout() {
+    local out
+    out=$(driver_cli_exec rollout) \
+        || fail "rollout oracle: real image reported a violated safe-rollout invariant:\n$out"
+    local step
+    for step in mixed-version-negotiation no-data-loss-migration \
+                readiness-gates-cutover clean-rollback \
+                no-traffic-before-ready; do
+        printf '%s\n' "$out" | grep -q "^ok: ${step}$" \
+            || fail "rollout oracle: real image did not report '$step' ok:\n$out"
+        info "oracle-observed: rollout-step '$step' ok (real safe-rollout invariant held on the real image)"
+    done
+    info "oracle-observed: rollout real-image mixed-version-negotiation/no-data-loss-migration/readiness-gates-cutover/clean-rollback/no-traffic-before-ready all ok (real compat/migration/federation/readiness path)"
+    return 0
+}
