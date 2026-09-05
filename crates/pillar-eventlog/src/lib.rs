@@ -198,6 +198,32 @@ impl EventContent {
     pub fn id(&self) -> EventId {
         EventId(self.digest())
     }
+
+    /// Build content OUTSIDE the normal `append`/`ingest` authoring path, for
+    /// a caller that must construct a deliberately forged/tampered fixture —
+    /// e.g. the pillar-integration harness's crypto-realness oracle, which
+    /// proves the audit view refuses to render a wrong-key-signed or
+    /// tampered-after-signing event as legitimate. An ordinary writer should
+    /// use [`EventLog::append`] instead; this constructor bypasses none of
+    /// the log's OWN invariants — only [`EventLog::insert_unchecked`]
+    /// (paired with this) skips `ingest`'s validation, and even then the
+    /// audit view still authenticates every entry independently.
+    #[must_use]
+    pub fn for_fixture(
+        author: Author,
+        seq: u64,
+        prev: Option<EventId>,
+        parents: BTreeSet<EventId>,
+        payload: Vec<u8>,
+    ) -> Self {
+        EventContent {
+            author,
+            seq,
+            prev,
+            parents,
+            payload,
+        }
+    }
 }
 
 /// Deterministically derive an author's real ed25519 signing keypair from
@@ -291,6 +317,23 @@ impl Signature {
     pub fn author(&self) -> &Author {
         &self.author
     }
+
+    /// Build a deliberately mislabeled signature: relabel a REAL signature
+    /// (e.g. genuinely produced by [`Signature::sign`] under a DIFFERENT
+    /// author's own secret key) as having been issued by `claimed_author`,
+    /// without holding `claimed_author`'s secret key. This is exactly the
+    /// forged-key impersonation attempt the crypto-realness oracle proves
+    /// [`Signature::verifies`] refuses (the claimed author's derived public
+    /// key can never validate signature bytes produced by a different
+    /// secret key) — a caller building a real fixture, never a shortcut
+    /// around the real check.
+    #[must_use]
+    pub fn relabel_for_fixture(claimed_author: Author, genuine_signature: &Signature) -> Self {
+        Signature {
+            author: claimed_author,
+            signature: genuine_signature.signature.clone(),
+        }
+    }
 }
 
 /// A fully-formed, signed event: its content plus its author's PGP signature,
@@ -333,9 +376,13 @@ impl Event {
     }
 
     /// Assemble an event from already-signed content, stamped with the current
-    /// envelope schema version. Used by the local-authoring path and by tests
-    /// exercising ingest.
-    fn stamped(content: EventContent, signature: Signature) -> Self {
+    /// envelope schema version. Used by the local-authoring path, by tests
+    /// exercising ingest, and by a caller building a deliberately forged/
+    /// tampered fixture (paired with [`EventContent::for_fixture`] and
+    /// [`EventLog::insert_unchecked`]) to prove the audit view refuses to
+    /// render it as legitimate.
+    #[must_use]
+    pub fn stamped(content: EventContent, signature: Signature) -> Self {
         Event {
             schema_version: Event::SCHEMA_VERSION,
             content,
@@ -622,11 +669,16 @@ impl EventLog {
     }
 
     /// Insert a fully-formed event into the store WITHOUT running ingest's
-    /// integrity checks — used ONLY by tests to model a forged/tampered event
-    /// that slipped into a replica's store, so the audit view can be shown to
-    /// still refuse to render it as legitimate.
-    #[cfg(test)]
-    pub(crate) fn insert_unchecked_for_test(&mut self, event: Event) {
+    /// integrity checks — used by tests, and by the pillar-integration
+    /// harness's crypto-realness oracle, to model a forged/tampered event
+    /// that slipped into a replica's store (paired with
+    /// [`EventContent::for_fixture`] / [`Signature::relabel_for_fixture`]),
+    /// so the audit view can be shown to still refuse to render it as
+    /// legitimate. An ordinary writer always goes through [`EventLog::append`]
+    /// or [`EventLog::ingest`], both of which DO enforce every invariant;
+    /// this bypass exists solely to construct the deliberately-invalid
+    /// fixture the audit view must independently reject.
+    pub fn insert_unchecked(&mut self, event: Event) {
         let id = event.content.id();
         let author = event.content.author.clone();
         let seq = event.content.seq;
@@ -636,6 +688,12 @@ impl EventLog {
         self.height.insert(author.clone(), next);
         self.by_seq.insert((author, seq), id.clone());
         self.events.insert(id, event);
+    }
+
+    /// Test-only alias retained for the existing in-crate fixture tests.
+    #[cfg(test)]
+    pub(crate) fn insert_unchecked_for_test(&mut self, event: Event) {
+        self.insert_unchecked(event);
     }
 }
 
