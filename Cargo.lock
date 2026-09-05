@@ -3147,6 +3147,7 @@ dependencies = [
  "pillar-surface-inventory",
  "pillar-topology",
  "pillar-web",
+ "tempfile",
  "tokio",
 ]
 

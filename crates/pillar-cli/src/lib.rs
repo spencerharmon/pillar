@@ -45,6 +45,7 @@ pub mod stream_cli;
 pub mod topology_cli;
 pub mod web_serve;
 pub mod webauthn_cli;
+pub mod workload_reconcile;
 
 use std::collections::BTreeMap;
 use std::fmt;

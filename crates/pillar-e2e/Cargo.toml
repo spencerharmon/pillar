@@ -37,6 +37,7 @@ libp2p = { version = "0.56", features = [
 ] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+tempfile = "3"
 
 [features]
 # Gates every acceptance test in this crate. Off by default so a plain
