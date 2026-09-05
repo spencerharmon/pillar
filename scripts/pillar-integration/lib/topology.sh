@@ -205,6 +205,11 @@ topology_publish_op() {
 # _topology_start_node <index> <dial|""> <publish|""> : start (or restart) ONE
 # meshed node container in place, WITHOUT touching the TOPO_NODES / node arrays
 # (used to recreate an already-tracked node, e.g. to have it publish an op).
+# Honours the optional global array TOPO_EXTRA_RUN_ARGS (extra `<runtime> run`
+# flags — e.g. an extra `-v`/`-e` pair to bind-mount a fault-injection library)
+# and TOPO_EXTRA_ENV (extra `-e KEY=VAL` pairs), both consumed (never cleared
+# by this function — the caller owns clearing them so a one-shot fault applies
+# to exactly the recreation it was set up for).
 _topology_start_node() {
     local idx="$1" dial="$2" publish="$3"
     local name="pillar-it-${FIXTURE_SCENARIO}-node${idx}"
@@ -212,6 +217,12 @@ _topology_start_node() {
     local -a envs=(-e "PILLAR_LISTEN=/ip4/0.0.0.0/tcp/${TOPO_P2P_PORT}")
     [ -n "$dial" ] && envs+=(-e "PILLAR_DIAL=$dial")
     [ -n "$publish" ] && envs+=(-e "PILLAR_TEST_PUBLISH=$publish")
+    local -a extra_run=("${TOPO_EXTRA_RUN_ARGS[@]:-}")
+    # bash quirk: an unset/empty array expands to one empty-string element;
+    # strip it so we never pass a stray "" arg to `<runtime> run`.
+    if [ "${#extra_run[@]}" -eq 1 ] && [ -z "${extra_run[0]}" ]; then
+        extra_run=()
+    fi
     local cid
     cid=$("$CONTAINER_RUNTIME" run -d \
         --name "$name" \
@@ -220,8 +231,97 @@ _topology_start_node() {
         -v "${vol}:/var/lib/pillar/data" \
         -p "127.0.0.1::${PILLAR_PROBE_PORT}" \
         "${envs[@]}" \
+        "${extra_run[@]}" \
         "$PILLAR_IMAGE" 2>&1) \
         || fail "node${idx} failed to (re)start: $cid"
+}
+
+# --- chaos / fault-injection fabric -----------------------------------------
+#
+# The impairment matrix the ROI's `chaos-fault` scenario family needs, layered
+# on the SAME provision/observe/teardown contract as the rest of this file.
+# Every fault below is a REAL external effect on the real container/network/
+# volume resources `topology_boot_meshed` created — never a stub or an
+# in-process fault hook.
+
+# topology_partition_node <index> : a REAL network partition — disconnect the
+# node's container from the scenario's dedicated bridge network entirely (the
+# black-box equivalent of unplugging its cable). The node process keeps
+# running but can reach no peer. Use `topology_heal_partition` +
+# `topology_restart_node` to heal it (the runtime dials its peer only at
+# process start — see `crates/pillar-cli/src/run.rs` — so rejoining the mesh
+# after a real partition requires the node to redial, exactly like any
+# partitioned peer reconnecting).
+topology_partition_node() {
+    local idx="$1"
+    local name="pillar-it-${FIXTURE_SCENARIO}-node${idx}"
+    info "chaos: partitioning node${idx} ($name) off network $TOPO_NET (real network disconnect)"
+    "$CONTAINER_RUNTIME" network disconnect "$TOPO_NET" "$name" >/dev/null 2>&1 \
+        || fail "could not disconnect node${idx} ($name) from $TOPO_NET"
+}
+
+# topology_heal_partition <index> : reconnect a partitioned node's container to
+# the scenario's bridge network (the REAL network-level heal). Pair with
+# `topology_restart_node` to also force the redial anti-entropy needs.
+topology_heal_partition() {
+    local idx="$1"
+    local name="pillar-it-${FIXTURE_SCENARIO}-node${idx}"
+    info "chaos: healing partition — reconnecting node${idx} ($name) to network $TOPO_NET"
+    "$CONTAINER_RUNTIME" network connect "$TOPO_NET" "$name" >/dev/null 2>&1 \
+        || fail "could not reconnect node${idx} ($name) to $TOPO_NET"
+}
+
+# topology_seed_dial : recompute node0's (the mesh seed's) dialable bridge
+# multiaddr, observed fresh from the real running container — used whenever a
+# node must be recreated/redialed after a fault (disk wipe, clock-skew
+# recreation, a second bootstrap interruption).
+topology_seed_dial() {
+    local seed_ip
+    seed_ip=$(_topology_node_bridge_ip "pillar-it-${FIXTURE_SCENARIO}-node0")
+    [ -n "$seed_ip" ] || fail "topology_seed_dial: could not resolve node0 bridge IP"
+    printf '/ip4/%s/tcp/%s' "$seed_ip" "$TOPO_P2P_PORT"
+}
+
+# topology_refresh_probe_addr <index> : re-resolve node <index>'s CURRENTLY
+# published readiness/liveness probe host-port and update TOPO_PROBE_ADDRS in
+# place. A full container recreation (a disk wipe, a clock-skew
+# recreation, `topology_publish_op`) gets a FRESH ephemeral host port each
+# time (`-p 127.0.0.1::${PILLAR_PROBE_PORT}`), so any code that still needs
+# to reach that node's HTTP surface AFTER recreating it must refresh here
+# first — the ORIGINAL boot-time address silently stops answering.
+topology_refresh_probe_addr() {
+    local idx="$1"
+    local name="pillar-it-${FIXTURE_SCENARIO}-node${idx}"
+    local addr
+    addr=$("$CONTAINER_RUNTIME" port "$name" "$PILLAR_PROBE_PORT" 2>/dev/null | head -1)
+    [ -n "$addr" ] || fail "topology_refresh_probe_addr: could not resolve published probe port for node${idx} ($name)"
+    TOPO_PROBE_ADDRS[$idx]="$addr"
+}
+
+# topology_wipe_node_disk <index> : a REAL disk wipe — stop the node, DELETE
+# its named durable-data volume outright (the content-addressed streamdb store
+# is gone, not merely unmounted), recreate an EMPTY volume under the identical
+# name, then restart the node onto it. The node boots with NO local history
+# (`ops=0`) — its only path back to the cell's state is the anti-entropy wire
+# protocol pulling the entire durable set fresh from a connected peer, proving
+# recovery does not depend on the node's own disk surviving. Refreshes
+# TOPO_PROBE_ADDRS[<index>] (the recreation gets a fresh ephemeral host port).
+topology_wipe_node_disk() {
+    local idx="$1"
+    local name="pillar-it-${FIXTURE_SCENARIO}-node${idx}"
+    local vol="pillar-it-${FIXTURE_SCENARIO}-vol${idx}"
+    info "chaos: wiping node${idx} ($name)'s durable disk — deleting volume $vol outright"
+    "$CONTAINER_RUNTIME" rm -f "$name" >/dev/null 2>&1 \
+        || fail "could not stop node${idx} ($name) before disk wipe"
+    "$CONTAINER_RUNTIME" volume rm -f "$vol" >/dev/null 2>&1 \
+        || fail "could not delete volume $vol for node${idx} (disk wipe)"
+    "$CONTAINER_RUNTIME" volume create --label "$FIXTURE_LABEL" "$vol" >/dev/null 2>&1 \
+        || fail "could not recreate empty volume $vol for node${idx} after wipe"
+    local dial
+    dial="$(topology_seed_dial)"
+    _topology_start_node "$idx" "$dial" ""
+    topology_refresh_probe_addr "$idx"
+    info "chaos: node${idx} ($name) restarted onto a FRESH empty volume (real disk wipe; no local history survives)"
 }
 
 # topology_node_streamdb_ops <index> : print the node's CURRENTLY-OPENED
