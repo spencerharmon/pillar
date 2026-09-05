@@ -167,3 +167,76 @@ fn releasing_a_vip_returns_it_to_the_pool_and_clears_the_record() {
     assert_eq!(b.addr, vip);
     assert_eq!(op.recorded_addr("reused-vip"), Some(vip));
 }
+
+/// A real MULTI-SITE topology (two regions, `west` and `east`, each with its
+/// own delegated VIP pool and its own load-balancer node): the operator
+/// surface's topology-scoped selection picks an address from the CORRECT
+/// site's pool for each node — a `west` node's allocation is refused an
+/// `east` address and vice versa, and each node's allocation is recorded
+/// against its own site's pool, never the other's.
+///
+/// This exercises `pillar-integration-scenarios-ipam`'s second acceptance
+/// clause: "assert topology-scoped selection picks an address from the
+/// correct pool for a multi-site topology."
+#[test]
+fn topology_scoped_selection_picks_the_correct_site_pool_in_a_multi_site_topology() {
+    let mut topo = Topology::new(TierHierarchy::default());
+    topo.declare(n("lb-west"), &[Label::new("region", "west")]);
+    topo.declare(n("lb-east"), &[Label::new("region", "east")]);
+    let mut ipam = TopologyScopedIpam::new(topo, "region").unwrap();
+    ipam.bind_pool("west", Pool::new(v4("10.1.0.0"), 256), 3);
+    ipam.bind_pool("east", Pool::new(v4("10.2.0.0"), 256), 3);
+    let mut op = IpamOperator::new(ipam);
+
+    let west_vip = v4("10.1.0.50");
+    let east_vip = v4("10.2.0.50");
+
+    // A `west` node allocates cleanly from the `west` pool and is recorded
+    // against it.
+    back_with_quorum(&mut op, &n("lb-west"), west_vip);
+    let west_binding = op
+        .allocate("west-frontend-vip", &n("lb-west"), west_vip)
+        .expect("west node allocates from the west pool");
+    assert_eq!(west_binding.node, n("lb-west"));
+    assert_eq!(op.recorded_addr("west-frontend-vip"), Some(west_vip));
+
+    // An `east` node allocates cleanly from the `east` pool and is recorded
+    // against it — the two sites' pools and records never cross.
+    back_with_quorum(&mut op, &n("lb-east"), east_vip);
+    let east_binding = op
+        .allocate("east-frontend-vip", &n("lb-east"), east_vip)
+        .expect("east node allocates from the east pool");
+    assert_eq!(east_binding.node, n("lb-east"));
+    assert_eq!(op.recorded_addr("east-frontend-vip"), Some(east_vip));
+    assert_eq!(op.len(), 2, "both site allocations are recorded independently");
+
+    // Topology-scoped selection is ENFORCED, not merely observed: a `west`
+    // node cannot be handed a DIFFERENT, not-yet-recorded `east`-pool address
+    // (out of its scope), and vice versa. Nothing is recorded on the refused
+    // attempt. (Use fresh addresses here so the refusal is the SCOPE fence,
+    // not the earlier duplicate-address guard.)
+    let another_east_vip = v4("10.2.0.51");
+    let cross_site_err = op
+        .allocate("west-tries-east-vip", &n("lb-west"), another_east_vip)
+        .expect_err("a west node cannot allocate an east-pool address");
+    assert!(
+        matches!(cross_site_err, OperatorError::Scoped(_)),
+        "expected a scope refusal, got {cross_site_err:?}"
+    );
+    assert!(op.get("west-tries-east-vip").is_none());
+
+    let another_west_vip = v4("10.1.0.51");
+    let reverse_cross_site_err = op
+        .allocate("east-tries-west-vip", &n("lb-east"), another_west_vip)
+        .expect_err("an east node cannot allocate a west-pool address");
+    assert!(
+        matches!(reverse_cross_site_err, OperatorError::Scoped(_)),
+        "expected a scope refusal, got {reverse_cross_site_err:?}"
+    );
+    assert!(op.get("east-tries-west-vip").is_none());
+
+    // The two legitimate, site-correct bindings still stand untouched.
+    assert_eq!(op.len(), 2);
+    assert_eq!(op.recorded_addr("west-frontend-vip"), Some(west_vip));
+    assert_eq!(op.recorded_addr("east-frontend-vip"), Some(east_vip));
+}

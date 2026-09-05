@@ -75,3 +75,29 @@ oracle_crypto_realness() {
     info "oracle-observed: crypto-realness real-image keygen/sign/trust/policy/fail-closed all ok (real crypto path)"
     return 0
 }
+
+# oracle_ipam_operator : assert the real IPAM operator surface
+# (`pillar_ipam::operator::IpamOperator`, the ONLY operator surface over IPAM
+# that exists today — no `pillar ipam` CLI verb or manifest kind has been
+# wired yet; see the ipam scenario's design doc) rejects a double-allocation
+# of the same VIP address and enforces topology-scoped pool selection across
+# a real multi-site topology. This runs the crate's own acceptance test
+# binary (built from the REAL `pillar-ipam`/`pillar-e2e` source under test,
+# `--features acceptance`, never a mock) as the realness oracle: a failing
+# assertion here means the real compiled operator surface admitted a double
+# allocation or picked the wrong site's pool — a real logic effect, not a
+# stub return code.
+oracle_ipam_operator() {
+    local out repo_root
+    repo_root="$(cd "$HERE/../.." && pwd)"
+    out=$(cd "$repo_root" && cargo test -p pillar-e2e --test ipam_operator_surface --features acceptance 2>&1) \
+        || fail "ipam operator oracle: the real IpamOperator acceptance suite failed:\n$out"
+
+    printf '%s\n' "$out" | grep -q "test double_allocation_of_the_same_vip_is_rejected ... ok" \
+        || fail "ipam operator oracle: double-allocation-rejected assertion did not report ok:\n$out"
+    printf '%s\n' "$out" | grep -q "test topology_scoped_selection_picks_the_correct_site_pool_in_a_multi_site_topology ... ok" \
+        || fail "ipam operator oracle: multi-site topology-scoped-selection assertion did not report ok:\n$out"
+
+    info "oracle-observed: ipam-operator double-allocation-rejected AND multi-site topology-scoped-selection both ok (real compiled operator surface)"
+    return 0
+}
