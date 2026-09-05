@@ -57,6 +57,7 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec { name: "stream", handler: cluster_stream },
     VerbSpec { name: "render", handler: |_v, args| render(args) },
     VerbSpec { name: "onboard", handler: |_v, _args| onboard() },
+    VerbSpec { name: "secrets-audit-rotation-mfa", handler: |_v, _args| secrets_audit_rotation_mfa() },
     VerbSpec { name: "obs", handler: |_v, _args| obs() },
     VerbSpec { name: "apply", handler: live_platform_guidance },
     VerbSpec { name: "get", handler: live_platform_guidance },
@@ -148,6 +149,19 @@ fn completion(args: &[String]) -> ExitCode {
 /// safety invariant `pillar_cli::onboard` checks.
 fn onboard() -> ExitCode {
     match crate::onboard::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar secrets-audit-rotation-mfa`: the sealed-secret-store/audit-log/
+/// key-rotation/step-up-MFA onboarding-style rig (see
+/// [`crate::secrets_audit_rotation_mfa`]).
+fn secrets_audit_rotation_mfa() -> ExitCode {
+    match crate::secrets_audit_rotation_mfa::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");

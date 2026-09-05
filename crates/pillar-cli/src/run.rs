@@ -784,6 +784,37 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
 
     tracing::info!("pillar peer running; press Ctrl-C to stop");
 
+    // The node's LIVE observability substrate (ROI "pillar-integration"
+    // observability-psl prerequisite): ONE shared store fed by ALL FIVE
+    // producers (metrics + profiles + metadata each tick, a log per handled
+    // event, a span per traced op), shared behind an `Arc<Mutex<_>>` with the
+    // web surface so `/portal/obs/live/*` queries PSL, evaluates recording
+    // rules + alerts, and materializes dashboards over the SAME live data the
+    // controller loop writes — never a disconnected/empty builder store.
+    //
+    // Node labels are this node's real peer id (`node=<peer-id>`) — an
+    // infrastructure-agnostic identity carried by every emitted signal, never
+    // a hostname/domain/IP.
+    let mut node_labels = pillar_observability::LabelSet::new();
+    node_labels.insert("node".to_string(), peer_id.to_string());
+    let node_counters = pillar_observability::NodeCounters::new();
+    let metadata_source = pillar_observability::NodeMetadataSource::new(
+        peer_id.to_string(),
+        format!("cell-{peer_id}"),
+        std::iter::once(peer_id.to_string()),
+        env!("CARGO_PKG_VERSION"),
+        option_env!("TARGET").map(str::to_owned),
+    );
+    let live_obs = std::sync::Arc::new(std::sync::Mutex::new(
+        pillar_observability::LiveObservabilitySubstrate::new(
+            node_labels,
+            node_counters.clone(),
+            metadata_source,
+            256,
+            100_000,
+        ),
+    ));
+
     // Serve the web UI on a configurable, possibly non-loopback bind (see
     // `crate::web_serve` for the auth-gate contract) — only when
     // `--web-bind`/`PILLAR_WEB_BIND` was actually configured; unset, `node
@@ -810,7 +841,8 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     format!("pillar-node-key-{peer_id}"),
                     pillar_core::NodeId::from("pillar-node"),
                     16,
-                );
+                )
+                .with_live_observability(std::sync::Arc::clone(&live_obs));
                 std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
             }
             Err(e) => {
@@ -830,20 +862,16 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         .then(|| Box::pin(tokio::time::sleep(TEST_PUBLISH_DELAY)));
     let mut published = false;
 
-    // Self-instrumentation (ROI Priority 0): this node instruments ITSELF
-    // over the same shared `TimeseriesStore` substrate every other producer
-    // rides, via `pillar_observability::MetricsProducer` — ON by default,
-    // config-overridable via `PILLAR_DISABLE_METRICS`.
-    let mut observability_store = pillar_observability::TimeseriesStore::new(256, 100_000);
-    let node_counters = pillar_observability::NodeCounters::new();
-    let mut metrics_producer =
-        pillar_observability::MetricsProducer::new(pillar_observability::NodeMetricSource::new(
-            node_counters.clone(),
-        ));
+    // Self-instrumentation (ROI Priority 0): this node instruments ITSELF over
+    // the shared LIVE substrate (`live_obs`) every producer rides — metrics ON
+    // by default, config-overridable via `PILLAR_DISABLE_METRICS`. All five
+    // producers feed the SAME store the web surface serves.
     if std::env::var(ENV_DISABLE_METRICS).is_ok() {
-        metrics_producer.set_enabled(false);
+        // Disabling metrics: drop the whole periodic sampler contribution by
+        // never ticking the interval below (handled via the flag).
         tracing::info!("pillar peer self-metrics producer disabled via PILLAR_DISABLE_METRICS");
     }
+    let metrics_enabled = std::env::var(ENV_DISABLE_METRICS).is_err();
     let mut self_metrics_tick: u64 = 0;
     let mut self_metrics_interval = tokio::time::interval(SELF_METRICS_INTERVAL);
     self_metrics_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -880,8 +908,27 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // straight from `/proc` inside the producer's source.
                 node_counters.record_streamdb_ops(stream.stream().log().len() as u64);
                 node_counters.set_p2p_peers(swarm.connected_peers().count() as u64);
-                let written = metrics_producer.sample(&mut observability_store, self_metrics_tick);
-                tracing::debug!(count = written, tick = self_metrics_tick, "pillar peer ingested self metrics");
+                if metrics_enabled {
+                    // Drive the periodic producers (metrics + profiles +
+                    // metadata) once onto the SHARED live substrate the web
+                    // surface serves; a real self-instrumentation span is also
+                    // recorded so the trace kind is genuinely ingested from the
+                    // node's own operation.
+                    let mut sub = live_obs.lock().expect("live observability lock");
+                    let written = sub.sample_periodic(self_metrics_tick);
+                    sub.record_span(
+                        format!("self-instrument-{self_metrics_tick}"),
+                        format!("span-{self_metrics_tick}"),
+                        "self_metrics_sample",
+                        self_metrics_tick,
+                    );
+                    sub.record_log(
+                        pillar_observability::LogLevel::Info,
+                        format!("self metrics sampled written={written}"),
+                        self_metrics_tick,
+                    );
+                    tracing::debug!(count = written, tick = self_metrics_tick, "pillar peer ingested self metrics");
+                }
                 self_metrics_tick += 1;
             }
             event = swarm.select_next_some() => {
@@ -905,6 +952,24 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     // real payload byte length ingested.
                     node_counters.record_requests(1);
                     node_counters.record_ingest_bytes(message.data.len() as u64);
+                    // Feed the LIVE observability substrate a real log + trace
+                    // span for THIS handled event, so a black-box observer can
+                    // trace the log/trace signal kinds back to a genuine
+                    // workload emission (the gossip event this node handled).
+                    {
+                        let mut sub = live_obs.lock().expect("live observability lock");
+                        sub.record_log(
+                            pillar_observability::LogLevel::Info,
+                            format!("gossip event handled bytes={}", message.data.len()),
+                            self_metrics_tick,
+                        );
+                        sub.record_span(
+                            format!("gossip-{self_metrics_tick}"),
+                            format!("handle-{self_metrics_tick}"),
+                            "handle_gossip_event",
+                            self_metrics_tick,
+                        );
+                    }
                     // Every gossiped event-log message is an append-only op the
                     // controller folds into the local stream view AND durably
                     // persists under the content-addressed data-dir store.
