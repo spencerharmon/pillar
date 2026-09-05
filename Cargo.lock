@@ -3021,6 +3021,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-blob-provider"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "libp2p",
+ "pillar-net",
+ "tokio",
+]
+
+[[package]]
 name = "pillar-bootstrap"
 version = "0.0.0"
 dependencies = [
