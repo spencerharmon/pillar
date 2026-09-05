@@ -3071,6 +3071,8 @@ dependencies = [
  "pillar-web",
  "pillar-web-api",
  "pillar-wot-authority",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",
@@ -3148,6 +3150,7 @@ dependencies = [
  "pillar-surface-inventory",
  "pillar-topology",
  "pillar-web",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

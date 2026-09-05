@@ -33,6 +33,10 @@ pub struct VerbSpec {
 /// what the inventory reports, by construction.
 pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
+        name: "surface-inventory",
+        handler: |_v, args| surface_inventory(args),
+    },
+    VerbSpec {
         name: "--web",
         handler: |_v, args| web(args),
     },
@@ -238,6 +242,17 @@ fn completion(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `pillar surface-inventory`: emit the `pillar-integration/v1` machine-
+/// readable inventory of every external surface THIS binary serves (CLI
+/// verbs, HTTP routes, manifest kinds, wire ops), read from the live
+/// registries — the black-box source of truth the `pillar-integration`
+/// portal-cli-parity scenario drives its parity assertion against. Prints
+/// JSON to stdout; exits 0.
+fn surface_inventory(_args: &[String]) -> ExitCode {
+    println!("{}", crate::surface_inventory::emit_json());
+    ExitCode::SUCCESS
 }
 
 /// `pillar onboard`: drive the keygen -> node-key signing -> cross-user

@@ -2351,6 +2351,27 @@ fn dispatch_landing(
     }
 }
 
+/// `GET /surface-inventory`: emit the `pillar-integration/v1` machine-readable
+/// inventory of every external surface this node serves — the portal
+/// counterpart of the `pillar surface-inventory` CLI verb, so an external
+/// black-box caller can obtain the real inventory from a RUNNING node over
+/// HTTP and drive the portal-cli-parity assertion. Served unauthenticated,
+/// like the landing page: it reveals only the shape of the public surface.
+fn dispatch_surface_inventory(
+    _ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type: "application/json",
+        session_token: None,
+        body: crate::surface_inventory::emit_json(),
+        bytes: None,
+    }
+}
+
 fn dispatch_bootstrap_status_route(
     ctx: &mut WebAuthContext,
     _peer: &SocketAddr,
@@ -2488,6 +2509,7 @@ fn dispatch_nonce(
 /// surface-inventory emitter observes, by construction.
 pub static ROUTES: &[RouteSpec] = &[
     RouteSpec { method: "GET", path: PathMatch::Exact("/"), handler: dispatch_landing },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/surface-inventory"), handler: dispatch_surface_inventory },
     RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/status"), handler: dispatch_bootstrap_status_route },
     RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create-cell"), handler: dispatch_bootstrap_create_cell },
     RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/name-check"), handler: dispatch_bootstrap_name_check },
