@@ -129,6 +129,14 @@ const ENV_DISABLE_METRICS: &str = "PILLAR_DISABLE_METRICS";
 /// `TimeseriesStore`.
 const SELF_METRICS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How often a node runs an anti-entropy catch-up round: it asks one connected
+/// peer for the durable ops it is missing (advertising what it holds) and
+/// persists the delta, so a partitioned/late peer reconverges to the identical
+/// content-addressed op set. Short enough that a reconnected node catches up
+/// quickly; the round is a cheap dedup no-op once converged (only the gap ever
+/// crosses the wire).
+const ANTI_ENTROPY_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How long after listen-address bind-up the [`ENV_TEST_PUBLISH`] hook waits
 /// before publishing, giving `--dial` connections + gossipsub mesh
 /// (re)grafting a real chance to settle first.
@@ -876,6 +884,22 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let mut self_metrics_interval = tokio::time::interval(SELF_METRICS_INTERVAL);
     self_metrics_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Anti-entropy catch-up sync (ROI P1 "Event order & integrity";
+    // pillar-integration chaos-fault RED/GREEN reconvergence): gossipsub is
+    // best-effort, so a node that was PARTITIONED (or joined late) during a
+    // publish permanently misses that op — gossip never re-delivers. On a
+    // periodic tick this node asks ONE connected peer for the ops it is missing
+    // (advertising the content-addresses it already holds) and persists the
+    // delta into its OWN durable streaming DB via `pillar_net::apply_op_sync`,
+    // so a lagging peer reconverges to the identical content-addressed op set
+    // (identical CIDs) its peers hold — no split-brain after a partition heal.
+    // Inbound requests are served from this node's durable store via
+    // `answer_op_sync`. The behaviour is multiplexed on the same connections as
+    // gossipsub (see `pillar_net::EventBehaviour`), so it needs no separate
+    // listen/dial wiring.
+    let mut anti_entropy_interval = tokio::time::interval(ANTI_ENTROPY_SYNC_INTERVAL);
+    anti_entropy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Controller loop: fold inbound event-log messages into the stream and
     // block until a shutdown signal.
     let mut shutdown = Box::pin(shutdown_signal());
@@ -896,6 +920,18 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     match swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload.clone().into_bytes()) {
                         Ok(_) => tracing::info!(%payload, "pillar peer published test payload"),
                         Err(e) => tracing::warn!(%payload, error = %e, "pillar peer failed to publish test payload"),
+                    }
+                    // Gossipsub never delivers a message back to its own
+                    // publisher, so fold the published op into THIS node's
+                    // durable store directly — the publisher authored it and
+                    // must hold it (otherwise it could not answer an
+                    // anti-entropy sync for the op it originated, and a peer
+                    // that missed the gossip could never catch up).
+                    if let Err(e) = stream.append(
+                        payload.clone().into_bytes(),
+                        pillar_core::SideEffect::Convergent,
+                    ) {
+                        tracing::warn!(error = %e, "pillar streaming DB append of own published op failed");
                     }
                 }
                 published = true;
@@ -930,6 +966,20 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     tracing::debug!(count = written, tick = self_metrics_tick, "pillar peer ingested self metrics");
                 }
                 self_metrics_tick += 1;
+            }
+            _ = anti_entropy_interval.tick() => {
+                // Catch-up round: pick one connected peer and ask it for the
+                // durable ops this node is missing, advertising the content-
+                // addresses we already hold. The peer answers with exactly the
+                // gap; its response is applied into our durable store when it
+                // arrives (below). Skipped when we have no peer to ask.
+                let target_peer = swarm.connected_peers().next().copied();
+                if let Some(peer) = target_peer {
+                    let request = pillar_net::op_sync_request(stream.stream().log());
+                    let have = request.have.len();
+                    swarm.behaviour_mut().op_sync.send_request(&peer, request);
+                    tracing::debug!(%peer, have, "pillar peer requested anti-entropy op sync");
+                }
             }
             event = swarm.select_next_some() => {
                 match &event {
@@ -978,6 +1028,50 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         pillar_core::SideEffect::Convergent,
                     ) {
                         tracing::warn!(error = %e, "pillar streaming DB append failed");
+                    }
+                } else if let SwarmEvent::Behaviour(pillar_net::EventBehaviourEvent::OpSync(
+                    libp2p::request_response::Event::Message { message, .. },
+                )) = event
+                {
+                    match message {
+                        // A peer asked us for the ops it is missing: answer from
+                        // our durable store with exactly the gap (never the whole
+                        // log), so the requester reconverges.
+                        libp2p::request_response::Message::Request {
+                            request, channel, ..
+                        } => {
+                            let response =
+                                pillar_net::answer_op_sync(stream.stream().log(), &request);
+                            let sent = response.ops.len();
+                            if swarm
+                                .behaviour_mut()
+                                .op_sync
+                                .send_response(channel, response)
+                                .is_err()
+                            {
+                                tracing::warn!("pillar peer failed to send op-sync response");
+                            } else {
+                                tracing::debug!(sent, "pillar peer answered anti-entropy op sync");
+                            }
+                        }
+                        // Our earlier request came back with the ops we were
+                        // missing: apply them into our OWN durable store. Each op
+                        // is re-addressed from its bytes, so it lands under the
+                        // identical content-addressed CID our peers hold — a
+                        // partitioned/late node reconverges to one consistent
+                        // state (no split-brain).
+                        libp2p::request_response::Message::Response { response, .. } => {
+                            let admitted = pillar_net::apply_op_sync(&mut stream, response);
+                            if admitted > 0 {
+                                node_counters
+                                    .record_streamdb_ops(stream.stream().log().len() as u64);
+                                tracing::info!(
+                                    admitted,
+                                    ops = stream.stream().log().len(),
+                                    "pillar peer applied anti-entropy op sync (reconverged)"
+                                );
+                            }
+                        }
                     }
                 }
             }

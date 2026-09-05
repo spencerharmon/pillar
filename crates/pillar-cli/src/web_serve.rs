@@ -179,11 +179,11 @@ use pillar_manifest::{
 };
 use pillar_observability::SignalKind;
 use pillar_observability::{LiveObservabilitySubstrate, DEFAULT_EVAL_TIER};
-use std::sync::{Arc, Mutex};
 use pillar_topology::{
     Assignment as TopologyAssignment, Label as TopologyLabel, Mismatch as TopologyMismatch,
     TierHierarchy, Topology as TopologyRegistry, ATTEST_ACTION as TOPOLOGY_ATTEST_ACTION,
 };
+use std::sync::{Arc, Mutex};
 // The shared client/server DTO crate (`pillar-web-api`): one type definition
 // for the portal's identity snapshot, session summary, and the
 // login/nonce/bootstrap wire-body framing, compiled into both this server
@@ -196,11 +196,11 @@ use pillar_topology::{
 // wire-facing DTO crate deliberately does not depend on (see
 // `pillar_web_api::CustodyRecord`'s doc for the plain-`String` shared
 // shape a client would consume instead).
-pub use pillar_web_api::{NodeIdentitySnapshot, SessionSummary};
 use pillar_web_api::{
     BootstrapCreateCellRequest, BootstrapCreateRequest, BootstrapCreateUserRequest,
     BootstrapStatus, LoginRequest, LoginResponse, NonceResponse,
 };
+pub use pillar_web_api::{NodeIdentitySnapshot, SessionSummary};
 
 /// The server-side state the node-side-custody portal needs: the node-custody
 /// verifier (holding this node's node key + its cell-DB view of node-sealed
@@ -392,10 +392,6 @@ pub struct CustodyRecord {
 /// version and the SDK's negotiated version can never drift apart — there is
 /// exactly ONE definition, not a parallel versioning scheme per side.
 pub use pillar_web_api::API_VERSION;
-/// The OLDEST HTTP ingest API version this build still accepts on a request —
-/// see [`pillar_web_api::MIN_API_VERSION`] (re-exported here for the same
-/// single-source-of-truth reason as [`API_VERSION`]).
-pub use pillar_web_api::MIN_API_VERSION;
 /// The response/request header carrying the HTTP ingest API [`SurfaceVersion`]
 /// stamp (rendered `vN` via its `Display`). Emitted on EVERY response so any
 /// client can see the version it was served at; OPTIONALLY sent by a request
@@ -403,6 +399,10 @@ pub use pillar_web_api::MIN_API_VERSION;
 /// compatibly at [`API_VERSION`]). Re-exported from `pillar_web_api` for the
 /// same single-source-of-truth reason as [`API_VERSION`].
 use pillar_web_api::API_VERSION_HEADER;
+/// The OLDEST HTTP ingest API version this build still accepts on a request —
+/// see [`pillar_web_api::MIN_API_VERSION`] (re-exported here for the same
+/// single-source-of-truth reason as [`API_VERSION`]).
+pub use pillar_web_api::MIN_API_VERSION;
 
 /// The `apiVersion` every resource-plane kind on the web UI shares.
 const RESOURCE_API: &str = "pillar.dev/v1";
@@ -815,7 +815,7 @@ impl WebAuthContext {
         let parts: Vec<&str> = spec.split('|').collect();
         let [id, psl, op, threshold] = parts.as_slice() else {
             return Some(Err(
-                "ALERT-SPEC expected <id>|<psl>|<gt|lt>|<threshold>".to_owned(),
+                "ALERT-SPEC expected <id>|<psl>|<gt|lt>|<threshold>".to_owned()
             ));
         };
         let thr: f64 = match threshold.parse() {
@@ -2058,7 +2058,11 @@ impl RouteSpec {
     }
 }
 
-fn dispatch_landing(_ctx: &mut WebAuthContext, _peer: &SocketAddr, _req: &HttpRequest) -> HttpResponse {
+fn dispatch_landing(
+    _ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
     HttpResponse {
         status: 200,
         reason: "OK",
@@ -2092,15 +2096,18 @@ fn dispatch_bootstrap_create_cell(
     _peer: &SocketAddr,
     request: &HttpRequest,
 ) -> HttpResponse {
-    let BootstrapCreateCellRequest { cell_id } = BootstrapCreateCellRequest::from_body(&request.body);
+    let BootstrapCreateCellRequest { cell_id } =
+        BootstrapCreateCellRequest::from_body(&request.body);
     if cell_id.is_empty() {
         return text_response(400, "Bad Request", "MISSING cell id".to_owned());
     }
     match ctx.create_cell(NodeId::from(cell_id.as_str())) {
         Ok(()) => text_response(200, "OK", "CELL-CREATED".to_owned()),
-        Err(BootstrapError::CellNameInUse) => {
-            text_response(409, "Conflict", format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"))
-        }
+        Err(BootstrapError::CellNameInUse) => text_response(
+            409,
+            "Conflict",
+            format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
+        ),
         Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
     }
 }
@@ -2163,18 +2170,28 @@ fn dispatch_bootstrap_create(
         password,
     } = BootstrapCreateRequest::from_body(&request.body);
     if cell_id.is_empty() || handle.is_empty() || password.is_empty() {
-        return text_response(400, "Bad Request", "MISSING cell-handle-or-password".to_owned());
+        return text_response(
+            400,
+            "Bad Request",
+            "MISSING cell-handle-or-password".to_owned(),
+        );
     }
     match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
         Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
-        Err(BootstrapError::CellNameInUse) => {
-            text_response(409, "Conflict", format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"))
-        }
+        Err(BootstrapError::CellNameInUse) => text_response(
+            409,
+            "Conflict",
+            format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
+        ),
         Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
     }
 }
 
-fn dispatch_nonce(ctx: &mut WebAuthContext, _peer: &SocketAddr, _req: &HttpRequest) -> HttpResponse {
+fn dispatch_nonce(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
     let nonce = ctx.verifier.issue_nonce(u64::MAX);
     text_response(
         200,
@@ -2192,68 +2209,318 @@ fn dispatch_nonce(ctx: &mut WebAuthContext, _peer: &SocketAddr, _req: &HttpReque
 /// removed here is added or removed from what is served AND from what a
 /// surface-inventory emitter observes, by construction.
 pub static ROUTES: &[RouteSpec] = &[
-    RouteSpec { method: "GET", path: PathMatch::Exact("/"), handler: dispatch_landing },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/status"), handler: dispatch_bootstrap_status_route },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create-cell"), handler: dispatch_bootstrap_create_cell },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/name-check"), handler: dispatch_bootstrap_name_check },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create-user"), handler: dispatch_bootstrap_create_user },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create"), handler: dispatch_bootstrap_create },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/nonce"), handler: dispatch_nonce },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/login"), handler: |ctx, _peer, request| dispatch_login(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/register/begin"), handler: |ctx, _peer, request| dispatch_webauthn_register_begin(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/register/finish"), handler: |ctx, _peer, request| dispatch_webauthn_register_finish(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/authenticate/begin"), handler: |ctx, _peer, request| dispatch_webauthn_authenticate_begin(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/authenticate/finish"), handler: |ctx, _peer, request| dispatch_webauthn_authenticate_finish(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/node"), handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, true) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/user"), handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, false) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/request/list"), handler: |ctx, _peer, _request| dispatch_request_list(ctx) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/approve"), handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, true) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/reject"), handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, false) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/status"), handler: |ctx, _peer, request| dispatch_portal_status(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/layout"), handler: |ctx, _peer, request| dispatch_layout_store(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/layout"), handler: |ctx, _peer, request| dispatch_layout_get(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/identity"), handler: |ctx, _peer, request| dispatch_identity_view(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/enroll"), handler: |ctx, _peer, request| dispatch_identity_enroll(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/rotate"), handler: |ctx, _peer, request| dispatch_identity_rotate(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/recover"), handler: |ctx, _peer, request| dispatch_identity_recover(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/domains"), handler: |ctx, _peer, request| dispatch_domain_view(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/members"), handler: |ctx, _peer, request| dispatch_members_view(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/members/add"), handler: |ctx, peer, request| dispatch_members_add(ctx, peer, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/members/role"), handler: |ctx, _peer, request| dispatch_members_role(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/sessions"), handler: |ctx, _peer, request| dispatch_sessions_view(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/sessions/revoke"), handler: |ctx, _peer, request| dispatch_sessions_revoke(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/sessions/revoke-all"), handler: |ctx, _peer, request| dispatch_sessions_revoke_all(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/attestations/build"), handler: |ctx, _peer, request| dispatch_attestation_build(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/trust-graph"), handler: |ctx, _peer, request| dispatch_trust_graph_view(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/kinds"), handler: |ctx, _peer, request| dispatch_obs_live_kinds(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/explore"), handler: |ctx, _peer, request| dispatch_obs_live_explore(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/query"), handler: |ctx, _peer, request| dispatch_obs_live_query(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/recording"), handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/alert"), handler: |ctx, _peer, request| dispatch_obs_live_alert(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/dashboard"), handler: |ctx, _peer, request| dispatch_obs_live_dashboard(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/tree"), handler: |ctx, _peer, request| dispatch_topology_tree(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/mismatches"), handler: |ctx, _peer, request| dispatch_topology_mismatches(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/declare"), handler: |ctx, _peer, request| dispatch_topology_label_declare(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/attest"), handler: |ctx, _peer, request| dispatch_topology_label_attest(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/failure-domain"), handler: |ctx, _peer, request| dispatch_topology_failure_domain(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/facet"), handler: |ctx, _peer, request| dispatch_topology_facet(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/migrate"), handler: |ctx, _peer, request| dispatch_custody_migrate(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/rotate"), handler: |ctx, _peer, request| dispatch_custody_rotate(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/seal"), handler: |ctx, _peer, request| dispatch_custody_seal(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/revoke"), handler: |ctx, _peer, request| dispatch_custody_revoke(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/get"), handler: |ctx, _peer, request| dispatch_resource_get(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/describe"), handler: |ctx, _peer, request| dispatch_resource_describe(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/dry-run"), handler: |ctx, _peer, request| dispatch_resource_dry_run(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/logs"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Logs) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/exec"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Exec) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/forward"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Forward) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/apply"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Apply) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/edit"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Edit) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/scale"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Scale) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/rollout"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Rollout) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/explore"), handler: |ctx, _peer, request| dispatch_obs_explore(ctx, request) },
-    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/query"), handler: |ctx, _peer, request| dispatch_obs_query(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/dashboard"), handler: |ctx, _peer, request| dispatch_obs_dashboard(ctx, request) },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/"),
+        handler: dispatch_landing,
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/bootstrap/status"),
+        handler: dispatch_bootstrap_status_route,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/create-cell"),
+        handler: dispatch_bootstrap_create_cell,
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/bootstrap/name-check"),
+        handler: dispatch_bootstrap_name_check,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/create-user"),
+        handler: dispatch_bootstrap_create_user,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/create"),
+        handler: dispatch_bootstrap_create,
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/nonce"),
+        handler: dispatch_nonce,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/login"),
+        handler: |ctx, _peer, request| dispatch_login(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/webauthn/register/begin"),
+        handler: |ctx, _peer, request| dispatch_webauthn_register_begin(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/webauthn/register/finish"),
+        handler: |ctx, _peer, request| dispatch_webauthn_register_finish(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/webauthn/authenticate/begin"),
+        handler: |ctx, _peer, request| dispatch_webauthn_authenticate_begin(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/webauthn/authenticate/finish"),
+        handler: |ctx, _peer, request| dispatch_webauthn_authenticate_finish(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/request/node"),
+        handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, true),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/request/user"),
+        handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, false),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/bootstrap/request/list"),
+        handler: |ctx, _peer, _request| dispatch_request_list(ctx),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/request/approve"),
+        handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, true),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/request/reject"),
+        handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, false),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/status"),
+        handler: |ctx, _peer, request| dispatch_portal_status(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/layout"),
+        handler: |ctx, _peer, request| dispatch_layout_store(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/layout"),
+        handler: |ctx, _peer, request| dispatch_layout_get(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/identity"),
+        handler: |ctx, _peer, request| dispatch_identity_view(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/identity/enroll"),
+        handler: |ctx, _peer, request| dispatch_identity_enroll(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/identity/rotate"),
+        handler: |ctx, _peer, request| dispatch_identity_rotate(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/identity/recover"),
+        handler: |ctx, _peer, request| dispatch_identity_recover(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/domains"),
+        handler: |ctx, _peer, request| dispatch_domain_view(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/members"),
+        handler: |ctx, _peer, request| dispatch_members_view(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/members/add"),
+        handler: |ctx, peer, request| dispatch_members_add(ctx, peer, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/members/role"),
+        handler: |ctx, _peer, request| dispatch_members_role(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/sessions"),
+        handler: |ctx, _peer, request| dispatch_sessions_view(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/sessions/revoke"),
+        handler: |ctx, _peer, request| dispatch_sessions_revoke(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/sessions/revoke-all"),
+        handler: |ctx, _peer, request| dispatch_sessions_revoke_all(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/attestations/build"),
+        handler: |ctx, _peer, request| dispatch_attestation_build(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/trust-graph"),
+        handler: |ctx, _peer, request| dispatch_trust_graph_view(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/obs/live/kinds"),
+        handler: |ctx, _peer, request| dispatch_obs_live_kinds(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/obs/live/explore"),
+        handler: |ctx, _peer, request| dispatch_obs_live_explore(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/obs/live/query"),
+        handler: |ctx, _peer, request| dispatch_obs_live_query(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/obs/live/recording"),
+        handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/obs/live/alert"),
+        handler: |ctx, _peer, request| dispatch_obs_live_alert(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/obs/live/dashboard"),
+        handler: |ctx, _peer, request| dispatch_obs_live_dashboard(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/topology/tree"),
+        handler: |ctx, _peer, request| dispatch_topology_tree(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/topology/mismatches"),
+        handler: |ctx, _peer, request| dispatch_topology_mismatches(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/topology/label/declare"),
+        handler: |ctx, _peer, request| dispatch_topology_label_declare(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/topology/label/attest"),
+        handler: |ctx, _peer, request| dispatch_topology_label_attest(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/topology/failure-domain"),
+        handler: |ctx, _peer, request| dispatch_topology_failure_domain(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/topology/facet"),
+        handler: |ctx, _peer, request| dispatch_topology_facet(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/custody/migrate"),
+        handler: |ctx, _peer, request| dispatch_custody_migrate(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/custody/rotate"),
+        handler: |ctx, _peer, request| dispatch_custody_rotate(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/custody/seal"),
+        handler: |ctx, _peer, request| dispatch_custody_seal(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/custody/revoke"),
+        handler: |ctx, _peer, request| dispatch_custody_revoke(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/get"),
+        handler: |ctx, _peer, request| dispatch_resource_get(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/describe"),
+        handler: |ctx, _peer, request| dispatch_resource_describe(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/dry-run"),
+        handler: |ctx, _peer, request| dispatch_resource_dry_run(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/logs"),
+        handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Logs),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/exec"),
+        handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Exec),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/forward"),
+        handler: |ctx, _peer, request| {
+            dispatch_resource_runtime(ctx, request, RuntimeReach::Forward)
+        },
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/resource/apply"),
+        handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Apply),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/resource/edit"),
+        handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Edit),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/resource/scale"),
+        handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Scale),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/resource/rollout"),
+        handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Rollout),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/obs/explore"),
+        handler: |ctx, _peer, request| dispatch_obs_explore(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/obs/query"),
+        handler: |ctx, _peer, request| dispatch_obs_query(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/obs/dashboard"),
+        handler: |ctx, _peer, request| dispatch_obs_dashboard(ctx, request),
+    },
 ];
 
 /// The real, currently-served HTTP route table — the exact data

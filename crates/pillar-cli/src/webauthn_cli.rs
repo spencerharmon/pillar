@@ -67,7 +67,9 @@ fn domain_from(parsed: &Args<'_>) -> Result<(String, String), String> {
         return Ok(authority_of(d));
     }
     let d = std::env::var(PILLAR_DOMAIN_ENV).map_err(|_| {
-        format!("no --domain and {PILLAR_DOMAIN_ENV} is unset — run `pillar login` or pass --domain")
+        format!(
+            "no --domain and {PILLAR_DOMAIN_ENV} is unset — run `pillar login` or pass --domain"
+        )
     })?;
     Ok(authority_of(&d))
 }
@@ -76,8 +78,9 @@ fn token_from(parsed: &Args<'_>) -> Result<String, String> {
     if let Some(t) = parsed.get("token") {
         return Ok(t.to_owned());
     }
-    std::env::var(PILLAR_TOKEN_ENV)
-        .map_err(|_| format!("{PILLAR_TOKEN_ENV} is unset — run `pillar login` first, or pass --token"))
+    std::env::var(PILLAR_TOKEN_ENV).map_err(|_| {
+        format!("{PILLAR_TOKEN_ENV} is unset — run `pillar login` first, or pass --token")
+    })
 }
 
 fn usage() -> &'static str {
@@ -121,7 +124,12 @@ fn register(args: &[String]) -> Result<String, String> {
     let token = token_from(&parsed)?;
     let origin = parsed.get("origin").unwrap_or(DEFAULT_ORIGIN);
 
-    let begin = http(&authority, "POST", "/webauthn/register/begin", &format!("{token}\n{user_handle}"))?;
+    let begin = http(
+        &authority,
+        "POST",
+        "/webauthn/register/begin",
+        &format!("{token}\n{user_handle}"),
+    )?;
     if begin.status != 200 {
         return Err(format!(
             "register/begin refused: {} {}",
@@ -166,9 +174,11 @@ fn register(args: &[String]) -> Result<String, String> {
     #[cfg(not(feature = "passkey"))]
     {
         let _ = (challenge_b64, rp_id, origin, token, authority);
-        Err("hardware WebAuthn ceremonies require the `passkey` build feature \
+        Err(
+            "hardware WebAuthn ceremonies require the `passkey` build feature \
              (the deployed node's `hsm` feature set includes it)"
-            .to_owned())
+                .to_owned(),
+        )
     }
 }
 
@@ -195,12 +205,7 @@ fn login(args: &[String]) -> Result<String, String> {
     let origin = parsed.get("origin").unwrap_or(DEFAULT_ORIGIN);
     let rp_id = parsed.get("rp-id").unwrap_or(DEFAULT_RP_ID);
 
-    let begin = http(
-        &authority,
-        "POST",
-        "/webauthn/authenticate/begin",
-        &token,
-    )?;
+    let begin = http(&authority, "POST", "/webauthn/authenticate/begin", &token)?;
     if begin.status != 200 {
         return Err(format!(
             "authenticate/begin refused: {} {}",
@@ -269,9 +274,11 @@ fn login(args: &[String]) -> Result<String, String> {
     #[cfg(not(feature = "passkey"))]
     {
         let _ = (challenge_b64, rp_id, origin, credential_id_b64);
-        Err("hardware WebAuthn ceremonies require the `passkey` build feature \
+        Err(
+            "hardware WebAuthn ceremonies require the `passkey` build feature \
              (the deployed node's `hsm` feature set includes it)"
-            .to_owned())
+                .to_owned(),
+        )
     }
 }
 
@@ -281,7 +288,12 @@ mod tests {
 
     #[test]
     fn args_parses_flags() {
-        let argv: Vec<String> = vec!["--user".into(), "alice".into(), "--domain".into(), "d".into()];
+        let argv: Vec<String> = vec![
+            "--user".into(),
+            "alice".into(),
+            "--domain".into(),
+            "d".into(),
+        ];
         let parsed = Args::parse(&argv).expect("parses");
         assert_eq!(parsed.get("user"), Some("alice"));
         assert_eq!(parsed.get("domain"), Some("d"));

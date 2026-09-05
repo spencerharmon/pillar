@@ -29,7 +29,7 @@ use libp2p::{
     identity::Keypair,
     kad, noise,
     pnet::{PnetConfig, PreSharedKey},
-    relay,
+    relay, request_response,
     swarm::behaviour::toggle::Toggle,
     tcp, upnp, yamux, PeerId, Swarm, Transport,
 };
@@ -58,6 +58,12 @@ pub mod antientropy;
 pub use antientropy::{
     answer_sync, apply_sync, build_anti_entropy_swarm, AntiEntropyBehaviour,
     AntiEntropyBehaviourEvent, SyncRequest, SyncResponse, ANTI_ENTROPY_PROTOCOL_NAME,
+};
+
+pub mod opsync;
+pub use opsync::{
+    answer_op_sync, apply_op_sync, op_sync_behaviour, op_sync_request, OpSyncRequest,
+    OpSyncResponse, OP_SYNC_PROTOCOL_NAME,
 };
 
 /// Gossipsub topic carrying Pillar's append-only event log.
@@ -165,6 +171,11 @@ pub struct EventBehaviour {
     /// Address/protocol exchange, required for Kademlia to learn dialable
     /// addresses of peers it hears about.
     pub identify: identify::Behaviour,
+    /// Durable streaming-DB op-set anti-entropy catch-up sync (see
+    /// [`crate::opsync`]): the request/response repair channel that reconverges
+    /// a node whose best-effort gossipsub feed had a gap, multiplexed over the
+    /// SAME connections as gossipsub/kademlia/identify.
+    pub op_sync: request_response::cbor::Behaviour<opsync::OpSyncRequest, opsync::OpSyncResponse>,
 }
 
 /// The behaviour run by a Pillar node acting as a relay (`libp2p::relay`
@@ -256,6 +267,7 @@ pub fn build_event_swarm_with_root(
                     gossipsub: gossipsub_behaviour(key),
                     kademlia: new_kademlia(peer_id),
                     identify: identify::Behaviour::new(identify_config(key)),
+                    op_sync: opsync::op_sync_behaviour(),
                 }
             })?
             .build(),
@@ -270,6 +282,7 @@ pub fn build_event_swarm_with_root(
                         gossipsub: gossipsub_behaviour(key),
                         kademlia: new_kademlia(peer_id),
                         identify: identify::Behaviour::new(identify_config(key)),
+                        op_sync: opsync::op_sync_behaviour(),
                     }
                 })?
                 .build()
