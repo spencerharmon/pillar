@@ -41,11 +41,83 @@
 //! substrate that already verifies content against its digest on receipt).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 
 use pillar_crypto::sign::{sign, verify};
 use pillar_crypto::{ContentId, Signature, SigningPublicKey, SigningSecretKey};
 
 use crate::content_address;
+
+// ---------------------------------------------------------------------------
+// On-disk durability codec helpers.
+//
+// A durable `ContentStore` (see `ContentStore::open`) mirrors its held
+// segments, pin/provided sets, and per-owner heads to a local directory tree
+// (the node's PVC-backed pin store — exactly how a real IPFS node persists its
+// pinned blocks; content-addressing itself is unchanged, still the plugin's
+// multihash). These helpers are the length-prefixed wire codec for the two
+// content-object types the store persists.
+// ---------------------------------------------------------------------------
+
+fn wire_put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+fn wire_take_bytes(inp: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let len = u32::from_be_bytes(inp.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+    *pos += 4;
+    let b = inp.get(*pos..*pos + len)?.to_vec();
+    *pos += len;
+    Some(b)
+}
+
+fn vis_to_u8(v: Visibility) -> u8 {
+    match v {
+        Visibility::Public => 0,
+        Visibility::Cell => 1,
+        Visibility::Sealed => 2,
+    }
+}
+
+fn vis_from_u8(b: u8) -> Option<Visibility> {
+    match b {
+        0 => Some(Visibility::Public),
+        1 => Some(Visibility::Cell),
+        2 => Some(Visibility::Sealed),
+        _ => None,
+    }
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push(char::from_digit((x >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((x & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char).to_digit(16)?;
+        let lo = (b[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn io_store_err(e: std::io::Error) -> StoreError {
+    StoreError::Io(e.kind())
+}
 
 /// A content identifier: the durable store's address for a content object,
 /// a pure, collision-resistant function of the object's bytes.
@@ -206,6 +278,40 @@ impl SignedSegment {
         )
         .map_err(|_| StoreError::BadSignature)
     }
+
+    /// Serialize to the durable on-disk wire form (length-prefixed
+    /// `bytes|signer|signature|visibility`). The inverse of
+    /// [`SignedSegment::from_wire`]; used only by a durable [`ContentStore`]'s
+    /// local pin store — the `Cid` is NOT stored (it is recomputed from
+    /// `bytes` on load, so the store can never map a segment file to a `Cid`
+    /// its bytes do not hash to).
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        wire_put_bytes(&mut out, &self.bytes);
+        wire_put_bytes(&mut out, self.signer.as_bytes());
+        wire_put_bytes(&mut out, self.signature.as_bytes());
+        out.push(vis_to_u8(self.visibility));
+        out
+    }
+
+    /// Reconstruct from the durable on-disk wire form. Returns `None` on a
+    /// truncated/corrupt record; the caller still re-[`verify`](Self::verify)s
+    /// authorship before trusting it.
+    #[must_use]
+    pub fn from_wire(w: &[u8]) -> Option<Self> {
+        let mut pos = 0usize;
+        let bytes = wire_take_bytes(w, &mut pos)?;
+        let signer = SigningPublicKey::from_bytes(wire_take_bytes(w, &mut pos)?);
+        let signature = Signature::from_bytes(wire_take_bytes(w, &mut pos)?);
+        let visibility = vis_from_u8(*w.get(pos)?)?;
+        Some(SignedSegment {
+            bytes,
+            signer,
+            signature,
+            visibility,
+        })
+    }
 }
 
 /// An IPNS-format mutable head record: an owner-signed, sequence-numbered,
@@ -315,6 +421,46 @@ impl HeadRecord {
         )
         .map_err(|_| StoreError::BadSignature)
     }
+
+    /// Serialize to the durable on-disk wire form
+    /// (`owner|seq|target|ttl|visibility|signature`). Inverse of
+    /// [`HeadRecord::from_wire`].
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        wire_put_bytes(&mut out, self.owner.as_bytes());
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        wire_put_bytes(&mut out, self.target.as_bytes());
+        out.extend_from_slice(&self.ttl_secs.to_be_bytes());
+        out.push(vis_to_u8(self.visibility));
+        wire_put_bytes(&mut out, self.signature.as_bytes());
+        out
+    }
+
+    /// Reconstruct from the durable on-disk wire form. Returns `None` on a
+    /// truncated/corrupt record; the caller still re-[`verify`](Self::verify)s
+    /// the owner signature before trusting it.
+    #[must_use]
+    pub fn from_wire(w: &[u8]) -> Option<Self> {
+        let mut pos = 0usize;
+        let owner = SigningPublicKey::from_bytes(wire_take_bytes(w, &mut pos)?);
+        let seq = u64::from_be_bytes(w.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let target = Cid(ContentId::from_bytes(wire_take_bytes(w, &mut pos)?));
+        let ttl_secs = u64::from_be_bytes(w.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let visibility = vis_from_u8(*w.get(pos)?)?;
+        pos += 1;
+        let signature = Signature::from_bytes(wire_take_bytes(w, &mut pos)?);
+        Some(HeadRecord {
+            owner,
+            seq,
+            target,
+            ttl_secs,
+            visibility,
+            signature,
+        })
+    }
 }
 
 /// A durable content-object store: the plugin-owned IPFS/libp2p surface the
@@ -331,6 +477,11 @@ pub struct ContentStore {
     pinned: HashSet<Cid>,
     dht: HashSet<Cid>,
     heads: BTreeMap<Vec<u8>, HeadRecord>,
+    /// When `Some`, every mutation is mirrored to this on-disk pin store so the
+    /// held/pinned/provided/head state survives a process restart (the node's
+    /// PVC-backed local block store). `None` = a pure in-memory store (the
+    /// original behaviour, used by peers/tests and by [`ContentStore::new`]).
+    root: Option<PathBuf>,
 }
 
 /// A reachable source of segments over the private swarm — the abstraction the
@@ -363,6 +514,139 @@ impl ContentStore {
         ContentStore::default()
     }
 
+    /// Open a DURABLE store rooted at `root` on local disk, loading any
+    /// previously persisted held segments, pin/provided sets, and per-owner
+    /// heads. Every subsequent mutation is mirrored back to `root`, so the
+    /// store's content survives a process restart — this is the node's
+    /// PVC-backed local pin store (how a real IPFS node persists pinned
+    /// blocks). Content-addressing is unchanged: each segment file is re-keyed
+    /// by the `Cid` recomputed from its own bytes on load, and a segment whose
+    /// authorship signature does not verify is skipped rather than trusted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] if the store directories cannot be created or read.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let root = root.into();
+        let seg_dir = root.join("segments");
+        let pin_dir = root.join("pinned");
+        let prov_dir = root.join("provided");
+        let head_dir = root.join("heads");
+        for d in [&seg_dir, &pin_dir, &prov_dir, &head_dir] {
+            fs::create_dir_all(d).map_err(io_store_err)?;
+        }
+
+        let mut store = ContentStore {
+            held: HashMap::new(),
+            pinned: HashSet::new(),
+            dht: HashSet::new(),
+            heads: BTreeMap::new(),
+            root: Some(root),
+        };
+
+        // Held segments: re-key each by the Cid recomputed from its bytes; skip
+        // anything corrupt or whose authorship signature does not verify.
+        for entry in fs::read_dir(&seg_dir).map_err(io_store_err)? {
+            let path = entry.map_err(io_store_err)?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let w = fs::read(&path).map_err(io_store_err)?;
+            if let Some(seg) = SignedSegment::from_wire(&w) {
+                if seg.verify().is_ok() {
+                    store.held.insert(seg.cid(), seg);
+                }
+            }
+        }
+        // Pin / provided markers: filenames are the cid hex; keep only those we
+        // actually hold (and, for provided, that are public-class).
+        for entry in fs::read_dir(&pin_dir).map_err(io_store_err)? {
+            let name = entry.map_err(io_store_err)?.file_name();
+            if let Some(cid) = name
+                .to_str()
+                .and_then(hex_decode)
+                .map(|b| Cid(ContentId::from_bytes(b)))
+            {
+                if store.held.contains_key(&cid) {
+                    store.pinned.insert(cid);
+                }
+            }
+        }
+        for entry in fs::read_dir(&prov_dir).map_err(io_store_err)? {
+            let name = entry.map_err(io_store_err)?.file_name();
+            if let Some(cid) = name
+                .to_str()
+                .and_then(hex_decode)
+                .map(|b| Cid(ContentId::from_bytes(b)))
+            {
+                if store
+                    .held
+                    .get(&cid)
+                    .is_some_and(|s| s.visibility().may_reach_dht())
+                {
+                    store.dht.insert(cid);
+                }
+            }
+        }
+        // Heads: one per owner, keyed by owner pubkey bytes; verify the owner
+        // signature before accepting.
+        for entry in fs::read_dir(&head_dir).map_err(io_store_err)? {
+            let path = entry.map_err(io_store_err)?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let w = fs::read(&path).map_err(io_store_err)?;
+            if let Some(head) = HeadRecord::from_wire(&w) {
+                if head.verify().is_ok() {
+                    store.heads.insert(head.owner().as_bytes().to_vec(), head);
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    /// Whether this store mirrors its state to durable local disk.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.root.is_some()
+    }
+
+    // Persist a single held segment to `<root>/segments/<cidhex>` (idempotent:
+    // a segment file is written once; its name is a pure function of content).
+    fn persist_segment(&self, cid: &Cid, seg: &SignedSegment) -> Result<(), StoreError> {
+        if let Some(root) = &self.root {
+            let path = root.join("segments").join(hex_encode(cid.as_bytes()));
+            if !path.exists() {
+                fs::write(&path, seg.to_wire()).map_err(io_store_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_marker(&self, dir: &str, cid: &Cid) -> Result<(), StoreError> {
+        if let Some(root) = &self.root {
+            let path = root.join(dir).join(hex_encode(cid.as_bytes()));
+            if !path.exists() {
+                fs::write(&path, []).map_err(io_store_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_head(&self, record: &HeadRecord) -> Result<(), StoreError> {
+        if let Some(root) = &self.root {
+            let path = root
+                .join("heads")
+                .join(hex_encode(record.owner().as_bytes()));
+            // A head only ever advances; overwrite is correct and atomic-enough
+            // for a single-writer node (write to a temp sibling then rename).
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, record.to_wire()).map_err(io_store_err)?;
+            fs::rename(&tmp, &path).map_err(io_store_err)?;
+        }
+        Ok(())
+    }
+
     /// Store a signed segment, returning its [`Cid`].
     ///
     /// Verifies the segment's authorship signature FIRST — a forged or tampered
@@ -377,6 +661,7 @@ impl ContentStore {
     pub fn put(&mut self, segment: SignedSegment) -> Result<Cid, StoreError> {
         segment.verify()?;
         let cid = segment.cid();
+        self.persist_segment(&cid, &segment)?;
         self.held.entry(cid.clone()).or_insert(segment);
         Ok(cid)
     }
@@ -411,6 +696,7 @@ impl ContentStore {
             return Err(StoreError::CidMismatch);
         }
         fetched.verify()?;
+        self.persist_segment(cid, &fetched)?;
         self.held.insert(cid.clone(), fetched.clone());
         Ok(fetched)
     }
@@ -439,6 +725,7 @@ impl ContentStore {
         if !self.held.contains_key(cid) {
             return Err(StoreError::NotFound);
         }
+        self.persist_marker("pinned", cid)?;
         self.pinned.insert(cid.clone());
         Ok(())
     }
@@ -466,6 +753,7 @@ impl ContentStore {
         if !seg.visibility().may_reach_dht() {
             return Err(StoreError::NotPublic);
         }
+        self.persist_marker("provided", cid)?;
         self.dht.insert(cid.clone());
         Ok(())
     }
@@ -510,6 +798,7 @@ impl ContentStore {
                 return Err(StoreError::StaleHead);
             }
         }
+        self.persist_head(&record)?;
         self.heads.insert(key, record);
         Ok(())
     }
@@ -535,6 +824,10 @@ pub enum StoreError {
     NotPublic,
     /// A head record did not strictly advance the owner's sequence number.
     StaleHead,
+    /// A durable-store local-disk I/O operation failed (create/read/write of
+    /// the PVC-backed pin store). Carries the [`std::io::ErrorKind`] so the
+    /// type stays `Copy` while still naming the fault.
+    Io(std::io::ErrorKind),
 }
 
 impl std::fmt::Display for StoreError {
@@ -545,6 +838,7 @@ impl std::fmt::Display for StoreError {
             StoreError::BadSignature => "segment or head signature did not verify",
             StoreError::NotPublic => "only a public anchor may be provided to the swarm DHT",
             StoreError::StaleHead => "head sequence did not strictly advance",
+            StoreError::Io(kind) => return write!(f, "durable store local-disk I/O error: {kind}"),
         };
         f.write_str(msg)
     }
