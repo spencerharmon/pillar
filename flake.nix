@@ -43,8 +43,27 @@
         pillar-frontend = pkgs.rustPlatform.buildRustPackage {
           pname = "pillar-frontend";
           version = "0.0.0";
-          # Only the frontend crate — its OWN Cargo.lock (own dep closure).
-          src = ./crates/pillar-frontend;
+          # The frontend crate builds to `wasm32-unknown-unknown` from its OWN
+          # Cargo.lock (own dep closure), but it PATH-depends on sibling crates
+          # (`pillar-web-frontend`, and through it `pillar-web-api`,
+          # `pillar-observability`, `pillar-manifest`, `pillar-crypto`, …), so
+          # the build src must contain the whole `crates/` tree, not just
+          # `pillar-frontend/`. `sourceRoot` then points cargo/trunk at the
+          # frontend crate itself. (Filtered to `crates/` so a change elsewhere
+          # in the repo — e.g. docs — does not needlessly bust this build.)
+          src = builtins.path {
+            path = ./.;
+            name = "pillar-src";
+            # The sibling path-deps (`pillar-web-frontend`, …) are workspace
+            # members that inherit `edition`/`version` from the ROOT workspace
+            # manifest, so cargo must see the repo-root `Cargo.toml` above them;
+            # `pillar-frontend` stays `exclude`d there and drives its OWN lock.
+            # Drop VCS / build detritus so this stays a clean, cache-stable src.
+            filter = path: _type:
+              let base = baseNameOf path;
+              in base != ".git" && base != "target" && base != "result";
+          };
+          sourceRoot = "pillar-src/crates/pillar-frontend";
 
           cargoLock = {
             lockFile = ./crates/pillar-frontend/Cargo.lock;

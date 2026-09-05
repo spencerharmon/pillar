@@ -2135,6 +2135,16 @@ const FRONTEND_JS: &[u8] =
     include_bytes!(concat!(env!("PILLAR_FRONTEND_DIST"), "/pillar-frontend.js"));
 const FRONTEND_CSS: &[u8] = include_bytes!(concat!(env!("PILLAR_FRONTEND_DIST"), "/portal.css"));
 
+/// The Yew portal's HTML ENTRYPOINT (`index.html`, trunk stage-1 output),
+/// embedded from the SAME bundle as the wasm/js/css above so the served page
+/// and the assets it references can never drift. This is the document a
+/// browser must receive to bootstrap the WebAssembly module (it carries the
+/// `<script type="module">import init …</script>` that fetches
+/// `/pillar-frontend.js` + streaming-compiles `/pillar-frontend_bg.wasm`).
+/// Embedding it here (rather than only the wasm/js/css) is what lets the node
+/// SERVE the Yew shell instead of a static HTML page that never loads it.
+const FRONTEND_INDEX: &str = include_str!(concat!(env!("PILLAR_FRONTEND_DIST"), "/index.html"));
+
 /// The correct `Content-Type` for a served static frontend asset, keyed by the
 /// request path's file extension. The three asset kinds the two-stage bundle
 /// ships each get their PROPER MIME type: `application/wasm` (the module a
@@ -2144,9 +2154,20 @@ const FRONTEND_CSS: &[u8] = include_bytes!(concat!(env!("PILLAR_FRONTEND_DIST"),
 /// can 404 rather than serve an asset under a guessed type.
 fn frontend_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
     match path {
-        "/assets/pillar-frontend_bg.wasm" => Some((FRONTEND_WASM, "application/wasm")),
-        "/assets/pillar-frontend.js" => Some((FRONTEND_JS, "text/javascript")),
-        "/assets/portal.css" => Some((FRONTEND_CSS, "text/css")),
+        // The paths the trunk-generated `index.html` ACTUALLY references are
+        // ROOT-relative (`/pillar-frontend.js`, `/pillar-frontend_bg.wasm`,
+        // `/portal.css`) — trunk emits absolute hrefs. These MUST be served,
+        // or the browser 404s every asset the entrypoint imports and the Yew
+        // app never boots (the exact defect that left the deployed portal on
+        // the old static page). The `/assets/...` aliases are kept so any
+        // caller wired to the earlier namespaced paths keeps working.
+        "/pillar-frontend_bg.wasm" | "/assets/pillar-frontend_bg.wasm" => {
+            Some((FRONTEND_WASM, "application/wasm"))
+        }
+        "/pillar-frontend.js" | "/assets/pillar-frontend.js" => {
+            Some((FRONTEND_JS, "text/javascript"))
+        }
+        "/portal.css" | "/assets/portal.css" => Some((FRONTEND_CSS, "text/css")),
         _ => None,
     }
 }
@@ -4273,6 +4294,71 @@ mod tests {
         // An unmapped asset path 404s rather than serving under a guessed type.
         let missing = get(&mut ctx, "/assets/does-not-exist.bin");
         assert_eq!(missing.status, 404);
+    }
+
+    // REGRESSION GUARD (the check that was missing when the Yew UI shipped
+    // unreachable): the embedded HTML entrypoint the portal serves must load
+    // the WebAssembly module, and EVERY asset URL it references must resolve
+    // to a real served asset. Without this, `index.html` could reference
+    // `/pillar-frontend.js` while the server only served `/assets/...` — the
+    // browser 404s every asset and the Yew app never boots, yet every
+    // asset-in-isolation test still passes. This ties the entrypoint and the
+    // asset routes together so they cannot silently diverge again.
+    #[test]
+    fn frontend_entrypoint_bootstraps_wasm_and_all_its_asset_refs_resolve() {
+        // The entrypoint must actually bootstrap the wasm module — a static
+        // page that never imports the module is exactly the regression.
+        assert!(
+            FRONTEND_INDEX.contains("init") && FRONTEND_INDEX.contains("pillar-frontend_bg.wasm"),
+            "the served entrypoint must import + init the WebAssembly module, \
+             not be a static page that never loads the Yew bundle"
+        );
+
+        // Extract every root-relative asset URL (`/....js|.wasm|.css`) the
+        // entrypoint references — from any quoted attribute or the module
+        // import — and assert each one is a real served asset.
+        let mut refs: Vec<&str> = Vec::new();
+        for quote in ['"', '\''] {
+            let mut rest = FRONTEND_INDEX;
+            while let Some(open) = rest.find(quote) {
+                rest = &rest[open + 1..];
+                if let Some(close) = rest.find(quote) {
+                    let tok = &rest[..close];
+                    rest = &rest[close + 1..];
+                    if tok.starts_with('/')
+                        && (tok.ends_with(".js")
+                            || tok.ends_with(".wasm")
+                            || tok.ends_with(".css"))
+                    {
+                        refs.push(tok);
+                    }
+                }
+            }
+        }
+        assert!(
+            !refs.is_empty(),
+            "expected the entrypoint to reference at least the wasm/js/css assets"
+        );
+
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        for asset in refs {
+            let resp = get(&mut ctx, asset);
+            assert_eq!(
+                resp.status, 200,
+                "entrypoint references `{asset}` but the server does not serve it \
+                 (the Yew bundle would 404 in the browser)"
+            );
+            assert!(
+                resp.bytes.map(|b| !b.is_empty()).unwrap_or(false),
+                "served asset `{asset}` must have a non-empty body"
+            );
+        }
     }
 
     #[test]
