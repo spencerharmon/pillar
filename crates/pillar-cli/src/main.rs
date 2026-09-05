@@ -22,6 +22,7 @@ fn usage() -> &'static str {
      \x20 pillar apply    <manifest.txt>            validate, authorize, sign, emit a signed event\n\
      \x20 pillar get      <api> <kind> <name>       render a resource from the materialized view\n\
      \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
+     \x20 pillar ingress-lb-udp serve <manifest.json>  bind a real UDP ingress/LB dataplane (VIP+backends+policy) and block\n\
      \x20 pillar bootstrap cell <name> --user <handle> [opts]  combined single-step cell+user bootstrap\n\
      \x20 pillar bootstrap node|user --domain <D> [opts]       submit a node/user join request\n\
      \x20 pillar bootstrap request list|approve <id> [--domain D]  review/decide join requests\n\

@@ -219,9 +219,12 @@ async fn select_backend<'a>(
 /// A deterministic, dependency-free hash of `key` into `[0, len)` — the same
 /// stable projection the manifest model's consistent-hash uses.
 fn consistent_hash(key: &str, len: usize) -> usize {
-    use std::collections::hash_map::DefaultHasher;
+    // LB backend-selection routing hash only (which backend a key lands on),
+    // never a security primitive — no content addressing, no signature, no
+    // integrity/authenticity claim rests on this value.
+    use std::collections::hash_map::DefaultHasher; // non-security: LB hash, not a security primitive
     use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
+    let mut h = DefaultHasher::new(); // non-security: LB hash, not a security primitive
     key.hash(&mut h);
     (h.finish() as usize) % len
 }

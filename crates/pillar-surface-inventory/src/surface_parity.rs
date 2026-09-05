@@ -118,6 +118,10 @@ pub static PARITY_MAP: &[ParityRule] = &[
         reason: "boots the node process (`pillar node run`); a lifecycle command with no in-portal action",
     },
     ParityRule::CliOnly {
+        verb: "ingress-lb-udp",
+        reason: "binds a real UDP ingress/LB dataplane and blocks (`pillar ingress-lb-udp serve <manifest>`); a lifecycle command with no in-portal action, same class as `node run`",
+    },
+    ParityRule::CliOnly {
         verb: "offer",
         reason: "operational-key offer seal/resolve is a library/CLI custody surface; the portal exposes custody via /portal/custody, not raw offers",
     },
@@ -172,6 +176,14 @@ pub static PARITY_MAP: &[ParityRule] = &[
     ParityRule::CliOnly {
         verb: "completion",
         reason: "shell-completion script generator; a local developer tool",
+    },
+    ParityRule::CliOnly {
+        verb: "apply-authz",
+        reason: "an in-process certify->trust->attest->revoke->RBAC-decider self-test rig; a local diagnostic, not a served action",
+    },
+    ParityRule::CliOnly {
+        verb: "versioning-rollout",
+        reason: "an in-process compat-negotiation/rolling-migration/readiness-gating/rollback self-test rig; a local diagnostic, not a served action",
     },
 
     // --- portal route families deliberately without a CLI verb -------------

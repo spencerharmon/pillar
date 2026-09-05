@@ -45,6 +45,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, args| node(args),
     },
     VerbSpec {
+        name: "ingress-lb-udp",
+        handler: |_v, args| ingress_lb_udp(args),
+    },
+    VerbSpec {
         name: "bootstrap",
         handler: |_v, args| bootstrap(args),
     },
@@ -412,6 +416,39 @@ fn cluster_stream(verb: &str, _args: &[String]) -> ExitCode {
     eprintln!("`pillar {verb} …` reads/acts over a live node's materialized substrate via the {module} library API.");
     eprintln!("Run `pillar --help` for the full verb list of this family.");
     ExitCode::from(2)
+}
+
+/// `pillar ingress-lb-udp serve <manifest.json>`: the real external surface
+/// wiring `pillar_net::UdpDataplane` into the published binary (see
+/// [`crate::ingress_lb_udp_serve`]). Binds the manifest's VIP, prints
+/// `LISTENING <ip:port>` on stdout, then blocks until interrupted.
+fn ingress_lb_udp(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("serve") => {
+            let Some(manifest_path) = args.get(1) else {
+                eprintln!("usage: pillar ingress-lb-udp serve <manifest.json>");
+                return ExitCode::from(2);
+            };
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to start async runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match runtime.block_on(crate::ingress_lb_udp_serve::serve(manifest_path)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("pillar ingress-lb-udp serve: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: pillar ingress-lb-udp serve <manifest.json>");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn node_run(args: &[String]) -> ExitCode {
