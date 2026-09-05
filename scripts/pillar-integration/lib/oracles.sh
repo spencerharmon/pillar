@@ -13,6 +13,10 @@
 #   crypto-realness   — the real crypto path runs end to end (the image's
 #                       `pillar onboard` drives real keygen/sign/trust and
 #                       fails closed on a forged/out-of-order step), not a stub.
+#   apply-authz       — the real trust/RBAC path (certify/trust/attest/revoke
+#                       over the real WoT-authority + RBAC-decider) DENIES an
+#                       unauthorized manifest `apply` with a real 403, and a
+#                       revoked grant flips a previously-allowed apply to denied.
 #   content-address   — (family stub) a content address resolves to its bytes.
 #   packet            — (family stub) packets observed on the wire.
 #   ciphertext        — (family stub) sealed payload decryptable only by a real
@@ -73,5 +77,43 @@ oracle_crypto_realness() {
             || fail "crypto oracle: real image onboard did not report '$step' ok:\n$out"
     done
     info "oracle-observed: crypto-realness real-image keygen/sign/trust/policy/fail-closed all ok (real crypto path)"
+    return 0
+}
+
+# oracle_apply_authz : assert the REAL trust/RBAC pipeline (certify -> trust ->
+# attest -> revoke over the real WoT-authority + RBAC-decider) rejects an
+# UNAUTHORIZED manifest `apply` with a real fail-closed 403 denial, observed
+# through the real image's `apply-authz` CLI verb — never a mocked check. The
+# verb fails closed (non-zero, without the `denied:`/`ok:` lines) if the real
+# decider WRONGLY admits the unauthorized apply, so observing the two `denied:
+# ... verdict=403` lines plus every `ok:` step is observing the real
+# authorization path deny an unauthorized apply.
+#
+# RED (a real failure) if an unauthorized apply is silently admitted: the verb
+# exits non-zero and this oracle fails. GREEN when the unauthorized apply — and
+# a revoked grant's apply — are both denied by the real decider.
+oracle_apply_authz() {
+    local out
+    out=$(driver_cli_exec apply-authz) \
+        || fail "apply-authz oracle: real image reported an unauthorized apply was ADMITTED (fail-closed 403 violated):\n$out"
+
+    # Every real trust/RBAC step must have reported ok:.
+    local step
+    for step in certify trust attest authorized-apply-allowed \
+                unauthorized-apply-denied revoke revoked-apply-denied; do
+        printf '%s\n' "$out" | grep -q "^ok: ${step}$" \
+            || fail "apply-authz oracle: real image did not report '$step' ok:\n$out"
+    done
+
+    # The decisive real effect: the UNGRANTED stranger's apply was denied with
+    # a real 403 by the real decider, and a revoked grant flipped a previously
+    # allowed apply to denied. Both must be observed as concrete `denied:`
+    # lines — not a bare return code.
+    printf '%s\n' "$out" | grep -q '^denied: apply subject=stranger-primary .*verdict=403' \
+        || fail "apply-authz oracle: no observed 403 denial of the unauthorized (stranger) apply:\n$out"
+    printf '%s\n' "$out" | grep -q '^denied: apply subject=operator-primary .*verdict=403 (grant revoked)' \
+        || fail "apply-authz oracle: no observed 403 denial of the revoked-grant apply:\n$out"
+
+    info "oracle-observed: apply-authz real decider DENIED unauthorized apply (stranger) and revoked-grant apply with 403 (real trust/RBAC path, fail-closed)"
     return 0
 }

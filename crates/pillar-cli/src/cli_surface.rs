@@ -57,6 +57,7 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec { name: "stream", handler: cluster_stream },
     VerbSpec { name: "render", handler: |_v, args| render(args) },
     VerbSpec { name: "onboard", handler: |_v, _args| onboard() },
+    VerbSpec { name: "apply-authz", handler: |_v, _args| apply_authz() },
     VerbSpec { name: "obs", handler: |_v, _args| obs() },
     VerbSpec { name: "apply", handler: live_platform_guidance },
     VerbSpec { name: "get", handler: live_platform_guidance },
@@ -154,6 +155,13 @@ fn onboard() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `pillar apply-authz`: drive the real certify->trust->attest->revoke
+/// pipeline and the real RBAC decider, proving an unauthorized manifest
+/// `apply` is rejected with a real fail-closed 403 (never a mock).
+fn apply_authz() -> ExitCode {
+    crate::trust_rbac_authz::run()
 }
 
 /// `pillar bootstrap …`.
