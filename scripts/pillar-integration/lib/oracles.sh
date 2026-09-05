@@ -105,6 +105,32 @@ oracle_secrets_audit_rotation_mfa() {
     return 0
 }
 
+# oracle_versioning_rollout : assert the real image's `versioning-rollout` CLI
+# verb runs end to end and reports every safety step ok — a mixed-version cell
+# rolling through a REAL compat-window negotiation (an out-of-window member
+# cleanly refused, never mis-linked), a rolling migration that loses NO data
+# across the cutover (the post-migration content-addressed Merkle root equals
+# the pre-migration one), a readiness gate that holds a mid-rollout node OUT of
+# service (503 not-ready) until its real health probe passes, and a rollback
+# that restores the prior version's op set CLEANLY. The command fails closed
+# (non-zero, no `ok:` line for the violated step) the instant any one invariant
+# does not hold, so observing all four `ok:` lines from the REAL published image
+# is observing the real versioning/migration/readiness/rollback path end to
+# end — never a stubbed return code, never linking a pillar crate.
+oracle_versioning_rollout() {
+    local out
+    out=$(driver_cli_exec versioning-rollout) \
+        || fail "versioning-rollout oracle: real image reported a violated invariant:\n$out"
+    local step
+    for step in compat-window-negotiation migration-no-data-loss \
+                readiness-gating-holds-node-out rollback-restores-prior-version; do
+        printf '%s\n' "$out" | grep -q "^ok: ${step}$" \
+            || fail "versioning-rollout oracle: real image did not report '$step' ok:\n$out"
+    done
+    info "oracle-observed: versioning-rollout real-image compat-window-negotiation (out-of-window refused), migration-no-data-loss (Merkle root survives cutover), readiness-gating-holds-node-out (503 until ready), rollback-restores-prior-version all ok (real compat/migration/readiness/rollback path)"
+    return 0
+}
+
 # oracle_streamdb_append <publisher-index> <op-value> <consumer-index...> :
 # assert a REAL append converges to the durable store of every consumer node.
 # The publisher node gossips <op-value> once to the event-log topic; each

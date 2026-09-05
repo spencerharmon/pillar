@@ -43,6 +43,7 @@ pub mod secrets_audit_rotation_mfa;
 pub mod session_cli;
 pub mod stream_cli;
 pub mod topology_cli;
+pub mod versioning_rollout;
 pub mod web_serve;
 pub mod webauthn_cli;
 pub mod workload_reconcile;
