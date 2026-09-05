@@ -218,3 +218,111 @@ oracle_ciphertext_no_leak() {
     info "oracle-observed: ciphertext-no-leak host response never contains the plaintext cell-key hex ($plaintext_hex) — host holds ciphertext+CID only, cannot decrypt"
     return 0
 }
+
+# oracle_seed_no_reconstruction <response> <guess...> : the adversarial-security
+# family's public-seed-reconstruction oracle. `response` is a real
+# `APPROVED bafy-cellkey-<sha256-hex>` line observed from the host's own
+# approve response (a real content address over the REAL sealed envelope
+# bytes, which include fresh AEAD randomness — never a deterministic hash of
+# public metadata). Each `guess` is a plausible public "seed" an attacker who
+# saw only the request's public fields (cell id, subject, request id) might
+# try as the preimage. Asserts NONE of the sha256 digests of those guesses
+# equals the real CID's digest — an attacker limited to public information
+# cannot reconstruct/predict the real content address by guessing.
+oracle_seed_no_reconstruction() {
+    local response="$1"; shift
+    local real_hex
+    real_hex=$(printf '%s\n' "$response" | grep -Eo 'bafy-cellkey-[0-9a-f]{64}' | sed 's/^bafy-cellkey-//')
+    [ -n "$real_hex" ] \
+        || fail "seed-reconstruction oracle: response '$response' carries no real content-addressed CID to test against"
+    local guess ghash
+    for guess in "$@"; do
+        ghash=$(printf '%s' "$guess" | sha256sum | cut -d' ' -f1)
+        if [ "$ghash" = "$real_hex" ]; then
+            fail "seed-reconstruction oracle: public-seed guess '$guess' RECONSTRUCTED the real CID digest $real_hex — the content address is guessable from public metadata"
+        fi
+    done
+    info "oracle-observed: seed-no-reconstruction real CID digest=$real_hex survives $# naive public-seed guess(es) unmatched (not reconstructible from public metadata; real sealed-envelope randomness required)"
+    return 0
+}
+
+# oracle_udp_no_amplification <host:port> : the adversarial-security family's
+# anti-amplification oracle against the REAL pillar-UDP dataplane transport
+# (`pillar_net::pillar_udp_transport`, the libp2p `…/udp/<port>/p-pillar`
+# substrate a real `pillar node run` process binds with a real
+# `tokio::net::UdpSocket` — see `crates/pillar-net/src/pillar_udp_transport.rs`).
+# Drives it with raw UDP datagrams from FRESH, never-before-seen source ports
+# (an unvalidated/"spoofable" client identity, exactly the return-routability
+# gate's threat model) and measures the REAL bytes reflected back — never a
+# return code:
+#
+#   1. a bare/garbage datagram (no valid frame, or a bare SYN) from a new,
+#      unvalidated source elicits ZERO reply bytes — the real listener never
+#      speaks first to an unvalidated peer, so an attacker gets no
+#      reflection to amplify at all.
+#   2. a well-formed DATA frame elicits exactly one ACK reply that is
+#      SMALLER than (or equal to) the request — never larger.
+#
+# Across every probe the total reflected bytes must never exceed the total
+# sent bytes (amplification factor <= 1x): fails closed the instant a future
+# regression lets an unvalidated/spoofed source draw a bigger reply than it
+# sent.
+oracle_udp_no_amplification() {
+    local addr="$1" host port
+    host="${addr%:*}"
+    port="${addr##*:}"
+    local out
+    out=$(python3 - "$host" "$port" <<'PYEOF'
+import socket, sys, time
+
+host, port = sys.argv[1], int(sys.argv[2])
+addr = (host, port)
+
+def frame(tag, seq, payload):
+    return bytes([tag]) + seq.to_bytes(8, "big") + len(payload).to_bytes(4, "big") + payload
+
+def probe(payload):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))  # a FRESH, never-before-seen source port each probe
+    sock.settimeout(1.5)
+    sock.sendto(payload, addr)
+    total = 0
+    packets = 0
+    deadline = time.time() + 1.2
+    try:
+        while time.time() < deadline:
+            data, _ = sock.recvfrom(4096)
+            total += len(data)
+            packets += 1
+    except socket.timeout:
+        pass
+    sock.close()
+    return len(payload), total, packets
+
+probes = [
+    ("bare-syn", frame(3, 0, b"")),
+    ("garbage-1B", b"\x99"),
+    ("garbage-64B", b"\x01" * 64),
+    ("valid-data-frame", frame(1, 0, b"adversarial-probe")),
+]
+
+total_sent = 0
+total_recv = 0
+for label, payload in probes:
+    sent, recv, packets = probe(payload)
+    total_sent += sent
+    total_recv += recv
+    print(f"PROBE {label} sent={sent} recv={recv} packets={packets}")
+
+print(f"TOTAL sent={total_sent} recv={total_recv}")
+print(f"OK={1 if total_recv <= total_sent else 0}")
+PYEOF
+    ) || fail "udp-amplification oracle: python3 probe against $addr failed to run"
+    printf '%s\n' "$out" | while IFS= read -r line; do info "udp-amplification: $line"; done
+    printf '%s\n' "$out" | grep -q '^OK=1$' \
+        || fail "udp-amplification oracle: total reflected bytes exceeded total sent bytes against $addr — real amplification observed:\n$out"
+    local totals
+    totals=$(printf '%s\n' "$out" | grep '^TOTAL ')
+    info "oracle-observed: udp-no-amplification addr=$addr $totals (reflected bytes never exceed sent bytes; unvalidated sources get zero reply)"
+    return 0
+}
