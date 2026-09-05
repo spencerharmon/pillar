@@ -689,17 +689,58 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
 
     // Streaming DB: the durable, content-addressed op store the controller
     // reconciles against, rooted under the data dir so ops survive a restart.
+    //
+    // The durability layer is the IPFS-backed content-object store
+    // ([`pillar_streamdb::IpfsPersistentStream`]), per the 2026-08-31 audit
+    // (non-negotiable #7): its pinned signed-segment chain + IPNS head are
+    // mirrored to the PVC-backed local pin store under `<data>/streamdb`, so a
+    // solo seed node rehydrates its whole op set from local disk after a
+    // restart/redeploy (it converges further with peers via op-sync/gossip).
+    //
+    // The segment-signing / IPNS-head key is derived DETERMINISTICALLY from the
+    // node's custody-held identity (the ed25519 keypair in identity.key) via a
+    // domain-separated seed. "Persistence follows crypto": the node's private
+    // key stays custody-held (never on disk in the store); the signing key is
+    // re-derived from it on every boot, so it need not itself be persisted or
+    // sealed — a restarting node recovers write capability from its own
+    // identity alone, matching the durability contract without a bespoke
+    // local-fs op-log.
     let streamdb_root = config.data_dir.join("streamdb");
-    let mut stream = pillar_streamdb::PersistentStream::open(&streamdb_root).map_err(|e| {
-        BootError::StreamDb {
-            path: streamdb_root.clone(),
-            reason: e.to_string(),
-        }
+    let identity_seed_material = {
+        let id_bytes = keypair
+            .to_protobuf_encoding()
+            .map_err(|e| BootError::Identity {
+                path: config.identity_key.clone(),
+                reason: format!("encode for streamdb-signer derivation: {e}"),
+            })?;
+        let mut m = b"pillar-streamdb/segment-signer/v1:".to_vec();
+        m.extend_from_slice(&id_bytes);
+        pillar_crypto::Seed::from_bytes(m)
+    };
+    let (signer_public, signer_secret) =
+        pillar_crypto::principal::principal_from_seed(&identity_seed_material).map_err(|e| {
+            BootError::StreamDb {
+                path: streamdb_root.clone(),
+                reason: format!("derive streamdb segment-signing key: {e}"),
+            }
+        })?;
+    let mut stream = pillar_streamdb::IpfsPersistentStream::open(
+        &streamdb_root,
+        signer_public.signing,
+        signer_secret.signing,
+        // The node's own op stream is cell-visibility: its head travels the
+        // private swarm's pubsub, never the public DHT.
+        pillar_streamdb::Visibility::Cell,
+    )
+    .map_err(|e| BootError::StreamDb {
+        path: streamdb_root.clone(),
+        reason: e.to_string(),
     })?;
     tracing::info!(
         streamdb_root = %streamdb_root.display(),
         ops = stream.stream().log().len(),
-        "pillar streaming DB opened (durable, content-addressed)"
+        durable = stream.store().is_durable(),
+        "pillar streaming DB opened (durable, IPFS-backed content-object store)"
     );
 
     // Readiness: at this point the identity keypair is loaded and the durable
@@ -841,13 +882,12 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // controller admission. The node's own controller subject is derived from
     // its stable identity peer id so the SAME subject reconciles across
     // restarts, and this node is the sole placement candidate in dev-mode.
-    let reconciler: crate::workload_reconcile::SharedReconciler =
-        std::sync::Arc::new(std::sync::Mutex::new(
-            crate::workload_reconcile::WorkloadReconciler::new(
-                peer_id.to_bytes().as_slice(),
-                pillar_core::NodeId::from(format!("{peer_id}").as_str()),
-            ),
-        ));
+    let reconciler: crate::workload_reconcile::SharedReconciler = std::sync::Arc::new(
+        std::sync::Mutex::new(crate::workload_reconcile::WorkloadReconciler::new(
+            peer_id.to_bytes().as_slice(),
+            pillar_core::NodeId::from(format!("{peer_id}").as_str()),
+        )),
+    );
     tracing::info!("pillar workload-runtime reconciler wired into the node");
 
     // Integration-rig-only hook (the SAME pattern as `PILLAR_TEST_PUBLISH`):

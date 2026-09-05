@@ -51,10 +51,41 @@ pub use store::{
 mod ipfs_persist;
 pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};
 
+/// A durable op-log both persistent stream implementations satisfy, so
+/// transport-level sync ([`pillar_net::apply_op_sync`]) can drive EITHER the
+/// local-fs [`PersistentStream`] or the IPFS-backed [`IpfsPersistentStream`]
+/// through one code path. It exposes exactly what op-sync needs: read the
+/// current op set, and admit a convergent op (persisting it through whichever
+/// durability layer backs the implementor).
+pub trait OpSyncTarget {
+    /// The current materialized op-log (for `have`/gap computation).
+    fn log(&self) -> &OpLog;
+    /// Append `payload` as a [`SideEffect::Convergent`] op, persisting it. A
+    /// policy refusal or durability fault leaves the set unchanged (the caller
+    /// re-reads [`OpSyncTarget::log`] to count what was actually admitted).
+    fn append_convergent(&mut self, payload: Vec<u8>);
+}
+
+impl OpSyncTarget for PersistentStream {
+    fn log(&self) -> &OpLog {
+        self.stream().log()
+    }
+    fn append_convergent(&mut self, payload: Vec<u8>) {
+        let _ = self.append(payload, SideEffect::Convergent);
+    }
+}
+
+impl OpSyncTarget for IpfsPersistentStream {
+    fn log(&self) -> &OpLog {
+        self.stream().log()
+    }
+    fn append_convergent(&mut self, payload: Vec<u8>) {
+        let _ = self.append(payload, SideEffect::Convergent);
+    }
+}
+
 pub mod geo_replication;
-pub use geo_replication::{
-    RemoteReplica, ReplicationError, ReplicationGrant, ReplicationTrust,
-};
+pub use geo_replication::{RemoteReplica, ReplicationError, ReplicationGrant, ReplicationTrust};
 
 /// A content address: the identity of an [`Op`], derived purely from its
 /// payload bytes via a **collision-resistant cryptographic** hash.
