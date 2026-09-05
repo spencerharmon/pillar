@@ -145,6 +145,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, _args| apply_authz(),
     },
     VerbSpec {
+        name: "versioning-rollout",
+        handler: |_v, _args| versioning_rollout(),
+    },
+    VerbSpec {
         name: "obs",
         handler: |_v, _args| obs(),
     },
@@ -277,6 +281,17 @@ fn onboard() -> ExitCode {
 /// [`crate::secrets_audit_rotation_mfa`]).
 fn secrets_audit_rotation_mfa() -> ExitCode {
     match crate::secrets_audit_rotation_mfa::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+/// `pillar versioning-rollout`: the compat-negotiation/rolling-migration/
+/// readiness-gating/rollback rig (see [`crate::versioning_rollout`]).
+fn versioning_rollout() -> ExitCode {
+    match crate::versioning_rollout::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
