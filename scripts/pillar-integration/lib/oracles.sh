@@ -555,3 +555,37 @@ PYEOF
     info "oracle-observed: udp-no-amplification addr=$addr $totals (reflected bytes never exceed sent bytes; unvalidated sources get zero reply)"
     return 0
 }
+
+# oracle_manifests_apply : assert the real manifest/CRD apply surface
+# (`pillar_manifest::apply::ManifestStore` + `ControllerRegistry` — the SAME
+# engine a `pillar node run` cell backs `pillar apply|get|delete` with, via
+# `pillar_cli`'s `ResourcePlane`) round-trips apply→get→delete for EVERY
+# declarable kind, plus routes a third-party CRD hook through the identical
+# plugin-interface path as a built-in kind. Today no `pillar apply|get|delete`
+# CLI verb operates against an in-process store in the published image's
+# throwaway binary (`cli_surface::live_platform_guidance` prints guidance and
+# exits 2 — the live cell backs those verbs), exactly as the ipam surface has
+# no CLI verb; so, like `oracle_ipam_operator`, this drives the REAL,
+# freshly-compiled `pillar-manifest`/`pillar-e2e` acceptance surface under test
+# (`--features acceptance`, never a mock) as the realness oracle. A failing
+# assertion means a kind's apply/get/delete round-trip SILENTLY NO-OPPED (an
+# applied object was not retrievable, or a deleted object was not gone) or the
+# third-party CRD hook diverged from the built-in dispatch/prune path — a real
+# logic effect the ROI's realness oracle demands (RED if any kind no-ops,
+# GREEN when every applied object is retrievable and deletable).
+oracle_manifests_apply() {
+    local out repo_root
+    repo_root="$(cd "$HERE/../.." && pwd)"
+    out=$(cd "$repo_root" && cargo test -p pillar-e2e --test manifests_apply_roundtrip --features acceptance 2>&1) \
+        || fail "manifests-apply oracle: the real manifest apply/get/delete acceptance suite failed:\n$out"
+
+    printf '%s\n' "$out" | grep -q "test every_declarable_kind_applies_gets_and_deletes ... ok" \
+        || fail "manifests-apply oracle: per-kind apply→get→delete round-trip assertion did not report ok (a kind silently no-opped):\n$out"
+    printf '%s\n' "$out" | grep -q "test every_registry_kind_is_covered_by_the_roundtrip ... ok" \
+        || fail "manifests-apply oracle: registry-coverage assertion did not report ok (a served kind has no round-trip):\n$out"
+    printf '%s\n' "$out" | grep -q "test a_third_party_crd_and_a_builtin_travel_the_same_controller_path ... ok" \
+        || fail "manifests-apply oracle: third-party-CRD/built-in shared-controller-path assertion did not report ok:\n$out"
+
+    info "oracle-observed: manifests-apply every declarable kind apply→get→delete round-trips (no silent no-op) AND a third-party CRD hook travels the same dispatch/prune path as a built-in (real compiled manifest engine)"
+    return 0
+}
