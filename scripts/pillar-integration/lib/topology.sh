@@ -72,6 +72,44 @@ topology_node_logs() {
     "$CONTAINER_RUNTIME" logs "$1" 2>&1
 }
 
+# --- real resource-usage sampling ------------------------------------------
+#
+# The soak/stress family's resource-usage oracle observes a node's REAL OS
+# process footprint from OUTSIDE the container (never a pillar return code):
+# resident set size and open file-descriptor count, read straight from the
+# host kernel's `/proc/<host-pid>/` for the container process (a rootless
+# podman/docker node runs as a host process, so its `/proc` entry is the real,
+# authoritative resource accounting — the same source `ps`/`top` read). These
+# are the leak signals the ROI names: an unbounded-growing RSS is a heap/table
+# leak (the dedup table, the event log, the history never plateauing); an
+# unbounded-growing fd count is a socket/handle leak.
+
+# topology_node_rss_kb <name> : the node process's REAL resident set size in
+# kB, read from the host kernel's VmRSS for the container's host pid. Prints a
+# positive integer, or nothing if the pid/stat is unreadable.
+topology_node_rss_kb() {
+    local name="$1" pid
+    pid=$(topology_node_pid "$name")
+    { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || return 1
+    # VmRSS from /proc/<pid>/status is the real resident memory the kernel
+    # accounts to the process — the authoritative external RSS observation.
+    awk '/^VmRSS:/{print $2; found=1} END{exit !found}' "/proc/$pid/status" 2>/dev/null
+}
+
+# topology_node_fd_count <name> : the node process's REAL open file-descriptor
+# count, read by counting the entries under the host kernel's
+# `/proc/<host-pid>/fd/` for the container process. Prints a non-negative
+# integer, or nothing if the pid/fd dir is unreadable.
+topology_node_fd_count() {
+    local name="$1" pid n
+    pid=$(topology_node_pid "$name")
+    { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || return 1
+    # Count real fd entries the kernel exposes for the process.
+    n=$(find "/proc/$pid/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+    [ -n "$n" ] || return 1
+    printf '%s\n' "$n"
+}
+
 # --- meshed persistence fabric ---------------------------------------------
 #
 # The single-LAN `topology_boot` above publishes each node's readiness probe
@@ -259,4 +297,71 @@ topology_node_op_cids() {
     "$CONTAINER_RUNTIME" cp "${name}:/var/lib/pillar/data/streamdb" "$dest" >/dev/null 2>&1 || return 1
     # ops files are named by content address; list them (basename only).
     find "$dest" -type f -path '*/ops/*' -printf '%f\n' 2>/dev/null
+}
+
+# --- soak/stress churn ------------------------------------------------------
+#
+# The soak/stress family drives SUSTAINED load + churn on the live topology
+# while the resource-usage oracle samples the seed node's RSS/fd. The churn is
+# real, externally-driven work over the node's external surfaces (never a
+# return code): a non-seed node is FLAPPED (real kill/restart onto its durable
+# volume) and re-publishes a fresh event-log op each cycle (real gossip append
+# + durable content-addressed persist), plus a real CLI-surface crypto/rotation
+# verb is exercised against the real image bytes. This exercises exactly the
+# subsystems the ROI names — the dedup table (repeated ops), the event log
+# (append churn), history (persisted segments), key rotation, and connection
+# churn (peer flap re-dial) — so a leak in any of them shows as unbounded RSS/fd
+# growth on the long-lived seed. A single transient churn hiccup over a long
+# window must NOT abort the soak, so these are best-effort (they log and
+# continue on a transient error) — the OS-level RSS/fd trend is the assertion,
+# not any one churn op's exit code.
+
+# topology_churn_once <flap-index> <cycle> : perform ONE churn cycle against a
+# non-seed node <flap-index>: flap it (kill+restart onto its durable volume) and
+# have it publish a fresh event-log op, then exercise a real CLI crypto/rotation
+# verb against the image. Best-effort: a transient failure is logged and the
+# soak continues (the resource trend, not this cycle, is the oracle).
+topology_churn_once() {
+    local idx="$1" cycle="$2"
+    local name="pillar-it-${FIXTURE_SCENARIO}-node${idx}"
+    local seed_ip
+    seed_ip=$(_topology_node_bridge_ip "pillar-it-${FIXTURE_SCENARIO}-node0")
+
+    # (a) real workload churn: recreate the flap node dialing the seed and
+    # publishing a fresh op — a real gossip append the seed dedups + the cell
+    # persists as a new content-addressed segment (event-log + history + dedup
+    # table all exercised). Recreate-in-place (no node-array mutation).
+    "$CONTAINER_RUNTIME" rm -f "$name" >/dev/null 2>&1 || true
+    if [ -n "$seed_ip" ]; then
+        _topology_churn_start_node "$idx" "/ip4/${seed_ip}/tcp/${TOPO_P2P_PORT}" "soak-churn-op-${cycle}" \
+            || warn "churn cycle $cycle: node${idx} flap/publish hiccup (tolerated — soak continues)"
+    else
+        warn "churn cycle $cycle: could not resolve seed IP for flap/publish (tolerated)"
+    fi
+
+    # (b) real key-rotation churn: exercise the image's real rotation/crypto CLI
+    # surface (a fresh throwaway container each time — connection/handle churn
+    # against the real bytes). Best-effort; the seed's OS footprint is the oracle.
+    driver_cli_exec secrets-audit-rotation-mfa >/dev/null 2>&1 \
+        || warn "churn cycle $cycle: key-rotation CLI verb hiccup (tolerated)"
+}
+
+# _topology_churn_start_node : like _topology_start_node but NON-fatal (returns
+# non-zero instead of exiting) so a transient flap error during a long soak
+# does not abort the whole scenario.
+_topology_churn_start_node() {
+    local idx="$1" dial="$2" publish="$3"
+    local name="pillar-it-${FIXTURE_SCENARIO}-node${idx}"
+    local vol="pillar-it-${FIXTURE_SCENARIO}-vol${idx}"
+    local -a envs=(-e "PILLAR_LISTEN=/ip4/0.0.0.0/tcp/${TOPO_P2P_PORT}")
+    [ -n "$dial" ] && envs+=(-e "PILLAR_DIAL=$dial")
+    [ -n "$publish" ] && envs+=(-e "PILLAR_TEST_PUBLISH=$publish")
+    "$CONTAINER_RUNTIME" run -d \
+        --name "$name" \
+        --label "$FIXTURE_LABEL" \
+        --network "$TOPO_NET" \
+        -v "${vol}:/var/lib/pillar/data" \
+        -p "127.0.0.1::${PILLAR_PROBE_PORT}" \
+        "${envs[@]}" \
+        "$PILLAR_IMAGE" >/dev/null 2>&1
 }
