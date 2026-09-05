@@ -44,6 +44,7 @@ fn usage() -> &'static str {
      \x20 pillar audit <cid>                                      proof chain + sentence (identity_trust_cli::AuditCli)\n\
      \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
+     \x20 pillar secrets-audit-rotation-mfa          seal/read a secret, signed-audit + forged-key rejection, key rotation, step-up MFA\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
      \x20 pillar render kustomize <base.txt>        (see library API for overlay construction)\n\
      \x20 pillar --web [--port N]                  serve the localhost-only bootstrap/web UI\n\

@@ -79,6 +79,32 @@ oracle_crypto_realness() {
     return 0
 }
 
+# oracle_secrets_audit_rotation_mfa : assert the real image's
+# `secrets-audit-rotation-mfa` CLI verb runs end to end and reports every
+# safety step ok — sealing+reading a secret through the real sealed-secret-
+# store (argon2id+AEAD, wrong password refused), a privileged action's
+# audit-log entry authenticating as a REAL signed event while a forged
+# (wrong-key) one is rejected, a key rotation revoking the old id's access,
+# and a privileged signing recovery refused without a fresh step-up (MFA)
+# token. The command fails closed (non-zero, no `ok:` line for the violated
+# step) the instant any one of those invariants does not hold, so observing
+# all four `ok:` lines from the REAL published image is observing the real
+# secrets/audit/rotation/MFA effect end to end — never a stubbed return code.
+oracle_secrets_audit_rotation_mfa() {
+    local out
+    out=$(driver_cli_exec secrets-audit-rotation-mfa) \
+        || fail "secrets-audit-rotation-mfa oracle: real image reported a violated invariant:\n$out"
+    local step
+    for step in seal-and-read-secret audit-log-signed-forged-rejected \
+                key-rotation-revokes-old-access \
+                stepup-mfa-required-for-privileged-action; do
+        printf '%s\n' "$out" | grep -q "^ok: ${step}$" \
+            || fail "secrets-audit-rotation-mfa oracle: real image did not report '$step' ok:\n$out"
+    done
+    info "oracle-observed: secrets-audit-rotation-mfa real-image seal/read-secret, signed-audit+forged-rejected, key-rotation-revokes-old, stepup-mfa-required all ok (real sealed-secret-store/audit-log/rotation/MFA path)"
+    return 0
+}
+
 # oracle_streamdb_append <publisher-index> <op-value> <consumer-index...> :
 # assert a REAL append converges to the durable store of every consumer node.
 # The publisher node gossips <op-value> once to the event-log topic; each
