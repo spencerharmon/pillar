@@ -3142,9 +3142,11 @@ dependencies = [
  "pillar-ipam",
  "pillar-manifest",
  "pillar-net",
+ "pillar-observability",
  "pillar-streamdb",
  "pillar-surface-inventory",
  "pillar-topology",
+ "pillar-web",
  "tokio",
 ]
 

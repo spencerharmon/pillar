@@ -178,6 +178,8 @@ use pillar_manifest::{
     Crd, FieldType, Metadata as CrdMetadata, Schema, SchemaRegistry, Value as CrdValue,
 };
 use pillar_observability::SignalKind;
+use pillar_observability::{LiveObservabilitySubstrate, DEFAULT_EVAL_TIER};
+use std::sync::{Arc, Mutex};
 use pillar_topology::{
     Assignment as TopologyAssignment, Label as TopologyLabel, Mismatch as TopologyMismatch,
     TierHierarchy, Topology as TopologyRegistry, ATTEST_ACTION as TOPOLOGY_ATTEST_ACTION,
@@ -342,7 +344,21 @@ pub struct WebAuthContext {
     /// No server-side database: the record store is in-process, exactly like
     /// every other portal substrate here.
     webauthn_rp: PillarRelyingParty,
+    /// The node's LIVE observability substrate (ROI "pillar-integration"
+    /// observability-psl prerequisite), shared with the running controller
+    /// loop that feeds all five producers. `None` on a node that opened its
+    /// web surface without a running node substrate (e.g. an unbootstrapped
+    /// portal). When `Some`, the `/portal/obs/live/*` endpoints query PSL,
+    /// evaluate recording rules + alerts, and materialize dashboards over the
+    /// SAME live store the controller loop writes — never the empty internal
+    /// builder store above.
+    live_obs: Option<SharedLiveObs>,
 }
+
+/// A thread-shared handle to the node's live observability substrate: the
+/// controller loop and the web server both hold a clone and take the lock only
+/// briefly (a periodic sample / one query), so neither starves the other.
+pub type SharedLiveObs = Arc<Mutex<LiveObservabilitySubstrate>>;
 
 /// One handle's custody record, as the key & offer UI renders/drives it: the
 /// current holder node, the offer's [`TrustCid`], whether it is currently
@@ -498,7 +514,18 @@ impl WebAuthContext {
             topology_nodes: BTreeMap::new(),
             observability: ObservabilityBuilders::new(),
             webauthn_rp: PillarRelyingParty::new(),
+            live_obs: None,
         }
+    }
+
+    /// Attach the node's LIVE observability substrate (shared with the running
+    /// controller loop that feeds all five producers), enabling the
+    /// `/portal/obs/live/*` endpoints to query PSL, evaluate recording rules +
+    /// alerts, and materialize dashboards over the SAME live store.
+    #[must_use]
+    pub fn with_live_observability(mut self, live: SharedLiveObs) -> Self {
+        self.live_obs = Some(live);
+        self
     }
 
     /// Inject this node's real identity/reachability snapshot (PeerId, listen
@@ -634,9 +661,237 @@ impl WebAuthContext {
         body
     }
 
+    /// Whether this node exposes a live observability substrate (a running
+    /// `node run` shared its store with the portal).
+    #[must_use]
+    pub fn has_live_observability(&self) -> bool {
+        self.live_obs.is_some()
+    }
+
+    /// Live-store `explore` for `kind`: every real signal of that kind the
+    /// running node's producers have ingested, rendered as
+    /// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` lines. `None` when no live
+    /// substrate is attached. A pure read — signs nothing.
+    pub fn live_obs_explore(&self, kind: SignalKind) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut body = String::new();
+        for r in sub.explore(kind) {
+            body.push_str(&format!(
+                "SIGNAL {} KIND {} PAYLOAD {}\n",
+                r.id.0,
+                signal_kind_tag(r.kind),
+                r.payload
+            ));
+        }
+        Some(body)
+    }
+
+    /// The per-kind counts of really-ingested signals in the live store,
+    /// rendered as `KIND <kind> COUNT <n>` lines (one per kind observed) — the
+    /// black-box "all five kinds really ingested" probe. `None` when no live
+    /// substrate is attached.
+    pub fn live_obs_kinds(&self) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut body = String::new();
+        for kind in [
+            SignalKind::Metric,
+            SignalKind::Log,
+            SignalKind::TraceSpan,
+            SignalKind::ProfileSample,
+            SignalKind::MetadataSample,
+        ] {
+            body.push_str(&format!(
+                "KIND {} COUNT {}\n",
+                signal_kind_tag(kind),
+                sub.count_of_kind(kind)
+            ));
+        }
+        Some(body)
+    }
+
+    /// Run a PSL query (`query_text`) against the LIVE store as of the node's
+    /// current logical clock, returning the matched signals rendered as
+    /// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` lines, and any correlate
+    /// groups as `GROUP <anchor> MEMBERS <id,id,...>` lines. `Err` carries a
+    /// parse/exec error message; `None` when no live substrate is attached. A
+    /// pure read — signs nothing.
+    pub fn live_obs_psl(&self, query_text: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let query = match pillar_observability::parse_psl(query_text) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+        };
+        // Query as of "now" = the highest write tick observed, so a relative
+        // range covers every ingested signal regardless of wall clock.
+        let now = sub.latest_tick();
+        let mut body = String::new();
+        for r in sub.psl_query(&query, now) {
+            body.push_str(&format!(
+                "SIGNAL {} KIND {} PAYLOAD {}\n",
+                r.id.0,
+                signal_kind_tag(r.kind),
+                r.payload
+            ));
+        }
+        for (anchor, members) in sub.psl_correlate(&query, now) {
+            let ids = members
+                .iter()
+                .map(|m| m.to_hex())
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!("GROUP {} MEMBERS {}\n", anchor.0, ids));
+        }
+        Some(Ok(body))
+    }
+
+    /// Register + evaluate a recording rule over the LIVE store in one shot
+    /// (the black-box driver's "install this rule and fire it" action): parse
+    /// `spec` as `<rule-id>|<kind>|<psl-query>|<emit-name>`, register it, then
+    /// evaluate it now, returning `RULE <id> FIRED <bool> EMITTED <n>` plus the
+    /// derived series as `DERIVED <v> ...`. `None` when no live substrate is
+    /// attached; `Err` on a bad spec / evaluation error.
+    pub fn live_obs_recording(&self, spec: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let mut sub = live.lock().expect("live observability lock");
+        let parts: Vec<&str> = spec.split('|').collect();
+        let [id, kind_tok, psl, emit] = parts.as_slice() else {
+            return Some(Err("RULE-SPEC expected <id>|<kind>|<psl>|<emit>".to_owned()));
+        };
+        let rule_kind = match *kind_tok {
+            "log-count" => pillar_observability::RuleKind::LogsToMetrics,
+            "trace-count" => pillar_observability::RuleKind::TracesToMetrics,
+            "metric-count" => pillar_observability::RuleKind::MetricsToMetrics,
+            other => return Some(Err(format!("RULE-KIND unknown {other}"))),
+        };
+        let query = match pillar_observability::parse_psl(psl) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+        };
+        let rule = match pillar_observability::RecordingRule::new(
+            *id,
+            rule_kind,
+            query,
+            pillar_observability::psl::Aggregate::Count,
+            Vec::new(),
+            *emit,
+            DEFAULT_EVAL_TIER,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(format!("RULE-BUILD {e:?}"))),
+        };
+        sub.register_rule(rule);
+        let now = sub.latest_tick();
+        match sub.evaluate_rule(id, DEFAULT_EVAL_TIER, now) {
+            Ok(ev) => {
+                let derived = sub.derived_series(id);
+                let mut body = format!(
+                    "RULE {id} FIRED {} EMITTED {}\n",
+                    ev.fired,
+                    ev.emitted.len()
+                );
+                let vals = derived
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                body.push_str(&format!("DERIVED {vals}\n"));
+                Some(Ok(body))
+            }
+            Err(e) => Some(Err(format!("RULE-EVAL {e:?}"))),
+        }
+    }
+
+    /// Register + evaluate an alert over the LIVE store in one shot: parse
+    /// `spec` as `<alert-id>|<psl-query>|<gt|lt>|<threshold>`, register it, and
+    /// evaluate it now, returning one `ALERT <id> VALUE <v>` line per fired
+    /// notification (empty body = no notification tripped). `None` when no live
+    /// substrate is attached; `Err` on a bad spec / evaluation error.
+    pub fn live_obs_alert(&self, spec: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let mut sub = live.lock().expect("live observability lock");
+        let parts: Vec<&str> = spec.split('|').collect();
+        let [id, psl, op, threshold] = parts.as_slice() else {
+            return Some(Err(
+                "ALERT-SPEC expected <id>|<psl>|<gt|lt>|<threshold>".to_owned(),
+            ));
+        };
+        let thr: f64 = match threshold.parse() {
+            Ok(t) => t,
+            Err(_) => return Some(Err(format!("ALERT-THRESHOLD not a number {threshold}"))),
+        };
+        let predicate = match *op {
+            "gt" => pillar_observability::AlertPredicate::GreaterThan(thr),
+            "lt" => pillar_observability::AlertPredicate::LessThan(thr),
+            other => return Some(Err(format!("ALERT-OP unknown {other}"))),
+        };
+        let query = match pillar_observability::parse_psl(psl) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+        };
+        let alert = match pillar_observability::Alert::new(
+            *id,
+            query,
+            pillar_observability::psl::Aggregate::Count,
+            Vec::new(),
+            predicate,
+            DEFAULT_EVAL_TIER,
+        ) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(format!("ALERT-BUILD {e:?}"))),
+        };
+        sub.register_alert(alert);
+        let now = sub.latest_tick();
+        match sub.evaluate_alert(id, DEFAULT_EVAL_TIER, now) {
+            Ok(notifs) => {
+                let mut body = String::new();
+                for n in notifs {
+                    body.push_str(&format!("ALERT {} VALUE {}\n", n.alert_id, n.value));
+                }
+                Some(Ok(body))
+            }
+            Err(e) => Some(Err(format!("ALERT-EVAL {e:?}"))),
+        }
+    }
+
+    /// Materialize a dashboard from the LIVE store: `spec` is a list of
+    /// `<panel-name>=<psl-query>` panels separated by newlines. Renders, per
+    /// panel, a `PANEL <name> COUNT <n>` header line followed by the panel's
+    /// matched `SIGNAL ...` lines — the dashboard's real materialized views.
+    /// `None` when no live substrate is attached; `Err` on a bad panel query.
+    pub fn live_obs_dashboard_materialize(&self, spec: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut panels = Vec::new();
+        for line in spec.lines().filter(|l| !l.trim().is_empty()) {
+            let Some((name, psl)) = line.split_once('=') else {
+                return Some(Err(format!("PANEL expected <name>=<psl>: {line}")));
+            };
+            let query = match pillar_observability::parse_psl(psl.trim()) {
+                Ok(q) => q,
+                Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+            };
+            panels.push((name.trim().to_owned(), query));
+        }
+        let mut body = String::new();
+        for (name, records) in sub.materialize_dashboard(&panels, sub.latest_tick()) {
+            body.push_str(&format!("PANEL {} COUNT {}\n", name, records.len()));
+            for r in records {
+                body.push_str(&format!(
+                    "SIGNAL {} KIND {} PAYLOAD {}\n",
+                    r.id.0,
+                    signal_kind_tag(r.kind),
+                    r.payload
+                ));
+            }
+        }
+        Some(Ok(body))
+    }
+
     /// Persist a named observability dashboard as ONE signed, content-addressed
     /// streaming-DB resource (the SAME no-server-side-database pattern
-    /// [`Self::store_layout`] uses for UI layouts): returns the resource's CID
     /// and the dashboard log's new streaming tip. The portal only ever calls
     /// this for an admitted session (`signer` is that session's handle).
     pub fn save_observability_dashboard(
@@ -1970,6 +2225,12 @@ pub static ROUTES: &[RouteSpec] = &[
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/sessions/revoke-all"), handler: |ctx, _peer, request| dispatch_sessions_revoke_all(ctx, request) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/attestations/build"), handler: |ctx, _peer, request| dispatch_attestation_build(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Exact("/portal/trust-graph"), handler: |ctx, _peer, request| dispatch_trust_graph_view(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/kinds"), handler: |ctx, _peer, request| dispatch_obs_live_kinds(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/explore"), handler: |ctx, _peer, request| dispatch_obs_live_explore(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/query"), handler: |ctx, _peer, request| dispatch_obs_live_query(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/recording"), handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/alert"), handler: |ctx, _peer, request| dispatch_obs_live_alert(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/dashboard"), handler: |ctx, _peer, request| dispatch_obs_live_dashboard(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/tree"), handler: |ctx, _peer, request| dispatch_topology_tree(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/mismatches"), handler: |ctx, _peer, request| dispatch_topology_mismatches(ctx, request) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/declare"), handler: |ctx, _peer, request| dispatch_topology_label_declare(ctx, request) },
@@ -2744,6 +3005,109 @@ fn dispatch_obs_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) -> Ht
     }
     let (cid, tip) = ctx.save_observability_dashboard(&session.subject.to_string(), name, spec);
     text_response(200, "OK", format!("OBS-DASHBOARD-CID {cid} TIP {tip}"))
+}
+
+/// Live-store per-kind counts: `GET /portal/obs/live/kinds?token=<s>`.
+/// Requires an admitted session and an attached live substrate. A pure view.
+fn dispatch_obs_live_kinds(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_kinds() {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store explore: `GET /portal/obs/live/explore?token=<s>&kind=<k>`.
+/// Requires an admitted session and an attached live substrate. A pure view.
+fn dispatch_obs_live_explore(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(kind) = parse_signal_kind(query_value(&request.path, "kind").unwrap_or("metric"))
+    else {
+        return text_response(400, "Bad Request", "BAD kind".to_owned());
+    };
+    match ctx.live_obs_explore(kind) {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store PSL query: `POST /portal/obs/live/query`, body
+/// `<token>\n<psl-query-text>`. Requires an admitted session + live substrate.
+/// A pure read — signs nothing.
+fn dispatch_obs_live_query(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_psl(&rest) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store recording-rule register+evaluate: `POST
+/// /portal/obs/live/recording`, body `<token>\n<id>|<kind>|<psl>|<emit>`.
+/// Evaluates the rule on the node's real scheduler engine over the live store,
+/// writing derived metrics back into it. Requires an admitted session + live
+/// substrate.
+fn dispatch_obs_live_recording(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_recording(rest.trim()) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store alert register+evaluate: `POST /portal/obs/live/alert`, body
+/// `<token>\n<id>|<psl>|<gt|lt>|<threshold>`. Fires notifications for every
+/// group tripping the predicate over the live store. Requires an admitted
+/// session + live substrate.
+fn dispatch_obs_live_alert(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_alert(rest.trim()) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store dashboard materialization: `POST /portal/obs/live/dashboard`,
+/// body `<token>\n<name>=<psl>\n<name>=<psl>...`. Renders each panel's real
+/// matched signals off the live store. Requires an admitted session + live
+/// substrate. A pure read.
+fn dispatch_obs_live_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_dashboard_materialize(&rest) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Split a `<token>\n<rest...>` request body into the first-line token and the
+/// remaining body (the shared framing every `/portal/obs/live/*` POST uses).
+fn split_token_body(body: &str) -> (String, String) {
+    match body.split_once('\n') {
+        Some((tok, rest)) => (tok.trim().to_owned(), rest.to_owned()),
+        None => (body.trim().to_owned(), String::new()),
+    }
 }
 
 /// The topology explorer tree: `GET

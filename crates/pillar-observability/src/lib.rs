@@ -41,9 +41,11 @@
 #![forbid(unsafe_code)]
 
 pub mod alerting;
+pub use alerting::{Alert, AlertEngine, AlertError, AlertPredicate, Notification, Notifier, RecordingNotifier};
 pub mod block;
 pub mod correlation;
 pub mod ingest;
+pub mod live;
 pub mod logs;
 pub mod metadata;
 pub mod metadata_index;
@@ -63,6 +65,7 @@ pub use block::{Signal, SignalId, SignalKind, TimeseriesBlock, TimeseriesStore, 
 pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
 pub use ingest::{MetricKind, MetricSource, MetricsProducer, NodeCounters, NodeMetricSource};
 pub use logs::{LogEvent, LogLevel, LogProducer};
+pub use live::{LiveObservabilitySubstrate, LiveRecord, DEFAULT_EVAL_TIER};
 pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };
