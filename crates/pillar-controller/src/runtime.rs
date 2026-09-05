@@ -44,7 +44,9 @@ pub enum RuntimeError {
 impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RuntimeError::Stage(e) => write!(f, "failed to stage workload image as executable: {e}"),
+            RuntimeError::Stage(e) => {
+                write!(f, "failed to stage workload image as executable: {e}")
+            }
             RuntimeError::Spawn(e) => write!(f, "failed to spawn workload process: {e}"),
             RuntimeError::Supervise(e) => write!(f, "failed to supervise workload process: {e}"),
         }
@@ -115,6 +117,20 @@ impl SupervisedWorkload {
             Some(_exit_status) => Ok(false),
             None => Ok(true),
         }
+    }
+
+    /// Wait for the child to actually exit and report whether it exited
+    /// SUCCESSFULLY (a real process exit status of 0). Used by the scheduler
+    /// node runtime to report a real job process's true exit back into the
+    /// scheduler engine (`succeed`/`fail`) — never a modeled transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Supervise`] if the child's exit cannot be
+    /// awaited.
+    pub async fn wait_success(&mut self) -> Result<bool, RuntimeError> {
+        let status = self.child.wait().await.map_err(RuntimeError::Supervise)?;
+        Ok(status.success())
     }
 
     /// Terminate the supervised child and wait for it to actually exit —

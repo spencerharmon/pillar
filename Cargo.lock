@@ -3088,6 +3088,7 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-identity",
+ "pillar-manifest",
  "pillar-net",
  "pillar-streamdb",
  "pillar-topology",

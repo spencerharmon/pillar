@@ -79,8 +79,10 @@ use pillar_streamdb::View;
 
 pub mod deployment;
 pub mod runtime;
+pub mod scheduler_runtime;
 pub use deployment::{Deployment, DeploymentReplica, DeploymentSpec, RestartPolicy};
 pub use runtime::{RuntimeError, SupervisedWorkload};
+pub use scheduler_runtime::{job_run_log_line, RunRecord, SchedulerRuntime};
 
 /// A declared resource a [`ResourceReconciler`] can reconcile: the plugin
 /// interface's extension point.
