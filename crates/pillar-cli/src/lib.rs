@@ -44,6 +44,7 @@ pub mod session_cli;
 pub mod stream_cli;
 pub mod surface_inventory;
 pub mod topology_cli;
+pub mod trust_rbac_authz;
 pub mod web_serve;
 pub mod webauthn_cli;
 pub mod workload_reconcile;

@@ -141,6 +141,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, _args| secrets_audit_rotation_mfa(),
     },
     VerbSpec {
+        name: "apply-authz",
+        handler: |_v, _args| apply_authz(),
+    },
+    VerbSpec {
         name: "obs",
         handler: |_v, _args| obs(),
     },
@@ -279,6 +283,13 @@ fn secrets_audit_rotation_mfa() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `pillar apply-authz`: drive the real certify->trust->attest->revoke
+/// pipeline and the real RBAC decider, proving an unauthorized manifest
+/// `apply` is rejected with a real fail-closed 403 (never a mock).
+fn apply_authz() -> ExitCode {
+    crate::trust_rbac_authz::run()
 }
 
 /// `pillar bootstrap …`.
