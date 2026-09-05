@@ -345,3 +345,105 @@ oracle_ipam_operator() {
     info "oracle-observed: ipam-operator double-allocation-rejected AND multi-site topology-scoped-selection both ok (real compiled operator surface)"
     return 0
 }
+
+# oracle_resource_usage <seed-index> <flap-index> <cycles> <sample-every> :
+# the soak/stress family's RESOURCE-USAGE oracle. Over an extended budget of
+# <cycles> churn cycles it drives SUSTAINED load + churn on the live topology
+# (a non-seed node flapped + re-publishing a fresh op each cycle, plus a real
+# key-rotation CLI verb — `topology_churn_once`) while SAMPLING the long-lived
+# seed node's REAL OS process footprint — resident set size (VmRSS) and open
+# file-descriptor count, read from the host kernel's `/proc/<host-pid>/` for the
+# container process (`topology_node_rss_kb` / `topology_node_fd_count`) — every
+# <sample-every> cycles. It then asserts NO UNBOUNDED GROWTH across the soak
+# window: the mean of the LATER half of samples must not exceed the mean of the
+# EARLIER half by more than a bounded tolerance for EITHER RSS or fd — i.e. the
+# resource must have PLATEAUED, not grown without bound. This is the leak the
+# ROI names (the dedup table / event log / history growing forever), caught only
+# by a sustained soak: RED if a monitored resource grows unbounded across the
+# window, GREEN when it plateaus. The observation is a real external OS artifact
+# (kernel-accounted memory + fd table), never a pillar return code.
+#
+# Tolerances (overridable): RSS may drift up to PILLAR_IT_SOAK_RSS_TOL_PCT
+# percent (default 40) between the window halves — real allocators, caches, and
+# arena growth plateau to a bounded steady state, so a modest bounded rise is
+# healthy; a genuine leak blows well past this over the window. fd count may
+# rise by at most PILLAR_IT_SOAK_FD_TOL (default 8) descriptors — an fd/socket/
+# handle leak is strictly monotonic and unbounded, so even a small sustained
+# rise is suspect while a bounded working set is not.
+oracle_resource_usage() {
+    local seed="$1" flap="$2" cycles="$3" every="$4"
+    local seed_name="pillar-it-${FIXTURE_SCENARIO}-node${seed}"
+    local rss_tol_pct="${PILLAR_IT_SOAK_RSS_TOL_PCT:-40}"
+    local fd_tol="${PILLAR_IT_SOAK_FD_TOL:-8}"
+
+    # Require a real, readable baseline BEFORE churn — proves the OS-level
+    # observation source works (host /proc for the container pid) rather than
+    # silently sampling nothing.
+    local base_rss base_fd
+    base_rss=$(topology_node_rss_kb "$seed_name") \
+        || fail "resource-usage oracle: could not read seed node $seed_name RSS from host /proc (no external observation source)"
+    base_fd=$(topology_node_fd_count "$seed_name") \
+        || fail "resource-usage oracle: could not read seed node $seed_name fd count from host /proc"
+    { [ -n "$base_rss" ] && [ "$base_rss" -gt 0 ] 2>/dev/null; } \
+        || fail "resource-usage oracle: seed baseline RSS is not a positive kB value (got '$base_rss')"
+    { [ -n "$base_fd" ] && [ "$base_fd" -gt 0 ] 2>/dev/null; } \
+        || fail "resource-usage oracle: seed baseline fd count is not positive (got '$base_fd')"
+    info "oracle-observed: resource-baseline seed=$seed_name RSS=${base_rss}kB fd=${base_fd} (real host /proc accounting)"
+
+    # Drive the soak: churn every cycle, sample the seed's real footprint every
+    # <every> cycles into ordered sample lists.
+    local -a rss_samples=() fd_samples=()
+    local c rss fd
+    for c in $(seq 1 "$cycles"); do
+        topology_churn_once "$flap" "$c"
+        if [ $(( c % every )) -eq 0 ]; then
+            rss=$(topology_node_rss_kb "$seed_name")
+            fd=$(topology_node_fd_count "$seed_name")
+            if [ -n "$rss" ] && [ "$rss" -gt 0 ] 2>/dev/null \
+               && [ -n "$fd" ] && [ "$fd" -gt 0 ] 2>/dev/null; then
+                rss_samples+=("$rss")
+                fd_samples+=("$fd")
+                info "soak-sample cycle=$c seed RSS=${rss}kB fd=${fd}"
+            else
+                warn "soak-sample cycle=$c: seed footprint unreadable this tick (tolerated)"
+            fi
+        fi
+    done
+
+    local nsamp="${#rss_samples[@]}"
+    [ "$nsamp" -ge 4 ] \
+        || fail "resource-usage oracle: only $nsamp usable samples over the soak window (need >=4 to compare window halves) — the seed process footprint was not observable across the run"
+
+    # Split the ordered samples into an EARLY half and a LATE half; compare
+    # their means. Unbounded growth = the late half's mean is materially above
+    # the early half's; a plateau = the two halves are within tolerance.
+    local half=$(( nsamp / 2 ))
+    local early_rss_sum=0 late_rss_sum=0 early_fd_sum=0 late_fd_sum=0 i
+    for i in $(seq 0 $(( half - 1 ))); do
+        early_rss_sum=$(( early_rss_sum + rss_samples[i] ))
+        early_fd_sum=$(( early_fd_sum + fd_samples[i] ))
+    done
+    for i in $(seq "$half" $(( nsamp - 1 ))); do
+        late_rss_sum=$(( late_rss_sum + rss_samples[i] ))
+        late_fd_sum=$(( late_fd_sum + fd_samples[i] ))
+    done
+    local early_n="$half" late_n=$(( nsamp - half ))
+    local early_rss_mean=$(( early_rss_sum / early_n )) late_rss_mean=$(( late_rss_sum / late_n ))
+    local early_fd_mean=$(( early_fd_sum / early_n )) late_fd_mean=$(( late_fd_sum / late_n ))
+
+    # RSS plateau: the late-half mean may exceed the early-half mean by at most
+    # rss_tol_pct percent. Integer math: late*100 <= early*(100+tol).
+    local rss_bound=$(( early_rss_mean * (100 + rss_tol_pct) ))
+    local rss_late_scaled=$(( late_rss_mean * 100 ))
+    if [ "$rss_late_scaled" -gt "$rss_bound" ]; then
+        fail "resource-usage oracle: seed RSS GREW UNBOUNDED across the soak window — early-half mean=${early_rss_mean}kB, late-half mean=${late_rss_mean}kB (rose >${rss_tol_pct}%); a memory leak (dedup table / event log / history not plateauing) — RED"
+    fi
+    # fd plateau: the late-half mean may exceed the early-half mean by at most
+    # fd_tol descriptors.
+    if [ $(( late_fd_mean - early_fd_mean )) -gt "$fd_tol" ]; then
+        fail "resource-usage oracle: seed fd count GREW UNBOUNDED across the soak window — early-half mean=${early_fd_mean}, late-half mean=${late_fd_mean} (rose >${fd_tol} descriptors); a socket/handle leak — RED"
+    fi
+
+    info "oracle-observed: resource-usage seed=$seed_name PLATEAUED over $nsamp samples / $cycles churn cycles — RSS early=${early_rss_mean}kB late=${late_rss_mean}kB (<=${rss_tol_pct}% drift), fd early=${early_fd_mean} late=${late_fd_mean} (<=${fd_tol} drift): no unbounded growth in the dedup table / event log / history — GREEN (real host /proc footprint, not a return code)"
+    return 0
+}
