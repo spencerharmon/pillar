@@ -17,7 +17,10 @@
 #   packet            — (family stub) packets observed on the wire.
 #   ciphertext        — (family stub) sealed payload decryptable only by a real
 #                       recipient key.
-#   state-survival    — (family stub) state survives a node restart.
+#   state-survival    — a killed node, restarted onto its SAME durable store,
+#                       rehydrates its materialized view from the persisted,
+#                       content-addressed segments (proven: the op count and the
+#                       op's CID survive the restart) — never lost.
 #
 # The smoke scenario exercises `oracle_process` (and `oracle_crypto_realness`
 # as the CLI-driver's applied-manifest effect). The remaining oracle families
@@ -73,5 +76,103 @@ oracle_crypto_realness() {
             || fail "crypto oracle: real image onboard did not report '$step' ok:\n$out"
     done
     info "oracle-observed: crypto-realness real-image keygen/sign/trust/policy/fail-closed all ok (real crypto path)"
+    return 0
+}
+
+# oracle_streamdb_append <publisher-index> <op-value> <consumer-index...> :
+# assert a REAL append converges to the durable store of every consumer node.
+# The publisher node gossips <op-value> once to the event-log topic; each
+# consumer node must (a) show it really RECEIVED the op over the wire, and
+# (b) hold >=1 op in its durable, content-addressed streamdb — the real
+# append/persist effect, observed from the node's own transcript and its
+# on-disk `ops/` content-addressed store, never a return code.
+oracle_streamdb_append() {
+    local pub="$1" value="$2"; shift 2
+    local -a consumers=("$@")
+
+    info "streamdb-append oracle: node$pub publishing op '$value' to the cell"
+    topology_publish_op "$pub" "$value"
+
+    # Wait for the real cross-process gossip convergence on every consumer
+    # (publish fires TEST_PUBLISH_DELAY=8s after the swarm settles, then the
+    # message propagates the mesh). Poll each consumer's transcript.
+    local idx
+    for idx in "${consumers[@]}"; do
+        _recv() { topology_node_received_op "$idx" "$value"; }
+        retry 60 _recv \
+            || fail "streamdb-append oracle: node$idx never received op '$value' over the wire within 60s"
+        info "oracle-observed: gossip-append node=$idx received op payload='$value' over libp2p (real cross-process convergence)"
+    done
+
+    # Each consumer must now hold the op DURABLY as a content-addressed segment.
+    for idx in "${consumers[@]}"; do
+        local cids ncids
+        _has_cid() { cids="$(topology_node_op_cids "$idx")"; [ -n "$cids" ]; }
+        retry 30 _has_cid \
+            || fail "streamdb-append oracle: node$idx persisted no content-addressed op under its streamdb store"
+        cids="$(topology_node_op_cids "$idx")"
+        ncids=$(printf '%s\n' "$cids" | grep -c . )
+        info "oracle-observed: content-address node=$idx durable ops/ holds $ncids content-addressed segment(s): $(printf '%s ' $cids)(real persisted CID)"
+    done
+    return 0
+}
+
+# oracle_state_survival <node-index> : assert a KILLED node, restarted onto its
+# SAME durable store, rehydrates its materialized view from the persisted
+# content-addressed segments — the ROI's state-survival oracle. Observes the
+# REAL effect from OUTSIDE the node: the durable op set (content-address CIDs)
+# and the node's rehydrated op count both SURVIVE the kill+restart unchanged.
+# RED if a killed node's state fails to reconverge; GREEN when it does.
+oracle_state_survival() {
+    local idx="$1"
+
+    # Snapshot the node's durable, content-addressed op set BEFORE the kill.
+    local before_cids before_n
+    before_cids="$(topology_node_op_cids "$idx" | sort)"
+    before_n=$(printf '%s\n' "$before_cids" | grep -c . )
+    [ "$before_n" -ge 1 ] \
+        || fail "state-survival oracle: node$idx holds no durable op to survive (pre-kill ops=$before_n)"
+    info "oracle-observed: pre-kill node=$idx durable store holds $before_n content-addressed op(s)"
+
+    # A REAL crash + recovery: kill the process, restart it onto the SAME
+    # named data-dir volume.
+    topology_restart_node "$idx"
+
+    # The restarted node must come back READY (rebound socket) AND report, in
+    # its fresh boot log, that it reopened the durable store and rehydrated the
+    # SAME materialized-view op count from the persisted segments (not zero —
+    # zero would be state LOST).
+    local addr
+    addr="${TOPO_PROBE_ADDRS[$idx]}"
+    _ready() { driver_http "$addr" /readyz >/dev/null 2>&1; }
+    retry 45 _ready \
+        || fail "state-survival oracle: node$idx never became ready again after restart"
+
+    local reopened_ops
+    _rehydrated() {
+        reopened_ops=$(topology_node_streamdb_ops "$idx")
+        [ -n "$reopened_ops" ] && [ "$reopened_ops" -ge "$before_n" ] 2>/dev/null
+    }
+    retry 30 _rehydrated \
+        || fail "state-survival oracle: node$idx did NOT rehydrate its materialized view after restart (reopened ops='${reopened_ops:-}', expected >= $before_n) — state was LOST"
+    info "oracle-observed: state-survival node=$idx reopened durable store and rehydrated ops=$reopened_ops (>= $before_n pre-kill) — materialized view SURVIVED the kill"
+
+    # The durable content-addressed op set must be IDENTICAL after recovery —
+    # the same segments (same CIDs), rehydrated from the persisted store, not a
+    # re-derived-from-nothing empty view.
+    local after_cids after_n
+    after_cids="$(topology_node_op_cids "$idx" | sort)"
+    after_n=$(printf '%s\n' "$after_cids" | grep -c . )
+    [ "$after_n" -ge "$before_n" ] \
+        || fail "state-survival oracle: node$idx durable op set shrank across restart (before=$before_n after=$after_n) — a lost write"
+    if [ "$before_cids" != "$after_cids" ]; then
+        # A superset (extra ops arrived from continued gossip) is fine; a
+        # DROPPED pre-kill CID is a lost write.
+        local missing
+        missing="$(comm -23 <(printf '%s\n' "$before_cids") <(printf '%s\n' "$after_cids"))"
+        [ -z "$missing" ] \
+            || fail "state-survival oracle: node$idx dropped pre-kill content-addressed op(s) across restart: $missing"
+    fi
+    info "oracle-observed: state-survival node=$idx durable content-addressed op set survived intact (before=$before_n after=$after_n CIDs, no dropped segment) — rehydrated from pinned segments, not lost"
     return 0
 }
