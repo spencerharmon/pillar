@@ -340,13 +340,9 @@ mod tests {
 
     #[test]
     fn output_flag_parses_json_yaml_text_and_strips_itself() {
-        let (fmt, rest) = parse_output_flag(&[
-            "Pod".into(),
-            "--output".into(),
-            "json".into(),
-            "web".into(),
-        ])
-        .unwrap();
+        let (fmt, rest) =
+            parse_output_flag(&["Pod".into(), "--output".into(), "json".into(), "web".into()])
+                .unwrap();
         assert_eq!(fmt, OutputFormat::Json);
         assert_eq!(rest, vec!["Pod".to_string(), "web".to_string()]);
 
@@ -416,8 +412,7 @@ mod tests {
     fn explain_prints_the_real_parsed_ast_and_execution_plan() {
         // A representative query touching every stage: two selects (one with a
         // per-kind predicate), a where predicate, a range, and a correlate.
-        let q =
-            "select: traces(service = api), logs where: env = prod range: now-5m \
+        let q = "select: traces(service = api), logs where: env = prod range: now-5m \
              correlate: { window: 30s, anchor: traces }";
         let out = explain_psl(q).unwrap();
 

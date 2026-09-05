@@ -73,7 +73,9 @@ pub fn registered_wire_ops() -> WireOpRegistry {
     let mut reg = WireOpRegistry::new();
     reg.register(WireOp::new(
         format!("wire:{BLOB_PROTOCOL_NAME}/fetch"),
-        format!("libp2p request/response {BLOB_PROTOCOL_NAME}: BlobRequest{{digest}} -> BlobResponse"),
+        format!(
+            "libp2p request/response {BLOB_PROTOCOL_NAME}: BlobRequest{{digest}} -> BlobResponse"
+        ),
     ));
     reg.register(WireOp::new(
         format!("wire:{ANTI_ENTROPY_PROTOCOL_NAME}/sync"),

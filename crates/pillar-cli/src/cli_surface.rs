@@ -32,38 +32,134 @@ pub struct VerbSpec {
 /// or removed here is added or removed from what the binary serves AND from
 /// what the inventory reports, by construction.
 pub static VERBS: &[VerbSpec] = &[
-    VerbSpec { name: "--web", handler: |_v, args| web(args) },
-    VerbSpec { name: "node", handler: |_v, args| node(args) },
-    VerbSpec { name: "bootstrap", handler: |_v, args| bootstrap(args) },
-    VerbSpec { name: "webauthn", handler: |_v, args| webauthn(args) },
-    VerbSpec { name: "session", handler: |_v, args| session(args) },
-    VerbSpec { name: "identity", handler: identity_trust },
-    VerbSpec { name: "user", handler: identity_trust },
-    VerbSpec { name: "key", handler: identity_trust },
-    VerbSpec { name: "offer", handler: identity_trust },
-    VerbSpec { name: "trust", handler: identity_trust },
-    VerbSpec { name: "attest", handler: identity_trust },
-    VerbSpec { name: "grant", handler: identity_trust },
-    VerbSpec { name: "caps", handler: identity_trust },
-    VerbSpec { name: "revoke", handler: identity_trust },
-    VerbSpec { name: "audit", handler: identity_trust },
-    VerbSpec { name: "login", handler: |_v, args| login(args) },
-    VerbSpec { name: "domain", handler: cluster_stream },
-    VerbSpec { name: "cell", handler: cluster_stream },
-    VerbSpec { name: "space", handler: cluster_stream },
-    VerbSpec { name: "peer", handler: cluster_stream },
-    VerbSpec { name: "lease", handler: cluster_stream },
-    VerbSpec { name: "request", handler: cluster_stream },
-    VerbSpec { name: "stream", handler: cluster_stream },
-    VerbSpec { name: "render", handler: |_v, args| render(args) },
-    VerbSpec { name: "onboard", handler: |_v, _args| onboard() },
-    VerbSpec { name: "secrets-audit-rotation-mfa", handler: |_v, _args| secrets_audit_rotation_mfa() },
-    VerbSpec { name: "obs", handler: |_v, _args| obs() },
-    VerbSpec { name: "apply", handler: live_platform_guidance },
-    VerbSpec { name: "get", handler: live_platform_guidance },
-    VerbSpec { name: "describe", handler: live_platform_guidance },
-    VerbSpec { name: "explain", handler: |_v, args| explain(args) },
-    VerbSpec { name: "completion", handler: |_v, args| completion(args) },
+    VerbSpec {
+        name: "--web",
+        handler: |_v, args| web(args),
+    },
+    VerbSpec {
+        name: "node",
+        handler: |_v, args| node(args),
+    },
+    VerbSpec {
+        name: "bootstrap",
+        handler: |_v, args| bootstrap(args),
+    },
+    VerbSpec {
+        name: "webauthn",
+        handler: |_v, args| webauthn(args),
+    },
+    VerbSpec {
+        name: "session",
+        handler: |_v, args| session(args),
+    },
+    VerbSpec {
+        name: "identity",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "user",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "key",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "offer",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "trust",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "attest",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "grant",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "caps",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "revoke",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "audit",
+        handler: identity_trust,
+    },
+    VerbSpec {
+        name: "login",
+        handler: |_v, args| login(args),
+    },
+    VerbSpec {
+        name: "domain",
+        handler: cluster_stream,
+    },
+    VerbSpec {
+        name: "cell",
+        handler: cluster_stream,
+    },
+    VerbSpec {
+        name: "space",
+        handler: cluster_stream,
+    },
+    VerbSpec {
+        name: "peer",
+        handler: cluster_stream,
+    },
+    VerbSpec {
+        name: "lease",
+        handler: cluster_stream,
+    },
+    VerbSpec {
+        name: "request",
+        handler: cluster_stream,
+    },
+    VerbSpec {
+        name: "stream",
+        handler: cluster_stream,
+    },
+    VerbSpec {
+        name: "render",
+        handler: |_v, args| render(args),
+    },
+    VerbSpec {
+        name: "onboard",
+        handler: |_v, _args| onboard(),
+    },
+    VerbSpec {
+        name: "secrets-audit-rotation-mfa",
+        handler: |_v, _args| secrets_audit_rotation_mfa(),
+    },
+    VerbSpec {
+        name: "obs",
+        handler: |_v, _args| obs(),
+    },
+    VerbSpec {
+        name: "apply",
+        handler: live_platform_guidance,
+    },
+    VerbSpec {
+        name: "get",
+        handler: live_platform_guidance,
+    },
+    VerbSpec {
+        name: "describe",
+        handler: live_platform_guidance,
+    },
+    VerbSpec {
+        name: "explain",
+        handler: |_v, args| explain(args),
+    },
+    VerbSpec {
+        name: "completion",
+        handler: |_v, args| completion(args),
+    },
 ];
 
 /// The real, currently-dispatched CLI verb table — the exact data `main()`

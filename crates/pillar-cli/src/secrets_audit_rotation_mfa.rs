@@ -77,9 +77,12 @@ fn step_seal_and_read_secret() -> Result<(), String> {
     keys.escrow(artifact.clone(), password, &secret)
         .map_err(|e| fail(STEP, format!("escrow store refused: {e:?}")))?;
 
-    let recovered = keys
-        .recover(&artifact, password)
-        .map_err(|e| fail(STEP, format!("recover with the correct password refused: {e:?}")))?;
+    let recovered = keys.recover(&artifact, password).map_err(|e| {
+        fail(
+            STEP,
+            format!("recover with the correct password refused: {e:?}"),
+        )
+    })?;
     if recovered != secret {
         return Err(fail(
             STEP,
@@ -120,9 +123,9 @@ fn step_audit_log_signed_and_forged_rejected() -> Result<(), String> {
     let genuine_id = log.append(&actor, genuine_record.to_payload());
 
     let view = log.audit_view();
-    let genuine_verified = view
-        .iter()
-        .any(|e| e.event() == &genuine_id && e.is_verified() && e.verified() == Some(&genuine_record));
+    let genuine_verified = view.iter().any(|e| {
+        e.event() == &genuine_id && e.is_verified() && e.verified() == Some(&genuine_record)
+    });
     if !genuine_verified {
         return Err(fail(
             STEP,
@@ -244,7 +247,10 @@ fn step_stepup_mfa_required_for_privileged_action() -> Result<(), String> {
     // No step-up: an already-consumed token must be refused before signing
     // recovery is granted — the privileged action is REJECTED without MFA.
     let mut spent_token = StepUpToken::fresh();
-    assert!(spent_token.consume(), "freshly minted token must consume once");
+    assert!(
+        spent_token.consume(),
+        "freshly minted token must consume once"
+    );
     if escrow
         .recover_plaintext_for_signing(artifact.id(), password, &mut spent_token)
         .is_ok()
@@ -259,12 +265,14 @@ fn step_stepup_mfa_required_for_privileged_action() -> Result<(), String> {
     let mut fresh_token = StepUpToken::fresh();
     let recovered = escrow
         .recover_plaintext_for_signing(artifact.id(), password, &mut fresh_token)
-        .map_err(|e| fail(STEP, format!("signing recovery with a fresh step-up token refused: {e:?}")))?;
+        .map_err(|e| {
+            fail(
+                STEP,
+                format!("signing recovery with a fresh step-up token refused: {e:?}"),
+            )
+        })?;
     if recovered != secret {
-        return Err(fail(
-            STEP,
-            "signing recovery returned the wrong plaintext",
-        ));
+        return Err(fail(STEP, "signing recovery returned the wrong plaintext"));
     }
 
     // The SAME token cannot authorize a second signing use (single-use).

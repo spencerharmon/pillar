@@ -72,7 +72,12 @@ pub(crate) fn authority_of(domain: &str) -> (String, String) {
 /// # Errors
 ///
 /// Any connection / I/O / parse failure, as a human-readable string.
-pub(crate) fn http(authority: &str, method: &str, path: &str, body: &str) -> Result<HttpReply, String> {
+pub(crate) fn http(
+    authority: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<HttpReply, String> {
     let mut stream =
         TcpStream::connect(authority).map_err(|e| format!("cannot reach {authority}: {e}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok();

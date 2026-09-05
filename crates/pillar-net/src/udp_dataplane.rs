@@ -248,8 +248,7 @@ fn spawn_forwarding(
             // consistent-hash / sticky LB keys on the client endpoint.
             let key = client.to_string();
 
-            let Some(backend) =
-                select_backend(&backends, &state, algorithm, affinity, &key).await
+            let Some(backend) = select_backend(&backends, &state, algorithm, affinity, &key).await
             else {
                 continue; // every backend down: drop (nothing to forward to)
             };
@@ -300,10 +299,7 @@ async fn relay(backend_addr: &SocketAddr, datagram: &[u8]) -> Option<Vec<u8>> {
 /// unhealthy (dropped from selection); one that answers is marked healthy again
 /// (recovery). This is the real active-health mechanism the acceptance test's
 /// failover relies on — a killed backend stops answering and is dropped.
-fn spawn_health_checks(
-    backends: Arc<Vec<Arc<LiveBackend>>>,
-    interval: Duration,
-) -> JoinHandle<()> {
+fn spawn_health_checks(backends: Arc<Vec<Arc<LiveBackend>>>, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             for b in backends.iter() {
@@ -318,7 +314,11 @@ fn spawn_health_checks(
 /// A single active health probe: send a well-known probe datagram and require
 /// an answer within a short deadline.
 async fn probe(addr: &SocketAddr) -> bool {
-    let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let Ok(sock) = UdpSocket::bind(bind).await else {
         return false;
     };
