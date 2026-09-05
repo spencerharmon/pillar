@@ -1,0 +1,31 @@
+[package]
+name = "pillar-blob-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Standalone real libp2p blob-provider process for the pillar-integration black-box scenario harness (scripts/pillar-integration/scenarios/workload-runtime.sh). A genuinely separate OS process — never linked into pillar_cli or any scenario script — that serves one file's bytes as a real content-addressed blob over pillar_net's /pillar/blob/1.0.0 wire protocol, so a real `pillar node run` process can fetch it by CID over live libp2p through its PILLAR_TEST_WORKLOAD boot hook. Kept as its OWN crate (rather than a bin under pillar-e2e) so its heavier real dependencies (pillar-net, libp2p, tokio) never burden the build of pillar-e2e's other bin targets (e.g. the musl-cross-compiled `udp_echo` scenario \"image\", which must stay a trivial std-only build)."
+publish = false
+
+[[bin]]
+name = "blob_provider"
+path = "src/bin/blob_provider.rs"
+
+[dependencies]
+pillar-net = { path = "../pillar-net" }
+libp2p = { version = "0.56", features = [
+    "noise",
+    "yamux",
+    "tcp",
+    "quic",
+    "tokio",
+    "macros",
+    "request-response",
+    "cbor",
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+[lints]
+workspace = true
