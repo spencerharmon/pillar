@@ -240,27 +240,21 @@ pub const ALL_PANELS: &[PanelSpec] = &[
             },
         ],
     },
-    // Swarm membership: which physical libp2p swarm this node speaks on. Lists
-    // the known swarms (active one marked) and wires the two membership acts —
-    // switch the active swarm, and mint a new private swarm. See
+    // Swarm: which physical libp2p swarm this node is running on. Read-only
+    // inspection (the running swarm's kind + fingerprint + seeds) plus one
+    // stateless act — mint a fresh private swarm key. Pillar keeps NO swarm
+    // state; a node is repointed only by rebooting with `--swarm-key`. See
     // `crates/pillar-cli/src/swarm_cli.rs` (CLI parity) and `pillar_swarm`.
     PanelSpec {
         id: "swarm",
         title: "Swarm",
         list_path: "/portal/swarm",
         line_prefix: "SWARM ",
-        actions: &[
-            PanelAction {
-                method: "POST",
-                path: "/portal/swarm/use",
-                label: "Use swarm",
-            },
-            PanelAction {
-                method: "POST",
-                path: "/portal/swarm/new",
-                label: "New private swarm",
-            },
-        ],
+        actions: &[PanelAction {
+            method: "POST",
+            path: "/portal/swarm/generate",
+            label: "Generate private swarm key",
+        }],
     },
 ];
 
@@ -535,24 +529,17 @@ mod tests {
     }
 
     #[test]
-    fn swarm_panel_parses_swarm_rows_and_wires_use_and_new() {
+    fn swarm_panel_shows_running_swarm_and_wires_generate() {
         let spec = find("swarm");
         assert_eq!(spec.list_path, "/portal/swarm");
-        assert_eq!(spec.primary_action().path, "/portal/swarm/use");
-        assert!(spec.actions.iter().any(|a| a.path == "/portal/swarm/new"));
-        // The list endpoint tags each row `SWARM <marker> <name> <kind> <fp>`;
-        // the panel strips the `SWARM ` prefix.
+        assert_eq!(spec.primary_action().path, "/portal/swarm/generate");
+        // The show endpoint tags the running swarm `SWARM <kind> <fp>` (and
+        // `SEED <addr>` lines); the panel strips the `SWARM ` prefix.
         let rows = parse_lines(
-            "SWARM * public public 0011223344556677\nSWARM - prod private aabbccddeeff0011\n",
+            "SWARM public 0011223344556677\nSEED /ip4/192.0.2.5/tcp/4001/p2p/abc\n",
             spec.line_prefix,
         );
-        assert_eq!(
-            rows,
-            vec![
-                "* public public 0011223344556677".to_string(),
-                "- prod private aabbccddeeff0011".to_string(),
-            ]
-        );
+        assert_eq!(rows, vec!["public 0011223344556677".to_string()]);
     }
 
     #[test]

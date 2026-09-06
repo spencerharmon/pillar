@@ -26,8 +26,8 @@
 //! | `--data-dir` | `PILLAR_DATA_DIR` | `./pillar-data` |
 //! | `--listen` (repeatable) | `PILLAR_LISTEN` (comma/space list) | `/ip4/0.0.0.0/tcp/0` |
 //! | `--dial` (repeatable) | `PILLAR_DIAL` (comma/space list) | none |
-//! | `--seed` (repeatable) | `PILLAR_SEED_MULTIADDR` (comma/space list) | none (this node is itself a seed) |
-//! | `--network-root` | `PILLAR_NETWORK_ROOT` | none (the well-known public root) |
+//! | `--seed-node` (repeatable, also `--seed`) | `PILLAR_SEED_NODE` (comma/space list, also `PILLAR_SEED_MULTIADDR`) | none (this node is itself a seed) |
+//! | `--swarm-key <path>` | `PILLAR_SWARM_KEY` | none (the public pillar swarm — baked-in key) |
 //!
 //! `--dial` names peer multiaddrs to connect out to at boot — the rootless,
 //! multi-process integration rig's only mesh-formation mechanism, since this
@@ -66,35 +66,33 @@ const ENV_IDENTITY_KEY: &str = "PILLAR_IDENTITY_KEY";
 const ENV_DATA_DIR: &str = "PILLAR_DATA_DIR";
 const ENV_LISTEN: &str = "PILLAR_LISTEN";
 const ENV_DIAL: &str = "PILLAR_DIAL";
-/// `--seed` / `PILLAR_SEED_MULTIADDR`: one or more federation seed multiaddrs
-/// (each terminating in `/p2p/<peer-id>`) used to JOIN Pillar's own Kademlia
-/// DHT. Unlike `--dial` (a raw libp2p dial), a seed is added to the Kademlia
+/// `--seed-node` (also `--seed`) / `PILLAR_SEED_NODE` (also
+/// `PILLAR_SEED_MULTIADDR`): one or more federation seed multiaddrs (each
+/// terminating in `/p2p/<peer-id>`) used to JOIN Pillar's own Kademlia DHT.
+/// Unlike `--dial` (a raw libp2p dial), a seed is added to the Kademlia
 /// routing table and a DHT bootstrap is issued from it, so the node actually
 /// enters the federation swarm. Unset means this node is itself a seed/first
 /// node. Seeds are discovery helpers, never a control plane — authority stays
-/// with the WoT.
-const ENV_SEED: &str = "PILLAR_SEED_MULTIADDR";
-/// `--network-root` / `PILLAR_NETWORK_ROOT`: the secret that defines this
-/// node's NETWORK — the physical libp2p swarm its packets can reach, not the
-/// WoT/cell identity within whichever network it joins. Unset (the default)
-/// means the well-known public root: [`pillar_net::PrivateSwarmKey::disabled`],
-/// the same open federation `build_event_swarm` has always built. Set to a
-/// secret value, the node derives a libp2p pnet pre-shared key from it
+/// with the WoT. A PRIVATE swarm (see `--swarm-key`) is transport-isolated
+/// from the public seeds, so joining one requires its OWN `--seed-node`(s).
+const ENV_SEED: &str = "PILLAR_SEED_NODE";
+/// Back-compat alias for [`ENV_SEED`].
+const ENV_SEED_LEGACY: &str = "PILLAR_SEED_MULTIADDR";
+/// `--swarm-key <path>` / `PILLAR_SWARM_KEY`: the path to a file holding the
+/// swarm key ([`pillar_swarm::SwarmKey`], as emitted by `pillar swarm
+/// generate`) that defines this node's NETWORK — the physical libp2p swarm its
+/// packets can reach, not the WoT/cell identity within whichever network it
+/// joins. Unset (the default) means the **public** pillar swarm
+/// ([`pillar_swarm::PUBLIC_PILLAR_ROOT`], a published baked-in pnet key). Set
+/// it, the node derives a libp2p pnet pre-shared key from the file's key
 /// ([`pillar_net::PrivateSwarmKey::from_root_secret`]) and only ever completes
-/// a transport handshake with a peer configured with the SAME root — a
-/// mismatched or absent root on the other side refuses the handshake below
+/// a transport handshake with a peer configured with the SAME key — a
+/// mismatched or absent key on the other side refuses the handshake below
 /// every higher protocol, so it can never dial into or be dialed by the
-/// public federation. Standing up a private/app-specific network needs no new
-/// mechanism: set the SAME `--network-root` on each owned node and point them
-/// at each other via the existing `--seed`/`PILLAR_SEED_MULTIADDR` — every
-/// pillar node is inherently a seed node.
-const ENV_NETWORK_ROOT: &str = "PILLAR_NETWORK_ROOT";
-
-/// Selects a named swarm from the node's swarm registry (`<data-dir>/swarm/
-/// registry.json`) to boot onto, when no explicit `--network-root` is given.
-/// Unset means the registry's active swarm (which defaults to the public
-/// pillar swarm). Managed with `pillar swarm …`.
-const ENV_SWARM: &str = "PILLAR_SWARM";
+/// public federation. Pillar keeps no swarm state: standing up a private
+/// network is just distributing one `generate`d key file to each owned node
+/// (`--swarm-key`) and pointing them at each other with `--seed-node`.
+const ENV_SWARM_KEY: &str = "PILLAR_SWARM_KEY";
 /// `--web-bind` / `PILLAR_WEB_BIND`: the address the web UI listens on.
 /// Unset (the default) disables the web surface entirely — `node run` never
 /// opens a web listener unless explicitly configured.
@@ -178,22 +176,16 @@ pub struct NodeConfig {
     /// rather than merely opening a point-to-point connection. May be empty
     /// (this node is itself a seed / first node). Distinct from `dial`.
     pub seed: Vec<Multiaddr>,
-    /// The configured network root secret (`--network-root` /
-    /// `PILLAR_NETWORK_ROOT`), if any. `None` is the public default — the
-    /// well-known OPEN federation, no pnet pre-shared key. `Some(secret)`
-    /// derives a private-swarm key via
-    /// [`pillar_net::PrivateSwarmKey::from_root_secret`] so this node's
-    /// transport only ever completes a handshake with a peer configured with
-    /// the identical root.
-    pub network_root: Option<String>,
-    /// The name of a swarm in this node's swarm registry
-    /// (`<data-dir>/swarm/registry.json`) to boot onto (`--swarm` /
-    /// `PILLAR_SWARM`). `None` means the registry's ACTIVE swarm, which
-    /// defaults to the public pillar swarm ([`pillar_swarm::PUBLIC_PILLAR_ROOT`],
-    /// a real published pnet key). Ignored when `network_root` is set (an
-    /// explicit root secret overrides the registry). Managed with
-    /// `pillar swarm …`.
-    pub swarm: Option<String>,
+    /// The path to this node's swarm-key file (`--swarm-key` /
+    /// `PILLAR_SWARM_KEY`), if any. `None` is the **public** default — the
+    /// published, baked-in pnet key ([`pillar_swarm::PUBLIC_PILLAR_ROOT`]).
+    /// `Some(path)` reads a private key ([`pillar_swarm::SwarmKey::from_file`],
+    /// as emitted by `pillar swarm generate`) and derives a private-swarm pnet
+    /// key from it via [`pillar_net::PrivateSwarmKey::from_root_secret`], so
+    /// this node's transport only ever completes a handshake with a peer
+    /// configured with the identical key. Pillar keeps no swarm state — the
+    /// key lives only in this operator-owned file.
+    pub swarm_key: Option<PathBuf>,
     /// The address the web UI listens on, if configured. `None` (the
     /// default) means `node run` serves no web surface at all. When set to
     /// a **non-loopback** address (e.g. `0.0.0.0`, so a k8s Service can
@@ -308,8 +300,7 @@ impl NodeConfig {
         let mut listen: Vec<Multiaddr> = Vec::new();
         let mut dial: Vec<Multiaddr> = Vec::new();
         let mut seed: Vec<Multiaddr> = Vec::new();
-        let mut network_root: Option<String> = None;
-        let mut swarm: Option<String> = None;
+        let mut swarm_key: Option<PathBuf> = None;
         let mut web_bind: Option<IpAddr> = None;
         let mut web_port: Option<u16> = None;
         let mut health_bind: Option<IpAddr> = None;
@@ -344,23 +335,18 @@ impl NodeConfig {
                     dial.push(parse_listen(v)?);
                     i += 2;
                 }
-                "--seed" => {
-                    let v = args.get(i + 1).ok_or(ConfigError::MissingValue("--seed"))?;
+                "--seed" | "--seed-node" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--seed-node"))?;
                     seed.push(parse_listen(v)?);
                     i += 2;
                 }
-                "--network-root" => {
+                "--swarm-key" => {
                     let v = args
                         .get(i + 1)
-                        .ok_or(ConfigError::MissingValue("--network-root"))?;
-                    network_root = Some(v.clone());
-                    i += 2;
-                }
-                "--swarm" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or(ConfigError::MissingValue("--swarm"))?;
-                    swarm = Some(v.clone());
+                        .ok_or(ConfigError::MissingValue("--swarm-key"))?;
+                    swarm_key = Some(PathBuf::from(v));
                     i += 2;
                 }
                 "--web-bind" => {
@@ -432,27 +418,21 @@ impl NodeConfig {
             }
         }
 
-        // Seed: explicit flags win; else a single env list; no default (a
-        // seed/first node has no seed to join through).
+        // Seed: explicit flags win; else a single env list (new name, then
+        // the legacy alias); no default (a seed/first node has no seed to join
+        // through).
         if seed.is_empty() {
-            if let Some(v) = env(ENV_SEED) {
+            if let Some(v) = env(ENV_SEED).or_else(|| env(ENV_SEED_LEGACY)) {
                 for entry in v.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
                     seed.push(parse_listen(entry)?);
                 }
             }
         }
 
-        // Network root: explicit flag wins; else env; else the public
-        // default (`None` — no pnet key, the well-known open federation).
-        if network_root.is_none() {
-            network_root = env(ENV_NETWORK_ROOT);
-        }
-
-        // Swarm selection: explicit flag wins; else env; else `None` (the
-        // registry's active swarm at boot). Only consulted when no explicit
-        // `network_root` secret was given.
-        if swarm.is_none() {
-            swarm = env(ENV_SWARM);
+        // Swarm key: explicit `--swarm-key` flag wins; else `PILLAR_SWARM_KEY`;
+        // else `None` — the PUBLIC pillar swarm (published baked-in pnet key).
+        if swarm_key.is_none() {
+            swarm_key = env(ENV_SWARM_KEY).map(PathBuf::from);
         }
 
         // web_bind: explicit flag wins; else env; else disabled (no web
@@ -489,8 +469,7 @@ impl NodeConfig {
             listen,
             dial,
             seed,
-            network_root,
-            swarm,
+            swarm_key,
             web_bind,
             web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
             health_bind,
@@ -826,44 +805,26 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     }
 
     // Transport: bring up the libp2p event swarm and subscribe to the log
-    // topic. Which physical swarm this node speaks on is resolved here:
-    //   1. an explicit `--network-root`/`PILLAR_NETWORK_ROOT` secret — an
-    //      ad-hoc private swarm, wins over everything;
-    //   2. else the node's swarm registry (`<data-dir>/swarm/registry.json`):
-    //      a `--swarm`/`PILLAR_SWARM` NAMED selection, or the registry's
-    //      ACTIVE swarm;
-    //   3. the registry defaults to the PUBLIC pillar swarm — the published,
-    //      baked-in root ([`pillar_swarm::PUBLIC_PILLAR_ROOT`]) — so a node
-    //      with nothing configured joins the one global public swarm on a REAL
-    //      pnet key that namespace-isolates it from the rest of the libp2p
-    //      world (not the old open transport). A private swarm the operator
-    //      minted with `pillar swarm new` is membership-gated.
-    let (root_secret, swarm_label) = match &config.network_root {
-        Some(secret) => (secret.clone(), "explicit --network-root".to_owned()),
-        None => {
-            let registry = pillar_swarm::SwarmRegistry::load_or_default(&config.data_dir)
-                .map_err(|e| BootError::Swarm(e.to_string()))?;
-            let profile = match &config.swarm {
-                Some(name) => registry.get(name).ok_or_else(|| {
-                    BootError::Swarm(format!(
-                        "no known swarm named `{name}` under {} — create it with \
-                         `pillar swarm new {name}` or adopt it with `pillar swarm import`",
-                        config.data_dir.display()
-                    ))
-                })?,
-                None => registry.active_profile(),
-            };
-            (
-                profile.root_secret().to_owned(),
-                format!(
-                    "swarm `{}` ({}, fp {})",
-                    profile.name(),
-                    profile.kind().tag(),
-                    profile.fingerprint()
-                ),
-            )
+    // topic.
+    // Transport: bring up the libp2p event swarm and subscribe to the log
+    // topic. Which physical swarm this node speaks on is resolved here, with
+    // NO pillar-side state:
+    //   * `--swarm-key <path>`/`PILLAR_SWARM_KEY` reads a PRIVATE swarm key
+    //     from an operator-owned file (as emitted by `pillar swarm generate`);
+    //   * with none, the node joins the PUBLIC pillar swarm — the published,
+    //     baked-in key ([`pillar_swarm::PUBLIC_PILLAR_ROOT`]) — so a node with
+    //     nothing configured joins the one global public swarm on a REAL pnet
+    //     key that namespace-isolates it from the rest of the libp2p world.
+    // A private swarm is transport-isolated from the public seeds, so joining
+    // one also needs its own `--seed-node`(s).
+    let swarm_key = match &config.swarm_key {
+        Some(path) => {
+            pillar_swarm::SwarmKey::from_file(path).map_err(|e| BootError::Swarm(e.to_string()))?
         }
+        None => pillar_swarm::SwarmKey::public(),
     };
+    let root_secret = swarm_key.root_secret().to_owned();
+    let swarm_label = format!("{} (fp {})", swarm_key.kind().tag(), swarm_key.fingerprint());
     tracing::info!(
         swarm = %swarm_label,
         "pillar peer transport bound to swarm (pnet-keyed pre-shared transport)"
@@ -1080,15 +1041,16 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 )
                 .with_live_observability(std::sync::Arc::clone(&live_obs))
                 .with_workload_reconciler(reconciler.clone())
-                .with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime));
-                // Back the portal's Swarm panel with the node's persistent
-                // swarm registry, so a `use`/`new` over the UI edits the SAME
-                // `<data-dir>/swarm/registry.json` the transport boots from.
-                // Best-effort: an unreadable registry leaves the in-memory
-                // public-only default rather than failing the node.
-                if let Err(e) = ctx.load_swarm_registry(config.data_dir.clone()) {
-                    tracing::warn!(error = %e, "pillar web UI: swarm registry unreadable; serving the public-only default");
-                }
+                .with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime))
+                // Tell the portal's Swarm panel which swarm this node is
+                // actually running on (read-only: kind + fingerprint + seeds).
+                // Pillar keeps no swarm state, so the panel only inspects and
+                // mints keys — it never repoints a running node.
+                .with_swarm_info(
+                    swarm_key.kind(),
+                    swarm_key.fingerprint(),
+                    config.seed.iter().map(|a| a.to_string()).collect(),
+                );
                 std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
             }
             Err(e) => {
@@ -1707,72 +1669,66 @@ mod tests {
     #[test]
     fn missing_seed_value_errors() {
         let err = NodeConfig::from_args_env(&[s("--seed")], no_env).unwrap_err();
-        assert_eq!(err, ConfigError::MissingValue("--seed"));
+        assert_eq!(err, ConfigError::MissingValue("--seed-node"));
     }
 
     #[test]
-    fn network_root_defaults_unset_the_public_default() {
+    fn swarm_key_defaults_unset_meaning_the_public_swarm() {
         let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
         assert_eq!(
-            cfg.network_root, None,
-            "no configured root means the well-known public federation"
+            cfg.swarm_key, None,
+            "no configured swarm key means the public pillar swarm"
         );
     }
 
     #[test]
-    fn network_root_flag_configures_a_private_root() {
-        let args = vec![s("--network-root"), s("my-app-secret-root")];
+    fn swarm_key_flag_configures_a_private_key_path() {
+        let args = vec![s("--swarm-key"), s("/etc/pillar/prod.key")];
         let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
-        assert_eq!(cfg.network_root, Some(s("my-app-secret-root")));
+        assert_eq!(cfg.swarm_key, Some(PathBuf::from("/etc/pillar/prod.key")));
     }
 
     #[test]
-    fn swarm_defaults_unset_meaning_the_active_registry_swarm() {
-        let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
-        assert_eq!(cfg.swarm, None);
-    }
-
-    #[test]
-    fn swarm_flag_selects_a_named_swarm() {
-        let args = vec![s("--swarm"), s("prod")];
-        let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
-        assert_eq!(cfg.swarm, Some(s("prod")));
-    }
-
-    #[test]
-    fn swarm_env_fills_when_flag_absent() {
+    fn swarm_key_env_fills_when_flag_absent() {
         let cfg = NodeConfig::from_args_env(&[], |k| {
-            (k == "PILLAR_SWARM").then(|| s("edge"))
+            (k == ENV_SWARM_KEY).then(|| s("/data/edge.key"))
         })
         .unwrap();
-        assert_eq!(cfg.swarm, Some(s("edge")));
+        assert_eq!(cfg.swarm_key, Some(PathBuf::from("/data/edge.key")));
     }
 
     #[test]
-    fn network_root_env_fills_when_flag_absent() {
-        let env = |k: &str| match k {
-            ENV_NETWORK_ROOT => Some(s("env-root-secret")),
-            _ => None,
-        };
-        let cfg = NodeConfig::from_args_env(&[], env).unwrap();
-        assert_eq!(cfg.network_root, Some(s("env-root-secret")));
-    }
-
-    #[test]
-    fn network_root_flag_wins_over_env() {
-        let env = |k: &str| match k {
-            ENV_NETWORK_ROOT => Some(s("env-root-secret")),
-            _ => None,
-        };
-        let args = vec![s("--network-root"), s("flag-root-secret")];
+    fn swarm_key_flag_wins_over_env() {
+        let env = |k: &str| (k == ENV_SWARM_KEY).then(|| s("/data/env.key"));
+        let args = vec![s("--swarm-key"), s("/data/flag.key")];
         let cfg = NodeConfig::from_args_env(&args, env).unwrap();
-        assert_eq!(cfg.network_root, Some(s("flag-root-secret")));
+        assert_eq!(cfg.swarm_key, Some(PathBuf::from("/data/flag.key")));
     }
 
     #[test]
-    fn missing_network_root_value_errors() {
-        let err = NodeConfig::from_args_env(&[s("--network-root")], no_env).unwrap_err();
-        assert_eq!(err, ConfigError::MissingValue("--network-root"));
+    fn missing_swarm_key_value_errors() {
+        let err = NodeConfig::from_args_env(&[s("--swarm-key")], no_env).unwrap_err();
+        assert_eq!(err, ConfigError::MissingValue("--swarm-key"));
+    }
+
+    #[test]
+    fn seed_node_flag_is_accepted_as_the_canonical_seed_flag() {
+        let addr = "/ip4/192.0.2.7/tcp/4001/p2p/12D3KooWA6WsQFA6jBrmM6xrDZQyMbvXwqDXK5W9E9y7hqCkQ7wZ";
+        let cfg = NodeConfig::from_args_env(&[s("--seed-node"), s(addr)], no_env).unwrap();
+        assert_eq!(cfg.seed.len(), 1);
+        // The legacy `--seed` spelling still parses to the same field.
+        let cfg2 = NodeConfig::from_args_env(&[s("--seed"), s(addr)], no_env).unwrap();
+        assert_eq!(cfg2.seed.len(), 1);
+    }
+
+    #[test]
+    fn seed_node_env_and_legacy_env_both_fill() {
+        let addr = "/ip4/192.0.2.9/tcp/4001/p2p/12D3KooWA6WsQFA6jBrmM6xrDZQyMbvXwqDXK5W9E9y7hqCkQ7wZ";
+        let cfg = NodeConfig::from_args_env(&[], |k| (k == ENV_SEED).then(|| s(addr))).unwrap();
+        assert_eq!(cfg.seed.len(), 1);
+        let cfg2 =
+            NodeConfig::from_args_env(&[], |k| (k == ENV_SEED_LEGACY).then(|| s(addr))).unwrap();
+        assert_eq!(cfg2.seed.len(), 1);
     }
 
     #[test]

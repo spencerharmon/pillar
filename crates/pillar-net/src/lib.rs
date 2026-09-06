@@ -515,8 +515,8 @@ impl PrivateSwarmKey {
     }
 
     /// Derives a private-swarm pre-shared key from an operator-configured
-    /// network root secret (the `--network-root` / `PILLAR_NETWORK_ROOT`
-    /// value).
+    /// swarm key (the `pillar_swarm::SwarmKey` root secret a node boots with
+    /// via `--swarm-key` / `PILLAR_SWARM_KEY`, or the baked-in public key).
     ///
     /// The derivation is a single SHAKE256 pass over the raw secret bytes,
     /// producing a fixed 32-byte pnet key: same root text always derives the

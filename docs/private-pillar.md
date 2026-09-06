@@ -1,64 +1,76 @@
 # Configuring private pillar
 
-Pillar ships with a **public default network**: a well-known network root
-(no `pnet` pre-shared key) plus well-known public seed nodes. Any node that
-knows a public seed can dial in and join the shared federation's Kademlia
-DHT — membership is open, and authority within that federation is gated by
-the PGP Web of Trust (WoT), not by network membership.
+Pillar ships with a **public default swarm**: a well-known, published swarm
+key baked into every binary (`pillar_swarm::PUBLIC_PILLAR_ROOT`) plus
+well-known public seed nodes. Any node that knows a public seed can dial in
+and join the shared federation's Kademlia DHT — membership is open, and
+authority within that federation is gated by the PGP Web of Trust (WoT), not
+by network membership. The public key provides **namespace isolation, not
+secrecy**: it keeps pillar's public swarm from co-mingling with unrelated
+`libp2p`/IPFS peers, but anyone can join it (they all bake in the same
+published value).
 
-An operator can instead run a **fully private pillar network**: configure a
-secret **network root**, stand up one or more nodes as owned seeds, and
-point every other node only at those owned seeds. A private network never
-dials the public root's seeds and never joins the public DHT, and a peer
-configured with a different (or no) root can never complete a transport
-handshake with it — the refusal happens below every higher protocol, at the
-`libp2p` `pnet` pre-shared-key handshake itself.
+An operator can instead run a **fully private pillar network**: mint a
+secret **swarm key**, distribute the key file to every node, stand up one or
+more nodes as owned seeds, and point every other node only at those owned
+seeds. A private network never dials the public seeds and never joins the
+public DHT, and a peer configured with a different (or no) key can never
+complete a transport handshake with it — the refusal happens below every
+higher protocol, at the `libp2p` `pnet` pre-shared-key handshake itself.
+
+**Pillar keeps no swarm state.** There is no swarm registry, no "active
+swarm" selection, nothing persisted. A swarm key lives only in the
+operator-owned file you generate; a node is told which swarm to join at boot
+with `--swarm-key <path>` (and, for a private swarm, its own `--seed-node`s).
+The `pillar swarm` CLI offers exactly two read-only/keygen facilities:
+`generate` (mint a key, print it to stdout) and `show` (inspect a key's kind
++ fingerprint).
 
 This document covers:
 
-- the root-vs-cell distinction (read this first — it's the single most
+- the swarm-key-vs-cell distinction (read this first — it's the single most
   common point of confusion),
 - choosing private vs public pillar,
-- standing up owned seed nodes and configuring a private root,
+- generating a swarm key, standing up owned seed nodes, and booting nodes
+  onto it,
 - one worked example per primitive use case, running fully app-specific
-  (private root, owned seeds only, no public root/seeds/DHT).
+  (private key, owned seeds only, no public key/seeds/DHT).
 
 All hostnames, IPs, and addresses below are neutral placeholders
 (`example.com`/`example.net` per RFC 2606, `192.0.2.0/24` per RFC 5737) —
 substitute your own infrastructure's real values.
 
-## Root vs. cell — read this first
+## Swarm key vs. cell — read this first
 
 Pillar has two entirely separate identity concepts, and "private pillar"
 changes only one of them:
 
-- **Network root** — which *physical swarm* a node's packets can reach at
-  all. This is what this document configures. A root is a secret value; two
-  nodes configured with the same root (or both left at the public default)
-  can complete a transport handshake and see each other's traffic. Two nodes
-  configured with *different* roots can never do so — the handshake itself
-  refuses.
-- **Cell** — the WoT/identity genesis *within* whichever network a node
-  joined. A private network still has cells, still has PGP-trusted peers,
-  and still enforces the identical capability-scoped authorization model
-  described in [`identity.md`](identity.md). Configuring a private root does
+- **Swarm key** — which *physical swarm* a node's packets can reach at all.
+  This is what this document configures. A key is a secret value (for the
+  public swarm it is the published baked-in key); two nodes configured with
+  the same key can complete a transport handshake and see each other's
+  traffic. Two nodes configured with *different* keys can never do so — the
+  handshake itself refuses.
+- **Cell** — the WoT/identity genesis *within* whichever swarm a node
+  joined. A private swarm still has cells, still has PGP-trusted peers, and
+  still enforces the identical capability-scoped authorization model
+  described in [`identity.md`](identity.md). Configuring a private key does
   **not** change, weaken, or bypass WoT authority in any way — it only
   changes which swarm the node's packets physically reach.
 
-In short: **root decides who your node can talk to at all; cell/WoT decides
-what an authenticated peer inside that swarm is allowed to do.** Running
-private pillar is purely a networking decision.
+In short: **the swarm key decides who your node can talk to at all; cell/WoT
+decides what an authenticated peer inside that swarm is allowed to do.**
+Running private pillar is purely a networking decision.
 
 ## Choosing private vs. public pillar
 
-Run **public pillar** (the default — no extra configuration) when you want
-your node to participate in the shared, open federation and rely on WoT
-authority to gate what peers are trusted to do. This is the right default
-for most deployments.
+Run **public pillar** (the default — no `--swarm-key`) when you want your
+node to participate in the shared, open federation and rely on WoT authority
+to gate what peers are trusted to do. This is the right default for most
+deployments.
 
-Run **private pillar** (configure a network root + owned seeds) when you
-need a network that is provably isolated from the public federation — for
-example:
+Run **private pillar** (a generated swarm key + owned seeds) when you need a
+network that is provably isolated from the public federation — for example:
 
 - an app-specific deployment that must never accept or dial public-federation
   peers, regardless of WoT trust decisions (defense in depth: a network-level
@@ -71,51 +83,64 @@ example:
 Every primitive use case below is written as a private-pillar deployment,
 since that is the common case for a dedicated, single-purpose swarm.
 
-## Standing up owned seed nodes with a private root
+## Generating a key and standing up owned seed nodes
 
 Every pillar node is inherently a seed node — there is no separate seed
 daemon or special "seed mode." Standing up a private, app-specific network
 is only:
 
-1. Generate a network root secret. Any sufficiently random, sufficiently
-   long string works — treat it exactly like a passphrase or a credential
-   (Pillar hashes it internally into a fixed-size `pnet` pre-shared key
-   under a fixed domain-separation tag, so the input string's exact length
-   or format is not itself significant, only its secrecy and uniqueness to
-   your network). Store it in your own secret manager; it is never
-   transmitted or discoverable by peers that don't already hold it.
-2. Set the **same** root on every node you want in this private network,
-   via either the flag or the environment variable:
+1. **Generate a swarm key** and save it to a file. `generate` prints only
+   the key to stdout, so redirecting yields a clean key file:
 
    ```
-   pillar node run --network-root '<your-generated-secret>' ...
+   pillar swarm generate > deployment.key
+   ```
+
+   The key is a high-entropy value minted from the OS CSPRNG. Treat the file
+   exactly like a credential — it is the join credential for the swarm; store
+   it in your own secret manager and distribute it only to nodes you want in
+   this network. You can confirm two files name the same swarm without
+   comparing the secret by checking their fingerprints:
+
+   ```
+   pillar swarm show --swarm-key deployment.key
+   ```
+
+2. **Distribute the same key file** to every node you want in this private
+   network, and boot each with `--swarm-key` (or `PILLAR_SWARM_KEY`):
+
+   ```
+   pillar node run --swarm-key /etc/pillar/deployment.key ...
    # or
-   PILLAR_NETWORK_ROOT='<your-generated-secret>' pillar node run ...
+   PILLAR_SWARM_KEY=/etc/pillar/deployment.key pillar node run ...
    ```
 
-3. Point each node at one or more of your other owned nodes as its seed(s),
-   via `--seed` (repeatable) or `PILLAR_SEED_MULTIADDR` (comma/space
-   separated list):
+3. **Point each node at one or more owned seeds**, via `--seed-node`
+   (repeatable) or `PILLAR_SEED_NODE` (comma/space separated list). A private
+   swarm is transport-isolated from the public seeds, so it needs its own:
 
    ```
    pillar node run \
-     --network-root '<your-generated-secret>' \
-     --seed /ip4/192.0.2.10/tcp/4001/p2p/<seed-node-peer-id> \
-     --seed /ip4/192.0.2.11/tcp/4001/p2p/<seed-node-peer-id> \
+     --swarm-key /etc/pillar/deployment.key \
+     --seed-node /ip4/192.0.2.10/tcp/4001/p2p/<seed-node-peer-id> \
+     --seed-node /ip4/192.0.2.11/tcp/4001/p2p/<seed-node-peer-id> \
      ...
    ```
 
    The very first node you bring up has nothing to seed from yet — leave
-   `--seed`/`PILLAR_SEED_MULTIADDR` unset for it; it acts as the network's
+   `--seed-node`/`PILLAR_SEED_NODE` unset for it; it acts as the network's
    first/seed node, and every subsequent node points at it (or at each
    other, once more than one node is up).
 
 That's it — no additional daemon, no separate bootstrap/rendezvous service,
-and no change to identity/cell/WoT configuration. Do **not** configure
-`--seed`/`PILLAR_SEED_MULTIADDR` to point at any public-federation seed
-address if you want a fully isolated network; simply never listing a public
-seed, combined with the mismatched-root refusal below, is what gives the "no
-public root/seeds/DHT" guarantee.
+no swarm registry, and no change to identity/cell/WoT configuration. Do
+**not** configure `--seed-node`/`PILLAR_SEED_NODE` to point at any
+public-federation seed address if you want a fully isolated network; simply
+never listing a public seed, combined with the mismatched-key refusal below,
+is what gives the "no public key/seeds/DHT" guarantee.
+
+> `--seed-node` supersedes the older `--seed` / `PILLAR_SEED_MULTIADDR`
+> spelling, which still works as an alias.
 
 ### Why this is safe from public-federation leakage
 
@@ -123,16 +148,16 @@ Two independent, layered guarantees prevent an app-specific private network
 from ever touching the public federation:
 
 1. **You never configure a public seed.** Nothing dials out to the public
-   federation's known seed addresses unless you put one in `--seed`/
-   `PILLAR_SEED_MULTIADDR` yourself.
-2. **The transport itself refuses a mismatched root.** Even if a public-
+   federation's known seed addresses unless you put one in
+   `--seed-node`/`PILLAR_SEED_NODE` yourself.
+2. **The transport itself refuses a mismatched key.** Even if a public-
    federation peer somehow attempted to dial or be dialed by one of your
    private nodes, the `pnet` pre-shared-key handshake — which runs below
    `noise`/`yamux`, before any higher protocol including the DHT protocol
    (`/pillar/kad`) is ever spoken — never completes unless both sides are
-   configured with the identical root. A public-default peer (no root
-   configured) and a private-root peer can never complete a handshake with
-   each other, in either direction.
+   configured with the identical key. A public peer (baked-in public key) and
+   a private-key peer can never complete a handshake with each other, in
+   either direction.
 
 `--dial`/`PILLAR_DIAL` is a separate, lower-level knob (a raw point-to-point
 libp2p dial used by the integration-test rig for mesh formation) and is
@@ -141,7 +166,7 @@ federation and most deployments never need it.
 
 ## Other node configuration (for reference)
 
-Alongside root and seed, every node also takes:
+Alongside the swarm key and seeds, every node also takes:
 
 | flag | env | default |
 |------|-----|---------|
@@ -150,13 +175,13 @@ Alongside root and seed, every node also takes:
 | `--listen` (repeatable) | `PILLAR_LISTEN` (comma/space list) | `/ip4/0.0.0.0/tcp/0` |
 
 These are unrelated to the private/public network decision and are set the
-same way regardless of which root you configure.
+same way regardless of which swarm you configure.
 
 ## Per-primitive worked examples
 
 Every primitive below uses the **identical** private-pillar pattern from
-above: generate one root secret for the deployment, set it on every node
-running that workload, and point the nodes at each other as owned seeds.
+above: generate one swarm key for the deployment, distribute it to every
+node running that workload, and point the nodes at each other as owned seeds.
 Only the workload manifest you run on top differs by primitive — there is
 no per-primitive networking mechanism. As of this writing, concrete
 `ResourceSpec` plugin drivers for these workload types are separate,
@@ -168,74 +193,78 @@ workload-specific object shape. Do not treat the manifest snippets below as
 authoritative — they illustrate only which node flags to set, not an
 unbuilt manifest schema.
 
-In every example below, substitute your own generated secret for
-`<root-secret>` and your own node addresses/peer IDs for the placeholders.
+In every example below, substitute your own generated key file for
+`<deployment>.key` and your own node addresses/peer IDs for the placeholders.
+Generate a *different* key per deployment (recommended) so a compromise or
+misconfiguration in one workload's network cannot reach another's.
 
 ### 1. SQL / relational layer
 
 Stand up a small owned cluster (e.g. 3 nodes) dedicated to this workload:
 
 ```
+# once: mint the key and distribute the file to all three nodes
+pillar swarm generate > sql.key
+
 # node A (first node)
-pillar node run --network-root '<root-secret>' ...
+pillar node run --swarm-key sql.key ...
 
 # node B, C (point at A)
-pillar node run --network-root '<root-secret>' \
-  --seed /ip4/192.0.2.20/tcp/4001/p2p/<node-A-peer-id> ...
+pillar node run --swarm-key sql.key \
+  --seed-node /ip4/192.0.2.20/tcp/4001/p2p/<node-A-peer-id> ...
 ```
 
 Deploy your SQL-layer workload's manifest against this swarm once its
-`ResourceSpec` plugin driver ships. No public root, seeds, or DHT are ever
+`ResourceSpec` plugin driver ships. No public key, seeds, or DHT are ever
 configured for this cluster.
 
 ### 2. Timeseries layer
 
-Same pattern — an owned, private swarm dedicated to the timeseries
-workload, isolated from any other primitive's swarm by using a *different*
-root secret per deployment (recommended) so a compromise or misconfiguration
-in one workload's network cannot reach another's:
+Same pattern — an owned, private swarm dedicated to the timeseries workload,
+isolated from any other primitive's swarm by using a *different* key file per
+deployment:
 
 ```
-pillar node run --network-root '<timeseries-root-secret>' \
-  --seed /ip4/192.0.2.30/tcp/4001/p2p/<seed-peer-id> ...
+pillar node run --swarm-key timeseries.key \
+  --seed-node /ip4/192.0.2.30/tcp/4001/p2p/<seed-peer-id> ...
 ```
 
 ### 3. Key/secret distribution layer
 
-Given this workload's sensitivity, treat the root secret with the same care
-as any other credential it will distribute (separate secret-manager entry,
+Given this workload's sensitivity, treat the key file with the same care as
+any other credential it will distribute (separate secret-manager entry,
 restricted access). Node configuration is otherwise identical:
 
 ```
-pillar node run --network-root '<secret-distribution-root-secret>' \
-  --seed /ip4/192.0.2.40/tcp/4001/p2p/<seed-peer-id> ...
+pillar node run --swarm-key secret-distribution.key \
+  --seed-node /ip4/192.0.2.40/tcp/4001/p2p/<seed-peer-id> ...
 ```
 
 ### 4. Key/value store
 
 ```
-pillar node run --network-root '<kv-root-secret>' \
-  --seed /ip4/192.0.2.50/tcp/4001/p2p/<seed-peer-id> ...
+pillar node run --swarm-key kv.key \
+  --seed-node /ip4/192.0.2.50/tcp/4001/p2p/<seed-peer-id> ...
 ```
 
 ### 5. Message bus
 
 ```
-pillar node run --network-root '<bus-root-secret>' \
-  --seed /ip4/192.0.2.60/tcp/4001/p2p/<seed-peer-id> ...
+pillar node run --swarm-key bus.key \
+  --seed-node /ip4/192.0.2.60/tcp/4001/p2p/<seed-peer-id> ...
 ```
 
 ### 6. User-management system
 
 ```
-pillar node run --network-root '<usermgmt-root-secret>' \
-  --seed /ip4/192.0.2.70/tcp/4001/p2p/<seed-peer-id> ...
+pillar node run --swarm-key usermgmt.key \
+  --seed-node /ip4/192.0.2.70/tcp/4001/p2p/<seed-peer-id> ...
 ```
 
 Note that this is still independent of WoT identity/authority
-([identity.md](identity.md)) — a private root isolates the *network*, while
+([identity.md](identity.md)) — a private key isolates the *network*, while
 the user-management workload's own authorization model (however its plugin
-defines it) is unaffected by which root the underlying pillar swarm uses.
+defines it) is unaffected by which swarm the underlying pillar transport uses.
 
 ### 7. Telemetry API + UI
 
@@ -244,25 +273,30 @@ already runs over the same event-log transport as everything else, so a
 telemetry-only deployment gets the identical isolation guarantee for free:
 
 ```
-pillar node run --network-root '<telemetry-root-secret>' \
-  --seed /ip4/192.0.2.80/tcp/4001/p2p/<seed-peer-id> \
+pillar node run --swarm-key telemetry.key \
+  --seed-node /ip4/192.0.2.80/tcp/4001/p2p/<seed-peer-id> \
   --web-bind 0.0.0.0 --web-port 8642 ...
 ```
 
 `--web-bind`/`PILLAR_WEB_BIND` (and `--web-port`/`PILLAR_WEB_PORT`, default
 `8642`) enable the node's web UI surface, which is otherwise off by default;
-they are unrelated to the network-root/seed configuration and can be set on
-any node regardless of public or private root.
+they are unrelated to the swarm-key/seed configuration and can be set on any
+node regardless of public or private swarm. The web UI's **Swarm** panel is
+read-only: it shows which swarm the node is running on (kind + fingerprint +
+seeds) and can `generate` a fresh private key to distribute, but it never
+repoints the running node — that only happens by rebooting with `--swarm-key`.
 
 ## Summary checklist for an app-specific private deployment
 
-- [ ] Generate one root secret per isolated deployment (do not reuse across
-      unrelated workloads).
-- [ ] Set `--network-root`/`PILLAR_NETWORK_ROOT` identically on every node
-      in that deployment.
+- [ ] Generate one swarm key per isolated deployment
+      (`pillar swarm generate > <name>.key`); do not reuse across unrelated
+      workloads.
+- [ ] Distribute that key file and set `--swarm-key`/`PILLAR_SWARM_KEY` to it
+      identically on every node in that deployment.
 - [ ] Point every node but the first at one or more owned nodes via
-      `--seed`/`PILLAR_SEED_MULTIADDR`.
+      `--seed-node`/`PILLAR_SEED_NODE`.
 - [ ] Never list a public-federation seed address.
-- [ ] Confirm no node in the deployment has `--network-root` unset (an unset
-      root falls back to the public default and that node will refuse to
-      talk to the rest of your private swarm).
+- [ ] Confirm no node in the deployment has `--swarm-key` unset (an unset key
+      falls back to the public swarm and that node will refuse to talk to the
+      rest of your private swarm). Confirm all nodes report the same
+      fingerprint with `pillar swarm show --swarm-key <name>.key`.

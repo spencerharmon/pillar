@@ -158,7 +158,7 @@ use pillar_rbac::{
     PolicyTarget, RbacDecider, Request as RbacRequest, ResourceClass,
 };
 use pillar_streamdb::{OpId, OpLog};
-use pillar_swarm::SwarmRegistry;
+use pillar_swarm::{SwarmKey, SwarmKind};
 use pillar_trust_artifacts::{
     parse_quota, Attest, Capacity as TrustCapacity, Cid as TrustCid, GraphEdge, Predicate,
     Proof as TrustProof, Sig as TrustSig, TrustError, TrustStore,
@@ -253,16 +253,15 @@ pub struct WebAuthContext {
     /// content-addressed [`OpId`] is the resource's CID, and
     /// `OpLog::root()` is the resource's streaming tip.
     layouts: OpLog,
-    /// The node's swarm registry (which physical libp2p swarm it speaks on) —
-    /// the Swarm panel's substrate. Defaults to the public-only in-memory
-    /// registry; a running node wires the persistent one under its data dir via
-    /// [`WebAuthContext::with_swarm_registry`], so portal edits (`use`/`new`)
-    /// land in the SAME `<data-dir>/swarm/registry.json` the transport boots
-    /// from. See `pillar_swarm`.
-    swarm: SwarmRegistry,
-    /// Where [`Self::swarm`] persists, when backed by a data dir. `None` keeps
-    /// portal swarm edits in-memory (host tests / an ephemeral node).
-    swarm_dir: Option<std::path::PathBuf>,
+    /// A read-only description of which physical libp2p swarm this node is
+    /// running on, for the Swarm panel's `show` view: the swarm kind, its
+    /// non-secret fingerprint, and the configured seed multiaddrs. Set at boot
+    /// via [`WebAuthContext::with_swarm_info`]; defaults to the public swarm
+    /// with no seeds. Pillar keeps NO swarm state — the panel only inspects
+    /// this and mints fresh keys; it never repoints a running node.
+    swarm_kind: SwarmKind,
+    swarm_fingerprint: String,
+    swarm_seeds: Vec<String>,
     /// The authenticated session's global identity log — the identity &
     /// domain UI's substrate (enroll/rotate/recover, per-domain keys).
     identity_log: IdentityLog,
@@ -546,8 +545,9 @@ impl WebAuthContext {
             lease,
             lease_epoch,
             layouts: OpLog::new(),
-            swarm: SwarmRegistry::default(),
-            swarm_dir: None,
+            swarm_kind: SwarmKind::Public,
+            swarm_fingerprint: SwarmKey::public().fingerprint(),
+            swarm_seeds: Vec::new(),
             identity_log: IdentityLog::genesis(IdentityGenesis {
                 initial_primary: IdentityKeyId::from("primary:0"),
                 recovery: Some(IdentityKeyId::from("recovery")),
@@ -597,50 +597,22 @@ impl WebAuthContext {
         self
     }
 
-    /// Back the portal's Swarm panel with the persistent swarm registry under
-    /// `data_dir` (the running node calls this from [`crate::run::run`]), so a
-    /// `use`/`new` over the portal writes the SAME
-    /// `<data-dir>/swarm/registry.json` the transport boots onto. Loads the
-    /// existing registry (or the public-only default if none yet).
-    ///
-    /// # Errors
-    /// Returns the [`pillar_swarm::SwarmError`] text if the registry exists but
-    /// cannot be read/parsed.
-    pub fn with_swarm_registry(
-        mut self,
-        data_dir: std::path::PathBuf,
-    ) -> Result<Self, String> {
-        self.load_swarm_registry(data_dir)?;
-        Ok(self)
-    }
-
-    /// In-place variant of [`Self::with_swarm_registry`] for callers that must
-    /// retain `self` on error (the node keeps serving the portal with the
-    /// in-memory public-only registry if the on-disk one is unreadable).
-    ///
-    /// # Errors
-    /// The [`pillar_swarm::SwarmError`] text if the registry exists but cannot
-    /// be read/parsed.
-    pub fn load_swarm_registry(&mut self, data_dir: std::path::PathBuf) -> Result<(), String> {
-        self.swarm =
-            SwarmRegistry::load_or_default(&data_dir).map_err(|e| e.to_string())?;
-        self.swarm_dir = Some(data_dir);
-        Ok(())
-    }
-
-    /// The node's swarm registry (the Swarm panel / `pillar swarm` substrate).
+    /// Tell the portal's Swarm panel which physical libp2p swarm this node is
+    /// running on (the running node calls this from [`crate::run::run`]) — its
+    /// kind, non-secret fingerprint, and configured seed multiaddrs. Read-only:
+    /// pillar keeps no swarm state, so the panel only inspects this and mints
+    /// fresh keys; it never repoints the running node.
     #[must_use]
-    pub fn swarm(&self) -> &SwarmRegistry {
-        &self.swarm
-    }
-
-    /// Persist the swarm registry if it is backed by a data dir; a no-op for an
-    /// in-memory registry. Returns the error text on a write failure.
-    fn persist_swarm(&self) -> Result<(), String> {
-        match &self.swarm_dir {
-            Some(dir) => self.swarm.save(dir).map_err(|e| e.to_string()),
-            None => Ok(()),
-        }
+    pub fn with_swarm_info(
+        mut self,
+        kind: SwarmKind,
+        fingerprint: String,
+        seeds: Vec<String>,
+    ) -> Self {
+        self.swarm_kind = kind;
+        self.swarm_fingerprint = fingerprint;
+        self.swarm_seeds = seeds;
+        self
     }
 
     /// Reconcile `name`'s declared image+replicas into the shared reconciler,
@@ -2634,8 +2606,7 @@ pub static ROUTES: &[RouteSpec] = &[
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/query"), handler: |ctx, _peer, request| dispatch_obs_query(ctx, request) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/dashboard"), handler: |ctx, _peer, request| dispatch_obs_dashboard(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/swarm"), handler: |ctx, _peer, request| dispatch_swarm_view(ctx, request) },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/swarm/use"), handler: dispatch_swarm_use },
-    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/swarm/new"), handler: dispatch_swarm_new },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/swarm/generate"), handler: dispatch_swarm_generate },
 ];
 
 /// The real, currently-served HTTP route table — the exact data
@@ -2648,43 +2619,43 @@ pub fn http_routes() -> &'static [RouteSpec] {
 }
 
 /// Map an HTTP request onto the portal action, preserving the auth gate.
-/// `GET /portal/swarm?token=<session>` — the Swarm panel's list view. One
-/// `SWARM <marker> <name> <kind> <fingerprint>` row per known swarm; the
-/// active swarm's marker is `*`, others `-`. Reads only; signs nothing. The
-/// public swarm's root is published, but a PRIVATE swarm's root secret is the
-/// join credential and is NEVER included here — only its non-secret
-/// fingerprint. To retrieve a private root use the CLI `pillar swarm export`.
+/// `GET /portal/swarm?token=<session>` — the Swarm panel's read-only view of
+/// which physical libp2p swarm THIS node is running on: a
+/// `SWARM <kind> <fingerprint>` line plus one `SEED <multiaddr>` line per
+/// configured seed. Reads only; signs nothing; keeps no state. A private
+/// swarm's key is the join credential and is NEVER exposed here — only its
+/// non-secret fingerprint. To retrieve a private key inspect the key file with
+/// the CLI `pillar swarm show --swarm-key <path> --secret`.
 fn dispatch_swarm_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let token = query_value(&request.path, "token").unwrap_or("");
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     }
-    let active = ctx.swarm().active_name().to_owned();
-    let mut body = String::new();
-    for p in ctx.swarm().list() {
-        let marker = if p.name() == active { '*' } else { '-' };
-        body.push_str(&format!(
-            "SWARM {marker} {} {} {}\n",
-            p.name(),
-            p.kind().tag(),
-            p.fingerprint()
-        ));
+    let mut body = format!(
+        "SWARM {} {}\n",
+        ctx.swarm_kind.tag(),
+        ctx.swarm_fingerprint
+    );
+    for seed in &ctx.swarm_seeds {
+        body.push_str(&format!("SEED {seed}\n"));
     }
     text_response(200, "OK", body)
 }
 
-/// `POST /portal/swarm/use` — switch the active swarm. Body: `<token>\n<name>`.
-/// A local node-config act (not a signed platform act), but still gated on an
-/// admitted portal session and the shared non-loopback signing guard so an
-/// unauthenticated caller cannot repoint the node's transport.
-fn dispatch_swarm_use(
+/// `POST /portal/swarm/generate` — mint a fresh PRIVATE swarm key. Body:
+/// `<token>`. STATELESS: the node persists nothing and does NOT switch onto the
+/// minted key — it simply returns `KEY <key>` (the join credential to save to a
+/// file and distribute out-of-band) plus `FINGERPRINT <fp>`, once, over the
+/// authenticated portal (the same trust boundary the CLI `generate` prints it
+/// on). Boot a node onto it with `pillar node run --swarm-key <file>
+/// --seed-node <addr>`. Gated on an admitted session and the shared
+/// non-loopback signing guard.
+fn dispatch_swarm_generate(
     ctx: &mut WebAuthContext,
     peer: &SocketAddr,
     request: &HttpRequest,
 ) -> HttpResponse {
-    let mut lines = request.body.lines();
-    let token = lines.next().unwrap_or("").trim();
-    let name = lines.next().unwrap_or("").trim();
+    let token = request.body.lines().next().unwrap_or("").trim();
     let session = ctx.login_session_for(token).cloned();
     if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
         return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
@@ -2692,61 +2663,12 @@ fn dispatch_swarm_use(
     if session.is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     }
-    if name.is_empty() {
-        return text_response(400, "Bad Request", "MISSING name".to_owned());
-    }
-    if let Err(e) = ctx.swarm.use_swarm(name) {
-        return text_response(404, "Not Found", format!("REFUSED {e}"));
-    }
-    if let Err(e) = ctx.persist_swarm() {
-        return text_response(500, "Internal Server Error", format!("PERSIST-FAILED {e}"));
-    }
-    let p = ctx.swarm().active_profile();
+    let key = SwarmKey::generate();
     text_response(
         200,
         "OK",
-        format!("SWARM * {} {} {}\n", p.name(), p.kind().tag(), p.fingerprint()),
+        format!("KEY {}\nFINGERPRINT {}\n", key.root_secret(), key.fingerprint()),
     )
-}
-
-/// `POST /portal/swarm/new` — mint a new PRIVATE swarm. Body: `<token>\n<name>`.
-/// Returns the new swarm's row PLUS its `ROOT <secret>` line — the join
-/// credential the operator distributes out-of-band — exactly once, at creation,
-/// over the authenticated portal (the same trust boundary the CLI `new` prints
-/// it on). Does NOT switch to it; call `use` to activate.
-fn dispatch_swarm_new(
-    ctx: &mut WebAuthContext,
-    peer: &SocketAddr,
-    request: &HttpRequest,
-) -> HttpResponse {
-    let mut lines = request.body.lines();
-    let token = lines.next().unwrap_or("").trim();
-    let name = lines.next().unwrap_or("").trim();
-    let session = ctx.login_session_for(token).cloned();
-    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
-        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
-    }
-    if session.is_none() {
-        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
-    }
-    if name.is_empty() {
-        return text_response(400, "Bad Request", "MISSING name".to_owned());
-    }
-    let profile = match ctx.swarm.create(name) {
-        Ok(p) => p,
-        Err(e) => return text_response(400, "Bad Request", format!("REFUSED {e}")),
-    };
-    if let Err(e) = ctx.persist_swarm() {
-        return text_response(500, "Internal Server Error", format!("PERSIST-FAILED {e}"));
-    }
-    let mut body = format!(
-        "SWARM - {} {} {}\n",
-        profile.name(),
-        profile.kind().tag(),
-        profile.fingerprint()
-    );
-    body.push_str(&format!("ROOT {}\n", profile.root_secret()));
-    text_response(200, "OK", body)
 }
 
 fn dispatch_http(
@@ -5468,51 +5390,57 @@ mod tests {
         );
     }
 
-    // User/member management: add/invite/role changes are signed acts
+    // The Swarm panel is read-only inspection + stateless keygen: `show` the
+    // node's running swarm, `generate` a fresh private key. It NEVER repoints
+    // the running node and keeps no state.
     #[test]
-    fn swarm_panel_lists_switches_and_mints_over_the_portal() {
+    fn swarm_panel_shows_running_swarm_and_generates_keys_over_the_portal() {
         let (mut ctx, _subkey) = provisioned_ctx();
+        // A running node reports which swarm it is on (default: public).
+        ctx = ctx.with_swarm_info(
+            pillar_swarm::SwarmKind::Public,
+            pillar_swarm::SwarmKey::public().fingerprint(),
+            vec!["/ip4/192.0.2.5/tcp/4001/p2p/12D3KooWExample".to_owned()],
+        );
         let token = login_alice(&mut ctx);
 
-        // Unauthenticated list is refused; the switch/mint acts are peer-gated
-        // (a bad session on a non-loopback peer is 403).
+        // Unauthenticated show is refused; generate is peer-gated (a bad
+        // session on a non-loopback peer is 403).
         assert_eq!(get(&mut ctx, "/portal/swarm").status, 401);
         assert_eq!(
-            post(&mut ctx, "/portal/swarm/use", "bad-token\npublic").status,
-            403
-        );
-        assert_eq!(
-            post(&mut ctx, "/portal/swarm/new", "bad-token\nprod").status,
+            post(&mut ctx, "/portal/swarm/generate", "bad-token").status,
             403
         );
 
-        // The default portal registry lists exactly the public swarm, marked
-        // active, tagged with the `SWARM ` prefix the panel parses.
-        let listed = get(&mut ctx, &format!("/portal/swarm?token={token}"));
-        assert_eq!(listed.status, 200, "got: {}", listed.body);
-        assert!(listed.body.contains("SWARM * public public"), "got: {}", listed.body);
-
-        // Mint a new private swarm: the response carries its row AND the ROOT
-        // secret to distribute, exactly once.
-        let minted = post(&mut ctx, "/portal/swarm/new", &format!("{token}\nprod"));
-        assert_eq!(minted.status, 200, "got: {}", minted.body);
-        assert!(minted.body.contains("SWARM - prod private"), "got: {}", minted.body);
-        assert!(minted.body.contains("ROOT pillar-swarm/v1:"), "got: {}", minted.body);
-        // A PRIVATE root is never leaked by the LIST view (only its fingerprint).
-        let listed2 = get(&mut ctx, &format!("/portal/swarm?token={token}"));
-        assert!(!listed2.body.contains("pillar-swarm/v1:"), "list must not leak private roots: {}", listed2.body);
-        assert!(listed2.body.contains("SWARM - prod private"), "got: {}", listed2.body);
-        assert!(listed2.body.contains("SWARM * public public"), "got: {}", listed2.body);
-
-        // Switch to it; the list now marks prod active.
-        let used = post(&mut ctx, "/portal/swarm/use", &format!("{token}\nprod"));
-        assert_eq!(used.status, 200, "got: {}", used.body);
-        assert_eq!(ctx.swarm().active_name(), "prod");
-        // Switching to an unknown swarm is refused.
-        assert_eq!(
-            post(&mut ctx, "/portal/swarm/use", &format!("{token}\nghost")).status,
-            404
+        // Show reports the running swarm's kind + fingerprint + seeds.
+        let shown = get(&mut ctx, &format!("/portal/swarm?token={token}"));
+        assert_eq!(shown.status, 200, "got: {}", shown.body);
+        assert!(
+            shown.body.contains(&format!(
+                "SWARM public {}",
+                pillar_swarm::SwarmKey::public().fingerprint()
+            )),
+            "got: {}",
+            shown.body
         );
+        assert!(shown.body.contains("SEED /ip4/192.0.2.5/tcp/4001"), "got: {}", shown.body);
+
+        // Generate mints a fresh PRIVATE key + fingerprint, statelessly.
+        let g = post(&mut ctx, "/portal/swarm/generate", &token);
+        assert_eq!(g.status, 200, "got: {}", g.body);
+        assert!(g.body.contains("KEY pillar-swarm/v1:"), "got: {}", g.body);
+        assert!(g.body.contains("FINGERPRINT "), "got: {}", g.body);
+        // Extract the minted key and confirm it parses to a private swarm.
+        let key_line = g.body.lines().find(|l| l.starts_with("KEY ")).expect("KEY line");
+        let key = pillar_swarm::SwarmKey::parse(&key_line["KEY ".len()..]).expect("parse");
+        assert_eq!(key.kind(), pillar_swarm::SwarmKind::Private);
+
+        // STATELESS: generating did not repoint the running node — show still
+        // reports the public swarm, and two generates never collide.
+        let shown2 = get(&mut ctx, &format!("/portal/swarm?token={token}"));
+        assert!(shown2.body.contains("SWARM public"), "got: {}", shown2.body);
+        let g2 = post(&mut ctx, "/portal/swarm/generate", &token);
+        assert_ne!(g.body, g2.body, "each generate mints a distinct key");
     }
 
     // (unauthorized refused); the identity view also renders the
@@ -7176,7 +7104,7 @@ mod tests {
     fn ui_confirms_swarm_panel() {
         assert_ui_wires(
             "swarm",
-            &["/portal/swarm", "/portal/swarm/use", "/portal/swarm/new"],
+            &["/portal/swarm", "/portal/swarm/generate"],
         );
     }
 }
