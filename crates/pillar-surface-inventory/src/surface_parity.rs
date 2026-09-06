@@ -173,6 +173,14 @@ pub static PARITY_MAP: &[ParityRule] = &[
         verb: "completion",
         reason: "shell-completion script generator; a local developer tool",
     },
+    ParityRule::CliOnly {
+        verb: "apply-authz",
+        reason: "in-process certify->trust->attest->revoke/RBAC self-test rig exercised by the pillar-integration trust-rbac scenario; a local diagnostic, not a served portal action",
+    },
+    ParityRule::CliOnly {
+        verb: "versioning-rollout",
+        reason: "in-process compat-negotiation/migration/readiness/rollback self-test rig exercised by the pillar-integration versioning-rollout scenario; a local diagnostic, not a served portal action",
+    },
 
     // --- portal route families deliberately without a CLI verb -------------
     ParityRule::PortalOnly {
