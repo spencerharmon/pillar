@@ -3,9 +3,18 @@
 # against a given ref actually completed SUCCESSFULLY.
 #
 # This asserts the REAL CI-executed effect of the pillar-integration workflow
-# (`.gitea/workflows/pillar-integration.yml`) — a dispatched run that booted the
-# black-box integration harness and finished green — not merely that a workflow
-# YAML file was committed. It queries the Gitea Actions HTTP API with curl+jq
+# — a dispatched run that booted the black-box integration harness and finished
+# green — not merely that a workflow YAML file was committed.
+#
+# WORKFLOW LOCATION: the canonical pillar-integration workflow lives in the
+# tracked `actions` hive submodule (a Gitea-HOSTED repo whose workflows DO
+# trigger), NOT in pillar's own `.gitea/workflows/`. pillar is GitHub-hosted, so
+# a `.gitea/workflows/` file in pillar can NEVER trigger a Gitea Actions run
+# (Gitea only executes workflows for repos it hosts); that dead fallback has been
+# retired. This verifier therefore queries the Gitea host that owns the actions
+# repo — point HOST/OWNER-REPO at that Gitea-hosted actions repo, not at pillar.
+#
+# It queries the Gitea Actions HTTP API with curl+jq
 # (neither denied by the check sandbox; skopeo/gh are not needed), so it runs
 # wherever curl and jq are present.
 #
@@ -17,8 +26,10 @@
 #
 # Usage: verify-actions-run.sh [HOST] [OWNER/REPO] [WORKFLOW_FILE] [REF]
 #   HOST           Gitea host (no scheme).            default: example.com
-#   OWNER/REPO     repository slug.                   default: example/pillar
-#   WORKFLOW_FILE  workflow filename under .gitea/.   default: pillar-integration.yml
+#   OWNER/REPO     the Gitea-hosted ACTIONS repo slug
+#                  (where pillar-integration.yml lives and triggers), NOT pillar.
+#                                                     default: example/actions
+#   WORKFLOW_FILE  workflow filename under .gitea/    default: pillar-integration.yml
 #   REF            branch/ref the run targeted.       default: main
 #
 # Auth: if $GITEA_TOKEN (or $GITEA_API_TOKEN) is set it is sent as an
@@ -31,7 +42,7 @@
 set -euo pipefail
 
 HOST="${1:-example.com}"
-SLUG="${2:-example/pillar}"
+SLUG="${2:-example/actions}"
 WORKFLOW="${3:-pillar-integration.yml}"
 REF="${4:-main}"
 
