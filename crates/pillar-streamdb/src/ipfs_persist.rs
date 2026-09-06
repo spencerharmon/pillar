@@ -206,7 +206,28 @@ impl IpfsPersistentStream {
         secret: SigningSecretKey,
         visibility: Visibility,
     ) -> Result<Self, IpfsPersistError> {
-        let store = ContentStore::open(root)?;
+        Self::open_with_store(ContentStore::open(root)?, owner, secret, visibility)
+    }
+
+    /// Like [`Self::open`] but over an already-constructed durable
+    /// [`ContentStore`] — e.g. one backed by a REAL kubo daemon via
+    /// [`ContentStore::with_backend`] + [`crate::ipfs_backend::KuboBackend`].
+    /// This is the constructor the node entrypoint uses to run its stream on
+    /// the private-swarm IPFS sidecar: on restart the view is rebuilt by
+    /// walking the pinned segment chain the backend already holds (local
+    /// blocks, no peer needed), and a missing block along the chain is
+    /// backfilled through the backend (bitswap, for kubo).
+    ///
+    /// # Errors
+    ///
+    /// [`IpfsPersistError::Store`] if a chain segment cannot be resolved;
+    /// [`IpfsPersistError::Corrupt`] if a pinned segment is malformed.
+    pub fn open_with_store(
+        store: ContentStore,
+        owner: SigningPublicKey,
+        secret: SigningSecretKey,
+        visibility: Visibility,
+    ) -> Result<Self, IpfsPersistError> {
         match store.resolve_head(&owner).cloned() {
             Some(head) => {
                 // Rebuild the view from the locally-pinned chain (newest-first

@@ -11,6 +11,18 @@ description = "Content-addressed op-log CRDT + materialized view + snapshot/comp
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 sha2 = "0.10"
+tracing = "0.1"
+# Optional: the real-IPFS (kubo) backend talks to a private-swarm kubo sidecar
+# over its HTTP RPC API. Blocking HTTP (ureq) keeps this crate free of an async
+# runtime; the daemon is on localhost so blocking is cheap. Gated behind the
+# `kubo` feature so the core data crate stays dependency-light for peers/tests.
+ureq = { version = "2", optional = true }
+
+[features]
+# Compile the real-IPFS (`KuboBackend`) durability backend. Enabled by the node
+# binary (pillar-cli); pure unit tests and peers use the in-memory / fs backends
+# and never pull in the HTTP client.
+kubo = ["dep:ureq"]
 
 [lints]
 workspace = true

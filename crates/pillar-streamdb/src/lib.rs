@@ -48,6 +48,11 @@ pub use store::{
     Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, StoreError, Visibility,
 };
 
+pub mod ipfs_backend;
+#[cfg(feature = "kubo")]
+pub use ipfs_backend::KuboBackend;
+pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, FsBackend, IpfsBackend};
+
 mod ipfs_persist;
 pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};
 
