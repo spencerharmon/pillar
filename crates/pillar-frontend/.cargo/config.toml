@@ -1,0 +1,12 @@
+# `getrandom` v0.3 requires BOTH its `wasm_js` cargo feature (enabled via the
+# target-specific dependency override in ../Cargo.toml) AND this rustc `--cfg`
+# flag to build for `wasm32-unknown-unknown` — enabling the feature alone is
+# explicitly documented as insufficient:
+# https://docs.rs/getrandom/0.3.4/#webassembly-support
+#
+# Scoped ONLY to this crate: pillar-frontend is deliberately excluded from the
+# root workspace and carries its own standalone Cargo.lock/cargo config, so
+# this flag never reaches the native (non-wasm) build of pillar-ipfs/libp2p or
+# any other crate in the root workspace.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

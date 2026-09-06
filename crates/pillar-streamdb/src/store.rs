@@ -41,13 +41,16 @@
 //! substrate that already verifies content against its digest on receipt).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "ipfs")]
 use std::path::PathBuf;
 
 use pillar_crypto::sign::{sign, verify};
 use pillar_crypto::{ContentId, Signature, SigningPublicKey, SigningSecretKey};
 
 use crate::content_address;
-use crate::ipfs_backend::{IpfsBackend, NativeIpfsBackend};
+use crate::ipfs_backend::IpfsBackend;
+#[cfg(feature = "ipfs")]
+use crate::ipfs_backend::NativeIpfsBackend;
 
 // ---------------------------------------------------------------------------
 // On-disk durability codec helpers.
@@ -90,6 +93,7 @@ fn vis_from_u8(b: u8) -> Option<Visibility> {
     }
 }
 
+#[cfg(feature = "ipfs")]
 pub(crate) fn hex_encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
@@ -99,6 +103,7 @@ pub(crate) fn hex_encode(b: &[u8]) -> String {
     s
 }
 
+#[cfg(feature = "ipfs")]
 pub(crate) fn io_store_err(e: std::io::Error) -> StoreError {
     StoreError::Io(e.kind())
 }
@@ -531,6 +536,7 @@ impl ContentStore {
     ///
     /// # Errors
     /// [`StoreError::Io`] if the store directories cannot be created or read.
+    #[cfg(feature = "ipfs")]
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         Self::with_backend(Box::new(NativeIpfsBackend::open(root.into())?))
     }
