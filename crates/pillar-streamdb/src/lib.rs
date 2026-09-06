@@ -49,9 +49,7 @@ pub use store::{
 };
 
 pub mod ipfs_backend;
-#[cfg(feature = "kubo")]
-pub use ipfs_backend::KuboBackend;
-pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, FsBackend, IpfsBackend};
+pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, IpfsBackend, NativeIpfsBackend};
 
 mod ipfs_persist;
 pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};

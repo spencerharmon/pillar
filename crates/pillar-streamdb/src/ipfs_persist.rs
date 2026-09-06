@@ -210,13 +210,13 @@ impl IpfsPersistentStream {
     }
 
     /// Like [`Self::open`] but over an already-constructed durable
-    /// [`ContentStore`] — e.g. one backed by a REAL kubo daemon via
-    /// [`ContentStore::with_backend`] + [`crate::ipfs_backend::KuboBackend`].
+    /// [`ContentStore`] — e.g. one backed by pillar's embedded IPFS node via
+    /// [`ContentStore::with_backend`] + [`crate::ipfs_backend::NativeIpfsBackend`].
     /// This is the constructor the node entrypoint uses to run its stream on
-    /// the private-swarm IPFS sidecar: on restart the view is rebuilt by
+    /// the embedded IPFS node: on restart the view is rebuilt by
     /// walking the pinned segment chain the backend already holds (local
     /// blocks, no peer needed), and a missing block along the chain is
-    /// backfilled through the backend (bitswap, for kubo).
+    /// backfilled through the backend (bitswap, once the network layer lands).
     ///
     /// # Errors
     ///

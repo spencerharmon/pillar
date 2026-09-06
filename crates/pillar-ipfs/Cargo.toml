@@ -1,0 +1,15 @@
+[package]
+name = "pillar-ipfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pillar's own embeddable IPFS node: real CIDv1 content addressing, a durable content-addressed blockstore, pin + provide sets. The IPFS/libp2p content-object primitive the streaming DB rides — no external daemon."
+
+[dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
+tracing = "0.1"
+
+[lints]
+workspace = true

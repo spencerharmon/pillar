@@ -690,30 +690,24 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // Streaming DB: the durable, content-addressed op store the controller
     // reconciles against.
     //
-    // The durability layer is a REAL IPFS node (non-negotiable #7 / #5): a
-    // private-swarm `ipfs/kubo` daemon runs as a sidecar in this pod, and the
-    // node talks to it over its localhost HTTP RPC API. Every op is authored
-    // into an owner-SIGNED segment stored as a real IPFS `raw` block
-    // (`block/put` + `pin/add`) whose CID a peer fetches over **bitswap** and
-    // verifies end to end — IPFS OWNS content-addressing and distribution; the
-    // streaming DB never re-implements it. kubo's on-disk blockstore lives on
-    // the same PVC (`IPFS_PATH`), so a solo seed node rehydrates its whole op
-    // set from its pinned blocks after a restart/redeploy, and converges with
-    // peers over the private swarm.
-    //
-    // The API endpoint comes from PILLAR_IPFS_API (default the in-pod sidecar
-    // http://127.0.0.1:5001). It is REQUIRED: if the daemon is unreachable the
-    // node fails fast rather than silently degrading to a non-durable store —
-    // the exact failure this whole change exists to prevent.
+    // The durability layer is pillar's OWN embedded IPFS node (non-negotiable
+    // #7 / #5) — [`pillar_ipfs::IpfsNode`], in-process, NO external daemon.
+    // Every op is authored into an owner-SIGNED segment stored as a real IPFS
+    // `raw` block addressed by a real CIDv1 (proven byte-for-byte identical to a
+    // reference IPFS node in pillar-ipfs's kubo oracle test) and pinned durable
+    // on the PVC — the IPFS node OWNS content-addressing; the streaming DB never
+    // re-implements it. A solo seed node rehydrates its whole op set from its
+    // pinned blocks after a restart/redeploy; cross-node block backfill (bitswap
+    // over pillar's private swarm) is the network layer being grown into the
+    // node.
     //
     // The segment-signing / IPNS-head key is derived DETERMINISTICALLY from the
     // node's custody-held identity (the ed25519 keypair in identity.key) via a
     // domain-separated seed. "Persistence follows crypto": the node's private
     // key stays custody-held (never stored); the signing key is re-derived from
     // it every boot, so a restarting node recovers write capability from its
-    // own identity alone. kubo cannot sign an IPNS record with a pillar key, so
-    // pillar owns head signing itself and the owner-signed head pointer is kept
-    // on the PVC under `<data>/streamdb/heads`.
+    // own identity alone. Pillar owns head signing itself and the owner-signed
+    // head pointer is kept on the PVC under `<data>/streamdb/heads`.
     let streamdb_root = config.data_dir.join("streamdb");
     let identity_seed_material = {
         let id_bytes = keypair
@@ -733,23 +727,10 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 reason: format!("derive streamdb segment-signing key: {e}"),
             }
         })?;
-    let ipfs_api =
-        std::env::var("PILLAR_IPFS_API").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string());
-    let backend =
-        pillar_streamdb::KuboBackend::connect(&ipfs_api, &streamdb_root).map_err(|e| {
-            BootError::StreamDb {
-                path: streamdb_root.clone(),
-                reason: format!(
-                    "connect to the private-swarm IPFS (kubo) sidecar at {ipfs_api}: {e} \
-                 — the durable streaming DB requires a reachable IPFS node (set \
-                 PILLAR_IPFS_API / check the kubo sidecar)"
-                ),
-            }
-        })?;
-    let store = pillar_streamdb::ContentStore::with_backend(Box::new(backend)).map_err(|e| {
+    let store = pillar_streamdb::ContentStore::open(&streamdb_root).map_err(|e| {
         BootError::StreamDb {
             path: streamdb_root.clone(),
-            reason: format!("reload durable IPFS content store: {e}"),
+            reason: format!("open durable embedded-IPFS content store: {e}"),
         }
     })?;
     let mut stream = pillar_streamdb::IpfsPersistentStream::open_with_store(
@@ -766,10 +747,9 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     })?;
     tracing::info!(
         streamdb_root = %streamdb_root.display(),
-        ipfs_api = %ipfs_api,
         ops = stream.stream().log().len(),
         durable = stream.store().is_durable(),
-        "pillar streaming DB opened (durable, real-IPFS/kubo content-object store)"
+        "pillar streaming DB opened (durable, embedded real-IPFS content-object node)"
     );
 
     // Readiness: at this point the identity keypair is loaded and the durable

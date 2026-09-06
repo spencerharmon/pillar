@@ -47,7 +47,7 @@ use pillar_crypto::sign::{sign, verify};
 use pillar_crypto::{ContentId, Signature, SigningPublicKey, SigningSecretKey};
 
 use crate::content_address;
-use crate::ipfs_backend::{FsBackend, IpfsBackend};
+use crate::ipfs_backend::{IpfsBackend, NativeIpfsBackend};
 
 // ---------------------------------------------------------------------------
 // On-disk durability codec helpers.
@@ -97,22 +97,6 @@ pub(crate) fn hex_encode(b: &[u8]) -> String {
         s.push(char::from_digit((x & 0x0f) as u32, 16).unwrap());
     }
     s
-}
-
-pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let mut i = 0;
-    while i < b.len() {
-        let hi = (b[i] as char).to_digit(16)?;
-        let lo = (b[i + 1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    Some(out)
 }
 
 pub(crate) fn io_store_err(e: std::io::Error) -> StoreError {
@@ -486,10 +470,11 @@ pub struct ContentStore {
     dht: HashSet<Cid>,
     heads: BTreeMap<Vec<u8>, HeadRecord>,
     /// When `Some`, every mutation is delegated to a durable IPFS substrate
-    /// (a real kubo daemon via [`crate::ipfs_backend::KuboBackend`], or an
-    /// on-disk block store via [`crate::ipfs_backend::FsBackend`]) so the
+    /// (pillar's own embedded [`pillar_ipfs::IpfsNode`] via
+    /// [`crate::ipfs_backend::NativeIpfsBackend`]) so the
     /// held/pinned/provided/head state survives a process restart AND a missing
-    /// block can be backfilled over the private swarm (bitswap). `None` = a
+    /// block can be backfilled over the private swarm (the network layer being
+    /// grown into the node). `None` = a
     /// pure in-memory store (ephemeral peers / unit tests / [`ContentStore::new`]).
     /// The in-memory maps above are a fast local index over the backend.
     backend: Option<Box<dyn IpfsBackend>>,
@@ -538,22 +523,23 @@ impl ContentStore {
         }
     }
 
-    /// Open a DURABLE store backed by an on-disk content-addressed block store
-    /// rooted at `root` (the node's PVC-backed block cache). Convenience for
-    /// [`Self::with_backend`] with an [`crate::ipfs_backend::FsBackend`]. No
-    /// network backfill: a solo node rehydrates from its own pinned blocks.
+    /// Open a DURABLE store backed by pillar's own embedded IPFS node
+    /// ([`pillar_ipfs::IpfsNode`]) rooted at `root` (the node's PVC). Convenience
+    /// for [`Self::with_backend`] with a [`crate::ipfs_backend::NativeIpfsBackend`].
+    /// A solo node rehydrates from its own pinned blocks; cross-node backfill is
+    /// the network layer being grown into the node.
     ///
     /// # Errors
     /// [`StoreError::Io`] if the store directories cannot be created or read.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        Self::with_backend(Box::new(FsBackend::open(root.into())?))
+        Self::with_backend(Box::new(NativeIpfsBackend::open(root.into())?))
     }
 
-    /// Open a DURABLE store over an arbitrary [`IpfsBackend`] (a real kubo
-    /// daemon, an on-disk block store, or a test double), reloading the pinned
+    /// Open a DURABLE store over an arbitrary [`IpfsBackend`] (pillar's embedded
+    /// IPFS node, or a test double), reloading the pinned
     /// blocks, DHT-advertised set, and per-owner heads the backend already
     /// holds. Every subsequent mutation is delegated to the backend, and a
-    /// missing block is backfilled through it (bitswap, for kubo).
+    /// missing block is backfilled through it.
     ///
     /// # Errors
     /// Propagates any backend fault encountered while reloading.
@@ -613,7 +599,8 @@ impl ContentStore {
         Ok(())
     }
 
-    /// Whether this store mirrors its state to a durable backend (fs or kubo).
+    /// Whether this store mirrors its state to a durable backend (the embedded
+    /// IPFS node).
     #[must_use]
     pub fn is_durable(&self) -> bool {
         self.backend.as_ref().is_some_and(|b| b.is_durable())
@@ -664,10 +651,10 @@ impl ContentStore {
         if let Some(seg) = self.held.get(cid) {
             return Ok(seg.clone());
         }
-        // REAL backfill: the IPFS backend fetches the block from the local
-        // blockstore or, for a kubo daemon, over bitswap from a private-swarm
-        // peer. The returned bytes are untrusted until proven to hash to `cid`
-        // AND to carry a valid authorship signature.
+        // REAL backfill: the embedded IPFS node fetches the block from the local
+        // blockstore or, once the network layer lands, over bitswap from a
+        // private-swarm peer. The returned bytes are untrusted until proven to
+        // hash to `cid` AND to carry a valid authorship signature.
         if let Some(b) = &self.backend {
             if let Some(w) = b.block_get(cid)? {
                 let seg = SignedSegment::from_wire(&w).ok_or(StoreError::CidMismatch)?;
@@ -679,9 +666,9 @@ impl ContentStore {
                 return Ok(seg);
             }
         }
-        // Legacy in-process SegmentSource fallback (non-kubo peers / tests): a
+        // Legacy in-process SegmentSource fallback (ephemeral peers / tests): a
         // peer that returns wrong or forged content is rejected and nothing is
-        // stored. For a kubo-backed node, bitswap above already IS the peer
+        // stored. Once the node's bitswap network layer lands it IS the peer
         // fetch, so `source` may be a no-op.
         let fetched = source.fetch(cid).ok_or(StoreError::NotFound)?;
         if fetched.cid() != *cid {
@@ -828,9 +815,9 @@ pub enum StoreError {
     /// the PVC-backed pin store). Carries the [`std::io::ErrorKind`] so the
     /// type stays `Copy` while still naming the fault.
     Io(std::io::ErrorKind),
-    /// The IPFS backend (a real kubo daemon) failed or was unreachable, or
-    /// returned a block whose CID disagreed with ours. The detail is logged at
-    /// the RPC call site (`tracing::warn!`) so the type stays `Copy`.
+    /// The IPFS node substrate failed, or returned a block whose CID disagreed
+    /// with ours. The detail is logged at the failing call site
+    /// (`tracing::warn!`) so the type stays `Copy`.
     Ipfs,
 }
 
@@ -843,7 +830,7 @@ impl std::fmt::Display for StoreError {
             StoreError::NotPublic => "only a public anchor may be provided to the swarm DHT",
             StoreError::StaleHead => "head sequence did not strictly advance",
             StoreError::Io(kind) => return write!(f, "durable store local-disk I/O error: {kind}"),
-            StoreError::Ipfs => "IPFS backend (kubo) error — see logs for detail",
+            StoreError::Ipfs => "IPFS node substrate error — see logs for detail",
         };
         f.write_str(msg)
     }
