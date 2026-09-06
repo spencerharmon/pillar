@@ -7,10 +7,24 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Content-addressed op-log CRDT + materialized view + snapshot/compaction, with a durable content-addressed on-disk backend: the Rust refinement of specs/StreamingDB.tla."
 
+[features]
+# The durable IPFS-node-backed substrate (`NativeIpfsBackend`, CIDv1 wire
+# codecs) that rides `pillar-ipfs` -> `libp2p` (tokio/mio TCP+QUIC transports,
+# not portable to `wasm32-unknown-unknown`). On by default for every native
+# consumer (`pillar-net`, `pillar-cli`, ...). Consumers that need ONLY the
+# pure content-addressing primitives (`OpId`/`content_address`, no IPFS
+# durability) — e.g. `pillar-observability`, which only ever tags signals with
+# a content address and never touches the IPFS backend — depend with
+# `default-features = false` to keep the wasm32 build (`pillar-frontend`, via
+# `pillar-web-frontend` -> `pillar-observability`) out of the `pillar-ipfs`/
+# `libp2p` closure entirely.
+default = ["ipfs"]
+ipfs = ["dep:pillar-ipfs"]
+
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
-pillar-ipfs = { path = "../pillar-ipfs" }
+pillar-ipfs = { path = "../pillar-ipfs", optional = true }
 sha2 = "0.10"
 tracing = "0.1"
 
