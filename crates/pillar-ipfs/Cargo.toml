@@ -9,7 +9,34 @@ description = "Pillar's own embeddable IPFS node: real CIDv1 content addressing,
 
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
+# The network layer (bitswap-style block exchange + Kademlia provider
+# routing) runs over a libp2p swarm bound to a private-network pre-shared
+# key ([`PrivateSwarmKey`]) — the same pnet mechanism `pillar-net` uses for
+# its own private-swarm root, reimplemented locally here (rather than taken
+# as a `pillar-net` dependency) because `pillar-streamdb` depends on THIS
+# crate and `pillar-net` depends on `pillar-streamdb`, so a `pillar-ipfs` ->
+# `pillar-net` edge would be a cycle.
+libp2p = { version = "0.56", features = [
+    "kad",
+    "identify",
+    "noise",
+    "yamux",
+    "tcp",
+    "quic",
+    "tokio",
+    "macros",
+    "request-response",
+    "cbor",
+    "pnet",
+] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+sha3 = "0.10.9"
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [lints]
 workspace = true

@@ -3199,7 +3199,12 @@ dependencies = [
 name = "pillar-ipfs"
 version = "0.0.0"
 dependencies = [
+ "futures",
+ "libp2p",
  "pillar-crypto",
+ "serde",
+ "sha3",
+ "tokio",
  "tracing",
 ]
 
