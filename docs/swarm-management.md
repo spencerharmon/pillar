@@ -51,7 +51,15 @@ reads the key from `pillar-swarm` and hands it to each transport).
   default (no `--swarm-key`), so the global pillar network is one swarm.
   Because the key is published it provides **namespace isolation, not
   secrecy**: it keeps pillar's public swarm from co-mingling with unrelated
-  libp2p/IPFS peers, but it is not a membership gate (anyone can read it).
+  libp2p/IPFS peers, but it is not a membership gate (anyone can read it). A
+  fresh public node joins with **zero configuration** — with no `--swarm-key`
+  and no `--seed-node` it bootstraps the public DHT from the baked-in
+  `PUBLIC_PILLAR_SEEDS` anchors (DNS seeds at pillar's own public
+  infrastructure, `pillar-rs.net`). Those anchors are public coordinates, not
+  secrets, and are the single source of truth for public bootstrap: adding or
+  rotating a public seed is one edit to that array, and `pillar_cli` asserts at
+  test time that every entry is a real federation seed (carries a
+  `/p2p/<peer-id>`), so a malformed anchor fails CI rather than production.
 - **Your own swarm** — a fresh 256-bit key minted from the OS CSPRNG
   (`pillar swarm generate`). Save it to a file, distribute it out-of-band to
   the nodes you want in your private network, and boot each with
@@ -88,6 +96,14 @@ Plus `--seed-node <multiaddr>` (repeatable; also `--seed` /
 private swarm needs. Standing up a private network is: `pillar swarm generate
 > prod.key` once, distribute the file, then boot each node with
 `--swarm-key prod.key --seed-node <addr>`.
+
+On the **public** swarm, `--seed-node` is optional: a node with none falls
+back to the baked-in `PUBLIC_PILLAR_SEEDS` anchors, so a fresh public node
+joins with zero configuration. Explicit `--seed-node`(s) always win and
+suppress the fallback; a private swarm never falls back (it is
+transport-isolated from the public seeds), so with no `--seed-node` it acts as
+its own seed/first node. The resolution is a pure helper
+(`run::resolve_effective_seeds`) so it is unit-tested directly.
 
 ## CLI
 

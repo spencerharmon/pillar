@@ -48,6 +48,9 @@
 //!   Because the key is published it provides **namespace isolation, not
 //!   secrecy**: it keeps pillar's public swarm from co-mingling with unrelated
 //!   libp2p/IPFS peers, but it is not a membership gate (anyone can read it).
+//!   A fresh public node joins with **zero configuration**: with no
+//!   `--swarm-key` and no `--seed-node`, it bootstraps the public DHT from the
+//!   baked-in [`PUBLIC_PILLAR_SEEDS`] anchors.
 //! - **Your own swarm** ([`SwarmKey::generate`]) — a fresh, high-entropy key
 //!   this crate mints from the OS CSPRNG. Distribute it out-of-band to the
 //!   nodes you want in your private network and boot each with `--swarm-key`;
@@ -72,6 +75,54 @@ use std::path::Path;
 /// version tag is the flag-day mechanism for rotating the public swarm.
 pub const PUBLIC_PILLAR_ROOT: &str =
     "pillar-public-swarm/v1:70696c6c61722d7075626c69632d737761726d2d726f6f742d76312d6b6579";
+
+/// The published, well-known **seed peers of the public pillar swarm**, baked
+/// into every binary so a fresh node joins the public network with ZERO
+/// configuration: `pillar node run` with no `--swarm-key` (⇒ public swarm) and
+/// no `--seed-node` falls back to these anchors to enter the public DHT.
+///
+/// Each entry is a libp2p multiaddr terminating in `/p2p/<peer-id>` (a
+/// federation seed MUST name the peer it dials — Kademlia keys its routing
+/// table on that peer id, and a peer-id-less address can never populate the
+/// DHT). The canonical form is a DNS anchor at pillar's own public
+/// infrastructure so a node survives a seed's IP changing:
+///
+/// ```text
+/// /dns4/seed1.pillar-rs.net/tcp/4001/p2p/<peer-id>
+/// ```
+///
+/// These are PUBLIC coordinates, not secrets — exactly like the well-known DNS
+/// seeds other P2P networks bake in — and they are the ONE exception to the
+/// "no infrastructure identifiers in source" rule: `pillar-rs.net` is the
+/// pillar project's *own public* infrastructure (not a deployment-private
+/// identifier), and a zero-config public network is only possible if the
+/// bootstrap anchor ships in the binary. A node on a PRIVATE swarm never uses
+/// these (a private swarm is transport-isolated from the public seeds); it
+/// always supplies its own `--seed-node`(s).
+///
+/// This list is the single source of truth: to add or rotate a public seed,
+/// edit THIS array. `pillar_cli` asserts at test time that every entry parses
+/// as a federation seed (carries a `/p2p/<peer-id>`), so a malformed entry
+/// fails CI rather than silently breaking zero-config bootstrap in production.
+///
+/// A `peer-id` here MUST be the real, stable peer id of a deployed public seed
+/// node (derived from that node's persistent ed25519 identity key) — never a
+/// placeholder. A wrong peer id makes every public node silently fail to
+/// bootstrap, so the list stays empty until the public seed nodes are deployed
+/// with fixed identities, at which point their real peer ids are baked here.
+pub const PUBLIC_PILLAR_SEEDS: &[&str] = &[
+    // /dns4/seed1.pillar-rs.net/tcp/4001/p2p/<peer-id>
+    // /dns4/seed2.pillar-rs.net/tcp/4001/p2p/<peer-id>
+];
+
+/// The baked-in public-swarm seed multiaddr strings (see
+/// [`PUBLIC_PILLAR_SEEDS`]). Returned as raw strings because this crate holds
+/// no libp2p dependency; the node runtime (`pillar_cli`) parses and validates
+/// them into federation seeds.
+#[must_use]
+pub fn public_seeds() -> &'static [&'static str] {
+    PUBLIC_PILLAR_SEEDS
+}
 
 /// Whether a swarm key is the shared public pillar network or an operator's own
 /// private, membership-gated network.

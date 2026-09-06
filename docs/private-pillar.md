@@ -2,8 +2,11 @@
 
 Pillar ships with a **public default swarm**: a well-known, published swarm
 key baked into every binary (`pillar_swarm::PUBLIC_PILLAR_ROOT`) plus
-well-known public seed nodes. Any node that knows a public seed can dial in
-and join the shared federation's Kademlia DHT — membership is open, and
+well-known public seed nodes baked in as `pillar_swarm::PUBLIC_PILLAR_SEEDS`
+(DNS anchors at pillar's own public infrastructure, `pillar-rs.net`). A fresh
+node with no `--swarm-key` and no `--seed-node` joins the public swarm with
+zero configuration — it derives the public pnet key and bootstraps the public
+Kademlia DHT straight from those baked anchors. Membership is open, and
 authority within that federation is gated by the PGP Web of Trust (WoT), not
 by network membership. The public key provides **namespace isolation, not
 secrecy**: it keeps pillar's public swarm from co-mingling with unrelated

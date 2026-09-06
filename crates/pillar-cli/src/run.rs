@@ -492,6 +492,33 @@ fn parse_listen(value: &str) -> Result<Multiaddr, ConfigError> {
         })
 }
 
+/// Resolves the federation seeds a node actually joins through.
+///
+/// Explicit operator `--seed-node`(s) always win. Otherwise, on the PUBLIC
+/// swarm ONLY, fall back to the baked-in [`pillar_swarm::PUBLIC_PILLAR_SEEDS`]
+/// anchors so a fresh public node bootstraps with zero configuration. A private
+/// swarm never falls back (it is transport-isolated from the public seeds), so
+/// with no operator seeds it returns empty and acts as its own seed/first node.
+///
+/// A baked anchor that fails to parse as a multiaddr is skipped here (and is
+/// caught at test time by `every_baked_public_seed_is_a_valid_federation_seed`,
+/// so it can never reach a release).
+fn resolve_effective_seeds(
+    operator_seeds: &[Multiaddr],
+    kind: pillar_swarm::SwarmKind,
+) -> Vec<Multiaddr> {
+    if !operator_seeds.is_empty() {
+        return operator_seeds.to_vec();
+    }
+    if kind == pillar_swarm::SwarmKind::Public {
+        return pillar_swarm::public_seeds()
+            .iter()
+            .filter_map(|s| s.parse::<Multiaddr>().ok())
+            .collect();
+    }
+    Vec::new()
+}
+
 fn parse_web_bind(value: &str) -> Result<IpAddr, ConfigError> {
     value
         .parse::<IpAddr>()
@@ -857,8 +884,21 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // Pillar's own swarm (NOT the public IPFS DHT). A malformed seed (no
     // `/p2p/<peer-id>`) is logged and skipped — one bad seed never aborts boot.
     // Seeds are discovery helpers only; authority stays with the WoT.
-    let mut seeds = Vec::with_capacity(config.seed.len());
-    for addr in &config.seed {
+    //
+    // Effective seeds: explicit operator `--seed-node`(s) win; otherwise, on
+    // the PUBLIC swarm ONLY, fall back to the baked-in public seed anchors so a
+    // fresh public node joins with zero configuration. A private swarm is
+    // transport-isolated from the public seeds, so it never falls back — it
+    // must carry its own `--seed-node`(s).
+    let effective_seeds = resolve_effective_seeds(&config.seed, swarm_key.kind());
+    if config.seed.is_empty() && !effective_seeds.is_empty() {
+        tracing::info!(
+            seeds = effective_seeds.len(),
+            "no --seed-node given; joining the public pillar swarm via baked-in public seed(s)"
+        );
+    }
+    let mut seeds = Vec::with_capacity(effective_seeds.len());
+    for addr in &effective_seeds {
         match pillar_net::parse_seed_multiaddr(addr.clone()) {
             Ok(seed) => {
                 tracing::info!(%addr, peer_id = %seed.peer_id, "pillar peer configured federation seed");
@@ -1049,7 +1089,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 .with_swarm_info(
                     swarm_key.kind(),
                     swarm_key.fingerprint(),
-                    config.seed.iter().map(|a| a.to_string()).collect(),
+                    effective_seeds.iter().map(|a| a.to_string()).collect(),
                 );
                 std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
             }
@@ -1709,6 +1749,54 @@ mod tests {
     fn missing_swarm_key_value_errors() {
         let err = NodeConfig::from_args_env(&[s("--swarm-key")], no_env).unwrap_err();
         assert_eq!(err, ConfigError::MissingValue("--swarm-key"));
+    }
+
+    #[test]
+    fn every_baked_public_seed_is_a_valid_federation_seed() {
+        // Guards the single bake point: any entry added to PUBLIC_PILLAR_SEEDS
+        // must be a real federation seed (a multiaddr terminating in
+        // `/p2p/<peer-id>`), or this fails CI before it can silently break
+        // zero-config public bootstrap in production. Vacuously true while the
+        // list is empty (no public seed nodes deployed yet).
+        for seed in pillar_swarm::public_seeds() {
+            let addr: Multiaddr = seed
+                .parse()
+                .unwrap_or_else(|e| panic!("baked public seed {seed:?} is not a multiaddr: {e}"));
+            pillar_net::parse_seed_multiaddr(addr).unwrap_or_else(|e| {
+                panic!("baked public seed {seed:?} lacks a /p2p/<peer-id>: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn public_swarm_with_no_operator_seed_falls_back_to_baked_seeds() {
+        // On the public swarm with no --seed-node, the effective seeds are
+        // exactly the baked public anchors (parsed).
+        let baked: Vec<Multiaddr> = pillar_swarm::public_seeds()
+            .iter()
+            .map(|s| s.parse().expect("baked seed parses"))
+            .collect();
+        let effective = resolve_effective_seeds(&[], pillar_swarm::SwarmKind::Public);
+        assert_eq!(effective, baked);
+    }
+
+    #[test]
+    fn explicit_operator_seed_suppresses_the_baked_public_fallback() {
+        let addr: Multiaddr =
+            "/ip4/192.0.2.7/tcp/4001/p2p/12D3KooWA6WsQFA6jBrmM6xrDZQyMbvXwqDXK5W9E9y7hqCkQ7wZ"
+                .parse()
+                .unwrap();
+        let effective =
+            resolve_effective_seeds(std::slice::from_ref(&addr), pillar_swarm::SwarmKind::Public);
+        assert_eq!(effective, vec![addr]);
+    }
+
+    #[test]
+    fn private_swarm_never_uses_the_baked_public_seeds() {
+        // A private swarm is transport-isolated from the public seeds; with no
+        // operator --seed-node it has no seed at all (acts as its own first node).
+        let effective = resolve_effective_seeds(&[], pillar_swarm::SwarmKind::Private);
+        assert!(effective.is_empty());
     }
 
     #[test]
