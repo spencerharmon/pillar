@@ -951,20 +951,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pillar-coordination"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
-]
-
-[[package]]
-name = "pillar-core"
-version = "0.0.0"
-dependencies = [
- "pillar-crypto",
-]
-
-[[package]]
 name = "pillar-crypto"
 version = "0.0.0"
 dependencies = [
@@ -988,80 +974,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pillar-manifest"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
- "pillar-crypto",
- "pillar-quota-ledger",
- "pillar-rbac",
- "pillar-topology",
- "pillar-trust-artifacts",
- "pillar-wot-authority",
- "serde",
- "serde_json",
- "serde_yaml",
-]
-
-[[package]]
-name = "pillar-observability"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
- "pillar-manifest",
- "pillar-streamdb",
- "pillar-topology",
- "pillar-wot-authority",
- "sha2",
-]
-
-[[package]]
-name = "pillar-quota-ledger"
-version = "0.0.0"
-dependencies = [
- "pillar-coordination",
- "pillar-core",
- "pillar-streamdb",
- "pillar-trust-artifacts",
-]
-
-[[package]]
-name = "pillar-rbac"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
- "pillar-crypto",
- "pillar-wot-authority",
-]
-
-[[package]]
-name = "pillar-streamdb"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
- "pillar-crypto",
- "sha2",
-]
-
-[[package]]
-name = "pillar-topology"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
- "pillar-trust-artifacts",
-]
-
-[[package]]
-name = "pillar-trust-artifacts"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
- "pillar-crypto",
- "pillar-rbac",
- "sha2",
-]
-
-[[package]]
 name = "pillar-web-api"
 version = "0.0.0"
 dependencies = [
@@ -1076,8 +988,6 @@ dependencies = [
  "base64",
  "gloo-net 0.4.0",
  "js-sys",
- "pillar-manifest",
- "pillar-observability",
  "pillar-web-api",
  "stylist",
  "wasm-bindgen",
@@ -1085,14 +995,6 @@ dependencies = [
  "web-sys",
  "yew",
  "yew-router",
-]
-
-[[package]]
-name = "pillar-wot-authority"
-version = "0.0.0"
-dependencies = [
- "pillar-core",
- "pillar-crypto",
 ]
 
 [[package]]
@@ -1342,19 +1244,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1571,12 +1460,6 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "urlencoding"
