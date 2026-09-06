@@ -26,6 +26,7 @@ pillar-web = { path = "../pillar-web" }
 pillar-web-api = { path = "../pillar-web-api" }
 pillar-net = { path = "../pillar-net" }
 pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-swarm = { path = "../pillar-swarm" }
 pillar-controller = { path = "../pillar-controller" }
 pillar-coordination = { path = "../pillar-coordination" }
 pillar-observability = { path = "../pillar-observability" }

@@ -43,6 +43,7 @@ pub mod secrets_audit_rotation_mfa;
 pub mod session_cli;
 pub mod stream_cli;
 pub mod surface_inventory;
+pub mod swarm_cli;
 pub mod topology_cli;
 pub mod trust_rbac_authz;
 pub mod versioning_rollout;

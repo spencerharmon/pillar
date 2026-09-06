@@ -12,6 +12,7 @@ members = [
     "crates/pillar-net",
     "crates/pillar-streamdb",
     "crates/pillar-ipfs",
+    "crates/pillar-swarm",
     "crates/pillar-observability",
     "crates/pillar-wot-authority",
     "crates/pillar-rbac",

@@ -89,6 +89,12 @@ const ENV_SEED: &str = "PILLAR_SEED_MULTIADDR";
 /// at each other via the existing `--seed`/`PILLAR_SEED_MULTIADDR` — every
 /// pillar node is inherently a seed node.
 const ENV_NETWORK_ROOT: &str = "PILLAR_NETWORK_ROOT";
+
+/// Selects a named swarm from the node's swarm registry (`<data-dir>/swarm/
+/// registry.json`) to boot onto, when no explicit `--network-root` is given.
+/// Unset means the registry's active swarm (which defaults to the public
+/// pillar swarm). Managed with `pillar swarm …`.
+const ENV_SWARM: &str = "PILLAR_SWARM";
 /// `--web-bind` / `PILLAR_WEB_BIND`: the address the web UI listens on.
 /// Unset (the default) disables the web surface entirely — `node run` never
 /// opens a web listener unless explicitly configured.
@@ -180,6 +186,14 @@ pub struct NodeConfig {
     /// transport only ever completes a handshake with a peer configured with
     /// the identical root.
     pub network_root: Option<String>,
+    /// The name of a swarm in this node's swarm registry
+    /// (`<data-dir>/swarm/registry.json`) to boot onto (`--swarm` /
+    /// `PILLAR_SWARM`). `None` means the registry's ACTIVE swarm, which
+    /// defaults to the public pillar swarm ([`pillar_swarm::PUBLIC_PILLAR_ROOT`],
+    /// a real published pnet key). Ignored when `network_root` is set (an
+    /// explicit root secret overrides the registry). Managed with
+    /// `pillar swarm …`.
+    pub swarm: Option<String>,
     /// The address the web UI listens on, if configured. `None` (the
     /// default) means `node run` serves no web surface at all. When set to
     /// a **non-loopback** address (e.g. `0.0.0.0`, so a k8s Service can
@@ -295,6 +309,7 @@ impl NodeConfig {
         let mut dial: Vec<Multiaddr> = Vec::new();
         let mut seed: Vec<Multiaddr> = Vec::new();
         let mut network_root: Option<String> = None;
+        let mut swarm: Option<String> = None;
         let mut web_bind: Option<IpAddr> = None;
         let mut web_port: Option<u16> = None;
         let mut health_bind: Option<IpAddr> = None;
@@ -339,6 +354,13 @@ impl NodeConfig {
                         .get(i + 1)
                         .ok_or(ConfigError::MissingValue("--network-root"))?;
                     network_root = Some(v.clone());
+                    i += 2;
+                }
+                "--swarm" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--swarm"))?;
+                    swarm = Some(v.clone());
                     i += 2;
                 }
                 "--web-bind" => {
@@ -426,6 +448,13 @@ impl NodeConfig {
             network_root = env(ENV_NETWORK_ROOT);
         }
 
+        // Swarm selection: explicit flag wins; else env; else `None` (the
+        // registry's active swarm at boot). Only consulted when no explicit
+        // `network_root` secret was given.
+        if swarm.is_none() {
+            swarm = env(ENV_SWARM);
+        }
+
         // web_bind: explicit flag wins; else env; else disabled (no web
         // surface). `node run` never opens a web listener unless configured.
         if web_bind.is_none() {
@@ -461,6 +490,7 @@ impl NodeConfig {
             dial,
             seed,
             network_root,
+            swarm,
             web_bind,
             web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
             health_bind,
@@ -536,6 +566,9 @@ pub enum BootError {
     },
     /// The libp2p swarm could not be built or bound.
     Transport(String),
+    /// The swarm registry under the data dir could not be read, or named a
+    /// swarm this node does not know.
+    Swarm(String),
     /// The durable streaming DB could not be opened under the data dir.
     StreamDb {
         /// The streaming DB root directory.
@@ -562,6 +595,7 @@ impl std::fmt::Display for BootError {
                 write!(f, "identity key {}: {reason}", path.display())
             }
             BootError::Transport(e) => write!(f, "transport bring-up: {e}"),
+            BootError::Swarm(e) => write!(f, "swarm selection: {e}"),
             BootError::StreamDb { path, reason } => {
                 write!(f, "streaming DB {}: {reason}", path.display())
             }
@@ -792,17 +826,49 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     }
 
     // Transport: bring up the libp2p event swarm and subscribe to the log
-    // topic. The configured network root (`None` == the public default)
-    // selects whether the transport is pnet-walled to a private swarm.
-    let root = match &config.network_root {
-        Some(secret) => {
-            tracing::info!(
-                "pillar peer configured with a PRIVATE network root (pnet-walled transport)"
-            );
-            pillar_net::PrivateSwarmKey::from_root_secret(secret)
+    // topic. Which physical swarm this node speaks on is resolved here:
+    //   1. an explicit `--network-root`/`PILLAR_NETWORK_ROOT` secret — an
+    //      ad-hoc private swarm, wins over everything;
+    //   2. else the node's swarm registry (`<data-dir>/swarm/registry.json`):
+    //      a `--swarm`/`PILLAR_SWARM` NAMED selection, or the registry's
+    //      ACTIVE swarm;
+    //   3. the registry defaults to the PUBLIC pillar swarm — the published,
+    //      baked-in root ([`pillar_swarm::PUBLIC_PILLAR_ROOT`]) — so a node
+    //      with nothing configured joins the one global public swarm on a REAL
+    //      pnet key that namespace-isolates it from the rest of the libp2p
+    //      world (not the old open transport). A private swarm the operator
+    //      minted with `pillar swarm new` is membership-gated.
+    let (root_secret, swarm_label) = match &config.network_root {
+        Some(secret) => (secret.clone(), "explicit --network-root".to_owned()),
+        None => {
+            let registry = pillar_swarm::SwarmRegistry::load_or_default(&config.data_dir)
+                .map_err(|e| BootError::Swarm(e.to_string()))?;
+            let profile = match &config.swarm {
+                Some(name) => registry.get(name).ok_or_else(|| {
+                    BootError::Swarm(format!(
+                        "no known swarm named `{name}` under {} — create it with \
+                         `pillar swarm new {name}` or adopt it with `pillar swarm import`",
+                        config.data_dir.display()
+                    ))
+                })?,
+                None => registry.active_profile(),
+            };
+            (
+                profile.root_secret().to_owned(),
+                format!(
+                    "swarm `{}` ({}, fp {})",
+                    profile.name(),
+                    profile.kind().tag(),
+                    profile.fingerprint()
+                ),
+            )
         }
-        None => pillar_net::PrivateSwarmKey::disabled(),
     };
+    tracing::info!(
+        swarm = %swarm_label,
+        "pillar peer transport bound to swarm (pnet-keyed pre-shared transport)"
+    );
+    let root = pillar_net::PrivateSwarmKey::from_root_secret(&root_secret);
     let mut swarm = pillar_net::build_event_swarm_with_root(keypair, root)
         .map_err(|e| BootError::Transport(e.to_string()))?;
     let topic = pillar_net::event_log_topic();
@@ -1015,6 +1081,14 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 .with_live_observability(std::sync::Arc::clone(&live_obs))
                 .with_workload_reconciler(reconciler.clone())
                 .with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime));
+                // Back the portal's Swarm panel with the node's persistent
+                // swarm registry, so a `use`/`new` over the UI edits the SAME
+                // `<data-dir>/swarm/registry.json` the transport boots from.
+                // Best-effort: an unreadable registry leaves the in-memory
+                // public-only default rather than failing the node.
+                if let Err(e) = ctx.load_swarm_registry(config.data_dir.clone()) {
+                    tracing::warn!(error = %e, "pillar web UI: swarm registry unreadable; serving the public-only default");
+                }
                 std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
             }
             Err(e) => {
@@ -1650,6 +1724,28 @@ mod tests {
         let args = vec![s("--network-root"), s("my-app-secret-root")];
         let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
         assert_eq!(cfg.network_root, Some(s("my-app-secret-root")));
+    }
+
+    #[test]
+    fn swarm_defaults_unset_meaning_the_active_registry_swarm() {
+        let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
+        assert_eq!(cfg.swarm, None);
+    }
+
+    #[test]
+    fn swarm_flag_selects_a_named_swarm() {
+        let args = vec![s("--swarm"), s("prod")];
+        let cfg = NodeConfig::from_args_env(&args, no_env).unwrap();
+        assert_eq!(cfg.swarm, Some(s("prod")));
+    }
+
+    #[test]
+    fn swarm_env_fills_when_flag_absent() {
+        let cfg = NodeConfig::from_args_env(&[], |k| {
+            (k == "PILLAR_SWARM").then(|| s("edge"))
+        })
+        .unwrap();
+        assert_eq!(cfg.swarm, Some(s("edge")));
     }
 
     #[test]

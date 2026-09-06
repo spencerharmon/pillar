@@ -240,6 +240,28 @@ pub const ALL_PANELS: &[PanelSpec] = &[
             },
         ],
     },
+    // Swarm membership: which physical libp2p swarm this node speaks on. Lists
+    // the known swarms (active one marked) and wires the two membership acts —
+    // switch the active swarm, and mint a new private swarm. See
+    // `crates/pillar-cli/src/swarm_cli.rs` (CLI parity) and `pillar_swarm`.
+    PanelSpec {
+        id: "swarm",
+        title: "Swarm",
+        list_path: "/portal/swarm",
+        line_prefix: "SWARM ",
+        actions: &[
+            PanelAction {
+                method: "POST",
+                path: "/portal/swarm/use",
+                label: "Use swarm",
+            },
+            PanelAction {
+                method: "POST",
+                path: "/portal/swarm/new",
+                label: "New private swarm",
+            },
+        ],
+    },
 ];
 
 /// The shared line-prefix response parser every `/portal/*`/`/bootstrap/*`
@@ -510,6 +532,27 @@ mod tests {
         let spec = find("custody");
         assert_eq!(spec.list_path, "/portal/trust-graph");
         assert_eq!(spec.primary_action().path, "/portal/custody/rotate");
+    }
+
+    #[test]
+    fn swarm_panel_parses_swarm_rows_and_wires_use_and_new() {
+        let spec = find("swarm");
+        assert_eq!(spec.list_path, "/portal/swarm");
+        assert_eq!(spec.primary_action().path, "/portal/swarm/use");
+        assert!(spec.actions.iter().any(|a| a.path == "/portal/swarm/new"));
+        // The list endpoint tags each row `SWARM <marker> <name> <kind> <fp>`;
+        // the panel strips the `SWARM ` prefix.
+        let rows = parse_lines(
+            "SWARM * public public 0011223344556677\nSWARM - prod private aabbccddeeff0011\n",
+            spec.line_prefix,
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "* public public 0011223344556677".to_string(),
+                "- prod private aabbccddeeff0011".to_string(),
+            ]
+        );
     }
 
     #[test]

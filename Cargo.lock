@@ -3076,6 +3076,7 @@ dependencies = [
  "pillar-observability",
  "pillar-rbac",
  "pillar-streamdb",
+ "pillar-swarm",
  "pillar-topology",
  "pillar-trust-artifacts",
  "pillar-web",
@@ -3324,6 +3325,16 @@ dependencies = [
  "pillar-net",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pillar-swarm"
+version = "0.0.0"
+dependencies = [
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha3",
 ]
 
 [[package]]
