@@ -97,7 +97,7 @@ run_case() {
     local desc="$1" body="$2" want="$3"
     printf '%s' "$body" > "$WORKDIR/response.json"
     local rc=0
-    PATH="$WORKDIR/bin:$PATH" "$SCRIPT" example.com example/pillar pillar-integration.yml main >/dev/null 2>&1 || rc=$?
+    PATH="$WORKDIR/bin:$PATH" "$SCRIPT" example.com example/actions pillar-integration.yml main >/dev/null 2>&1 || rc=$?
     if [ "$want" = "success" ]; then
         [ "$rc" -eq 0 ] || fail "$desc: expected exit 0, got $rc"
     else
