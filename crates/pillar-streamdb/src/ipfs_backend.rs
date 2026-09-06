@@ -366,9 +366,28 @@ mod kubo_backend {
                 agent,
                 heads: FsBackend::open(head_root)?,
             };
-            // Fail fast: prove the sidecar answers before we call the store ready.
-            me.rpc_bytes("id", &[])?;
-            Ok(me)
+            // Fail fast — but tolerate a still-starting sidecar. The kubo daemon
+            // is a sidecar that boots concurrently with the node; poll its RPC
+            // (`/api/v0/id`) for up to ~30s before giving up, so ordinary
+            // start-order jitter does not crashloop the node while a genuinely
+            // absent/misconfigured daemon still errors out promptly.
+            let mut last = StoreError::Ipfs;
+            for attempt in 0..30 {
+                match me.rpc_bytes("id", &[]) {
+                    Ok(_) => return Ok(me),
+                    Err(e) => {
+                        last = e;
+                        if attempt == 0 {
+                            tracing::info!(
+                                api = %me.api_base,
+                                "waiting for the IPFS (kubo) sidecar RPC to come up"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+            Err(last)
         }
 
         fn url(&self, path: &str, args: &[(&str, &str)]) -> String {
