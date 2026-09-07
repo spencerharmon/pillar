@@ -85,10 +85,9 @@ impl SupervisedWorkload {
     pub fn spawn(image_bytes: &[u8], args: &[String]) -> Result<Self, RuntimeError> {
         let staging_dir = tempfile::tempdir().map_err(RuntimeError::Stage)?;
         let exec_path = staging_dir.path().join("workload-entrypoint");
-        std::fs::write(&exec_path, image_bytes).map_err(RuntimeError::Stage)?;
-        make_executable(&exec_path).map_err(RuntimeError::Stage)?;
+        stage_executable(&exec_path, image_bytes).map_err(RuntimeError::Stage)?;
 
-        let child = spawn_child(&exec_path, args)?;
+        let child = spawn_child_retrying(&exec_path, args)?;
 
         Ok(SupervisedWorkload {
             _staging_dir: staging_dir,
@@ -159,8 +158,66 @@ impl SupervisedWorkload {
     /// stopped, or [`RuntimeError::Spawn`] if the new one cannot be started.
     pub async fn restart(&mut self) -> Result<(), RuntimeError> {
         self.stop().await?;
-        self.child = spawn_child(&self.exec_path, &self.args)?;
+        self.child = spawn_child_retrying(&self.exec_path, &self.args)?;
         Ok(())
+    }
+}
+
+/// Stage `image_bytes` to `exec_path` as an executable file, ensuring the
+/// writable file handle is fully flushed (`sync_all`) and CLOSED (dropped)
+/// before returning — so no writable descriptor to this file remains open
+/// in this process by the time [`spawn_child_retrying`] execs it.
+///
+/// This narrows (but does not by itself eliminate — see
+/// [`spawn_child_retrying`]) the classic fork/exec `ETXTBSY` race: under
+/// `cargo test --all`'s full parallelism, another thread may `fork()` (to
+/// `exec` its own child) while THIS thread still holds `exec_path` open for
+/// writing; the forked child inherits that writable fd, and if it has not
+/// yet execve'd itself away by the time we try to exec `exec_path`, the
+/// kernel refuses with `ETXTBSY`. Explicitly closing our own writable fd as
+/// early as possible shrinks the window (it is now bounded by an unrelated
+/// sibling's fork()->exec() gap only, not by ours).
+fn stage_executable(exec_path: &PathBuf, image_bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    {
+        let mut file = std::fs::File::create(exec_path)?;
+        file.write_all(image_bytes)?;
+        file.sync_all()?;
+        // `file` is dropped (and its fd closed) at the end of this block,
+        // strictly before `make_executable`/exec below.
+    }
+    make_executable(exec_path)
+}
+
+/// Maximum number of `ETXTBSY` retries before giving up and surfacing the
+/// spawn error. A sibling thread's inherited writable fd closes as soon as
+/// its own forked child finishes exec'ing (typically sub-millisecond), so a
+/// handful of short-backoff retries is enough to ride out the race without
+/// masking a genuinely persistent spawn failure.
+const SPAWN_ETXTBSY_MAX_RETRIES: u32 = 20;
+/// Base backoff between `ETXTBSY` retries; grows linearly with attempt
+/// number to spread contention if several threads are racing at once.
+const SPAWN_ETXTBSY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Spawn `exec_path` as a child process, retrying with a short bounded
+/// backoff if the kernel refuses the `execve` with `ETXTBSY` ("text file
+/// busy") — the canonical fix for the fork/exec race where a sibling
+/// thread's just-forked-but-not-yet-exec'd child transiently holds a
+/// writable fd open on the same freshly-written executable.
+fn spawn_child_retrying(exec_path: &PathBuf, args: &[String]) -> Result<Child, RuntimeError> {
+    let mut attempt = 0;
+    loop {
+        match spawn_child(exec_path, args) {
+            Ok(child) => return Ok(child),
+            Err(RuntimeError::Spawn(e))
+                if e.kind() == io::ErrorKind::ExecutableFileBusy
+                    && attempt < SPAWN_ETXTBSY_MAX_RETRIES =>
+            {
+                attempt += 1;
+                std::thread::sleep(SPAWN_ETXTBSY_RETRY_BACKOFF * attempt);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
