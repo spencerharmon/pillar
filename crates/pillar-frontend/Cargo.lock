@@ -952,7 +952,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pillar-crypto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-frontend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pillar-web-frontend",
  "wasm-bindgen",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-web-api"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pillar-crypto",
  "serde",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-web-frontend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64",
  "gloo-net 0.4.0",
