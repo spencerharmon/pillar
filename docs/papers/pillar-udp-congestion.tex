@@ -20,6 +20,7 @@
 \definecolor{pcell}{RGB}{235,240,248}
 \definecolor{pcellb}{RGB}{240,247,240}
 \definecolor{pgray}{RGB}{110,110,110}
+\definecolor{pmid}{RGB}{210,140,20}
 
 \newcommand{\code}[1]{\texttt{\small #1}}
 
@@ -97,8 +98,11 @@ that supports a subset of its features:
   is a small, PGP-signed, content-addressed (CID) unit. The sender emits
   redundant copies; the receiver deduplicates by CID, so at-least-once
   transport plus CID identity yields exactly-once \emph{processing}. Fan-out per
-  round is capped by a \emph{redundancy allowance} carried in the header, so a
-  known-bad link states its characteristics up front.
+  round is capped by a \emph{redundancy allowance} carried in the header; the
+  allowance scales \emph{down} toward a single copy on a clean, cheap path and
+  \emph{up} as measured loss rises, so redundancy is the default delivery
+  posture---dynamically bounded to what conditions warrant---rather than a mode
+  entered only for links already known to be bad.
   \item \textbf{Automatic, dynamic, clustered multipath congestion avoidance.}
   The control variable is \emph{route and source selection}, not window size.
   Redundant datagrams are emitted from as dispersed a set of node addresses as
@@ -273,20 +277,96 @@ remaining ones. Reply-node \emph{diversity}---how many distinct nodes can send
   \item \textbf{IPv4 $+$ DCUtR---partial.} Behind NAT, the publicly reachable
   ingest node coordinates DCUtR (direct-connection-upgrade-through-relay) hole
   punches so that \emph{additional} nodes obtain direct paths to the client,
-  widening diversity past the single ingest. But each punched peer consumes a
-  distinct port mapping on the client's NAT: DCUtR removes the single-node
-  bottleneck only to replace it with a \emph{port-exhaustion} one, so this tier
-  cannot scale to a large fan-out.
-  \item \textbf{IPv4, no DCUtR---floor.} Only the port-forwarded ingest node(s)
-  the client actually dialed can answer, over the client-initiated mappings.
-  Delivery is effectively single-path---the regime pillar-UDP's redundancy is
-  least able to improve.
+  widening diversity past the fixed port-forwarded set. But each punched peer
+  consumes a distinct port mapping on the client's NAT: DCUtR removes the
+  small-fixed-set bottleneck only to replace it with a \emph{port-exhaustion}
+  one, so this tier cannot scale to a large fan-out.
+  \item \textbf{IPv4, no DCUtR---floor.} Only the handful of port-forwarded
+  ingest nodes the client dialed can answer, over the client-initiated mappings.
+  Reply-path redundancy is capped at that small, deployment-fixed set---enough
+  for basic resilience but far short of the cell-wide diversity IPv6 unlocks.
 \end{itemize}
 IPv6 is therefore strictly preferred, for a structural reason rather than a
 performance heuristic: DCUtR trades one bottleneck for another, whereas a global
 address removes the bottleneck outright. The IPv6-native reply mesh is what lets
 a single client---not only an inter-cell mesh---enjoy the full dispersed-path
 redundancy the models prove.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=4.9cm,
+  xlabel={requested reply-node fan-out $W$},
+  ylabel={reachable reply nodes},
+  xmin=0,xmax=20, ymin=0, ymax=21,
+  xtick={0,4,8,12,16,20}, ytick={0,4,8,12,16,20},
+  legend pos=north west, legend style={font=\tiny,fill opacity=0.85,draw=none},
+  tick label style={font=\tiny}, label style={font=\tiny},
+  grid=both, grid style={gray!18},
+]
+% IPv6: reachable = requested (unbounded by NAT)
+\addplot[pnode,thick,domain=0:20,samples=2] {x};
+\addlegendentry{IPv6 (GUA)}
+% IPv4 + DCUtR: reachable = min(W, F+B), plateau at port budget (F=2, B=6)
+\addplot[pmid,very thick,dashed] coordinates {(0,0)(8,8)(20,8)};
+\addlegendentry{IPv4 $+$ DCUtR}
+% IPv4 floor: reachable = min(W, F), plateau at port-forwarded set (F=2)
+\addplot[pbad,thick,dash dot] coordinates {(0,0)(2,2)(20,2)};
+\addlegendentry{IPv4, no DCUtR}
+\draw[pmid,densely dotted] (axis cs:8,0) -- (axis cs:8,8);
+\node[font=\tiny,pmid,align=left,anchor=west] at (axis cs:8.6,10.4)
+   {NAT port-mapping\\ceiling ($F{+}B$)};
+\node[font=\tiny,pbad,anchor=west] at (axis cs:8.6,2.0)
+   {port-forwarded set ($F$)};
+\end{axis}
+\end{tikzpicture}
+\caption{\textbf{Reply-node reachability by address family.} How many distinct
+cell nodes can send \emph{back} to a client that requested a reply fan-out $W$.
+With an IPv6 GUA every requested node reaches the client (diagonal, unbounded).
+Behind IPv4 NAT only the few port-forwarded ingest nodes the client dialed can
+reply (floor, $F$); DCUtR hole-punches additional nodes but saturates at the
+client's NAT port-mapping budget ($F{+}B$; here $F{=}2,\,B{=}6$). The plateau is
+the port-exhaustion ceiling.}
+\label{fig:replydiv}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=4.9cm,
+  xlabel={per-path loss probability $p$},
+  ylabel={$\log_{10} P(\text{undelivered})$ on the reply path},
+  xmin=0,xmax=0.9, ymin=-20, ymax=0,
+  xtick={0,0.1,0.2,0.3,0.5,0.75,0.9}, ytick={0,-5,-10,-15,-20},
+  legend pos=south east, legend style={font=\tiny,fill opacity=0.85,draw=none},
+  tick label style={font=\tiny}, label style={font=\tiny},
+  grid=both, grid style={gray!18},
+]
+% IPv6: effective reply-path W = 20
+\addplot[pnode,thick,mark=*,mark size=1pt] coordinates {
+  (0.10,-20)(0.20,-13.98)(0.30,-10.46)(0.50,-6.02)(0.75,-2.50)(0.90,-0.92)};
+\addlegendentry{IPv6, $W_{\mathrm{eff}}{=}20$}
+% IPv4 + DCUtR: effective W = 8 (port-budget cap)
+\addplot[pmid,very thick,mark=triangle*,mark size=1.3pt,dashed] coordinates {
+  (0.01,-16.0)(0.02,-13.59)(0.05,-10.41)(0.10,-8.0)(0.20,-5.59)(0.30,-4.18)(0.50,-2.41)(0.75,-1.00)(0.90,-0.37)};
+\addlegendentry{IPv4$+$DCUtR, $W_{\mathrm{eff}}{=}8$}
+% IPv4 floor: effective W = 2 (port-forwarded set)
+\addplot[pbad,thick,mark=square*,mark size=1pt,dash dot] coordinates {
+  (0.01,-4.0)(0.05,-2.60)(0.10,-2.0)(0.20,-1.40)(0.30,-1.05)(0.50,-0.60)(0.75,-0.25)(0.90,-0.09)};
+\addlegendentry{IPv4 floor, $W_{\mathrm{eff}}{=}2$}
+\end{axis}
+\end{tikzpicture}
+\caption{\textbf{Reliability consequence of the addressing tier.} The reachable
+reply-node count (Fig.~\ref{fig:replydiv}) caps the effective reply-path
+redundancy $W_{\mathrm{eff}}$, and residual reply loss is $p^{W_{\mathrm{eff}}}$.
+IPv6 attains the full redundancy benefit, IPv4$+$DCUtR a bounded fraction of it,
+and the IPv4 floor---limited to the port-forwarded set---barely bends the curve.
+The request path (client$\to$cell) is unaffected: the client dials whatever
+reachable nodes it likes. Lower is better; log scale.}
+\label{fig:replyloss}
+\end{figure}
 
 \section{Redundancy characteristics}\label{sec:redundancy}
 Redundancy is what buys loss tolerance. If a message rides in $W$ consecutive or
@@ -340,10 +420,16 @@ Table~\ref{tab:contrast} summarises the posture difference. The essential point
 is architectural, not parametric: TCP and QUIC place congestion control on a
 single client over a single path and react to loss by \emph{reducing} the
 offered rate; pillar-UDP places it on a cluster over many paths and reacts to
-loss by \emph{relocating} the offered traffic. On a healthy link QUIC is the
-right tool and remains pillar's default; pillar-UDP is selected---as an
-additional libp2p transport---only where the link itself is the problem, the
-regime in which single-path congestion control degrades toward zero.
+loss by \emph{relocating} the offered traffic. pillar-UDP is therefore the
+\emph{preferred} transport for pillar node-to-node and pillar-native client
+traffic---registered as an additional libp2p transport---with its redundancy
+allowance scaled down toward a single copy on clean, cheap paths and up only as
+measured loss demands, so it pays little where the link is good and covers the
+link where it is not. QUIC and TCP remain the fallback and legacy-interoperability
+paths---the HTTPS/HTTP-3 ingress for non-pillar clients, and any link where no
+pillar-UDP peer is available---not the default: their single-path,
+window-throttled posture is precisely what degrades toward zero on the lossy
+links pillar targets.
 
 \begin{table}[t]
 \centering\small
@@ -356,6 +442,7 @@ loss reaction & shrink congestion window & re-route / re-disperse redundancy \\
 reliability via & retransmit after RTT & redundant copies ($p^{W}$) + NACK \\
 identity / trust & 5-tuple / TLS cert & per-message WoT signature (CID) \\
 reply source & same connection & any dispersed node \\
+role in pillar & fallback / legacy interop & preferred node \& client transport \\
 lossy-link limit & collapses past $\sim$17\% loss \cite{grayson} & delivers while $\ge 1$ path is good \\
 \bottomrule
 \end{tabular}
@@ -368,9 +455,13 @@ multiplexing over TCP but keeps the single-path, window-throttled posture.}
 The models are finite instances (three ingest nodes; a $2{\times}2$ mesh); they
 establish the protocol's logical guarantees, not a performance bound. The
 redundancy posture is deliberately \emph{not} congestion-controlled in the TCP
-sense: it trades bandwidth for reliability and must therefore be gated to
-degraded/adversarial links and bounded by the allowance, never run as an
-open-internet default. Bulk transfer is a distinct problem addressed by
+sense: it trades bandwidth for reliability, so the redundancy allowance is a
+per-connection budget that scales \emph{down} toward a single copy on a clean,
+cheap path and \emph{up} only as measured loss warrants. It is this adaptive
+bound---not a restriction of the protocol to bad links---that lets pillar-UDP
+serve as the default transport without paying a fixed bandwidth multiple; the
+high-fan-out regime, not the protocol itself, is what is reserved for degraded
+and adversarial links. Bulk transfer is a distinct problem addressed by
 erasure-coded, CID-verified chunking over the same dispersed spray, and the
 redundancy-header format and its loss/bandwidth scaling are the subject of the
 companion paper. The anti-amplification obligation (return-routability before
