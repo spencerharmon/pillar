@@ -50,7 +50,19 @@
 scenario_versioning-rollout() {
     local n="${PILLAR_IT_NODES:-3}"
 
-    # (1) real >=3-node topology on the real ghcr image.
+    # Ensure the image the scenario drives ACTUALLY serves the versioning/
+    # rollout CLI surface (`versioning-rollout`). If the published
+    # ghcr.io/spencerharmon/pillar:latest image lags the working tree (the CI
+    # publish workflow has not yet republished past this branch's merge — or
+    # the image is otherwise unreachable), this builds a reproducible
+    # image-under-test from the flake (`nix build .#pillar-oci-image`) and
+    # repoints $PILLAR_IMAGE at it, so the scenario stays black-box and does
+    # not spuriously fail with "unknown verb" or an unpullable published tag.
+    # Mirrors trust-rbac.sh's identical guard for `apply-authz`.
+    image_require_verb versioning-rollout
+
+    # (1) real >=3-node topology on the real ghcr image (or the local
+    # image-under-test built above).
     topology_boot "$n"
 
     # READINESS GATING on the live cell: every node must be a real running
