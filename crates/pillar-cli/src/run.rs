@@ -756,6 +756,14 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let peer_id = pillar_net::peer_id_of(&keypair);
     tracing::info!(%peer_id, data_dir = %config.data_dir.display(), "pillar peer identity loaded");
 
+    // Optional co-located ingress/LB/pillar-UDP dataplane: when
+    // `PILLAR_INGRESS_LB_UDP_MANIFEST` names a manifest file, bind the real
+    // `UdpDataplane` for it alongside the node so the published image exposes an
+    // externally-drivable LB VIP (a container `-p` mapping resolves the printed
+    // `vip=<ip:port>`), exactly like the CLI `ingress-lb-udp serve` verb. The
+    // bound dataplane is held alive for the node's lifetime.
+    let _ingress_lb_udp = spawn_ingress_lb_udp_from_env().await;
+
     // Streaming DB: the durable, content-addressed op store the controller
     // reconciles against.
     //
@@ -1563,6 +1571,49 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// If `PILLAR_INGRESS_LB_UDP_MANIFEST` is set, parse the named manifest and bind
+/// the real [`UdpDataplane`](pillar_net::UdpDataplane), returning the live
+/// handle (held for the node's lifetime). The concrete bound VIP is logged and
+/// printed as `ingress-lb-udp listening vip=<ip:port> backends=<n>` so a harness
+/// / container `-p` mapping can resolve the port. A missing/unreadable/malformed
+/// manifest or a bind failure is logged and yields `None` rather than aborting
+/// node boot — the dataplane is an optional co-located surface.
+async fn spawn_ingress_lb_udp_from_env() -> Option<pillar_net::UdpDataplane> {
+    let path = std::env::var("PILLAR_INGRESS_LB_UDP_MANIFEST").ok()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(manifest = %path, error = %e, "ingress-lb-udp manifest unreadable; skipping");
+            return None;
+        }
+    };
+    let manifest = match crate::ingress_lb_udp::IngressLbUdpManifest::parse(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(manifest = %path, error = %e, "ingress-lb-udp manifest invalid; skipping");
+            return None;
+        }
+    };
+    match manifest.bind().await {
+        Ok(dataplane) => {
+            let vip = dataplane.vip_addr();
+            tracing::info!(%vip, backends = manifest.backends.len(), "ingress-lb-udp dataplane bound");
+            println!(
+                "ingress-lb-udp listening vip={} backends={}",
+                vip,
+                manifest.backends.len()
+            );
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            Some(dataplane)
+        }
+        Err(e) => {
+            tracing::warn!(manifest = %path, error = %e, "ingress-lb-udp bind failed; skipping");
+            None
+        }
     }
 }
 
