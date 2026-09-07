@@ -648,6 +648,26 @@ mod tests {
         );
     }
 
+    /// Mount-audit (anti-facade DoD, ROI Priority 2 Phase 4): `DrilldownPanel`
+    /// (`crate::drilldown::DrilldownPanel`) was, per the ROI, built but never
+    /// mounted anywhere — an orphaned component. This module's `DrilldownTab`
+    /// now mounts it with real server-fed data (`drilldown_live::build_drilldowns`
+    /// over the live correlate join), closing that root-cause defect. Assert the
+    /// reference on this module's own source so a future edit can never silently
+    /// drop the mount and re-orphan the component.
+    #[test]
+    fn obs_console_mounts_the_drilldown_panel() {
+        let src = include_str!("obs_console.rs");
+        assert!(
+            src.contains("crate::drilldown::DrilldownPanel"),
+            "obs_console.rs no longer imports crate::drilldown::DrilldownPanel"
+        );
+        assert!(
+            src.contains("<DrilldownPanel"),
+            "obs_console.rs no longer renders the previously-orphaned DrilldownPanel"
+        );
+    }
+
     #[test]
     fn kind_counts_parse_the_backend_line_format() {
         let body = "KIND metric COUNT 12\nKIND log COUNT 3\nKIND trace COUNT 0\n";
