@@ -15,6 +15,7 @@
 //! [`components`] (behind the default `yew` feature) simply attach those
 //! classes, so the visual language is defined exactly once.
 
+pub mod attestation_custody_console;
 pub mod auth;
 pub mod command_palette;
 pub mod console;

@@ -175,6 +175,7 @@ pub use yew_impl::ConsoleView;
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::{NavGroup, Section};
+    use crate::attestation_custody_console::{AttestationWizard, CustodyWizard};
     use crate::auth::{use_auth, AuthAction};
     use crate::command_palette::CommandPalette;
     use crate::obs_console::ObservabilityConsole;
@@ -283,7 +284,13 @@ mod yew_impl {
             Section::Identity => html! { <IdentityTile /> },
             Section::Members => html! { <MembersTile /> },
             Section::Sessions => html! { <SessionsTile /> },
-            Section::Trust => html! { <TrustGraphConsole /> },
+            Section::Trust => html! {
+                <>
+                    <TrustGraphConsole />
+                    <AttestationWizard />
+                    <CustodyWizard />
+                </>
+            },
             Section::Swarm => html! { <SwarmTile /> },
             Section::Inbox => html! { <InboxTile /> },
         }
@@ -348,5 +355,26 @@ mod tests {
     fn overview_is_the_first_section() {
         assert_eq!(Section::all()[0], Section::Overview);
         assert_eq!(Section::Overview.path(), "/overview");
+    }
+
+    /// Mount-audit (anti-facade DoD): the Trust section must mount BOTH guided
+    /// wizards (`AttestationWizard`, `CustodyWizard`) alongside the trust graph,
+    /// so a future edit can never silently drop them and re-orphan the wizard
+    /// components built in `attestation_custody_console.rs`.
+    #[test]
+    fn trust_section_mounts_the_attestation_and_custody_wizards() {
+        let src = include_str!("console.rs");
+        assert!(
+            src.contains("crate::attestation_custody_console::{AttestationWizard, CustodyWizard}"),
+            "console.rs no longer imports the attestation/custody wizards"
+        );
+        assert!(
+            src.contains("<AttestationWizard />"),
+            "console.rs no longer mounts AttestationWizard in the Trust section"
+        );
+        assert!(
+            src.contains("<CustodyWizard />"),
+            "console.rs no longer mounts CustodyWizard in the Trust section"
+        );
     }
 }

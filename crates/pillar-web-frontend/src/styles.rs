@@ -466,6 +466,17 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .ds-tab:hover {{ color: {text}; }}
         .ds-tab.is-active {{ color: {text}; border-bottom-color: {accent}; }}
 
+        .wizard-steps {{
+            display: flex; gap: 0.5rem; flex-wrap: wrap; list-style: none;
+            padding: 0; margin: 0 0 0.9rem 0; font-size: 0.8rem;
+        }}
+        .wizard-step {{
+            color: {muted}; padding: 0.25rem 0.6rem; border-radius: 999px;
+            border: 1px solid {border}; transition: {transition};
+        }}
+        .wizard-step.is-done {{ color: {text}; border-color: {accent}; opacity: 0.75; }}
+        .wizard-step.is-active {{ color: {text}; border-color: {accent}; background: {glow}; font-weight: 600; }}
+
         .ds-table-wrap {{ display: flex; flex-direction: column; gap: 0.5rem; }}
         .ds-table__filter {{
             align-self: flex-start; min-width: 12rem; padding: 0.4rem 0.6rem;
