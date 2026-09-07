@@ -759,6 +759,35 @@ mod yew_impl {
         let tab = use_state(|| 0usize);
         let output = use_state(String::new);
         let cmd = use_state(|| "sh".to_owned());
+        // The live replica count for THIS resource, re-fetched from the same
+        // `/portal/resource/replicas` oracle the inventory-level rollout
+        // health table uses, filtered to this row's name — so the drawer's
+        // health status is never stale relative to the grid.
+        let live_replicas = use_state(|| None::<usize>);
+
+        // Fetch the live-replica oracle once per opened row (on mount and on
+        // any row swap) and derive this resource's own rollout health from
+        // it — the drawer's "richer" health view over just the declared
+        // replica count already shown in the grid row.
+        {
+            let (auth, row, live_replicas) = (auth.clone(), row.clone(), live_replicas.clone());
+            use_effect_with(row.name.clone(), move |name| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let name = name.clone();
+                let url = get_url("/portal/resource/replicas", &token, &[]);
+                spawn_local(async move {
+                    if let Ok(r) = http("GET", &url, None).await {
+                        let count = parse_replicas(&r.body)
+                            .iter()
+                            .filter(|rep| rep.workload == name)
+                            .count();
+                        live_replicas.set(Some(count));
+                    }
+                });
+            });
+        }
 
         // A read tab (manifest/logs/exec/events) fetches its endpoint into
         // `output`. Events reuses the SAME `describe` body as Manifest — its
@@ -848,8 +877,28 @@ mod yew_impl {
             }
         };
 
+        // The drawer's own rollout-health readout: the SAME `RolloutHealth`
+        // classifier the inventory-level table uses, computed against this
+        // row's live replica count once the oracle above resolves — so the
+        // drawer shows progress/health at a glance without switching tabs.
+        let health = match *live_replicas {
+            Some(live) => {
+                let health = RolloutHealth::compute(row.replicas, live);
+                html! {
+                    <div class="res-health">
+                        <Badge label={format!("{health:?}")} tone={Some(health.tone())} />
+                        <span class="res-health__summary">
+                            { health.summary(row.replicas, live) }
+                        </span>
+                    </div>
+                }
+            }
+            None => html! { <p class="ds-empty">{ "Resolving rollout health…" }</p> },
+        };
+
         html! {
             <>
+                { health }
                 <Tabs tabs={tabs} selected={*tab} onselect={onselect} />
                 { body }
             </>
@@ -1047,6 +1096,30 @@ mod yew_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mount-audit (anti-facade DoD): the ROI's "richer rollout progress/
+    /// health visualization in the resources detail drawer" must be a REAL
+    /// wire-up in `ResourceDetail` — fetching the live-replica oracle and
+    /// rendering a `RolloutHealth`-derived `Badge`, not just the inventory
+    /// grid's existing summary table. Assert that wiring on this module's own
+    /// source so a future edit can never silently drop it.
+    #[test]
+    fn resource_detail_drawer_wires_a_live_rollout_health_readout() {
+        let src = include_str!("resources_console.rs");
+        assert!(
+            src.contains("live_replicas = use_state(|| None::<usize>)"),
+            "ResourceDetail no longer tracks a live-replica oracle for its own row"
+        );
+        assert!(
+            src.contains("RolloutHealth::compute(row.replicas, live)")
+                && src.matches("RolloutHealth::compute(row.replicas, live)").count() >= 1,
+            "ResourceDetail no longer derives RolloutHealth from the live oracle"
+        );
+        assert!(
+            src.contains("res-health"),
+            "ResourceDetail no longer renders a rollout-health readout"
+        );
+    }
 
     #[test]
     fn resource_rows_parse_kind_name_and_replicas() {

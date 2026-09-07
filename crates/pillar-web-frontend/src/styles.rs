@@ -537,6 +537,8 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .res-openrow {{ display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; }}
         .res-change h4 {{ margin: 0.9rem 0 0.4rem; }}
         .res-verdict {{ display: flex; align-items: center; gap: 0.75rem; margin: 0.75rem 0; }}
+        .res-health {{ display: flex; align-items: center; gap: 0.6rem; margin: 0 0 0.75rem; }}
+        .res-health__summary {{ color: {muted}; font-size: 0.85rem; }}
 
         /* ---- node-link graph (trust) ---- */
         .ds-graph {{ width: 100%; height: auto; max-height: 60vh; display: block; }}
