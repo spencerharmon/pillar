@@ -81,6 +81,27 @@
           overlays = [ cratesIoStaticCdnOverlay ];
         };
 
+        # trunk's offline wasm-bindgen step must run the EXACT `wasm-bindgen-cli`
+        # version matching the frontend crate's `wasm-bindgen` library
+        # (=0.2.121, lockstep with web-sys/js-sys 0.3.98). The pinned nixpkgs
+        # ships `wasm-bindgen-cli` 0.2.100 (paired with the older web-sys 0.3.77,
+        # which lacks the WebAuthn bindings the portal uses), so build 0.2.121
+        # from its crates.io source, vendoring its deps from its OWN bundled
+        # Cargo.lock (fetched through the static-CDN overlay above). Verified the
+        # crate's fetchCrate hash locally.
+        wasmBindgenCliSrc = pkgs.fetchCrate {
+          pname = "wasm-bindgen-cli";
+          version = "0.2.121";
+          hash = "sha256-ZOMgFNOcGkO66Jz/Z83eoIu+DIzo3Z/vq6Z5g6BDY/w=";
+        };
+        wasmBindgenCli = pkgs.wasm-bindgen-cli.overrideAttrs (_: {
+          version = "0.2.121";
+          src = wasmBindgenCliSrc;
+          cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = "${wasmBindgenCliSrc}/Cargo.lock";
+          };
+        });
+
         # ---------------------------------------------------------------------
         # Stage 1 of the two-stage build: compile the Yew + WebAssembly portal
         # (crate pillar-frontend, EXCLUDED from the native workspace) to
@@ -119,11 +140,12 @@
           };
 
           # trunk (Node-free wasm bundler) + a wasm-bindgen-cli whose version
-          # MUST equal the crate's `wasm-bindgen` (0.2.127, pinned in the
-          # frontend Cargo.lock) or wasm-bindgen refuses the module.
+          # MUST equal the crate's `wasm-bindgen` (=0.2.121, pinned in the
+          # frontend Cargo.lock) or wasm-bindgen refuses the module. The pinned
+          # nixpkgs ships 0.2.100, so `wasmBindgenCli` (above) builds 0.2.121.
           nativeBuildInputs = [
             pkgs.trunk
-            pkgs.wasm-bindgen-cli
+            wasmBindgenCli
             pkgs.binaryen
             pkgs.lld
           ];
