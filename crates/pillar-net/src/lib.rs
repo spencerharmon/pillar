@@ -241,27 +241,39 @@ fn identify_config(keypair: &Keypair) -> identify::Config {
 pub fn build_event_swarm(
     keypair: Keypair,
 ) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
-    build_event_swarm_with_root(keypair, PrivateSwarmKey::disabled(), false)
+    build_event_swarm_with_root(keypair, PrivateSwarmKey::disabled(), false, true)
 }
 
 /// Builds a [`Swarm`] running [`EventBehaviour`] whose TRANSPORT is bound to
 /// `root`'s configured [`PrivateSwarmKey`].
 ///
-/// - `root.is_enabled() == false` (the public default): identical to
-///   [`build_event_swarm`] — TCP + QUIC, open to any peer.
-/// - `root.is_enabled() == true` (a configured private network root): the
-///   swarm runs over TCP ONLY, wrapped in the libp2p pnet pre-shared-key
-///   handshake ([`libp2p::pnet::PnetConfig`]) derived from the root. A peer
-///   whose transport-level handshake carries a DIFFERENT (or no) key can
-///   never complete the pnet XSalsa20 handshake at all — the connection is
-///   refused below every higher protocol (noise, yamux, kademlia), so a
-///   mismatched-root peer cannot even reach the point of speaking
-///   `/pillar/kad` to probe the DHT. This is the "two swarms configured with
-///   different roots do not discover each other" guarantee: it is enforced
-///   by the pnet handshake refusing to complete, not by any DHT-level check.
-///   QUIC is not offered in this mode: QUIC's own TLS handshake is not
-///   pnet-wrapped by this crate, so admitting it would open a side channel
-///   that bypasses the root check.
+/// - `root.is_enabled() == false` (a disabled root — the open test/substrate
+///   path taken only by [`build_event_swarm`] and unit tests): TCP + QUIC +
+///   pillar-UDP, no pnet layer, open to any peer.
+/// - `root.is_enabled() == true` (EVERY real node): a pnet pre-shared-key swarm
+///   ([`libp2p::pnet::PnetConfig`]) derived from the root. This covers BOTH the
+///   PUBLIC pillar swarm (on the published, baked-in
+///   [`pillar_swarm::PUBLIC_PILLAR_ROOT`] key — a namespace tag, not a secret)
+///   AND a PRIVATE swarm (on an operator's secret key). The transports are
+///   pnet-wrapped **TCP** and pnet-wrapped **pillar-UDP** — pillar-UDP is the
+///   preferred transport (see [`select_preferred_transport`]), TCP the
+///   fallback/legacy-interop leg. Both carry the pnet XSalsa20 handshake below
+///   noise/yamux, so a peer whose handshake carries a DIFFERENT (or no) key can
+///   never complete it — the connection is refused below every higher protocol
+///   (noise, yamux, kademlia), so a mismatched-root peer cannot even reach the
+///   point of speaking `/pillar/kad`. This is the "two swarms configured with
+///   different roots do not discover each other" guarantee, enforced by the
+///   pnet handshake refusing to complete, not by any DHT-level check.
+///
+/// `quic_enabled` governs whether QUIC is additionally offered on a pnet swarm.
+/// QUIC integrates its own TLS handshake and so CANNOT be pnet-wrapped by this
+/// crate; admitting it bypasses the transport-level root check. It is therefore
+/// offered ONLY for the PUBLIC swarm (published key ⇒ the root is a namespace
+/// tag with no secrecy to protect, and the behaviour-layer `/pillar/*` protocol
+/// names still namespace it) and WITHHELD for a PRIVATE swarm, whose pnet key is
+/// a secret membership gate an un-pnet'd QUIC side channel would bypass. The
+/// caller ([`crate`] consumers via `pillar_swarm::SwarmKind`) sets it. Ignored
+/// for a disabled root, which always offers QUIC (the open substrate).
 ///
 /// `upnp_enabled` toggles a UPnP/NAT-PMP port-mapping behaviour (the
 /// [`EventBehaviour::upnp`] [`Toggle`]). Off (the default for a directly
@@ -273,14 +285,8 @@ pub fn build_event_swarm_with_root(
     keypair: Keypair,
     root: PrivateSwarmKey,
     upnp_enabled: bool,
+    quic_enabled: bool,
 ) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
-    let make_upnp = || -> Toggle<upnp::tokio::Behaviour> {
-        if upnp_enabled {
-            Toggle::from(Some(upnp::tokio::Behaviour::default()))
-        } else {
-            Toggle::from(None)
-        }
-    };
     let swarm = match root.0 {
         None => libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -292,37 +298,54 @@ pub fn build_event_swarm_with_root(
             .with_quic()
             .with_other_transport(pillar_udp_boxed_transport)?
             .with_dns()?
-            .with_behaviour(|key| {
-                let peer_id = key.public().to_peer_id();
-                EventBehaviour {
-                    gossipsub: gossipsub_behaviour(key),
-                    kademlia: new_kademlia(peer_id),
-                    identify: identify::Behaviour::new(identify_config(key)),
-                    op_sync: opsync::op_sync_behaviour(),
-                    upnp: make_upnp(),
-                }
-            })?
+            .with_behaviour(|key| make_event_behaviour(key, upnp_enabled))?
             .build(),
+        // Every real node: a pnet swarm. pillar-UDP (preferred) + TCP legs are
+        // pnet-wrapped so the root check gates them; QUIC (un-pnet'able) is
+        // added only for the PUBLIC swarm (see `quic_enabled` on the fn doc).
+        Some(key) if quic_enabled => {
+            let psk = PreSharedKey::new(key);
+            libp2p::SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_other_transport(move |kp| pnet_tcp_transport(kp, psk))?
+                .with_other_transport(quic_boxed_transport)?
+                .with_other_transport(move |kp| pnet_pillar_udp_transport(kp, psk))?
+                .with_dns()?
+                .with_behaviour(|key| make_event_behaviour(key, upnp_enabled))?
+                .build()
+        }
         Some(key) => {
             let psk = PreSharedKey::new(key);
             libp2p::SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
-                .with_other_transport(|kp| pnet_tcp_transport(kp, psk))?
+                .with_other_transport(move |kp| pnet_tcp_transport(kp, psk))?
+                .with_other_transport(move |kp| pnet_pillar_udp_transport(kp, psk))?
                 .with_dns()?
-                .with_behaviour(|key| {
-                    let peer_id = key.public().to_peer_id();
-                    EventBehaviour {
-                        gossipsub: gossipsub_behaviour(key),
-                        kademlia: new_kademlia(peer_id),
-                        identify: identify::Behaviour::new(identify_config(key)),
-                        op_sync: opsync::op_sync_behaviour(),
-                        upnp: make_upnp(),
-                    }
-                })?
+                .with_behaviour(|key| make_event_behaviour(key, upnp_enabled))?
                 .build()
         }
     };
     Ok(swarm)
+}
+
+/// Constructs the [`EventBehaviour`] shared by every transport composition of
+/// [`build_event_swarm_with_root`]. `upnp_enabled` builds the UPnP/NAT-PMP
+/// [`Toggle`] on (a NAT'd seed/public node) or leaves it inert. MUST be invoked
+/// from within a Tokio runtime when `upnp_enabled` — libp2p's UPnP behaviour
+/// constructs its reactor eagerly.
+fn make_event_behaviour(key: &Keypair, upnp_enabled: bool) -> EventBehaviour {
+    let peer_id = key.public().to_peer_id();
+    EventBehaviour {
+        gossipsub: gossipsub_behaviour(key),
+        kademlia: new_kademlia(peer_id),
+        identify: identify::Behaviour::new(identify_config(key)),
+        op_sync: opsync::op_sync_behaviour(),
+        upnp: if upnp_enabled {
+            Toggle::from(Some(upnp::tokio::Behaviour::default()))
+        } else {
+            Toggle::from(None)
+        },
+    }
 }
 
 /// Builds a TCP transport wrapped in the pnet pre-shared-key handshake, then
@@ -361,8 +384,42 @@ fn pillar_udp_boxed_transport(
         .boxed()
 }
 
-/// Builds a [`Swarm`] running [`RelayServerBehaviour`] over TCP, acting as a
-/// circuit-relay-v2 relay for other Pillar nodes.
+/// The pillar-UDP transport wrapped in the pnet pre-shared-key handshake, then
+/// Noise-authenticated and yamux-multiplexed exactly like [`pnet_tcp_transport`]
+/// — the pnet layer sits directly on the reliable-ordered pillar-UDP byte
+/// stream, so a peer without the matching root key cannot complete the
+/// pillar-UDP path either. This is what keeps pillar-UDP (the PREFERRED
+/// transport) root-isolated on both the public and private pnet swarms, so the
+/// corrected "pillar-UDP preferred" posture holds for every real node, not just
+/// the disabled-root [`build_event_swarm`] used in tests.
+fn pnet_pillar_udp_transport(
+    keypair: &Keypair,
+    psk: PreSharedKey,
+) -> libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)> {
+    let pnet_config = PnetConfig::new(psk);
+    PillarUdpTransport::new(keypair.clone())
+        .and_then(move |socket, _| pnet_config.handshake(socket))
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(keypair).expect("static noise config is valid"))
+        .multiplex(yamux::Config::default())
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
+        .boxed()
+}
+
+/// The libp2p QUIC transport as a boxed `(PeerId, StreamMuxerBox)` so it can be
+/// registered via `with_other_transport` alongside the pnet-wrapped TCP /
+/// pillar-UDP legs. QUIC carries its own TLS handshake and is fully upgraded by
+/// the transport itself (no separate noise/yamux), so it is only `.map`ped into
+/// a boxed muxer. It CANNOT be pnet-wrapped — hence it is registered only on the
+/// PUBLIC swarm; see [`build_event_swarm_with_root`]'s `quic_enabled`.
+fn quic_boxed_transport(
+    keypair: &Keypair,
+) -> libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)> {
+    let config = libp2p::quic::Config::new(keypair);
+    libp2p::quic::tokio::Transport::new(config)
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
+        .boxed()
+}
 pub fn build_relay_server_swarm(
     keypair: Keypair,
 ) -> Result<Swarm<RelayServerBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
@@ -1417,6 +1474,7 @@ mod tests {
             Keypair::generate_ed25519(),
             PrivateSwarmKey::disabled(),
             true,
+            true,
         )
         .expect("upnp-enabled public swarm builds");
         drop(public);
@@ -1424,6 +1482,7 @@ mod tests {
             Keypair::generate_ed25519(),
             PrivateSwarmKey::from_root_secret("seed-upnp-test-root"),
             true,
+            false,
         )
         .expect("upnp-enabled private swarm builds");
         drop(private);
@@ -1563,6 +1622,7 @@ mod tests {
             Keypair::generate_ed25519(),
             PrivateSwarmKey::disabled(),
             false,
+            true,
         )
         .unwrap();
         let mut b = build_event_swarm(Keypair::generate_ed25519()).unwrap();
@@ -1607,6 +1667,60 @@ mod tests {
         );
     }
 
+    /// Regression for the transport-posture correction ON THE REAL PATH. EVERY
+    /// real node boots through the ENABLED-root (pnet) branch — both the public
+    /// swarm (published key) and a private swarm — NOT the disabled-root
+    /// `build_event_swarm` path the other tests here use. That branch used to be
+    /// TCP-ONLY, so a deployed node given a `--listen …/udp/<p>/quic-v1` addr
+    /// crash-looped `listen_on … Multiaddr is not supported`, and pillar-UDP (the
+    /// PREFERRED transport) was absent from real nodes entirely. This asserts the
+    /// corrected posture against the real path by exercising `listen_on` — which
+    /// returns `Err(MultiaddrNotSupported)` synchronously for a transport the
+    /// swarm did not register (the exact error the node hit):
+    ///   * a PUBLIC pnet swarm accepts pillar-UDP, QUIC, and TCP listen addrs;
+    ///   * a PRIVATE pnet swarm accepts pillar-UDP + TCP but REJECTS QUIC — QUIC
+    ///     cannot be pnet-wrapped, so it must not open an un-gated side channel
+    ///     around a private swarm's secret root.
+    #[tokio::test]
+    async fn pnet_swarm_registers_pillar_udp_and_class_scoped_quic() {
+        let pillar_udp: Multiaddr = "/ip4/127.0.0.1/udp/0/unix/p-pillar".parse().unwrap();
+        let quic: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let tcp: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        // PUBLIC swarm (an enabled root, quic_enabled=true): the deployed seeds
+        // and default public node.
+        let public_root = PrivateSwarmKey::from_root_secret("posture-public-class-root");
+        let mut public =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), public_root, false, true)
+                .unwrap();
+        public.listen_on(pillar_udp.clone()).expect(
+            "a public pnet swarm must accept a pillar-UDP listen addr (the preferred transport)",
+        );
+        public.listen_on(quic.clone()).expect(
+            "a public pnet swarm must accept a QUIC listen addr — the regression that crash-looped",
+        );
+        public
+            .listen_on(tcp.clone())
+            .expect("a public pnet swarm must accept a TCP listen addr (the fallback leg)");
+
+        // PRIVATE swarm (an enabled root, quic_enabled=false).
+        let private_root = PrivateSwarmKey::from_root_secret("posture-private-class-root");
+        let mut private =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), private_root, false, false)
+                .unwrap();
+        private.listen_on(pillar_udp).expect(
+            "a private pnet swarm must accept a pillar-UDP listen addr (the preferred transport)",
+        );
+        private
+            .listen_on(tcp)
+            .expect("a private pnet swarm must accept a TCP listen addr (the fallback leg)");
+        assert!(
+            private.listen_on(quic).is_err(),
+            "a private pnet swarm must REJECT a QUIC listen addr: QUIC cannot be pnet-wrapped, so \
+             admitting it would bypass the secret-root membership gate"
+        );
+    }
+
     /// Two nodes configured with DIFFERENT network roots do NOT discover each
     /// other: the pnet pre-shared-key handshake mismatches below noise/yamux,
     /// so the transport-level connection never completes and no
@@ -1619,9 +1733,9 @@ mod tests {
         let root_b = PrivateSwarmKey::from_root_secret("network-beta");
 
         let mut a =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root_a, false).unwrap();
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_a, false, false).unwrap();
         let mut b =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root_b, false).unwrap();
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_b, false, false).unwrap();
         let b_peer_id = *b.local_peer_id();
 
         let b_addr = listen_and_get_addr(&mut b).await;
@@ -1666,7 +1780,8 @@ mod tests {
         let root = PrivateSwarmKey::from_root_secret("shared-private-root");
 
         let mut seed =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root.clone(), false).unwrap();
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root.clone(), false, false)
+                .unwrap();
         let seed_peer_id = *seed.local_peer_id();
         let seed_addr = listen_and_get_addr(&mut seed).await;
         let seed_multiaddr = seed_addr.with(Protocol::P2p(seed_peer_id));
@@ -1678,7 +1793,7 @@ mod tests {
         });
 
         let mut joiner =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root, false).unwrap();
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root, false, false).unwrap();
         let seeds = vec![parse_seed_multiaddr(seed_multiaddr).unwrap()];
         let added = seed_event_dht(&mut joiner, &seeds);
         assert_eq!(added, 1, "one seed configured");

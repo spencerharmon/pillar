@@ -886,8 +886,15 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         "pillar peer transport bound to swarm (pnet-keyed pre-shared transport)"
     );
     let root = pillar_net::PrivateSwarmKey::from_root_secret(&root_secret);
-    let mut swarm = pillar_net::build_event_swarm_with_root(keypair, root, config.upnp)
-        .map_err(|e| BootError::Transport(e.to_string()))?;
+    // QUIC cannot be pnet-wrapped, so it is offered only on the PUBLIC swarm
+    // (its pnet key is published — a namespace tag, not a secret) and withheld
+    // from a private swarm, whose pnet key is a secret membership gate an
+    // un-pnet'd QUIC side channel would bypass. pillar-UDP (pnet-wrapped) stays
+    // the preferred transport either way; TCP is the fallback.
+    let quic_enabled = matches!(swarm_key.kind(), pillar_swarm::SwarmKind::Public);
+    let mut swarm =
+        pillar_net::build_event_swarm_with_root(keypair, root, config.upnp, quic_enabled)
+            .map_err(|e| BootError::Transport(e.to_string()))?;
     let topic = pillar_net::event_log_topic();
     swarm
         .behaviour_mut()

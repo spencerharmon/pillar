@@ -43,6 +43,7 @@ async fn upnp_enabled_swarm_has_active_mapping_behaviour() {
         Keypair::generate_ed25519(),
         PrivateSwarmKey::disabled(),
         true,
+        true,
     )
     .expect("upnp-enabled public swarm builds");
     assert!(
@@ -54,6 +55,7 @@ async fn upnp_enabled_swarm_has_active_mapping_behaviour() {
         Keypair::generate_ed25519(),
         PrivateSwarmKey::from_root_secret("seed-upnp-acceptance-root"),
         true,
+        false,
     )
     .expect("upnp-enabled private swarm builds");
     assert!(
@@ -78,6 +80,7 @@ async fn upnp_off_by_default_leaves_behaviour_inert() {
         Keypair::generate_ed25519(),
         PrivateSwarmKey::disabled(),
         false,
+        true,
     )
     .expect("upnp-off swarm builds");
     assert!(
@@ -101,6 +104,7 @@ async fn discovered_external_addr_enters_advertised_set() {
     let mut swarm = build_event_swarm_with_root(
         Keypair::generate_ed25519(),
         PrivateSwarmKey::disabled(),
+        true,
         true,
     )
     .expect("upnp-enabled public swarm builds");

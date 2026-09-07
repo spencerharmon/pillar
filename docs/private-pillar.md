@@ -194,6 +194,29 @@ its public address is stable enough to name in a `_dnsaddr` TXT record. If no
 UPnP-capable gateway is found the node logs it and keeps running (it is simply
 not auto-mapped); a directly reachable node does not need `--upnp`.
 
+### Transport composition (what a listen addr may be)
+
+Every real node runs a `pnet` pre-shared-key swarm (both the public swarm, on
+the published baked-in key, and a private swarm, on your secret key). On that
+swarm the registered transports are:
+
+- **pillar-UDP** (`…/udp/<port>/unix/p-pillar`) — the PREFERRED transport,
+  `pnet`-wrapped so the root check gates it. This is pillar's reliable-ordered
+  datagram substrate; a node prefers it whenever a pillar-UDP-capable peer is
+  reachable.
+- **TCP** (`…/tcp/<port>`) — the `pnet`-wrapped fallback / legacy-interop leg.
+- **QUIC** (`…/udp/<port>/quic-v1`) — offered ONLY on the **public** swarm.
+  QUIC integrates its own TLS handshake and cannot be `pnet`-wrapped, so it is
+  deliberately withheld from a **private** swarm: admitting it there would open
+  an un-gated side channel around your secret root. On the public swarm the key
+  is published (a namespace tag, not a secret) and the `/pillar/*` protocol
+  names still namespace it, so QUIC is safe to offer. A private node given a
+  `…/quic-v1` listen addr is refused (`Multiaddr is not supported`) by design —
+  use pillar-UDP or TCP.
+
+So a `--listen`/`PILLAR_LISTEN` entry may be a pillar-UDP, TCP, or (public-only)
+QUIC multiaddr; mix them freely (e.g. a public seed can listen on all three).
+
 ## Per-primitive worked examples
 
 Every primitive below uses the **identical** private-pillar pattern from
