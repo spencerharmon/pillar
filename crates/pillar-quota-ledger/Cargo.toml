@@ -10,7 +10,7 @@ description = "Quorum-fenced reservation ledger over the streaming DB: reserves 
 [dependencies]
 pillar-core = { path = "../pillar-core" }
 pillar-coordination = { path = "../pillar-coordination" }
-pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-streamdb = { path = "../pillar-streamdb", default-features = false }
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 
 [lints]

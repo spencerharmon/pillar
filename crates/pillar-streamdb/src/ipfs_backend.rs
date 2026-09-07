@@ -30,13 +30,19 @@
 //! pillar's own gossip. This matches the spec's `publishHead` (owner-signed,
 //! monotone) precisely.
 
+#[cfg(feature = "ipfs")]
 use std::collections::HashMap;
+#[cfg(feature = "ipfs")]
 use std::path::PathBuf;
+#[cfg(feature = "ipfs")]
 use std::sync::Mutex;
 
+#[cfg(feature = "ipfs")]
 use pillar_ipfs::IpfsNode;
 
-use crate::store::{hex_encode, io_store_err, Cid, HeadRecord, StoreError};
+use crate::store::{Cid, HeadRecord, StoreError};
+#[cfg(feature = "ipfs")]
+use crate::store::{hex_encode, io_store_err};
 
 /// The abstract IPFS content-object substrate a [`crate::ContentStore`]
 /// delegates its durability to. Every method is synchronous (the store surface
@@ -85,6 +91,7 @@ pub trait IpfsBackend: std::fmt::Debug + Send + Sync {
     fn is_durable(&self) -> bool;
 }
 
+#[cfg(feature = "ipfs")]
 fn ipfs_err(e: pillar_ipfs::IpfsError) -> StoreError {
     match e {
         pillar_ipfs::IpfsError::Io(kind) => StoreError::Io(kind),
@@ -100,12 +107,14 @@ fn ipfs_err(e: pillar_ipfs::IpfsError) -> StoreError {
 /// (blocks/pins/provides) plus an owner-signed [`HeadStore`] for the mutable
 /// IPNS-format head. Durable when opened on the PVC ([`Self::open`]);
 /// in-memory for tests ([`Self::in_memory`]).
+#[cfg(feature = "ipfs")]
 #[derive(Debug)]
 pub struct NativeIpfsBackend {
     node: IpfsNode,
     heads: HeadStore,
 }
 
+#[cfg(feature = "ipfs")]
 impl NativeIpfsBackend {
     /// Open a durable node rooted at `root` on the PVC (content under
     /// `root`, heads under `root/heads`).
@@ -129,6 +138,7 @@ impl NativeIpfsBackend {
     }
 }
 
+#[cfg(feature = "ipfs")]
 impl IpfsBackend for NativeIpfsBackend {
     fn block_put(&self, cid: &Cid, wire: &[u8]) -> Result<(), StoreError> {
         self.node.put_block_checked(&cid.0, wire).map_err(ipfs_err)
@@ -189,6 +199,7 @@ impl IpfsBackend for NativeIpfsBackend {
 
 /// Persistence for the mutable, owner-signed head record (one per owner). A
 /// head only advances; a write overwrites the owner's previous record.
+#[cfg(feature = "ipfs")]
 #[derive(Debug)]
 enum HeadStore {
     /// One length-prefixed record file per owner under a PVC directory.
@@ -197,6 +208,7 @@ enum HeadStore {
     Mem(Mutex<HashMap<Vec<u8>, HeadRecord>>),
 }
 
+#[cfg(feature = "ipfs")]
 impl HeadStore {
     fn open(dir: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let dir = dir.into();
@@ -262,18 +274,20 @@ impl HeadStore {
 // ---------------------------------------------------------------------------
 
 /// The CIDv1(`raw`) multibase-`base32` string (`bafkrei…`) for a pillar [`Cid`].
+#[cfg(feature = "ipfs")]
 #[must_use]
 pub fn cid_to_cidv1_raw(cid: &Cid) -> String {
     pillar_ipfs::to_cidv1_raw(&cid.0)
 }
 
 /// Parse a CIDv1(`raw`) multibase-`base32` string back to a pillar [`Cid`].
+#[cfg(feature = "ipfs")]
 #[must_use]
 pub fn cidv1_raw_to_cid(s: &str) -> Option<Cid> {
     pillar_ipfs::from_cidv1_raw(s).map(Cid)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ipfs"))]
 mod tests {
     use super::*;
     use crate::store::Cid;

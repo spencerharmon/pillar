@@ -26,6 +26,7 @@
 //! segment chain.
 
 use pillar_core::{SideEffect, ViewPolicy};
+#[cfg(feature = "ipfs")]
 use std::path::PathBuf;
 
 use pillar_crypto::seal::{seal_to_recipients, unseal};
@@ -200,6 +201,7 @@ impl IpfsPersistentStream {
     /// [`IpfsPersistError::Store`] if the on-disk store cannot be opened;
     /// [`IpfsPersistError::Corrupt`] if a locally-pinned segment in the chain
     /// is malformed.
+    #[cfg(feature = "ipfs")]
     pub fn open(
         root: impl Into<PathBuf>,
         owner: SigningPublicKey,

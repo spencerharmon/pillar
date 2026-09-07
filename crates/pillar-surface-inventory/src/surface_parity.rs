@@ -106,6 +106,7 @@ pub static PARITY_MAP: &[ParityRule] = &[
         reason: "kubectl-parity resource describe; served in the portal under the shared /portal/resource/* family (paired via `apply`)",
     },
     ParityRule::Paired { verb: "space", route_prefix: "/portal/topology" },
+    ParityRule::Paired { verb: "swarm", route_prefix: "/portal/swarm" },
     ParityRule::Paired { verb: "request", route_prefix: "/bootstrap/request" },
 
     // --- CLI verbs deliberately without a portal route ---------------------
