@@ -535,6 +535,36 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .ds-graph__nlabel {{ fill: {text}; font-size: 11px; text-anchor: middle; }}
         .ds-graph__elabel {{ fill: {muted}; font-size: 9px; text-anchor: middle; }}
 
+        /* ---- overview KPI band ---- */
+        .ov-kpis {{
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 0.75rem; margin-bottom: 1rem;
+        }}
+
+        /* ---- command palette (Cmd/Ctrl-K) ---- */
+        .cmdk {{ position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-start; justify-content: center; }}
+        .cmdk__scrim {{ position: absolute; inset: 0; background: rgba(0,0,0,0.55); }}
+        .cmdk__panel {{
+            position: relative; margin-top: 12vh; width: min(560px, 92vw);
+            background-color: {surface_raised}; border: 1px solid {border};
+            border-radius: {radius}; box-shadow: {shadow_elevated}; overflow: hidden;
+            animation: ds-slide-in 180ms {motion_easing};
+        }}
+        .cmdk__input {{
+            width: 100%; border: none; border-bottom: 1px solid {border};
+            background-color: {surface_base}; color: {text}; font-size: 1rem;
+            padding: 0.9rem 1.1rem; outline: none;
+        }}
+        .cmdk__list {{ list-style: none; margin: 0; padding: 0.35rem; max-height: 50vh; overflow: auto; }}
+        .cmdk__item {{
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0.55rem 0.75rem; border-radius: 8px; cursor: pointer;
+        }}
+        .cmdk__item:hover {{ background-color: {surface_overlay}; }}
+        .cmdk__label {{ color: {text}; font-size: 0.9rem; }}
+        .cmdk__hint {{ color: {muted}; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+        .cmdk__empty {{ color: {muted}; padding: 0.75rem; font-size: 0.85rem; }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{

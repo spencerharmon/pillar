@@ -168,16 +168,18 @@ impl Section {
 }
 
 #[cfg(feature = "yew")]
+pub(crate) use yew_impl::section_route;
+#[cfg(feature = "yew")]
 pub use yew_impl::ConsoleView;
 
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::{NavGroup, Section};
     use crate::auth::{use_auth, AuthAction};
+    use crate::command_palette::CommandPalette;
     use crate::obs_console::ObservabilityConsole;
-    use crate::portal::{
-        IdentityTile, InboxTile, MembersTile, NodeStatusTile, SessionsTile, SwarmTile,
-    };
+    use crate::overview::OverviewConsole;
+    use crate::portal::{IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile};
     use crate::resources_console::ResourcesConsole;
     use crate::router::Route;
     use crate::topology_console::{TopologyConsole, TrustGraphConsole};
@@ -231,6 +233,7 @@ mod yew_impl {
                         { render_section(active) }
                     </main>
                 </div>
+                <CommandPalette />
             </div>
         }
     }
@@ -273,16 +276,7 @@ mod yew_impl {
     /// orientation note; every other section mounts its one capability tile.
     fn render_section(section: Section) -> Html {
         match section {
-            Section::Overview => html! {
-                <>
-                    <NodeStatusTile />
-                    <div class="tile">
-                        <h3>{ "Welcome" }</h3>
-                        <p>{ "Use the sidebar to manage resources, observability, \
-                              topology, identity, and cluster membership." }</p>
-                    </div>
-                </>
-            },
+            Section::Overview => html! { <OverviewConsole /> },
             Section::Resources => html! { <ResourcesConsole /> },
             Section::Observability => html! { <ObservabilityConsole /> },
             Section::Topology => html! { <TopologyConsole /> },
@@ -299,7 +293,7 @@ mod yew_impl {
     /// bridged for `<Link>` targets. The host-side round-trip test
     /// ([`super::tests::section_paths_match_routes`]) pins that this agrees with
     /// [`Section::path`].
-    fn section_route(section: Section) -> Route {
+    pub(crate) fn section_route(section: Section) -> Route {
         match section {
             Section::Overview => Route::Overview,
             Section::Resources => Route::Resources,

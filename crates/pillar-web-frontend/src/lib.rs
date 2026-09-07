@@ -16,12 +16,14 @@
 //! classes, so the visual language is defined exactly once.
 
 pub mod auth;
+pub mod command_palette;
 pub mod console;
 pub mod dashboard;
 pub mod drilldown;
 pub mod drilldown_live;
 pub mod explore;
 pub mod obs_console;
+pub mod overview;
 pub mod panels;
 pub mod portal;
 pub mod portal_entry;
