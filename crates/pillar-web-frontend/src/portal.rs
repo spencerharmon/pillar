@@ -995,7 +995,7 @@ mod yew_impl {
                     { for domains.iter().map(|d| html! { <p class="domain-row">{ d.clone() }</p> }) }
                 </div>
                 <label for="identity-domain-input">{ "Enroll in a domain" }</label>
-                <input id="identity-domain-input" r#type="text" placeholder="domain"
+                <input id="identity-domain-input" type="text" placeholder="domain"
                     value={(*domain_input).clone()} oninput={on_domain} />
                 <PendingButton id="identity-enroll-btn" label="Enroll" busy={*busy}
                     onclick={act("/portal/identity/enroll", true, false)} />
@@ -1092,9 +1092,9 @@ mod yew_impl {
                     { for rows.iter().map(|m| html! { <p class="member-row">{ m.clone() }</p> }) }
                 </div>
                 <label for="member-handle-input">{ "Add / invite member" }</label>
-                <input id="member-handle-input" r#type="text" placeholder="handle"
+                <input id="member-handle-input" type="text" placeholder="handle"
                     value={(*handle).clone()} oninput={on_handle} />
-                <input id="member-role-input" r#type="text" placeholder="role"
+                <input id="member-role-input" type="text" placeholder="role"
                     value={(*role).clone()} oninput={on_role} />
                 <PendingButton id="member-add-btn" label="Add / invite" busy={*busy} onclick={add} />
                 { message_line("member-add-msg", &msg) }
@@ -1354,32 +1354,32 @@ mod yew_impl {
                     { for edges.iter().map(|e| html! { <p class="trust-edge">{ e.clone() }</p> }) }
                 </div>
                 <label>{ "Build an attestation" }</label>
-                <input id="attest-issuer" r#type="text" placeholder="issuer" value={attest.issuer.clone()}
+                <input id="attest-issuer" type="text" placeholder="issuer" value={attest.issuer.clone()}
                     oninput={attest_field(|a| a.issuer.clone(), |a, v| a.issuer = v)} />
-                <input id="attest-capacity" r#type="text" placeholder="capacity (self or role@scope)" value={attest.capacity.clone()}
+                <input id="attest-capacity" type="text" placeholder="capacity (self or role@scope)" value={attest.capacity.clone()}
                     oninput={attest_field(|a| a.capacity.clone(), |a, v| a.capacity = v)} />
-                <input id="attest-authority" r#type="text" placeholder="authority cid (optional)" value={attest.authority.clone()}
+                <input id="attest-authority" type="text" placeholder="authority cid (optional)" value={attest.authority.clone()}
                     oninput={attest_field(|a| a.authority.clone(), |a, v| a.authority = v)} />
-                <input id="attest-subject" r#type="text" placeholder="subject" value={attest.subject.clone()}
+                <input id="attest-subject" type="text" placeholder="subject" value={attest.subject.clone()}
                     oninput={attest_field(|a| a.subject.clone(), |a, v| a.subject = v)} />
-                <input id="attest-action" r#type="text" placeholder="action" value={attest.action.clone()}
+                <input id="attest-action" type="text" placeholder="action" value={attest.action.clone()}
                     oninput={attest_field(|a| a.action.clone(), |a, v| a.action = v)} />
-                <input id="attest-resource" r#type="text" placeholder="resource" value={attest.resource.clone()}
+                <input id="attest-resource" type="text" placeholder="resource" value={attest.resource.clone()}
                     oninput={attest_field(|a| a.resource.clone(), |a, v| a.resource = v)} />
-                <input id="attest-quota" r#type="text" placeholder="quota (optional)" value={attest.quota.clone()}
+                <input id="attest-quota" type="text" placeholder="quota (optional)" value={attest.quota.clone()}
                     oninput={attest_field(|a| a.quota.clone(), |a, v| a.quota = v)} />
-                <input id="attest-scope" r#type="text" placeholder="scope" value={attest.scope.clone()}
+                <input id="attest-scope" type="text" placeholder="scope" value={attest.scope.clone()}
                     oninput={attest_field(|a| a.scope.clone(), |a, v| a.scope = v)} />
                 <PendingButton id="attest-build-btn" label="Build attestation" busy={*busy} onclick={build_attestation} />
                 <div id="attestation-result">
                     { for attest_result.iter().map(|l| html! { <p class="attest-line">{ l.clone() }</p> }) }
                 </div>
                 <label>{ "Key / offer custody" }</label>
-                <input id="custody-handle" r#type="text" placeholder="handle" value={custody.handle.clone()}
+                <input id="custody-handle" type="text" placeholder="handle" value={custody.handle.clone()}
                     oninput={custody_field(|c, v| c.handle = v)} />
-                <input id="custody-cid" r#type="text" placeholder="new cid (rotate/migrate)" value={custody.cid.clone()}
+                <input id="custody-cid" type="text" placeholder="new cid (rotate/migrate)" value={custody.cid.clone()}
                     oninput={custody_field(|c, v| c.cid = v)} />
-                <input id="custody-holder" r#type="text" placeholder="new holder (migrate)" value={custody.holder.clone()}
+                <input id="custody-holder" type="text" placeholder="new holder (migrate)" value={custody.holder.clone()}
                     oninput={custody_field(|c, v| c.holder = v)} />
                 <div class="row">
                     <PendingButton id="custody-rotate-btn" label="Rotate" busy={*busy} onclick={custody_act("/portal/custody/rotate", CustodyKind::Rotate)} />
@@ -1558,16 +1558,16 @@ mod yew_impl {
                 <h3>{ "Resources & workloads" }</h3>
                 <p>{ "List, apply, edit, scale, and roll out workloads; preview a dry-run." }</p>
                 <label>{ "List resources" }</label>
-                <input id="resource-kind" r#type="text" placeholder="kind" value={(*kind).clone()} oninput={on_kind} />
-                <input id="resource-selector" r#type="text" placeholder="selector (optional)" value={(*selector).clone()} oninput={on_selector} />
+                <input id="resource-kind" type="text" placeholder="kind" value={(*kind).clone()} oninput={on_kind} />
+                <input id="resource-selector" type="text" placeholder="selector (optional)" value={(*selector).clone()} oninput={on_selector} />
                 <button type="button" id="resource-get-btn" onclick={get_click}>{ "Get" }</button>
                 <PendingButton id="resource-dryrun-btn" label="Dry-run" busy={*busy} onclick={dry_run} />
                 <div id="resource-list">
                     { for rows.iter().map(|r| html! { <p class="resource-row">{ r.clone() }</p> }) }
                 </div>
                 <label>{ "Apply / edit / scale / roll out a workload" }</label>
-                <input id="resource-name" r#type="text" placeholder="name" value={(*name).clone()} oninput={on_name} />
-                <input id="resource-arg" r#type="text" placeholder="image (apply/edit) or replicas (scale)" value={(*arg).clone()} oninput={on_arg} />
+                <input id="resource-name" type="text" placeholder="name" value={(*name).clone()} oninput={on_name} />
+                <input id="resource-arg" type="text" placeholder="image (apply/edit) or replicas (scale)" value={(*arg).clone()} oninput={on_arg} />
                 <div class="row">
                     <PendingButton id="resource-apply-btn" label="Apply" busy={*busy} onclick={act("/portal/resource/apply")} />
                     <PendingButton id="resource-edit-btn" label="Edit" busy={*busy} onclick={act("/portal/resource/edit")} />
@@ -1761,20 +1761,20 @@ mod yew_impl {
                     { for mismatches.iter().map(|m| html! { <p class="topology-mismatch">{ m.clone() }</p> }) }
                 </div>
                 <label>{ "Attest a topology label" }</label>
-                <input id="topology-issuer" r#type="text" placeholder="issuer" value={fields.issuer.clone()} oninput={topo_field(|f, v| f.issuer = v)} />
-                <input id="topology-capacity" r#type="text" placeholder="capacity (self or role@scope)" value={fields.capacity.clone()} oninput={topo_field(|f, v| f.capacity = v)} />
-                <input id="topology-authority" r#type="text" placeholder="authority cid (optional)" value={fields.authority.clone()} oninput={topo_field(|f, v| f.authority = v)} />
-                <input id="topology-subject" r#type="text" placeholder="subject (node)" value={fields.subject.clone()} oninput={topo_field(|f, v| f.subject = v)} />
-                <input id="topology-tier" r#type="text" placeholder="tier" value={fields.tier.clone()} oninput={topo_field(|f, v| f.tier = v)} />
-                <input id="topology-value" r#type="text" placeholder="value" value={fields.value.clone()} oninput={topo_field(|f, v| f.value = v)} />
-                <input id="topology-scope" r#type="text" placeholder="scope" value={fields.scope.clone()} oninput={topo_field(|f, v| f.scope = v)} />
+                <input id="topology-issuer" type="text" placeholder="issuer" value={fields.issuer.clone()} oninput={topo_field(|f, v| f.issuer = v)} />
+                <input id="topology-capacity" type="text" placeholder="capacity (self or role@scope)" value={fields.capacity.clone()} oninput={topo_field(|f, v| f.capacity = v)} />
+                <input id="topology-authority" type="text" placeholder="authority cid (optional)" value={fields.authority.clone()} oninput={topo_field(|f, v| f.authority = v)} />
+                <input id="topology-subject" type="text" placeholder="subject (node)" value={fields.subject.clone()} oninput={topo_field(|f, v| f.subject = v)} />
+                <input id="topology-tier" type="text" placeholder="tier" value={fields.tier.clone()} oninput={topo_field(|f, v| f.tier = v)} />
+                <input id="topology-value" type="text" placeholder="value" value={fields.value.clone()} oninput={topo_field(|f, v| f.value = v)} />
+                <input id="topology-scope" type="text" placeholder="scope" value={fields.scope.clone()} oninput={topo_field(|f, v| f.scope = v)} />
                 <div class="row">
                     <PendingButton id="topology-declare-btn" label="Declare" busy={*busy} onclick={declare} />
                     <PendingButton id="topology-attest-btn" label="Attest" busy={*busy} onclick={attest} />
                 </div>
                 <label>{ "Failure-domain spread overlay" }</label>
-                <input id="topology-fd-tier" r#type="text" placeholder="tier" value={fields.fd_tier.clone()} oninput={topo_field(|f, v| f.fd_tier = v)} />
-                <input id="topology-fd-nodes" r#type="text" placeholder="nodes (a,b,c)" value={fields.fd_nodes.clone()} oninput={topo_field(|f, v| f.fd_nodes = v)} />
+                <input id="topology-fd-tier" type="text" placeholder="tier" value={fields.fd_tier.clone()} oninput={topo_field(|f, v| f.fd_tier = v)} />
+                <input id="topology-fd-nodes" type="text" placeholder="nodes (a,b,c)" value={fields.fd_nodes.clone()} oninput={topo_field(|f, v| f.fd_nodes = v)} />
                 <PendingButton id="topology-fd-btn" label="Compute spread" busy={*busy} onclick={compute_spread} />
                 <div id="topology-fd-list">
                     { for fd.iter().map(|r| html! { <p class="topology-fd-row">{ r.clone() }</p> }) }
@@ -1912,7 +1912,7 @@ mod yew_impl {
                     <option value="profile">{ "profile" }</option>
                     <option value="metadata">{ "metadata" }</option>
                 </select>
-                <input id="obs-filter" r#type="text" placeholder="filter (optional)" value={(*filter).clone()} oninput={on_filter} />
+                <input id="obs-filter" type="text" placeholder="filter (optional)" value={(*filter).clone()} oninput={on_filter} />
                 <div class="row">
                     <button type="button" id="obs-explore-btn" onclick={explore_click}>{ "Explore" }</button>
                     <button type="button" id="obs-query-btn" onclick={query}>{ "Query" }</button>
@@ -1955,8 +1955,8 @@ mod yew_impl {
                     }
                 </div>
                 <label>{ "Save a dashboard" }</label>
-                <input id="obs-dashboard-name" r#type="text" placeholder="name" value={(*dash_name).clone()} oninput={on_name} />
-                <input id="obs-dashboard-spec" r#type="text" placeholder="spec" value={(*dash_spec).clone()} oninput={on_spec} />
+                <input id="obs-dashboard-name" type="text" placeholder="name" value={(*dash_name).clone()} oninput={on_name} />
+                <input id="obs-dashboard-spec" type="text" placeholder="spec" value={(*dash_spec).clone()} oninput={on_spec} />
                 <PendingButton id="obs-dashboard-btn" label="Save dashboard" busy={*busy} onclick={save_dashboard} />
                 { message_line("obs-dashboard-msg", &msg) }
             </div>

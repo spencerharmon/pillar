@@ -103,10 +103,10 @@ mod yew_impl {
             <form id="login-form" class="pillar-login" onsubmit={on_submit}>
                 <h2>{ "Sign in to manage your node" }</h2>
                 <label for="identifier">{ "User identifier" }</label>
-                <input id="identifier" r#type="text" value={(*identifier).clone()}
+                <input id="identifier" type="text" value={(*identifier).clone()}
                     placeholder="you@pillar / username / genesis CID" oninput={on_id} />
                 <label for="password">{ "Unlock factor" }</label>
-                <input id="password" r#type="password" value={(*password).clone()}
+                <input id="password" type="password" value={(*password).clone()}
                     placeholder="Password or passkey token" oninput={on_pw} />
                 <button id="submit" type="submit" disabled={*busy}>{ "Sign in" }</button>
                 { message_line("msg", &message) }
@@ -241,7 +241,7 @@ mod yew_impl {
             <form id="bootstrap-form" class="pillar-bootstrap" onsubmit={on_submit}>
                 <div class="step" id="bootstrap-step">{ "Set up this node \u{2014} create your cell and first user" }</div>
                 <label for="cell-id">{ "Cell name" }</label>
-                <input id="cell-id" r#type="text" value={(*cell).clone()} placeholder="e.g. spencer-cell" oninput={on_cell} />
+                <input id="cell-id" type="text" value={(*cell).clone()} placeholder="e.g. spencer-cell" oninput={on_cell} />
                 <div id="cell-name-hint" class={hint_cls}>{ hint_text }</div>
                 <label for="custody">{ "Cell key custody" }</label>
                 <select id="custody">
@@ -251,9 +251,9 @@ mod yew_impl {
                     <option value="keyring">{ "OS keyring" }</option>
                 </select>
                 <label for="first-handle">{ "First user handle" }</label>
-                <input id="first-handle" r#type="text" value={(*handle).clone()} placeholder="e.g. spencer" oninput={on_handle} />
+                <input id="first-handle" type="text" value={(*handle).clone()} placeholder="e.g. spencer" oninput={on_handle} />
                 <label for="first-factor">{ "Unlock factor" }</label>
-                <input id="first-factor" r#type="password" value={(*factor).clone()} placeholder="Password or passkey token" oninput={on_factor} />
+                <input id="first-factor" type="password" value={(*factor).clone()} placeholder="Password or passkey token" oninput={on_factor} />
                 <button id="bootstrap-submit" type="submit" disabled={*busy}>{ "Create cell & first user" }</button>
                 <div class="explainer" id="bootstrap-explainer">
                     <strong>{ "What happens next:" }</strong>
