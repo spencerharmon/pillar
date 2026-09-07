@@ -40,7 +40,7 @@ image_repo_root() {
 # working tree's flake and load it into the container runtime, printing the
 # loaded image reference. Fails loudly (non-zero) if nix or the load fails.
 image_build_local() {
-    local root tag streamer
+    local root tag streamer gcroot
     root="$(image_repo_root)"
     tag="pillar-it-under-test:local"
 
@@ -49,15 +49,29 @@ image_build_local() {
 
     info "image: building reproducible image-under-test from $root/flake.nix (nix .#pillar-oci-image)"
     # streamLayeredImage yields a *streamer script*; run it to produce the OCI
-    # tar on stdout and load it directly into the runtime.
+    # tar on stdout and load it directly into the runtime. This build can take
+    # several minutes (a from-source rust build) on a shared nix store the
+    # rest of the swarm is concurrently building/GC'ing against, so we MUST
+    # pin a real GC root for the duration: `--no-link` registers none, which
+    # lets a concurrent `nix-collect-garbage`/eviction reap our just-built
+    # output out from under us between build completion and use (observed:
+    # "expected an executable streamer" for a path that no longer existed).
+    # `--out-link` to a private tmp path keeps the whole closure alive until
+    # we explicitly remove the link below.
+    gcroot="$(mktemp -u "${TMPDIR:-/tmp}/pillar-it-oci-image.XXXXXX")"
     streamer="$(nix --extra-experimental-features "nix-command flakes" \
-        build --no-link --print-out-paths "$root#pillar-oci-image" 2>&1 | tail -1)" \
-        || fail "image_build_local: nix build .#pillar-oci-image failed:\n$streamer"
-    [ -x "$streamer" ] \
-        || fail "image_build_local: expected an executable streamer at '$streamer'"
+        build --out-link "$gcroot" --print-out-paths "$root#pillar-oci-image" 2>&1 | tail -1)" \
+        || { rm -f "$gcroot"; fail "image_build_local: nix build .#pillar-oci-image failed:\n$streamer"; }
+    if [ ! -x "$streamer" ]; then
+        rm -f "$gcroot"
+        fail "image_build_local: expected an executable streamer at '$streamer'"
+    fi
 
     info "image: loading the built image-under-test into $CONTAINER_RUNTIME as $tag"
-    "$streamer" | "$CONTAINER_RUNTIME" load 2>&1 | tail -3 \
+    "$streamer" | "$CONTAINER_RUNTIME" load 2>&1 | tail -3
+    local load_rc=$?
+    rm -f "$gcroot"
+    [ "$load_rc" -eq 0 ] \
         || fail "image_build_local: loading the streamed image into $CONTAINER_RUNTIME failed"
     # streamLayeredImage's config names the image; retag to our stable local
     # ref so the topology fabric can reference it deterministically.
