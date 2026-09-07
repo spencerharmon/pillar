@@ -176,8 +176,8 @@ mod yew_impl {
     use crate::auth::{use_auth, AuthAction};
     use crate::obs_console::ObservabilityConsole;
     use crate::portal::{
-        IdentityTile, InboxTile, MembersTile, NodeStatusTile, ResourceTile,
-        SessionsTile, SwarmTile, TopologyTile, TrustTile,
+        IdentityTile, InboxTile, MembersTile, NodeStatusTile, ResourceTile, SessionsTile,
+        SwarmTile, TopologyTile, TrustTile,
     };
     use crate::router::Route;
     use yew::prelude::*;
@@ -334,7 +334,10 @@ mod tests {
     #[test]
     fn every_group_has_at_least_one_section_and_all_sections_are_grouped() {
         for group in NavGroup::all() {
-            let n = Section::all().into_iter().filter(|s| s.group() == group).count();
+            let n = Section::all()
+                .into_iter()
+                .filter(|s| s.group() == group)
+                .count();
             assert!(n >= 1, "group {group:?} has no sections");
         }
         // Every section resolves to a group in the group list (total coverage).

@@ -33,13 +33,12 @@ pub fn parse_kind_counts(body: &str) -> Vec<KindCount> {
         .filter_map(|line| {
             let mut it = line.split_whitespace();
             match (it.next(), it.next(), it.next(), it.next()) {
-                (Some("KIND"), Some(kind), Some("COUNT"), Some(n)) => n
-                    .parse::<u64>()
-                    .ok()
-                    .map(|count| KindCount {
+                (Some("KIND"), Some(kind), Some("COUNT"), Some(n)) => {
+                    n.parse::<u64>().ok().map(|count| KindCount {
                         kind: kind.to_owned(),
                         count,
-                    }),
+                    })
+                }
                 _ => None,
             }
         })
@@ -255,7 +254,7 @@ mod yew_impl {
     fn render_overview(counts: &[KindCount]) -> Html {
         if counts.is_empty() {
             return html! { <p class="obs-empty">{ "No live signals yet, or no live \
-                substrate attached to this node." }</p> };
+            substrate attached to this node." }</p> };
         }
         html! {
             <div class="obs-statgrid">
@@ -284,8 +283,13 @@ mod yew_impl {
             Callback::from(move |e: InputEvent| spec.set(input_value(&e)))
         };
         let materialize = {
-            let (auth, spec, panels, msg, busy) =
-                (auth.clone(), spec.clone(), panels.clone(), msg.clone(), busy.clone());
+            let (auth, spec, panels, msg, busy) = (
+                auth.clone(),
+                spec.clone(),
+                panels.clone(),
+                msg.clone(),
+                busy.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
                 if *busy {
                     return;
@@ -372,8 +376,14 @@ mod yew_impl {
         };
         let run = {
             let (auth, id, kind, psl, emit, result, msg, busy) = (
-                auth.clone(), id.clone(), kind.clone(), psl.clone(), emit.clone(),
-                result.clone(), msg.clone(), busy.clone(),
+                auth.clone(),
+                id.clone(),
+                kind.clone(),
+                psl.clone(),
+                emit.clone(),
+                result.clone(),
+                msg.clone(),
+                busy.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 if *busy {
@@ -445,8 +455,14 @@ mod yew_impl {
         };
         let run = {
             let (auth, id, psl, op, threshold, result, msg, busy) = (
-                auth.clone(), id.clone(), psl.clone(), op.clone(), threshold.clone(),
-                result.clone(), msg.clone(), busy.clone(),
+                auth.clone(),
+                id.clone(),
+                psl.clone(),
+                op.clone(),
+                threshold.clone(),
+                result.clone(),
+                msg.clone(),
+                busy.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 if *busy {
@@ -463,7 +479,9 @@ mod yew_impl {
                         Ok(r) if r.ok() => {
                             let lines: Vec<String> = r.body.lines().map(str::to_owned).collect();
                             if lines.iter().all(|l| l.trim().is_empty()) {
-                                result.set(vec!["No alert fired (predicate not tripped).".to_owned()]);
+                                result.set(vec![
+                                    "No alert fired (predicate not tripped).".to_owned()
+                                ]);
                             } else {
                                 result.set(lines);
                             }
@@ -539,9 +557,18 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                KindCount { kind: "metric".into(), count: 12 },
-                KindCount { kind: "log".into(), count: 3 },
-                KindCount { kind: "trace".into(), count: 0 },
+                KindCount {
+                    kind: "metric".into(),
+                    count: 12
+                },
+                KindCount {
+                    kind: "log".into(),
+                    count: 3
+                },
+                KindCount {
+                    kind: "trace".into(),
+                    count: 0
+                },
             ]
         );
     }
@@ -550,7 +577,13 @@ mod tests {
     fn kind_counts_skip_malformed_lines_and_never_fabricate() {
         let body = "KIND metric COUNT 5\ngarbage\nKIND log COUNT notanumber\n\n";
         let got = parse_kind_counts(body);
-        assert_eq!(got, vec![KindCount { kind: "metric".into(), count: 5 }]);
+        assert_eq!(
+            got,
+            vec![KindCount {
+                kind: "metric".into(),
+                count: 5
+            }]
+        );
     }
 
     #[test]
