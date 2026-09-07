@@ -881,15 +881,22 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
 
     // Federation join: parse each configured seed multiaddr and seed the
     // Kademlia routing table, then kick a DHT bootstrap so this node enters
-    // Pillar's own swarm (NOT the public IPFS DHT). A malformed seed (no
-    // `/p2p/<peer-id>`) is logged and skipped — one bad seed never aborts boot.
-    // Seeds are discovery helpers only; authority stays with the WoT.
+    // Pillar's own swarm (NOT the public IPFS DHT). Seeds are discovery helpers
+    // only; authority stays with the WoT.
     //
     // Effective seeds: explicit operator `--seed-node`(s) win; otherwise, on
     // the PUBLIC swarm ONLY, fall back to the baked-in public seed anchors so a
     // fresh public node joins with zero configuration. A private swarm is
     // transport-isolated from the public seeds, so it never falls back — it
     // must carry its own `--seed-node`(s).
+    //
+    // Each seed is classified: a `/p2p/<peer-id>`-terminated address is added
+    // directly to Kademlia; a peer-id-less `/dnsaddr/<host>` (or `/dns…`)
+    // bootstrap anchor is DIALED instead — the DNS transport resolves its
+    // `_dnsaddr.<host>` TXT record and the `identify` exchange on the resulting
+    // connection reveals the peer id, which the event loop folds into Kademlia
+    // (see `note_identified_peer`). This is how zero-config public bootstrap
+    // works without a peer id in the binary.
     let effective_seeds = resolve_effective_seeds(&config.seed, swarm_key.kind());
     if config.seed.is_empty() && !effective_seeds.is_empty() {
         tracing::info!(
@@ -897,20 +904,32 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             "no --seed-node given; joining the public pillar swarm via baked-in public seed(s)"
         );
     }
-    let mut seeds = Vec::with_capacity(effective_seeds.len());
+    let mut direct_seeds = Vec::new();
+    let mut dial_seeds = 0usize;
     for addr in &effective_seeds {
-        match pillar_net::parse_seed_multiaddr(addr.clone()) {
-            Ok(seed) => {
+        match pillar_net::classify_seed(addr.clone()) {
+            pillar_net::FederationSeed::Direct(seed) => {
                 tracing::info!(%addr, peer_id = %seed.peer_id, "pillar peer configured federation seed");
-                seeds.push(seed);
+                direct_seeds.push(seed);
             }
-            Err(e) => tracing::warn!(%addr, error = %e, "ignoring malformed federation seed"),
+            pillar_net::FederationSeed::Dial(anchor) => {
+                match pillar_net::dial_bootstrap_seed(&mut swarm, anchor.clone()) {
+                    Ok(()) => {
+                        dial_seeds += 1;
+                        tracing::info!(%addr, "pillar peer dialing DNS bootstrap seed anchor (peer id learned via identify)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(%addr, error = %e, "failed to dial bootstrap seed anchor")
+                    }
+                }
+            }
         }
     }
-    let added = pillar_net::seed_event_dht(&mut swarm, &seeds);
-    if added > 0 {
+    let added = pillar_net::seed_event_dht(&mut swarm, &direct_seeds);
+    if added > 0 || dial_seeds > 0 {
         tracing::info!(
-            seeds = added,
+            direct = added,
+            dialed = dial_seeds,
             "pillar peer bootstrapping DHT from federation seed(s)"
         );
     } else {
@@ -1294,6 +1313,29 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         tracing::info!(%peer_id, "pillar peer connection established");
+                    }
+                    // A peer we connected to (notably a dialed `/dnsaddr`
+                    // bootstrap anchor, whose peer id we did NOT know in
+                    // advance) has just told us who it is and where it listens.
+                    // Fold those addresses into Kademlia under the now-known
+                    // peer id and bootstrap, so the node actually enters the
+                    // DHT through it. This is what completes zero-config public
+                    // join from a peer-id-less seed anchor.
+                    SwarmEvent::Behaviour(pillar_net::EventBehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id, info, .. },
+                    )) => {
+                        let learned = pillar_net::note_identified_peer(
+                            &mut swarm,
+                            peer_id,
+                            info.listen_addrs.iter().cloned(),
+                        );
+                        if learned > 0 {
+                            tracing::info!(
+                                %peer_id,
+                                addrs = learned,
+                                "learned peer from identify; added to DHT routing table"
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -1754,17 +1796,37 @@ mod tests {
     #[test]
     fn every_baked_public_seed_is_a_valid_federation_seed() {
         // Guards the single bake point: any entry added to PUBLIC_PILLAR_SEEDS
-        // must be a real federation seed (a multiaddr terminating in
-        // `/p2p/<peer-id>`), or this fails CI before it can silently break
-        // zero-config public bootstrap in production. Vacuously true while the
-        // list is empty (no public seed nodes deployed yet).
+        // must parse as a multiaddr and classify as a federation seed — either
+        // a `/p2p`-terminated Direct seed or a peer-id-less Dial anchor (e.g.
+        // `/dnsaddr/seed.pillar-rs.net`). A malformed entry fails CI before it
+        // can silently break zero-config public bootstrap in production.
         for seed in pillar_swarm::public_seeds() {
             let addr: Multiaddr = seed
                 .parse()
                 .unwrap_or_else(|e| panic!("baked public seed {seed:?} is not a multiaddr: {e}"));
-            pillar_net::parse_seed_multiaddr(addr).unwrap_or_else(|e| {
-                panic!("baked public seed {seed:?} lacks a /p2p/<peer-id>: {e}")
-            });
+            // classify_seed is total; assert the concrete shape is sane.
+            match pillar_net::classify_seed(addr) {
+                pillar_net::FederationSeed::Direct(_) => {}
+                pillar_net::FederationSeed::Dial(a) => {
+                    // A Dial anchor must be DNS-resolvable (a `/dns*` or
+                    // `/dnsaddr` host), never a bare peer-id-less IP that could
+                    // never be reached across a changing deployment.
+                    let has_dns = a.iter().any(|p| {
+                        matches!(
+                            p,
+                            libp2p::multiaddr::Protocol::Dnsaddr(_)
+                                | libp2p::multiaddr::Protocol::Dns(_)
+                                | libp2p::multiaddr::Protocol::Dns4(_)
+                                | libp2p::multiaddr::Protocol::Dns6(_)
+                        )
+                    });
+                    assert!(
+                        has_dns,
+                        "baked public seed {seed:?} is a peer-id-less Dial anchor with no DNS \
+                         component; use /dnsaddr/<host> or /dns4/<host>/…"
+                    );
+                }
+            }
         }
     }
 

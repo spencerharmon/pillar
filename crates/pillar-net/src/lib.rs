@@ -261,6 +261,7 @@ pub fn build_event_swarm_with_root(
             )?
             .with_quic()
             .with_other_transport(pillar_udp_boxed_transport)?
+            .with_dns()?
             .with_behaviour(|key| {
                 let peer_id = key.public().to_peer_id();
                 EventBehaviour {
@@ -276,6 +277,7 @@ pub fn build_event_swarm_with_root(
             libp2p::SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
                 .with_other_transport(|kp| pnet_tcp_transport(kp, psk))?
+                .with_dns()?
                 .with_behaviour(|key| {
                     let peer_id = key.public().to_peer_id();
                     EventBehaviour {
@@ -425,6 +427,90 @@ impl std::fmt::Display for SeedAddrMissingPeerId {
 }
 
 impl std::error::Error for SeedAddrMissingPeerId {}
+
+/// A classified federation seed: how a joining node should bootstrap from it.
+///
+/// A seed multiaddr comes in two shapes, and they enter the DHT differently:
+///
+/// - **[`FederationSeed::Direct`]** — the multiaddr terminates in a
+///   `/p2p/<peer-id>`, so the peer id is known up front. It is added straight
+///   to the Kademlia routing table (via [`seed_event_dht`]).
+/// - **[`FederationSeed::Dial`]** — the multiaddr has no `/p2p/<peer-id>`
+///   (typically a `/dnsaddr/<host>` bootstrap anchor, or a bare
+///   `/dns4|/dns6|/ip4 …/tcp/<port>`). Its peer id is not known until the node
+///   connects, so it is **dialed**; the `identify` exchange on the resulting
+///   connection then reveals the peer id + its listen addrs, which are folded
+///   into Kademlia by [`note_identified_peer`]. This is the IPFS-style
+///   `/dnsaddr` bootstrap: the peer id lives in the operator's
+///   `_dnsaddr.<host>` TXT record (resolved at runtime by the DNS transport),
+///   never in the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederationSeed {
+    /// A seed whose peer id is known from a trailing `/p2p/<id>`.
+    Direct(SeedPeer),
+    /// A peer-id-less bootstrap address to dial; identify learns the peer.
+    Dial(libp2p::Multiaddr),
+}
+
+/// Classifies a federation seed multiaddr into how the node bootstraps from it.
+///
+/// If the address terminates in `/p2p/<peer-id>` it is a
+/// [`FederationSeed::Direct`] (added to Kademlia immediately); otherwise it is
+/// a [`FederationSeed::Dial`] (dialed, with `identify` learning the peer). This
+/// never fails: a peer-id-less address is a valid bootstrap-dial anchor (e.g. a
+/// `/dnsaddr/seed.example.net`), not an error — unlike [`parse_seed_multiaddr`],
+/// which requires the peer id for the direct add-to-routing-table path.
+#[must_use]
+pub fn classify_seed(addr: libp2p::Multiaddr) -> FederationSeed {
+    match parse_seed_multiaddr(addr.clone()) {
+        Ok(seed) => FederationSeed::Direct(seed),
+        Err(_) => FederationSeed::Dial(addr),
+    }
+}
+
+/// Dials a [`FederationSeed::Dial`] bootstrap anchor so the DNS transport
+/// resolves it (a `/dnsaddr/<host>` expands via its `_dnsaddr.<host>` TXT
+/// record; a `/dns4|/dns6/<host>` resolves A/AAAA) and connects. The peer id is
+/// learned from the ensuing `identify` exchange (see [`note_identified_peer`]),
+/// so no peer id need be known in advance.
+///
+/// Returns the dial outcome; a failure (e.g. an anchor whose TXT record does
+/// not exist yet) is non-fatal at the call site — the node simply finds no
+/// seed and acts as its own first node until the anchor resolves.
+pub fn dial_bootstrap_seed(
+    swarm: &mut Swarm<EventBehaviour>,
+    addr: libp2p::Multiaddr,
+) -> Result<(), libp2p::swarm::DialError> {
+    swarm.dial(addr)
+}
+
+/// Folds a peer learned from an `identify` exchange into the Kademlia routing
+/// table: each of the peer's advertised listen addresses is added under its
+/// (now-known) peer id, and a single `bootstrap()` is kicked so the node walks
+/// outward from the freshly learned peer.
+///
+/// This is what turns a [`FederationSeed::Dial`] bootstrap dial into DHT
+/// membership: the dial establishes the connection, `identify` reveals the peer
+/// id + addrs, and this adds them so Kademlia can route through the peer.
+/// Returns the number of addresses added.
+pub fn note_identified_peer(
+    swarm: &mut Swarm<EventBehaviour>,
+    peer_id: &PeerId,
+    listen_addrs: impl IntoIterator<Item = libp2p::Multiaddr>,
+) -> usize {
+    let mut added = 0usize;
+    for addr in listen_addrs {
+        swarm.behaviour_mut().kademlia.add_address(peer_id, addr);
+        added += 1;
+    }
+    if added > 0 {
+        // Non-fatal: a bootstrap over a now-non-empty table walks outward. An
+        // error (e.g. a transient NoKnownPeers race) is ignored; discovery
+        // retries as peers appear.
+        let _ = swarm.behaviour_mut().kademlia.bootstrap();
+    }
+    added
+}
 
 /// Parses a federation seed multiaddr into its [`SeedPeer`] parts.
 ///
@@ -1262,6 +1348,57 @@ mod tests {
 
         let no_p2p: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
         assert!(parse_seed_multiaddr(no_p2p).is_err());
+    }
+
+    #[test]
+    fn classify_seed_splits_direct_and_dial() {
+        // A `/p2p`-terminated seed classifies Direct with the peer id known.
+        let peer = PeerId::random();
+        let direct: Multiaddr = format!("/dns4/seed.example.net/tcp/4001/p2p/{peer}")
+            .parse()
+            .unwrap();
+        match classify_seed(direct) {
+            FederationSeed::Direct(s) => assert_eq!(s.peer_id, peer),
+            FederationSeed::Dial(a) => panic!("expected Direct, got Dial({a})"),
+        }
+
+        // A peer-id-less `/dnsaddr` bootstrap anchor classifies Dial verbatim
+        // (peer id learned later via identify).
+        let anchor: Multiaddr = "/dnsaddr/seed.pillar-rs.net".parse().unwrap();
+        match classify_seed(anchor.clone()) {
+            FederationSeed::Dial(a) => assert_eq!(a, anchor),
+            FederationSeed::Direct(_) => panic!("expected Dial for a peer-id-less dnsaddr"),
+        }
+
+        // A bare peer-id-less address is also a Dial anchor (dial + identify).
+        let bare: Multiaddr = "/ip4/192.0.2.9/tcp/4001".parse().unwrap();
+        assert!(matches!(classify_seed(bare), FederationSeed::Dial(_)));
+    }
+
+    #[test]
+    fn note_identified_peer_adds_addresses_to_kademlia() {
+        // Build a real event swarm and confirm learning a peer from identify
+        // adds its addresses to the Kademlia routing table.
+        let kp = Keypair::generate_ed25519();
+        let mut swarm = build_event_swarm(kp).expect("event swarm builds");
+        let peer = PeerId::random();
+        let addrs = vec![
+            "/ip4/192.0.2.5/tcp/4001".parse::<Multiaddr>().unwrap(),
+            "/ip4/192.0.2.6/tcp/4001".parse::<Multiaddr>().unwrap(),
+        ];
+        let added = note_identified_peer(&mut swarm, &peer, addrs.clone());
+        assert_eq!(added, 2);
+        // The peer is now present in Kademlia's routing table.
+        let in_table = swarm
+            .behaviour_mut()
+            .kademlia
+            .kbucket(peer)
+            .map(|b| b.iter().any(|e| *e.node.key.preimage() == peer))
+            .unwrap_or(false);
+        assert!(
+            in_table,
+            "identified peer must be in the Kademlia routing table"
+        );
     }
 
     /// The private-swarm key is OFF by default (the public root); a root
