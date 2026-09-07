@@ -44,7 +44,42 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        # crates.io started returning HTTP 403 on the legacy per-crate download
+        # endpoint `https://crates.io/api/v1/crates/<name>/<ver>/download` for
+        # curl-like User-Agents (an empty UA still 302-redirects; the static CDN
+        # `https://static.crates.io/crates/<name>/<name>-<ver>.crate` serves the
+        # byte-identical `.crate` with a plain 200). The pinned nixpkgs'
+        # `importCargoLock` fetches every non-cached crate via that legacy URL
+        # with a curl UA, so any crate NOT already in `cache.nixos.org` (e.g. a
+        # freshly published `aes 0.9.3`, pulled by `ctap-hid-fido2`) fails the
+        # image build with `error: cannot download crate-<name>.tar.gz`. This
+        # overlay rewrites ONLY those legacy crates.io download URLs to the
+        # static CDN. The tarball bytes are identical (verified: the static
+        # `.crate` sha256 equals the `Cargo.lock` checksum), so every fixed-
+        # output hash still validates and already-cached crates still substitute
+        # unchanged (an FOD is content-addressed by its output hash + name, not
+        # its URL). Independent of the LLVM-19 rustc pin below.
+        cratesIoStaticCdnOverlay = final: prev: {
+          fetchurl = args:
+            if (args ? url)
+              && prev.lib.hasPrefix "https://crates.io/api/v1/crates/" (toString args.url)
+            then
+              let
+                parts = prev.lib.splitString "/" (toString args.url);
+                # .../api/v1/crates/<name>/<version>/download
+                crateName = builtins.elemAt parts 6;
+                crateVersion = builtins.elemAt parts 7;
+              in
+              prev.fetchurl (args // {
+                url = "https://static.crates.io/crates/${crateName}/${crateName}-${crateVersion}.crate";
+              })
+            else prev.fetchurl args;
+        };
+
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ cratesIoStaticCdnOverlay ];
+        };
 
         # ---------------------------------------------------------------------
         # Stage 1 of the two-stage build: compile the Yew + WebAssembly portal
