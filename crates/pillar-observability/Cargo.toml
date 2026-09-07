@@ -9,7 +9,14 @@ description = "Built-in distributed observability riding the streaming DB: confi
 
 [dependencies]
 pillar-core = { path = "../pillar-core" }
-pillar-streamdb = { path = "../pillar-streamdb" }
+# `default-features = false`: pillar-observability only ever tags signals with
+# a pure content address (`pillar_streamdb::{OpId, content_address}`) and never
+# touches the IPFS-backed durability substrate, so it opts out of the `ipfs`
+# feature (which pulls `pillar-ipfs` -> `libp2p` -> tokio/mio, not portable to
+# `wasm32-unknown-unknown`) — keeping the `pillar-frontend` wasm build's
+# dependency closure out of that unwanted edge entirely. See
+# crates/pillar-streamdb/Cargo.toml's `ipfs` feature doc.
+pillar-streamdb = { path = "../pillar-streamdb", default-features = false }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-manifest = { path = "../pillar-manifest" }
 pillar-topology = { path = "../pillar-topology" }
