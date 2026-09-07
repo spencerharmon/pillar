@@ -45,6 +45,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, args| node(args),
     },
     VerbSpec {
+        name: "ingress-lb-udp",
+        handler: |_v, args| ingress_lb_udp(args),
+    },
+    VerbSpec {
         name: "bootstrap",
         handler: |_v, args| bootstrap(args),
     },
@@ -452,6 +456,47 @@ fn node_run(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("pillar node run: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar ingress-lb-udp serve <manifest-file>`: the REAL externally-drivable
+/// ingress/LB/pillar-UDP surface on the published image. Parses a
+/// Frontend/Route/LoadBalancerPolicy manifest, binds the real
+/// [`UdpDataplane`](pillar_net::UdpDataplane) on the named VIP, prints the
+/// concrete bound `vip=<ip:port>` line so a container `-p` mapping resolves it,
+/// and blocks forwarding real UDP datagrams until signalled.
+fn ingress_lb_udp(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("serve") => {
+            let Some(manifest) = args.get(1) else {
+                eprintln!("pillar ingress-lb-udp serve: needs a <manifest-file>");
+                return ExitCode::from(2);
+            };
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to start async runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match runtime.block_on(crate::ingress_lb_udp::serve(manifest)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("pillar ingress-lb-udp serve: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!(
+                "pillar ingress-lb-udp: unknown subcommand `{other}` (want `serve <manifest-file>`)"
+            );
+            ExitCode::from(2)
+        }
+        None => {
+            eprintln!("pillar ingress-lb-udp: needs `serve <manifest-file>`");
+            ExitCode::from(2)
         }
     }
 }

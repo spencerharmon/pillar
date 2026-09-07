@@ -119,6 +119,10 @@ pub static PARITY_MAP: &[ParityRule] = &[
         reason: "boots the node process (`pillar node run`); a lifecycle command with no in-portal action",
     },
     ParityRule::CliOnly {
+        verb: "ingress-lb-udp",
+        reason: "binds the real UDP LB dataplane on a VIP (`pillar ingress-lb-udp serve <manifest>`); a data-plane lifecycle command with no in-portal action",
+    },
+    ParityRule::CliOnly {
         verb: "offer",
         reason: "operational-key offer seal/resolve is a library/CLI custody surface; the portal exposes custody via /portal/custody, not raw offers",
     },
