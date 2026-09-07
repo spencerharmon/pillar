@@ -15,7 +15,6 @@ use crate::auth::{use_auth, AuthProvider};
 #[cfg(feature = "yew")]
 use crate::components::LoginPanel;
 #[cfg(feature = "yew")]
-use crate::portal::Portal;
 #[cfg(feature = "yew")]
 use crate::portal_entry::PortalEntry;
 #[cfg(feature = "yew")]
@@ -27,7 +26,10 @@ use yew::prelude::*;
 #[cfg(feature = "yew")]
 use yew_router::prelude::*;
 
-/// The app shell's route table.
+/// The app shell's route table. Each authenticated section of the console is
+/// its own protected route, so the browser URL reflects the active section and
+/// deep-links work; the persistent frame ([`crate::console::ConsoleView`])
+/// re-renders only its content area on a section change.
 #[cfg_attr(feature = "yew", derive(yew_router::Routable))]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Route {
@@ -37,8 +39,38 @@ pub enum Route {
     /// The login screen.
     #[cfg_attr(feature = "yew", at("/login"))]
     Login,
-    /// A protected panel — stands in for the real per-panel routes each
-    /// panel task adds; every one of them is protected the same way.
+    /// Node status + at-a-glance console home.
+    #[cfg_attr(feature = "yew", at("/overview"))]
+    Overview,
+    /// Workload / resource inventory + lifecycle.
+    #[cfg_attr(feature = "yew", at("/resources"))]
+    Resources,
+    /// The five-signal observability console.
+    #[cfg_attr(feature = "yew", at("/observability"))]
+    Observability,
+    /// Failure-domain / topology explorer.
+    #[cfg_attr(feature = "yew", at("/topology"))]
+    Topology,
+    /// This user's identity, domains, enrollment.
+    #[cfg_attr(feature = "yew", at("/identity"))]
+    Identity,
+    /// Cell members administration.
+    #[cfg_attr(feature = "yew", at("/members"))]
+    Members,
+    /// Active sessions + revocation.
+    #[cfg_attr(feature = "yew", at("/sessions"))]
+    Sessions,
+    /// Web-of-Trust graph + attestation/custody builders.
+    #[cfg_attr(feature = "yew", at("/trust"))]
+    Trust,
+    /// libp2p swarm identity + mint.
+    #[cfg_attr(feature = "yew", at("/swarm"))]
+    Swarm,
+    /// Node/user bootstrap request inbox.
+    #[cfg_attr(feature = "yew", at("/inbox"))]
+    Inbox,
+    /// Legacy alias for the old single-page portal — redirects to the
+    /// [`Route::Overview`] console home so existing links keep working.
     #[cfg_attr(feature = "yew", at("/dashboard"))]
     Dashboard,
     /// Unmatched path.
@@ -48,9 +80,45 @@ pub enum Route {
 }
 
 impl Route {
-    /// Whether this route requires an active [`AuthSession`] to render.
+    /// Whether this route requires an active [`AuthSession`] to render. Every
+    /// console section (and the legacy `/dashboard` alias) is protected; only
+    /// the public landing, the login screen, and the not-found page are open.
     pub fn requires_auth(&self) -> bool {
-        matches!(self, Route::Dashboard)
+        matches!(
+            self,
+            Route::Overview
+                | Route::Resources
+                | Route::Observability
+                | Route::Topology
+                | Route::Identity
+                | Route::Members
+                | Route::Sessions
+                | Route::Trust
+                | Route::Swarm
+                | Route::Inbox
+                | Route::Dashboard
+        )
+    }
+
+    /// The [`crate::console::Section`] this route displays, if it is a console
+    /// section route (the legacy `/dashboard` alias resolves to
+    /// [`Section::Overview`]). Non-section routes (public/login/404) return
+    /// `None`.
+    pub fn section(&self) -> Option<crate::console::Section> {
+        use crate::console::Section;
+        Some(match self {
+            Route::Overview | Route::Dashboard => Section::Overview,
+            Route::Resources => Section::Resources,
+            Route::Observability => Section::Observability,
+            Route::Topology => Section::Topology,
+            Route::Identity => Section::Identity,
+            Route::Members => Section::Members,
+            Route::Sessions => Section::Sessions,
+            Route::Trust => Section::Trust,
+            Route::Swarm => Section::Swarm,
+            Route::Inbox => Section::Inbox,
+            Route::Home | Route::Login | Route::NotFound => return None,
+        })
     }
 }
 
@@ -84,11 +152,18 @@ struct GuardedProps {
 #[function_component(Guarded)]
 fn guarded(props: &GuardedProps) -> Html {
     let session = use_auth();
-    match guard(props.route.clone(), &session) {
-        Route::Home => html! { <PortalEntry /> },
+    let effective = guard(props.route.clone(), &session);
+    // A console section route renders the persistent frame with that section
+    // active; the public/login/404 routes render their standalone screens.
+    if let Some(section) = effective.section() {
+        return html! { <crate::console::ConsoleView section={section} /> };
+    }
+    match effective {
         Route::Login => html! { <LoginPanel /> },
-        Route::Dashboard => html! { <Portal /> },
         Route::NotFound => html! { <p>{ "not found" }</p> },
+        // `Home` (and any route that resolved to `Login` above) — the public
+        // landing / entry surface.
+        _ => html! { <PortalEntry /> },
     }
 }
 

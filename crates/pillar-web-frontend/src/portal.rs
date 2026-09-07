@@ -440,6 +440,15 @@ pub use yew_impl::{CopyValue, PendingButton, Portal};
 #[cfg(feature = "yew")]
 pub(crate) use yew_impl::{http, input_value};
 
+// The per-capability tiles, exposed to the console shell ([`crate::console`])
+// so it can mount each one into its own navigable section. They are defined
+// once here and reused verbatim by the shell.
+#[cfg(feature = "yew")]
+pub(crate) use yew_impl::{
+    IdentityTile, InboxTile, MembersTile, NodeStatusTile, ObservabilityTile, ResourceTile,
+    SessionsTile, SwarmTile, TopologyTile, TrustTile,
+};
+
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::*;
@@ -627,7 +636,7 @@ mod yew_impl {
     /// Node identity / peers / lease-holder, from real node state, with copy
     /// affordances on the PeerId and lease-holder fingerprint.
     #[function_component(NodeStatusTile)]
-    fn node_status_tile() -> Html {
+    pub(crate) fn node_status_tile() -> Html {
         let auth = use_auth();
         let status = use_state(StatusView::default);
         {
@@ -671,7 +680,7 @@ mod yew_impl {
     /// swarm key to reboot a node onto with `--swarm-key`. Ports the Swarm
     /// panel; wires `/portal/swarm` + `/portal/swarm/generate`.
     #[function_component(SwarmTile)]
-    fn swarm_tile() -> Html {
+    pub(crate) fn swarm_tile() -> Html {
         let auth = use_auth();
         let view = use_state(SwarmView::default);
         let busy = use_state(|| false);
@@ -758,7 +767,7 @@ mod yew_impl {
     /// what-happens-next explainer and Approve/Reject (a CID on approve gets a
     /// copy affordance).
     #[function_component(InboxTile)]
-    fn inbox_tile() -> Html {
+    pub(crate) fn inbox_tile() -> Html {
         let auth = use_auth();
         let rows = use_state(Vec::<InboxRow>::new);
         let busy = use_state(|| false);
@@ -886,7 +895,7 @@ mod yew_impl {
     /// Identity & domains: CID (copyable) + generation + per-domain keys, with
     /// enroll / rotate-primary / recover acts.
     #[function_component(IdentityTile)]
-    fn identity_tile() -> Html {
+    pub(crate) fn identity_tile() -> Html {
         let auth = use_auth();
         let view = use_state(IdentityView::default);
         let domains = use_state(Vec::<String>::new);
@@ -1001,7 +1010,7 @@ mod yew_impl {
 
     /// Members: list + add/invite with handle + role.
     #[function_component(MembersTile)]
-    fn members_tile() -> Html {
+    pub(crate) fn members_tile() -> Html {
         let auth = use_auth();
         let rows = use_state(Vec::<String>::new);
         let handle = use_state(String::new);
@@ -1096,7 +1105,7 @@ mod yew_impl {
     /// Active server-side sessions with expiry + a "(this session)" marker and
     /// per-session revoke + sign-out-everywhere.
     #[function_component(SessionsTile)]
-    fn sessions_tile() -> Html {
+    pub(crate) fn sessions_tile() -> Html {
         let auth = use_auth();
         let rows = use_state(Vec::<SessionRow>::new);
         let msg = use_state(|| None::<(String, bool)>);
@@ -1201,7 +1210,7 @@ mod yew_impl {
 
     /// Trust graph + attestation builder + key/offer custody actions.
     #[function_component(TrustTile)]
-    fn trust_tile() -> Html {
+    pub(crate) fn trust_tile() -> Html {
         let auth = use_auth();
         let edges = use_state(Vec::<String>::new);
         let attest = use_state(AttestFields::default);
@@ -1413,7 +1422,7 @@ mod yew_impl {
     /// Resource / workload: get (kind + selector), dry-run, and the signed
     /// apply/edit/scale/rollout acts (name + arg).
     #[function_component(ResourceTile)]
-    fn resource_tile() -> Html {
+    pub(crate) fn resource_tile() -> Html {
         let auth = use_auth();
         let rows = use_state(Vec::<String>::new);
         let kind = use_state(|| "Workload".to_owned());
@@ -1573,7 +1582,7 @@ mod yew_impl {
     /// Topology explorer: tier tree + mismatches + label declare/attest +
     /// failure-domain spread overlay.
     #[function_component(TopologyTile)]
-    fn topology_tile() -> Html {
+    pub(crate) fn topology_tile() -> Html {
         let auth = use_auth();
         let tree = use_state(String::new);
         let mismatches = use_state(Vec::<String>::new);
@@ -1790,7 +1799,7 @@ mod yew_impl {
 
     /// Observability: explore/query the five signal kinds + save a dashboard.
     #[function_component(ObservabilityTile)]
-    fn observability_tile() -> Html {
+    pub(crate) fn observability_tile() -> Html {
         let auth = use_auth();
         let rows = use_state(Vec::<String>::new);
         let kind = use_state(|| "metric".to_owned());
