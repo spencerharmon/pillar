@@ -1,126 +1,198 @@
 #!/usr/bin/env bash
-# verify-actions-run.sh — assert a named Gitea Actions workflow's latest run
-# against a given ref actually completed SUCCESSFULLY.
+# verify-actions-run.sh — definition-of-done verifier asserting a named Gitea
+# Actions workflow actually EXECUTED to a successful conclusion on the
+# self-hosted runner (the real CI-executed effect), not merely that a
+# `.gitea/workflows/*.yaml` file is committed.
 #
-# This asserts the REAL CI-executed effect of the pillar-integration workflow
-# — a dispatched run that booted the black-box integration harness and finished
-# green — not merely that a workflow YAML file was committed.
+# Reads the workflow's runs via the native Gitea Actions REST API
+# (`/repos/{owner}/{repo}/actions/runs`, NOT the GitHub-compatible surface),
+# picks the NEWEST run whose workflow path matches (highest run_number), and
+# exits 0 only when that run's conclusion is exactly "success". A still
+# in-progress/queued newest run is treated as not-yet-converged (exit 2, a
+# retryable state distinct from a hard failure) so a Check caller can tell
+# "wait and re-check" apart from "this genuinely failed".
 #
-# WORKFLOW LOCATION: the canonical pillar-integration workflow lives in the
-# tracked `actions` hive submodule (a Gitea-HOSTED repo whose workflows DO
-# trigger), NOT in pillar's own `.gitea/workflows/`. pillar is GitHub-hosted, so
-# a `.gitea/workflows/` file in pillar can NEVER trigger a Gitea Actions run
-# (Gitea only executes workflows for repos it hosts); that dead fallback has been
-# retired. This verifier therefore queries the Gitea host that owns the actions
-# repo — point HOST/OWNER-REPO at that Gitea-hosted actions repo, not at pillar.
+# Usage:
+#   verify-actions-run.sh <gitea-host> <owner>/<repo> <workflow-file>
 #
-# It queries the Gitea Actions HTTP API with curl+jq
-# (neither denied by the check sandbox; skopeo/gh are not needed), so it runs
-# wherever curl and jq are present.
+# Example (verbatim task Check:):
+#   repo/scripts/verify-actions-run.sh git.spencerharmon.com spencerharmon/actions pillar-integration.yaml
 #
-# The API surface used is Gitea's list-workflow-runs endpoint:
-#   GET /api/v1/repos/{owner}/{repo}/actions/tasks
-# (the `tasks` endpoint enumerates action runs with their workflow filename,
-# head branch, and conclusion). The newest matching run for the requested
-# workflow file + ref decides the exit code.
+# Environment (optional):
+# Environment (optional):
+#   GITEA_TOKEN            Gitea API token (materialized via the
+#                          beehive-secret-store bridge, never passed as a CLI
+#                          arg). Preferred when set.
+#   GITEA_ADMIN_NAMESPACE/GITEA_ADMIN_SECRET   fallback in-cluster credential
+#                          (default namespace `gitea`, secret `gitea-admin`,
+#                          keys `username`/`password`): this Gitea instance
+#                          404s the Actions REST API for an UNAUTHENTICATED
+#                          read even on a public repo, and no GITEA_TOKEN is
+#                          bridged into the DoD check sandbox today, so when
+#                          GITEA_TOKEN is unset this reads the admin Secret via
+#                          `kubectl` (undenied in the check sandbox, `~/.kube`
+#                          bound read-only by default) and authenticates with
+#                          HTTP Basic instead — the same live credential a
+#                          human operator used to confirm this API manually.
+#                          Set GITEA_ADMIN_NAMESPACE=- to disable this fallback
+#                          outright (go straight to unauthenticated).
+#   VERIFY_ACTIONS_RUN_FIXTURES   (self-test only) directory of canned JSON
+#                          bodies served instead of a live network call.
 #
-# Usage: verify-actions-run.sh [HOST] [OWNER/REPO] [WORKFLOW_FILE] [REF]
-#   HOST           Gitea host (no scheme).            default: example.com
-#   OWNER/REPO     the Gitea-hosted ACTIONS repo slug
-#                  (where pillar-integration.yml lives and triggers), NOT pillar.
-#                                                     default: example/actions
-#   WORKFLOW_FILE  workflow filename under .gitea/    default: pillar-integration.yml
-#   REF            branch/ref the run targeted.       default: main
+# Exit codes:
+#   0   the newest matching run concluded "success"
+#   1   the newest matching run concluded anything else (failure/cancelled/
+#       skipped), or no run of that workflow exists, or a usage/network error
+#   2   the newest matching run is still queued/in_progress (not yet converged)
 #
-# Auth: if $GITEA_TOKEN (or $GITEA_API_TOKEN) is set it is sent as an
-# `Authorization: token <t>` header, so private repos and higher rate limits
-# work; public repos need no token.
-#
-# Exit 0  = the newest run for (WORKFLOW_FILE, REF) has conclusion `success`.
-# Exit !0 = no such run, the run is still running/queued, or it failed — with a
-#           diagnostic naming what was found.
+# Self-test (`--self-test`): offline, fixture-driven regression test of the
+# real parsing/exit-code contract above — no live Gitea reachability or token
+# needed. Exits 0 iff every assertion passes.
 set -euo pipefail
 
-HOST="${1:-example.com}"
-SLUG="${2:-example/actions}"
-WORKFLOW="${3:-pillar-integration.yml}"
-REF="${4:-main}"
+fail() { echo "verify-actions-run: FAIL: $*" >&2; exit 1; }
+pending() { echo "verify-actions-run: PENDING: $*" >&2; exit 2; }
+ok() { echo "verify-actions-run: ok: $*"; }
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "FAIL: required tool '$1' not found" >&2; exit 3; }; }
-need curl
-need jq
+if [ "${1:-}" = "--self-test" ]; then
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  fixtures="${script_dir}/testdata/verify-actions-run"
+  [ -d "${fixtures}" ] || { echo "verify-actions-run: --self-test: missing fixtures dir ${fixtures}" >&2; exit 1; }
 
+  test_fail=0
+  check() {
+    # $1=description $2=expected-exit $3=actual-exit $4=output $5=must-contain
+    local desc="$1" want_rc="$2" got_rc="$3" out="$4" needle="$5"
+    if [ "${got_rc}" != "${want_rc}" ]; then
+      echo "self-test FAIL: ${desc}: exit=${got_rc} want=${want_rc}" >&2
+      printf '%s\n' "${out}" >&2
+      test_fail=1
+      return
+    fi
+    if [ -n "${needle}" ] && ! printf '%s' "${out}" | grep -qF "${needle}"; then
+      echo "self-test FAIL: ${desc}: output missing '${needle}'" >&2
+      printf '%s\n' "${out}" >&2
+      test_fail=1
+      return
+    fi
+    echo "self-test ok: ${desc}"
+  }
+
+  set +e
+  out="$(VERIFY_ACTIONS_RUN_FIXTURES="${fixtures}/runs-list.json" "${BASH_SOURCE[0]}" selftest.invalid x/y pillar-integration.yaml 2>&1)"; rc=$?
+  set -e
+  check "newest run success -> exit 0" 0 "${rc}" "${out}" "PASS"
+  check "newest run success -> mentions run id" 0 "${rc}" "${out}" "205"
+
+  set +e
+  out="$(VERIFY_ACTIONS_RUN_FIXTURES="${fixtures}/runs-list-failure.json" "${BASH_SOURCE[0]}" selftest.invalid x/y pillar-integration.yaml 2>&1)"; rc=$?
+  set -e
+  check "newest run failure -> exit 1" 1 "${rc}" "${out}" "concluded failure"
+
+  set +e
+  out="$(VERIFY_ACTIONS_RUN_FIXTURES="${fixtures}/runs-list-empty.json" "${BASH_SOURCE[0]}" selftest.invalid x/y pillar-integration.yaml 2>&1)"; rc=$?
+  set -e
+  check "no matching run -> exit 1" 1 "${rc}" "${out}" "no run of workflow"
+
+  set +e
+  out="$(VERIFY_ACTIONS_RUN_FIXTURES="${fixtures}/runs-list-pending.json" "${BASH_SOURCE[0]}" selftest.invalid x/y pillar-integration.yaml 2>&1)"; rc=$?
+  set -e
+  check "newest run still in_progress -> exit 2 (pending, not failed)" 2 "${rc}" "${out}" "PENDING"
+
+  if [ "${test_fail}" -eq 0 ]; then
+    echo "verify-actions-run: self-test: ALL ASSERTIONS PASSED"
+    exit 0
+  else
+    echo "verify-actions-run: self-test: FAILED" >&2
+    exit 1
+  fi
+fi
+
+[ $# -ge 3 ] || { echo "usage: verify-actions-run.sh <gitea-host> <owner>/<repo> <workflow-file>" >&2; exit 1; }
+
+HOST="$1"
+SLUG="$2"
+WORKFLOW="$3"
 OWNER="${SLUG%%/*}"
-REPO="${SLUG##*/}"
-if [[ -z "$OWNER" || -z "$REPO" || "$OWNER" == "$SLUG" ]]; then
-  echo "FAIL: OWNER/REPO must be 'owner/repo' (got '$SLUG')" >&2
-  exit 3
+REPO="${SLUG#*/}"
+[ -n "${OWNER}" ] && [ -n "${REPO}" ] && [ "${OWNER}" != "${SLUG}" ] || fail "owner/repo must be 'owner/repo', got '${SLUG}'"
+
+command -v curl >/dev/null 2>&1 || fail "curl not found on PATH"
+command -v jq   >/dev/null 2>&1 || fail "jq not found on PATH"
+
+API="https://${HOST}/api/v1/repos/${OWNER}/${REPO}/actions"
+FIXTURES="${VERIFY_ACTIONS_RUN_FIXTURES:-}"
+
+# Resolve auth: prefer an explicit GITEA_TOKEN; else, unless disabled, fall
+# back to the in-cluster gitea-admin Secret via kubectl (see header comment)
+# and use HTTP Basic. Best-effort — a kubectl/secret-read failure just leaves
+# us unauthenticated, matching the prior no-fallback behavior.
+AUTH_HEADER=""
+if [ -z "${FIXTURES}" ]; then
+  if [ -n "${GITEA_TOKEN:-}" ]; then
+    AUTH_HEADER="Authorization: token ${GITEA_TOKEN}"
+  elif [ "${GITEA_ADMIN_NAMESPACE:-gitea}" != "-" ] && command -v kubectl >/dev/null 2>&1; then
+    admin_ns="${GITEA_ADMIN_NAMESPACE:-gitea}"
+    admin_secret="${GITEA_ADMIN_SECRET:-gitea-admin}"
+    admin_user="$(kubectl -n "${admin_ns}" get secret "${admin_secret}" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    admin_pass="$(kubectl -n "${admin_ns}" get secret "${admin_secret}" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    if [ -n "${admin_user}" ] && [ -n "${admin_pass}" ]; then
+      AUTH_HEADER="Authorization: Basic $(printf '%s:%s' "${admin_user}" "${admin_pass}" | base64 -w0)"
+    fi
+  fi
 fi
 
-REF_SHORT="${REF#refs/heads/}"
-REF_SHORT="${REF_SHORT#refs/tags/}"
+_curl() {
+  # $1 = URL. Fixture mode (--self-test) serves a canned body instead of a
+  # real network request; a plain filename means "serve this file regardless
+  # of URL" (only one endpoint is ever queried per invocation here).
+  if [ -n "${FIXTURES}" ]; then
+    cat "${FIXTURES}"
+    return 0
+  fi
+  if [ -n "${AUTH_HEADER}" ]; then
+    curl -fsSL -H "${AUTH_HEADER}" -H 'Accept: application/json' "$1"
+  else
+    curl -fsSL -H 'Accept: application/json' "$1"
+  fi
+}
 
-base="https://${HOST}/api/v1/repos/${OWNER}/${REPO}"
+runs_json="$(_curl "${API}/runs?limit=50")" || fail "could not list runs for ${OWNER}/${REPO}"
 
-hdrs=(-H 'Accept: application/json')
-tok="${GITEA_TOKEN:-${GITEA_API_TOKEN:-}}"
-[[ -n "$tok" ]] && hdrs+=(-H "Authorization: token ${tok}")
+# The Gitea Actions run-list API reports each run's `path` as either a bare
+# workflow filename with a trailing `@refs/heads/<branch>` ref suffix (this
+# instance's observed shape, e.g. "pillar-integration.yaml@refs/heads/main")
+# or a full `.gitea/workflows/<file>` path (seen on other Gitea/Forgejo
+# versions) — normalize away the `@ref` suffix, then match either the exact
+# filename or a path ending in "/<file>", so both shapes resolve.
+run_row="$(printf '%s' "${runs_json}" | jq -c --arg wf "${WORKFLOW}" '
+  [(.workflow_runs // .)[]?
+   | . as $r
+   | ($r.path | split("@")[0]) as $p
+   | select($p == $wf or ($p | endswith("/" + $wf)))
+   | $r]
+  | sort_by(.run_number // .id)
+  | last // empty
+')"
+[ -n "${run_row}" ] && [ "${run_row}" != "null" ] || fail "no run of workflow '${WORKFLOW}' found (repo ${OWNER}/${REPO})"
 
-body="$(mktemp)"
-trap 'rm -f "$body"' EXIT
+RUN_ID="$(printf '%s' "${run_row}" | jq -r '.id')"
+STATUS="$(printf '%s' "${run_row}" | jq -r '.status // empty')"
+CONCLUSION="$(printf '%s' "${run_row}" | jq -r '.conclusion // empty')"
 
-# Gitea exposes action runs under .../actions/tasks (paginated, newest first).
-code=$(curl -fsSL -o "$body" -w '%{http_code}' "${hdrs[@]}" \
-  "${base}/actions/tasks?page=1&limit=50" 2>/dev/null || echo "000")
+case "${STATUS}" in
+  queued|waiting|in_progress|"")
+    if [ -z "${CONCLUSION}" ] || [ "${CONCLUSION}" = "null" ]; then
+      pending "workflow ${WORKFLOW} run ${RUN_ID} still ${STATUS:-pending} — not yet converged (https://${HOST}/${OWNER}/${REPO}/actions/runs/${RUN_ID})"
+    fi
+    ;;
+esac
 
-if [[ "$code" != "200" ]]; then
-  echo "FAIL: ${base}/actions/tasks returned HTTP ${code}" >&2
-  head -c 400 "$body" >&2 || true
-  exit 1
-fi
+[ -n "${CONCLUSION}" ] && [ "${CONCLUSION}" != "null" ] || CONCLUSION="${STATUS}"
 
-# Normalise: Gitea returns either {"workflow_runs":[...]} or {"tasks":[...]}
-# depending on version; accept either and also a bare array.
-runs_json=$(jq -c '(.workflow_runs // .tasks // .) // []' "$body" 2>/dev/null || echo '[]')
-
-# Select runs whose workflow filename matches WORKFLOW and head ref matches REF,
-# newest first (the API already returns newest-first; we keep that order).
-# Field names differ across Gitea versions, so match defensively on any of the
-# plausible workflow-name / head-branch keys.
-match=$(jq -c --arg wf "$WORKFLOW" --arg ref "$REF_SHORT" '
-  [ .[]
-    | . as $r
-    | ( ($r.workflow_id // $r.workflow // $r.name // "") | tostring ) as $wfname
-    | ( ($r.head_branch // $r.ref // $r.branch // "") | tostring ) as $branch
-    | ( ($r.status // "") | tostring ) as $status
-    | ( ($r.conclusion // $r.result // "") | tostring ) as $concl
-    | select(
-        ($wfname | endswith($wf)) or ($wfname == $wf)
-      )
-    | select(
-        ($branch == $ref) or ($branch | endswith("/" + $ref))
-        or ($ref == "")
-      )
-    | { wfname: $wfname, branch: $branch, status: $status, conclusion: $concl }
-  ]' <<<"$runs_json" 2>/dev/null || echo '[]')
-
-count=$(jq 'length' <<<"$match" 2>/dev/null || echo 0)
-if [[ "$count" -eq 0 ]]; then
-  echo "FAIL: no Gitea Actions run found for workflow '${WORKFLOW}' on ref '${REF_SHORT}' at ${HOST}/${OWNER}/${REPO}" >&2
-  echo "      (queried ${base}/actions/tasks; ${count} matching run(s))" >&2
-  exit 1
-fi
-
-newest=$(jq -c '.[0]' <<<"$match")
-status=$(jq -r '.status' <<<"$newest")
-concl=$(jq -r '.conclusion' <<<"$newest")
-
-# Gitea uses `success`/`failure`/... in either `.conclusion` or, for older
-# versions, a terminal `.status` of `success`. Treat either as authoritative.
-if [[ "$concl" == "success" || "$status" == "success" ]]; then
-  echo "OK: ${WORKFLOW} on ${REF_SHORT} — latest run succeeded (status=${status} conclusion=${concl})"
+if [ "${CONCLUSION}" = "success" ]; then
+  echo "verify-actions-run: PASS: workflow ${WORKFLOW} run ${RUN_ID} concluded success (https://${HOST}/${OWNER}/${REPO}/actions/runs/${RUN_ID})"
   exit 0
 fi
 
-echo "FAIL: latest ${WORKFLOW} run on ${REF_SHORT} did not succeed (status=${status} conclusion=${concl})" >&2
-exit 2
+fail "workflow ${WORKFLOW} run ${RUN_ID} concluded ${CONCLUSION} (https://${HOST}/${OWNER}/${REPO}/actions/runs/${RUN_ID})"

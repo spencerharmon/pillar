@@ -1,0 +1,5 @@
+{"workflow_runs":[
+  {"id":204,"run_number":239,"path":"pillar-integration.yaml@refs/heads/main","status":"completed","conclusion":"failure"},
+  {"id":205,"run_number":240,"path":"pillar-integration.yaml@refs/heads/main","status":"completed","conclusion":"success"},
+  {"id":206,"run_number":241,"path":".gitea/workflows/sync-pillar-mirror.yaml@refs/heads/main","status":"completed","conclusion":"success"}
+]}
