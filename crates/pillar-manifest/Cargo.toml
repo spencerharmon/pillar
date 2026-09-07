@@ -8,7 +8,20 @@ rust-version.workspace = true
 description = "Signed intent manifests: a CRD-compatible body inside a pillar-native envelope (signer-key, causal-parents, content-hash, capability-scope) riding the merkle-DAG log."
 
 [dependencies]
-pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-crypto = { path = "../pillar-crypto" }
+pillar-core = { path = "../pillar-core" }
+pillar-topology = { path = "../pillar-topology" }
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+pillar-quota-ledger = { path = "../pillar-quota-ledger" }
+pillar-rbac = { path = "../pillar-rbac" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+serde_json = "1"
+serde_yaml = "0.9"
 
 [lints]
 workspace = true

@@ -1,0 +1,48 @@
+{
+  "schema": "pillar-integration/v1",
+  "surface_inventory": [
+    {
+      "id": "cli:pillar-node-join",
+      "kind": "cli-verb",
+      "signature": "pillar node join --cell <cell> --token <tok>"
+    },
+    {
+      "id": "http:POST /v1/events",
+      "kind": "http-route",
+      "signature": "POST /v1/events (application/pillar-event)"
+    },
+    {
+      "id": "manifest:Cell",
+      "kind": "manifest-kind",
+      "signature": "apiVersion=pillar/v1 kind=Cell"
+    },
+    {
+      "id": "wire:op.append",
+      "kind": "wire-op",
+      "signature": "op=append fields=[author,seq,prev,payload_cid]"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "node-join-happy-path",
+      "claims": ["cli:pillar-node-join", "manifest:Cell"],
+      "oracle": "process",
+      "skip": null
+    },
+    {
+      "id": "event-ingest-roundtrip",
+      "claims": ["http:POST /v1/events", "wire:op.append"],
+      "oracle": "content-address",
+      "skip": null
+    },
+    {
+      "id": "sealed-payload-confidentiality",
+      "claims": ["wire:op.append"],
+      "oracle": "ciphertext",
+      "skip": {
+        "reason": "sealed-artifact-impl not yet landed",
+        "deadline": "2026-12-31"
+      }
+    }
+  ]
+}

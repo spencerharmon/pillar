@@ -8,7 +8,11 @@ rust-version.workspace = true
 description = "Content-addressed op-log CRDT + materialized view + snapshot/compaction, with a durable content-addressed on-disk backend: the Rust refinement of specs/StreamingDB.tla."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
+pillar-ipfs = { path = "../pillar-ipfs" }
+sha2 = "0.10"
+tracing = "0.1"
 
 [lints]
 workspace = true

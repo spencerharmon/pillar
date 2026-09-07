@@ -30,15 +30,26 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod cli_surface;
 pub mod cluster;
+pub mod health;
 pub mod identity_trust_cli;
 pub mod observability_ui;
 pub mod onboard;
+pub mod polish;
 pub mod resource;
 pub mod run;
+pub mod secrets_audit_rotation_mfa;
 pub mod session_cli;
 pub mod stream_cli;
+pub mod surface_inventory;
+pub mod swarm_cli;
+pub mod topology_cli;
+pub mod trust_rbac_authz;
+pub mod versioning_rollout;
 pub mod web_serve;
+pub mod webauthn_cli;
+pub mod workload_reconcile;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -116,7 +127,7 @@ impl std::error::Error for ApplyError {}
 /// The record of one successful apply: the emitted event and the sealed
 /// manifest's content-hash. Returned so a caller can correlate the CLI action
 /// with the log entry it produced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     /// The id of the signed event emitted for this apply.
     pub event: EventId,
@@ -131,7 +142,7 @@ pub struct Applied {
 /// real apply of this exact body would seal, so `preview(..).content_hash ==
 /// apply(..).content_hash` holds whenever both succeed: predicted ==
 /// enforced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Previewed {
     /// The content-hash the sealed envelope would carry if applied for real.
     pub content_hash: ContentHash,
@@ -226,24 +237,17 @@ impl Platform {
         // preview's verdict can never diverge from what this apply enforces.
         self.preview(actor, capability, &body)?;
 
-        let envelope = Envelope::import(
-            body,
-            actor.0.clone(),
-            causal_parents,
-            capability_scope,
-        );
+        let envelope = Envelope::import(body, actor.0.clone(), causal_parents, capability_scope);
         let content_hash = envelope.content_hash();
 
         // Emit exactly one signed event; its payload names the sealed
         // manifest by content-hash — the view resolves it from the store.
         let author = Author(actor.0.clone());
-        let event = self
-            .log
-            .append(&author, content_hash.0.to_le_bytes().to_vec());
+        let event = self.log.append(&author, content_hash.as_bytes().to_vec());
 
-        self.store.insert(content_hash, envelope);
-        self.applied.push(content_hash);
-        self.applied_events.push(event);
+        self.store.insert(content_hash.clone(), envelope);
+        self.applied.push(content_hash.clone());
+        self.applied_events.push(event.clone());
 
         Ok(Applied {
             event,
@@ -335,7 +339,7 @@ impl Platform {
             .rev()
             .find_map(|(hash, ev)| {
                 let env = self.store.get(hash)?;
-                (ResourceKey::of(env.body()) == *key).then_some(*ev)
+                (ResourceKey::of(env.body()) == *key).then_some(ev.clone())
             })
     }
 
@@ -366,7 +370,7 @@ impl Platform {
         }
         out.push_str("Envelope:\n");
         out.push_str(&format!("  Signer:        {}\n", env.signer()));
-        out.push_str(&format!("  Content-Hash:  {}\n", env.content_hash().0));
+        out.push_str(&format!("  Content-Hash:  {}\n", env.content_hash()));
         if let Some(cid) = self.event_cid(&key) {
             out.push_str(&format!("  Event-CID:     {}\n", cid.0));
         }
@@ -380,7 +384,7 @@ impl Platform {
         } else {
             out.push('\n');
             for p in env.causal_parents() {
-                out.push_str(&format!("    {}\n", p.0));
+                out.push_str(&format!("    {p}\n"));
             }
         }
         out.push_str("  Capability-Scope:");
@@ -806,7 +810,7 @@ mod tests {
 
     // The log is private; expose a tiny read helper just for the test.
     fn p_get_event(p: &Platform, id: EventId) -> pillar_eventlog::Event {
-        p.log.get(id).expect("event exists").clone()
+        p.log.get(&id).expect("event exists").clone()
     }
 
     #[test]
@@ -875,7 +879,8 @@ mod tests {
     }
 
     #[test]
-    fn describe_exercised_authority_reflects_an_explicit_grant_and_never_fabricates_with_no_scope() {
+    fn describe_exercised_authority_reflects_an_explicit_grant_and_never_fabricates_with_no_scope()
+    {
         let owner = NodeId::from(OWNER);
         // An explicit ALLOW grant is the rung actually exercised here.
         let grants = vec![ExplicitGrant {
@@ -889,14 +894,21 @@ mod tests {
             default_resource_class_policies(&RbacCapability(CAP.to_owned())),
             grants,
         );
-        p.apply(&owner, CAP, route_crd("granted"), [], [ManifestCapability::from(CAP)])
-            .unwrap();
+        p.apply(
+            &owner,
+            CAP,
+            route_crd("granted"),
+            [],
+            [ManifestCapability::from(CAP)],
+        )
+        .unwrap();
         let described = p.describe(API, KIND, "granted").unwrap();
         assert!(described.contains("Exercised-Authority: explicit grant (allow)"));
 
         // An envelope applied with NO capability-scope has nothing to
         // explain — describe says so plainly rather than guessing a rung.
-        p.apply(&owner, CAP, route_crd("scopeless"), [], []).unwrap();
+        p.apply(&owner, CAP, route_crd("scopeless"), [], [])
+            .unwrap();
         let described = p.describe(API, KIND, "scopeless").unwrap();
         assert!(described.contains("Exercised-Authority: (no capability-scope"));
     }

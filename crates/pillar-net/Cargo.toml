@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "libp2p transport substrate for Pillar: gossipsub event log, Kademlia discovery, relay/dcutr NAT traversal."
 
 [dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
 libp2p = { version = "0.56", features = [
     "gossipsub",
     "kad",
@@ -28,6 +29,13 @@ libp2p = { version = "0.56", features = [
 ] }
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-eventlog = { path = "../pillar-eventlog" }
+pillar-core = { path = "../pillar-core" }
+pillar-ipam = { path = "../pillar-ipam" }
+# The live UDP ingress dataplane (udp_dataplane) rides the manifest LB policy
+# types (LoadBalancerPolicy/Algorithm/Affinity) so backend selection is the
+# manifest's own decision, not a parallel one. pillar-manifest does not depend
+# on pillar-net, so this is acyclic.
+pillar-manifest = { path = "../pillar-manifest" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -43,6 +51,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # which is exactly the "overlay never a bootstrap dep of the substrate"
 # invariant this task requires.
 pillar-streamdb = { path = "../pillar-streamdb" }
+# Dev-only: builds a TopologyScopedIpam fixture for the pillar-UDP reply-set
+# determinism test. Not a runtime dep (pillar-ipam is; topology comes through it).
+pillar-topology = { path = "../pillar-topology" }
+# Dev-only: the distributed-lb-acceptance test composes the ingress/LB
+# manifest model (Route/Frontend/derive_routing_table) and the WoT trust
+# artifacts gating Route attachment. (pillar-manifest is now a runtime dep of
+# this crate for the UDP dataplane, above.)
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 
 [lints]
 workspace = true

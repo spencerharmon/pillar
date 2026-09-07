@@ -139,63 +139,69 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::time::Instant;
 
-use pillar_core::{Epoch, NodeId};
-use pillar_coordination::LeaseRegister;
-use pillar_eventlog::{Author, EventId, EventLog};
-use pillar_rbac::{
-    default_resource_class_policies, Capability as RbacCapability, Decision, PolicyEvent, PolicyTarget,
-    RbacDecider, Request as RbacRequest, ResourceClass,
-};
-use pillar_identity::global_identity::{
-    Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
-    Rotation as IdentityRotation, Sig as IdentitySig,
-};
-use pillar_identity::session_registry::{RevokeError, Session, SessionRegistry};
-use pillar_identity::NodeSubkey;
-use pillar_streamdb::{OpId, OpLog};
-use pillar_web::key_login::{LoginSession, Origin};
-use pillar_web::node_custody::{
-    BootstrapError, CellBootstrap, CellNameRegistry, CellNameStatus, Cid, InMemoryCellNameRegistry,
-    NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey, CELL_NAME_IN_USE_MESSAGE,
-};
-use pillar_web::{authorize_nonloopback_signing_action, bind_web};
 use pillar_bootstrap::custody::parse_custody_kind;
 use pillar_bootstrap::{
     BootstrapRequestId, BootstrapRequestKind, BootstrapRequestQueue, CustodyKind, NodeIdentity,
     RequestError,
 };
-use pillar_wot_authority::{FencedActor, WotAuthority};
+use pillar_coordination::LeaseRegister;
+use pillar_core::{Epoch, NodeId};
+use pillar_eventlog::{Author, EventId, EventLog};
+use pillar_identity::global_identity::{
+    Domain as IdentityDomain, Genesis as IdentityGenesis, IdentityLog, KeyId as IdentityKeyId,
+    Rotation as IdentityRotation,
+};
+use pillar_identity::session_registry::{RevokeError, Session, SessionRegistry};
+use pillar_identity::NodeSubkey;
+use pillar_rbac::{
+    default_resource_class_policies, Capability as RbacCapability, Decision, PolicyEvent,
+    PolicyTarget, RbacDecider, Request as RbacRequest, ResourceClass,
+};
+use pillar_streamdb::{OpId, OpLog};
+use pillar_swarm::{SwarmKey, SwarmKind};
 use pillar_trust_artifacts::{
     parse_quota, Attest, Capacity as TrustCapacity, Cid as TrustCid, GraphEdge, Predicate,
     Proof as TrustProof, Sig as TrustSig, TrustError, TrustStore,
 };
-
-use pillar_manifest::{
-    Crd, Metadata as CrdMetadata, SchemaRegistry, Schema, FieldType, Value as CrdValue,
+use pillar_web::key_login::{LoginSession, Origin};
+use pillar_web::node_custody::{
+    BootstrapError, CellBootstrap, CellNameRegistry, CellNameStatus, Cid, InMemoryCellNameRegistry,
+    NodeCustodyError, NodeCustodySession, NodeCustodyVerifier, NodeKey, CELL_NAME_IN_USE_MESSAGE,
 };
+use pillar_web::webauthn::{RelyingParty as PillarRelyingParty, RpError};
+use pillar_web::{authorize_nonloopback_signing_action, bind_web};
+use pillar_wot_authority::{FencedActor, WotAuthority};
+
+use crate::observability_ui::ObservabilityBuilders;
+use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
+use crate::Platform;
+use pillar_manifest::{
+    Crd, FieldType, Metadata as CrdMetadata, Schema, SchemaRegistry, Value as CrdValue,
+};
+use pillar_observability::SignalKind;
+use pillar_observability::{LiveObservabilitySubstrate, DEFAULT_EVAL_TIER};
 use pillar_topology::{
     Assignment as TopologyAssignment, Label as TopologyLabel, Mismatch as TopologyMismatch,
     TierHierarchy, Topology as TopologyRegistry, ATTEST_ACTION as TOPOLOGY_ATTEST_ACTION,
 };
-use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
-use crate::Platform;
-
-/// A read-only snapshot of this node's identity/reachability, as the
-/// authenticated portal renders it: [`NodeId`]-derived peer id, the
-/// multiaddrs this node listens on, and the peers it currently considers
-/// connected. Real values are supplied by the boot-time `pillar-net` swarm
-/// (see `crates/pillar-cli/src/run.rs`); the default here is an empty view
-/// (a node with no configured listen/dial peers yet) until wired via
-/// [`WebAuthContext::with_identity`].
-#[derive(Clone, Debug, Default)]
-pub struct NodeIdentitySnapshot {
-    /// This node's libp2p-style peer id (derived from its identity keypair).
-    pub peer_id: String,
-    /// The multiaddrs this node listens on.
-    pub listen_addrs: Vec<String>,
-    /// The peers this node currently considers connected (peer ids).
-    pub connected_peers: Vec<String>,
-}
+use std::sync::{Arc, Mutex};
+// The shared client/server DTO crate (`pillar-web-api`): one type definition
+// for the portal's identity snapshot, session summary, and the
+// login/nonce/bootstrap wire-body framing, compiled into both this server
+// and the future Rust/WASM Yew client so the two cannot drift. A
+// `NodeIdentitySnapshot`/`SessionSummary` used to be defined HERE,
+// server-private; they now live in `pillar_web_api` and are re-exported
+// under their same names so every existing call site keeps compiling
+// unchanged. `CustodyRecord` stays server-local: its `holder`/`cid`
+// fields carry the server's internal `NodeId`/`Cid` newtypes, which this
+// wire-facing DTO crate deliberately does not depend on (see
+// `pillar_web_api::CustodyRecord`'s doc for the plain-`String` shared
+// shape a client would consume instead).
+use pillar_web_api::{
+    BootstrapCreateCellRequest, BootstrapCreateRequest, BootstrapCreateUserRequest,
+    BootstrapStatus, LoginRequest, LoginResponse, NonceResponse,
+};
+pub use pillar_web_api::{NodeIdentitySnapshot, SessionSummary};
 
 /// The server-side state the node-side-custody portal needs: the node-custody
 /// verifier (holding this node's node key + its cell-DB view of node-sealed
@@ -247,6 +253,15 @@ pub struct WebAuthContext {
     /// content-addressed [`OpId`] is the resource's CID, and
     /// `OpLog::root()` is the resource's streaming tip.
     layouts: OpLog,
+    /// A read-only description of which physical libp2p swarm this node is
+    /// running on, for the Swarm panel's `show` view: the swarm kind, its
+    /// non-secret fingerprint, and the configured seed multiaddrs. Set at boot
+    /// via [`WebAuthContext::with_swarm_info`]; defaults to the public swarm
+    /// with no seeds. Pillar keeps NO swarm state — the panel only inspects
+    /// this and mints fresh keys; it never repoints a running node.
+    swarm_kind: SwarmKind,
+    swarm_fingerprint: String,
+    swarm_seeds: Vec<String>,
     /// The authenticated session's global identity log — the identity &
     /// domain UI's substrate (enroll/rotate/recover, per-domain keys).
     identity_log: IdentityLog,
@@ -325,7 +340,60 @@ pub struct WebAuthContext {
     /// alongside each node's resolved placement path, and rolls up per tier.
     /// `node-id -> (health, capacity)`.
     topology_nodes: BTreeMap<String, (String, u64)>,
+    /// The observability UI's substrate (ROI P3 addendum "Web portal / UI
+    /// rework": observability explore/query/dashboard) — the five-kind
+    /// (metric/log/trace/profile/metadata) explore+query builders layered over
+    /// [`pillar_observability`], plus the signed streaming-DB resource logs the
+    /// saved-query/dashboard builders persist to. Views (explore/query) sign
+    /// nothing; a dashboard SAVE is ONE signed, content-addressed streaming-DB
+    /// resource event — no server-side database, exactly like `layouts`.
+    observability: ObservabilityBuilders,
+    /// The real WebAuthn relying party backing the `/webauthn/*` ceremony
+    /// endpoints: the single-use time-bounded challenge protocol and the
+    /// shared credential-record store (`pillar_web::webauthn::RelyingParty`).
+    /// No server-side database: the record store is in-process, exactly like
+    /// every other portal substrate here.
+    webauthn_rp: PillarRelyingParty,
+    /// The node's LIVE observability substrate (ROI "pillar-integration"
+    /// observability-psl prerequisite), shared with the running controller
+    /// loop that feeds all five producers. `None` on a node that opened its
+    /// web surface without a running node substrate (e.g. an unbootstrapped
+    /// portal). When `Some`, the `/portal/obs/live/*` endpoints query PSL,
+    /// evaluate recording rules + alerts, and materialize dashboards over the
+    /// SAME live store the controller loop writes — never the empty internal
+    /// builder store above.
+    live_obs: Option<SharedLiveObs>,
+    /// The optional workload-runtime reconcile bridge. When the running node
+    /// has wired a [`crate::workload_reconcile::WorkloadReconciler`] into its
+    /// boot path, every authorized `apply`/`scale` of a `Workload` here is
+    /// forwarded to it, driving the REAL fetch-by-CID + digest-verified
+    /// admission + supervised-process spawn vertical. `None` in a bare
+    /// unit-test context (the resource plane still records the signed event
+    /// exactly as before; nothing runs).
+    workload_reconciler: Option<crate::workload_reconcile::SharedReconciler>,
+    /// The optional scheduler node runtime (`scheduler-node-runtime-wiring` /
+    /// `scheduler-apply-admission-registration`). When the running node has
+    /// wired a [`pillar_controller::SchedulerRuntime`] into its boot path
+    /// (`pillar node run`'s real wall-clock scheduler loop), every authorized
+    /// `apply`/`delete` of a `CronJob`/`Job` manifest here is translated into
+    /// a [`pillar_manifest::scheduler::Job`] and registered/deregistered into
+    /// it — the production route that replaces the `PILLAR_TEST_CRONJOB` rig
+    /// hook. `None` in a bare unit-test context (the resource plane still
+    /// records the signed event exactly as before; nothing is scheduled).
+    scheduler_runtime: Option<SharedSchedulerRuntime>,
 }
+
+/// A thread-shared handle to the node's live scheduler runtime: the running
+/// node's real wall-clock tick loop and the web server's manifest-admission
+/// path both hold a clone, so an applied `CronJob`/`Job` manifest registers
+/// into the IDENTICAL engine the tick loop drives (never a second, disconnected
+/// scheduler).
+pub type SharedSchedulerRuntime = Arc<Mutex<pillar_controller::SchedulerRuntime>>;
+
+/// A thread-shared handle to the node's live observability substrate: the
+/// controller loop and the web server both hold a clone and take the lock only
+/// briefly (a periodic sample / one query), so neither starves the other.
+pub type SharedLiveObs = Arc<Mutex<LiveObservabilitySubstrate>>;
 
 /// One handle's custody record, as the key & offer UI renders/drives it: the
 /// current holder node, the offer's [`TrustCid`], whether it is currently
@@ -342,6 +410,35 @@ pub struct CustodyRecord {
     pub generation: u64,
 }
 
+/// The HTTP INGEST API surface's own EXPLICIT version stamp (ROI P1
+/// "Versioning, compatibility & safe rollout") — versioned INDEPENDENTLY of
+/// any event/message/body it carries. This is the distinct wire surface a
+/// browser/`curl`/k8s Ingress/generated SDK speaks to this portal; it
+/// advances on its OWN line (`v1`, `v2`, …) as request/response framing
+/// changes, unrelated to the event-envelope or pillar-message version
+/// numbers. Every response advertises it via [`API_VERSION_HEADER`], and a
+/// request MAY assert the version it speaks; the server checks that
+/// assertion against `[MIN_API_VERSION, API_VERSION]` with the shared
+/// [`pillar_crypto::SurfaceVersion`] primitive.
+///
+/// Re-exported from `pillar_web_api` (the `stable-http-api-sdk` task) rather
+/// than defined here a second time: `pillar_web_api::client::SdkClient` (the
+/// generated SDK) declares the SAME constant, so the server's published
+/// version and the SDK's negotiated version can never drift apart — there is
+/// exactly ONE definition, not a parallel versioning scheme per side.
+pub use pillar_web_api::API_VERSION;
+/// The response/request header carrying the HTTP ingest API [`SurfaceVersion`]
+/// stamp (rendered `vN` via its `Display`). Emitted on EVERY response so any
+/// client can see the version it was served at; OPTIONALLY sent by a request
+/// to assert the version it speaks (a request without it is served backward-
+/// compatibly at [`API_VERSION`]). Re-exported from `pillar_web_api` for the
+/// same single-source-of-truth reason as [`API_VERSION`].
+use pillar_web_api::API_VERSION_HEADER;
+/// The OLDEST HTTP ingest API version this build still accepts on a request —
+/// see [`pillar_web_api::MIN_API_VERSION`] (re-exported here for the same
+/// single-source-of-truth reason as [`API_VERSION`]).
+pub use pillar_web_api::MIN_API_VERSION;
+
 /// The `apiVersion` every resource-plane kind on the web UI shares.
 const RESOURCE_API: &str = "pillar.dev/v1";
 /// The capability every resource act is gated on, per the shared RBAC
@@ -352,10 +449,23 @@ const RESOURCE_CAP: &str = "resource/act";
 const WORKLOAD_KIND: &str = "Workload";
 /// An identity-object kind the SAME verb surface is polymorphic over.
 const IDENTITY_KIND: &str = "User";
+/// The `CronJob` built-in kind's `kind` string — reused verbatim from
+/// [`pillar_manifest::builtin::BuiltinKind::CronJob`] rather than a second,
+/// hand-rolled constant, so the resource plane's `CronJob` object is
+/// admitted through the SAME `(apiVersion, kind)` identity as every other
+/// place in the platform that recognizes a built-in `CronJob`.
+const CRONJOB_KIND: &str = "CronJob";
+/// The `Job` (one-shot) built-in kind's `kind` string, likewise reused from
+/// [`pillar_manifest::builtin::BuiltinKind::Job`].
+const JOB_KIND: &str = "Job";
 
 /// Build the resource plane's schema registry: a workload kind (with an
-/// `image` + `replicas` spec the UI scales/rolls-out) and an identity kind,
-/// proving the plane is polymorphic over both.
+/// `image` + `replicas` spec the UI scales/rolls-out), an identity kind, and
+/// EVERY built-in kind [`pillar_manifest::builtin`] declares — including
+/// `CronJob`/`Job`, admitted here through the exact same
+/// [`pillar_manifest::builtin::register_builtin_schemas`] call any other
+/// built-in consumer in the platform uses (proving the plane is polymorphic
+/// over a hand-rolled kind, an identity kind, AND a real built-in kind alike).
 fn resource_registry() -> SchemaRegistry {
     let mut reg = SchemaRegistry::new();
     reg.register(
@@ -364,33 +474,13 @@ fn resource_registry() -> SchemaRegistry {
             .property("replicas", FieldType::Integer)
             .property("generation", FieldType::Integer),
     );
-    reg.register(
-        Schema::new(RESOURCE_API, IDENTITY_KIND)
-            .required("handle", FieldType::String),
-    );
+    reg.register(Schema::new(RESOURCE_API, IDENTITY_KIND).required("handle", FieldType::String));
+    pillar_manifest::builtin::register_builtin_schemas(&mut reg);
     reg
 }
 
-/// A portal session-management panel's per-session view: `(id, node/domain,
-/// issued-at, expiry, whether this IS the caller's own current session)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionSummary {
-    /// The session id (== the portal bearer token it was minted for).
-    pub id: String,
-    /// The node/domain this session was issued on (this node's own peer id
-    /// — a portal session is always local-node scoped).
-    pub node: String,
-    /// Logical issue time.
-    pub issued_at: u64,
-    /// Logical expiry time — the panel derives its live countdown from this.
-    pub expiry: u64,
-    /// Whether this is the session the panel's own caller is viewing under.
-    pub is_current: bool,
-}
-
-/// The fixed session lifetime (logical-clock ticks) every portal login mints
-/// under — long enough that a same-pass test sequence never trips it, short
-/// enough to be a real bound.
+/// A portal session-management panel's per-session view is now the shared
+/// [`SessionSummary`] DTO (re-exported above from `pillar_web_api`).
 const SESSION_TTL_TICKS: u64 = 1_000_000;
 
 impl WebAuthContext {
@@ -430,7 +520,11 @@ impl WebAuthContext {
         let lease_epoch = Epoch(1);
         // A solo node is its own voter and candidate: self-grant + acquire so
         // a fresh node reports itself as the lease holder out of the box.
-        let _ = lease.grant(owner_for_lease.clone(), owner_for_lease.clone(), lease_epoch);
+        let _ = lease.grant(
+            owner_for_lease.clone(),
+            owner_for_lease.clone(),
+            lease_epoch,
+        );
         let _ = lease.try_acquire(&owner_for_lease, lease_epoch);
         WebAuthContext {
             verifier: NodeCustodyVerifier::new(node_key, Origin::from(origin.as_str())),
@@ -451,6 +545,9 @@ impl WebAuthContext {
             lease,
             lease_epoch,
             layouts: OpLog::new(),
+            swarm_kind: SwarmKind::Public,
+            swarm_fingerprint: SwarmKey::public().fingerprint(),
+            swarm_seeds: Vec::new(),
             identity_log: IdentityLog::genesis(IdentityGenesis {
                 initial_primary: IdentityKeyId::from("primary:0"),
                 recovery: Some(IdentityKeyId::from("recovery")),
@@ -467,7 +564,235 @@ impl WebAuthContext {
             resource_authority,
             topology: TopologyRegistry::new(TierHierarchy::default()),
             topology_nodes: BTreeMap::new(),
+            observability: ObservabilityBuilders::new(),
+            webauthn_rp: PillarRelyingParty::new(),
+            live_obs: None,
+            workload_reconciler: None,
+            scheduler_runtime: None,
         }
+    }
+
+    /// Wire a workload-runtime reconcile bridge into this web plane. The
+    /// running node ([`crate::run::run`]) calls this so every authorized
+    /// `Workload` apply/scale over the portal drives the real fetch + admit +
+    /// spawn vertical against the shared reconciler.
+    #[must_use]
+    pub fn with_workload_reconciler(
+        mut self,
+        reconciler: crate::workload_reconcile::SharedReconciler,
+    ) -> Self {
+        self.workload_reconciler = Some(reconciler);
+        self
+    }
+
+    /// Wire the node's real scheduler runtime into this web plane. The running
+    /// node ([`crate::run::run`]) calls this so every authorized `CronJob`/
+    /// `Job` apply/delete over the portal registers/deregisters into the SAME
+    /// [`pillar_controller::SchedulerRuntime`] its real wall-clock tick loop
+    /// drives — the production route `scheduler-apply-admission-registration`
+    /// wires in place of the `PILLAR_TEST_CRONJOB` rig hook.
+    #[must_use]
+    pub fn with_scheduler_runtime(mut self, runtime: SharedSchedulerRuntime) -> Self {
+        self.scheduler_runtime = Some(runtime);
+        self
+    }
+
+    /// Tell the portal's Swarm panel which physical libp2p swarm this node is
+    /// running on (the running node calls this from [`crate::run::run`]) — its
+    /// kind, non-secret fingerprint, and configured seed multiaddrs. Read-only:
+    /// pillar keeps no swarm state, so the panel only inspects this and mints
+    /// fresh keys; it never repoints the running node.
+    #[must_use]
+    pub fn with_swarm_info(
+        mut self,
+        kind: SwarmKind,
+        fingerprint: String,
+        seeds: Vec<String>,
+    ) -> Self {
+        self.swarm_kind = kind;
+        self.swarm_fingerprint = fingerprint;
+        self.swarm_seeds = seeds;
+        self
+    }
+
+    /// Reconcile `name`'s declared image+replicas into the shared reconciler,
+    /// if one is wired. Best-effort: a reconcile failure is logged but never
+    /// fails the (already-recorded) signed manifest act — the manifest log is
+    /// the source of truth; the runtime converges toward it.
+    fn drive_reconcile(&self, name: &str) {
+        let Some(shared) = &self.workload_reconciler else {
+            return;
+        };
+        // Read the current declared image + replicas from the resource plane.
+        let Some(crd) = self
+            .resource_platform
+            .get(&self.resource_api, WORKLOAD_KIND, name)
+        else {
+            return;
+        };
+        let image = match crd.spec.get("image") {
+            Some(CrdValue::String(s)) => s.clone(),
+            _ => return,
+        };
+        let replicas = match crd.spec.get("replicas") {
+            Some(CrdValue::Integer(n)) => (*n).max(0) as usize,
+            _ => 1,
+        };
+        if let Ok(mut reconciler) = shared.lock() {
+            if let Err(e) = reconciler.reconcile(name, &image, replicas) {
+                tracing::debug!(workload = name, error = %e, "workload reconcile did not converge yet");
+            }
+        }
+    }
+
+    /// `apply` (ACT) for a `CronJob`/`Job` manifest — the production admission
+    /// route (`scheduler-apply-admission-registration`): validates + records
+    /// the manifest through the exact same signed resource-plane apply path a
+    /// `Workload` apply rides (schema-checked against the REAL built-in
+    /// `CronJob`/`Job` schema from [`pillar_manifest::builtin`], not a
+    /// hand-rolled one), then — when a [`SharedSchedulerRuntime`] is wired —
+    /// translates the admitted manifest into a real
+    /// [`pillar_manifest::scheduler::Job`] and registers it into the LIVE
+    /// engine via [`pillar_controller::SchedulerRuntime::register_workload`]:
+    /// the SAME registration the `PILLAR_TEST_CRONJOB` rig hook performs, but
+    /// sourced from a real applied manifest rather than an env var.
+    ///
+    /// `schedule_secs` is this job's fire period in seconds (how often a due
+    /// tick fires it — the CronJob's schedule, expressed as a period rather
+    /// than a five-field cron string, matching the schema's plain-string
+    /// `schedule` field); `command` is the path to the verified on-disk
+    /// executable the job spawns when due, read + supervised exactly like a
+    /// `PILLAR_TEST_CRONJOB` script.
+    ///
+    /// # Errors
+    /// [`ResourceError::Apply`] if the manifest fails schema validation or the
+    /// actor is unauthorized; on any failure NOTHING is mutated or scheduled.
+    pub fn resource_apply_cronjob(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+        schedule_secs: f64,
+        command: &str,
+    ) -> Result<String, ResourceError> {
+        self.resource_apply_scheduled(actor, CRONJOB_KIND, name, schedule_secs, command)
+    }
+
+    /// The one-shot `Job` counterpart of [`Self::resource_apply_cronjob`]:
+    /// the SAME admission + registration path against the built-in `Job`
+    /// schema instead of `CronJob`. A one-shot job is registered with
+    /// [`pillar_manifest::scheduler::ConcurrencyPolicy::Forbid`] and an
+    /// immediately-due schedule (`schedule_secs` of `0.0` fires on the very
+    /// next tick, then never re-fires while the run stays live/backed-off) —
+    /// callers that want a genuinely repeating job apply a `CronJob` instead.
+    ///
+    /// # Errors
+    /// The SAME errors [`Self::resource_apply_cronjob`] returns.
+    pub fn resource_apply_job(
+        &mut self,
+        actor: &NodeId,
+        name: &str,
+        command: &str,
+    ) -> Result<String, ResourceError> {
+        self.resource_apply_scheduled(actor, JOB_KIND, name, 0.0, command)
+    }
+
+    fn resource_apply_scheduled(
+        &mut self,
+        actor: &NodeId,
+        kind: &str,
+        name: &str,
+        schedule_secs: f64,
+        command: &str,
+    ) -> Result<String, ResourceError> {
+        let body = Crd::new(&self.resource_api, kind, CrdMetadata::new(name))
+            .with_spec("schedule", CrdValue::String(schedule_secs.to_string()))
+            .with_spec("command", CrdValue::String(command.to_owned()));
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        let applied = plane
+            .apply(actor, RESOURCE_CAP, body)
+            .map(|applied| format!("{}", applied.event.0))?;
+        // Drive the real scheduler-runtime registration toward the
+        // just-declared manifest state (best-effort: an unreadable command
+        // logs and skips scheduling rather than failing the already-recorded
+        // signed manifest act — the manifest log is the source of truth).
+        self.register_scheduler_job(name, schedule_secs, command);
+        Ok(applied)
+    }
+
+    /// `delete` (ACT) for a `CronJob`/`Job` manifest: the tombstone half of
+    /// [`Self::resource_apply_cronjob`]/[`Self::resource_apply_job`], riding
+    /// the identical signed resource-plane delete path. Deregisters `name`
+    /// from the live [`SharedSchedulerRuntime`] (if wired) so a deleted
+    /// CronJob/Job stops firing — the manifest-removal counterpart of the
+    /// apply-time registration. `kind` selects which built-in kind's object
+    /// to tombstone (pass [`CRONJOB_KIND`]-shaped `"CronJob"` or `"Job"`).
+    ///
+    /// # Errors
+    /// [`ResourceError::NotFound`] if no such manifest exists; else the
+    /// underlying apply error.
+    pub fn resource_delete_cronjob(
+        &mut self,
+        actor: &NodeId,
+        kind: &str,
+        name: &str,
+    ) -> Result<String, ResourceError> {
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        let applied = plane
+            .delete(actor, RESOURCE_CAP, &Address::new(kind, name))
+            .map(|applied| format!("{}", applied.event.0))?;
+        if let Some(shared) = &self.scheduler_runtime {
+            if let Ok(mut runtime) = shared.lock() {
+                runtime.deregister(name);
+            }
+        }
+        Ok(applied)
+    }
+
+
+    /// Register (or replace) `name`'s real scheduler-runtime job from an
+    /// admitted CronJob/Job manifest's schedule period + command path, if a
+    /// [`SharedSchedulerRuntime`] is wired. Best-effort: an unreadable command
+    /// executable is logged and skipped rather than failing the caller — the
+    /// manifest log already recorded the signed apply; the runtime converges
+    /// toward it (a later re-apply, once the executable is readable,
+    /// registers it).
+    fn register_scheduler_job(&mut self, name: &str, schedule_secs: f64, command: &str) {
+        let Some(shared) = &self.scheduler_runtime else {
+            return;
+        };
+        let image_bytes = match std::fs::read(command) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    %command,
+                    error = %e,
+                    cronjob = name,
+                    "CronJob apply: unreadable command executable; not registered into the live scheduler"
+                );
+                return;
+            }
+        };
+        use pillar_manifest::scheduler::{ConcurrencyPolicy, Job, JobKind};
+        if let Ok(mut runtime) = shared.lock() {
+            runtime.register_workload(
+                name.to_owned(),
+                Job::new(JobKind::Workload, ConcurrencyPolicy::Forbid, "node", 3, 8),
+                std::time::Duration::from_secs_f64(schedule_secs.max(0.0)),
+                "node",
+                image_bytes,
+                Vec::new(),
+            );
+        }
+    }
+
+    /// Attach the node's LIVE observability substrate (shared with the running
+    /// controller loop that feeds all five producers), enabling the
+    /// `/portal/obs/live/*` endpoints to query PSL, evaluate recording rules +
+    /// alerts, and materialize dashboards over the SAME live store.
+    #[must_use]
+    pub fn with_live_observability(mut self, live: SharedLiveObs) -> Self {
+        self.live_obs = Some(live);
+        self
     }
 
     /// Inject this node's real identity/reachability snapshot (PeerId, listen
@@ -482,6 +807,18 @@ impl WebAuthContext {
     #[must_use]
     pub fn identity(&self) -> &NodeIdentitySnapshot {
         &self.identity
+    }
+
+    /// The WebAuthn relying-party id the ceremony endpoints advertise. Derived
+    /// from this node's identity peer id (the portal's stable origin host); a
+    /// browser client scopes `navigator.credentials.{create,get}` to it.
+    #[must_use]
+    fn origin_rp_id(&self) -> String {
+        if self.identity.peer_id.is_empty() {
+            "pillar.local".to_owned()
+        } else {
+            self.identity.peer_id.clone()
+        }
     }
 
     /// Seconds elapsed since this context was created — the portal's uptime.
@@ -509,20 +846,329 @@ impl WebAuthContext {
     /// Resolve a previously stored layout by its CID, returning
     /// `(signer, content)`.
     #[must_use]
-    pub fn get_layout(&self, id: OpId) -> Option<(String, String)> {
-        self.layouts.order().into_iter().find(|op| op.id() == id).and_then(|op| {
-            let text = String::from_utf8_lossy(op.payload());
-            let mut lines = text.splitn(2, '\n');
-            let signer = lines.next()?.to_owned();
-            let content = lines.next().unwrap_or("").to_owned();
-            Some((signer, content))
-        })
+    pub fn get_layout(&self, id: &OpId) -> Option<(String, String)> {
+        self.layouts
+            .order()
+            .into_iter()
+            .find(|op| &op.id() == id)
+            .and_then(|op| {
+                let text = String::from_utf8_lossy(op.payload());
+                let mut lines = text.splitn(2, '\n');
+                let signer = lines.next()?.to_owned();
+                let content = lines.next().unwrap_or("").to_owned();
+                Some((signer, content))
+            })
     }
 
     /// The streaming tip (Merkle root) of the layout resource log.
     #[must_use]
-    pub fn layout_tip(&self) -> u64 {
+    pub fn layout_tip(&self) -> pillar_streamdb::MerkleRoot {
         self.layouts.root()
+    }
+
+    /// The observability explore builder for `kind`, rendered as one
+    /// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` line per held signal of
+    /// that kind. A pure read — signs nothing.
+    pub fn observability_explore(&mut self, kind: SignalKind) -> String {
+        let mut body = String::new();
+        for r in self.observability.explore(kind) {
+            body.push_str(&format!(
+                "SIGNAL {} KIND {} PAYLOAD {}\n",
+                r.id.0,
+                signal_kind_tag(kind),
+                r.payload
+            ));
+        }
+        body
+    }
+
+    /// The observability per-kind query builder: metric/log/trace substring
+    /// query, profile `top`, or metadata entity query, rendered as text. A
+    /// pure read — signs nothing.
+    pub fn observability_query(&mut self, kind: SignalKind, filter: Option<&str>) -> String {
+        let mut body = String::new();
+        match kind {
+            SignalKind::MetadataSample => {
+                for (entity, view) in self.observability.metadata_query(filter) {
+                    let labels = view
+                        .current
+                        .map(|ls| {
+                            ls.iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    body.push_str(&format!("ENTITY {} LABELS {}\n", entity.0, labels));
+                }
+            }
+            _ => {
+                let records = match kind {
+                    SignalKind::Metric => self.observability.metric_query(filter),
+                    SignalKind::Log => self.observability.log_query(filter),
+                    SignalKind::TraceSpan => self.observability.trace_search(filter),
+                    // Profile has no substring query; `top <n>` is its query
+                    // verb — an optional numeric `filter` picks `n`.
+                    SignalKind::ProfileSample => {
+                        let n = filter.and_then(|f| f.parse::<usize>().ok()).unwrap_or(20);
+                        self.observability.profile_top(n)
+                    }
+                    SignalKind::MetadataSample => unreachable!("handled above"),
+                };
+                for r in records {
+                    body.push_str(&format!(
+                        "SIGNAL {} KIND {} PAYLOAD {}\n",
+                        r.id.0,
+                        signal_kind_tag(kind),
+                        r.payload
+                    ));
+                }
+            }
+        }
+        body
+    }
+
+    /// Whether this node exposes a live observability substrate (a running
+    /// `node run` shared its store with the portal).
+    #[must_use]
+    pub fn has_live_observability(&self) -> bool {
+        self.live_obs.is_some()
+    }
+
+    /// Live-store `explore` for `kind`: every real signal of that kind the
+    /// running node's producers have ingested, rendered as
+    /// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` lines. `None` when no live
+    /// substrate is attached. A pure read — signs nothing.
+    pub fn live_obs_explore(&self, kind: SignalKind) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut body = String::new();
+        for r in sub.explore(kind) {
+            body.push_str(&format!(
+                "SIGNAL {} KIND {} PAYLOAD {}\n",
+                r.id.0,
+                signal_kind_tag(r.kind),
+                r.payload
+            ));
+        }
+        Some(body)
+    }
+
+    /// The per-kind counts of really-ingested signals in the live store,
+    /// rendered as `KIND <kind> COUNT <n>` lines (one per kind observed) — the
+    /// black-box "all five kinds really ingested" probe. `None` when no live
+    /// substrate is attached.
+    pub fn live_obs_kinds(&self) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut body = String::new();
+        for kind in [
+            SignalKind::Metric,
+            SignalKind::Log,
+            SignalKind::TraceSpan,
+            SignalKind::ProfileSample,
+            SignalKind::MetadataSample,
+        ] {
+            body.push_str(&format!(
+                "KIND {} COUNT {}\n",
+                signal_kind_tag(kind),
+                sub.count_of_kind(kind)
+            ));
+        }
+        Some(body)
+    }
+
+    /// Run a PSL query (`query_text`) against the LIVE store as of the node's
+    /// current logical clock, returning the matched signals rendered as
+    /// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` lines, and any correlate
+    /// groups as `GROUP <anchor> MEMBERS <id,id,...>` lines. `Err` carries a
+    /// parse/exec error message; `None` when no live substrate is attached. A
+    /// pure read — signs nothing.
+    pub fn live_obs_psl(&self, query_text: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let query = match pillar_observability::parse_psl(query_text) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+        };
+        // Query as of "now" = the highest write tick observed, so a relative
+        // range covers every ingested signal regardless of wall clock.
+        let now = sub.latest_tick();
+        let mut body = String::new();
+        for r in sub.psl_query(&query, now) {
+            body.push_str(&format!(
+                "SIGNAL {} KIND {} PAYLOAD {}\n",
+                r.id.0,
+                signal_kind_tag(r.kind),
+                r.payload
+            ));
+        }
+        for (anchor, members) in sub.psl_correlate(&query, now) {
+            let ids = members
+                .iter()
+                .map(|m| m.to_hex())
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!("GROUP {} MEMBERS {}\n", anchor.0, ids));
+        }
+        Some(Ok(body))
+    }
+
+    /// Register + evaluate a recording rule over the LIVE store in one shot
+    /// (the black-box driver's "install this rule and fire it" action): parse
+    /// `spec` as `<rule-id>|<kind>|<psl-query>|<emit-name>`, register it, then
+    /// evaluate it now, returning `RULE <id> FIRED <bool> EMITTED <n>` plus the
+    /// derived series as `DERIVED <v> ...`. `None` when no live substrate is
+    /// attached; `Err` on a bad spec / evaluation error.
+    pub fn live_obs_recording(&self, spec: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let mut sub = live.lock().expect("live observability lock");
+        let parts: Vec<&str> = spec.split('|').collect();
+        let [id, kind_tok, psl, emit] = parts.as_slice() else {
+            return Some(Err("RULE-SPEC expected <id>|<kind>|<psl>|<emit>".to_owned()));
+        };
+        let rule_kind = match *kind_tok {
+            "log-count" => pillar_observability::RuleKind::LogsToMetrics,
+            "trace-count" => pillar_observability::RuleKind::TracesToMetrics,
+            "metric-count" => pillar_observability::RuleKind::MetricsToMetrics,
+            other => return Some(Err(format!("RULE-KIND unknown {other}"))),
+        };
+        let query = match pillar_observability::parse_psl(psl) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+        };
+        let rule = match pillar_observability::RecordingRule::new(
+            *id,
+            rule_kind,
+            query,
+            pillar_observability::psl::Aggregate::Count,
+            Vec::new(),
+            *emit,
+            DEFAULT_EVAL_TIER,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(format!("RULE-BUILD {e:?}"))),
+        };
+        sub.register_rule(rule);
+        let now = sub.latest_tick();
+        match sub.evaluate_rule(id, DEFAULT_EVAL_TIER, now) {
+            Ok(ev) => {
+                let derived = sub.derived_series(id);
+                let mut body = format!(
+                    "RULE {id} FIRED {} EMITTED {}\n",
+                    ev.fired,
+                    ev.emitted.len()
+                );
+                let vals = derived
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                body.push_str(&format!("DERIVED {vals}\n"));
+                Some(Ok(body))
+            }
+            Err(e) => Some(Err(format!("RULE-EVAL {e:?}"))),
+        }
+    }
+
+    /// Register + evaluate an alert over the LIVE store in one shot: parse
+    /// `spec` as `<alert-id>|<psl-query>|<gt|lt>|<threshold>`, register it, and
+    /// evaluate it now, returning one `ALERT <id> VALUE <v>` line per fired
+    /// notification (empty body = no notification tripped). `None` when no live
+    /// substrate is attached; `Err` on a bad spec / evaluation error.
+    pub fn live_obs_alert(&self, spec: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let mut sub = live.lock().expect("live observability lock");
+        let parts: Vec<&str> = spec.split('|').collect();
+        let [id, psl, op, threshold] = parts.as_slice() else {
+            return Some(Err(
+                "ALERT-SPEC expected <id>|<psl>|<gt|lt>|<threshold>".to_owned()
+            ));
+        };
+        let thr: f64 = match threshold.parse() {
+            Ok(t) => t,
+            Err(_) => return Some(Err(format!("ALERT-THRESHOLD not a number {threshold}"))),
+        };
+        let predicate = match *op {
+            "gt" => pillar_observability::AlertPredicate::GreaterThan(thr),
+            "lt" => pillar_observability::AlertPredicate::LessThan(thr),
+            other => return Some(Err(format!("ALERT-OP unknown {other}"))),
+        };
+        let query = match pillar_observability::parse_psl(psl) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+        };
+        let alert = match pillar_observability::Alert::new(
+            *id,
+            query,
+            pillar_observability::psl::Aggregate::Count,
+            Vec::new(),
+            predicate,
+            DEFAULT_EVAL_TIER,
+        ) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(format!("ALERT-BUILD {e:?}"))),
+        };
+        sub.register_alert(alert);
+        let now = sub.latest_tick();
+        match sub.evaluate_alert(id, DEFAULT_EVAL_TIER, now) {
+            Ok(notifs) => {
+                let mut body = String::new();
+                for n in notifs {
+                    body.push_str(&format!("ALERT {} VALUE {}\n", n.alert_id, n.value));
+                }
+                Some(Ok(body))
+            }
+            Err(e) => Some(Err(format!("ALERT-EVAL {e:?}"))),
+        }
+    }
+
+    /// Materialize a dashboard from the LIVE store: `spec` is a list of
+    /// `<panel-name>=<psl-query>` panels separated by newlines. Renders, per
+    /// panel, a `PANEL <name> COUNT <n>` header line followed by the panel's
+    /// matched `SIGNAL ...` lines — the dashboard's real materialized views.
+    /// `None` when no live substrate is attached; `Err` on a bad panel query.
+    pub fn live_obs_dashboard_materialize(&self, spec: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut panels = Vec::new();
+        for line in spec.lines().filter(|l| !l.trim().is_empty()) {
+            let Some((name, psl)) = line.split_once('=') else {
+                return Some(Err(format!("PANEL expected <name>=<psl>: {line}")));
+            };
+            let query = match pillar_observability::parse_psl(psl.trim()) {
+                Ok(q) => q,
+                Err(e) => return Some(Err(format!("PSL-PARSE {}", e.0))),
+            };
+            panels.push((name.trim().to_owned(), query));
+        }
+        let mut body = String::new();
+        for (name, records) in sub.materialize_dashboard(&panels, sub.latest_tick()) {
+            body.push_str(&format!("PANEL {} COUNT {}\n", name, records.len()));
+            for r in records {
+                body.push_str(&format!(
+                    "SIGNAL {} KIND {} PAYLOAD {}\n",
+                    r.id.0,
+                    signal_kind_tag(r.kind),
+                    r.payload
+                ));
+            }
+        }
+        Some(Ok(body))
+    }
+
+    /// Persist a named observability dashboard as ONE signed, content-addressed
+    /// streaming-DB resource (the SAME no-server-side-database pattern
+    /// and the dashboard log's new streaming tip. The portal only ever calls
+    /// this for an admitted session (`signer` is that session's handle).
+    pub fn save_observability_dashboard(
+        &mut self,
+        signer: &str,
+        name: &str,
+        spec: &str,
+    ) -> (OpId, pillar_streamdb::MerkleRoot) {
+        let cid = self.observability.create_dashboard(signer, name, spec);
+        (cid, self.observability.dashboard_tip())
     }
 
     /// Read-only access to this session's global identity log — the
@@ -561,10 +1207,10 @@ impl WebAuthContext {
         new_primary: &str,
     ) -> Result<u64, pillar_identity::global_identity::IdentityLogError> {
         let signer = self.identity_log.current_primary().clone();
-        self.identity_log.rotate(IdentityRotation {
-            new_primary: IdentityKeyId::from(new_primary),
-            sig: IdentitySig::by(signer),
-        })
+        self.identity_log.rotate(IdentityRotation::signed_by(
+            IdentityKeyId::from(new_primary),
+            signer.0,
+        ))
     }
 
     /// Recover: rotate to a fresh primary using the genesis-committed
@@ -580,10 +1226,10 @@ impl WebAuthContext {
             .cloned()
             .unwrap_or_else(|| IdentityKeyId::from("no-recovery-configured"));
         let gen = self.identity_log.head_generation() + 1;
-        self.identity_log.rotate(IdentityRotation {
-            new_primary: IdentityKeyId::from(format!("recovered-primary-{gen}").as_str()),
-            sig: IdentitySig::by(recovery),
-        })
+        self.identity_log.rotate(IdentityRotation::signed_by(
+            IdentityKeyId::from(format!("recovered-primary-{gen}").as_str()),
+            recovery.0,
+        ))
     }
 
     /// The domain (naming-only) grouping view: each domain's cells. Read-only
@@ -661,7 +1307,9 @@ impl WebAuthContext {
     #[must_use]
     pub fn exercised_authority(&self, actor: &NodeId) -> String {
         match self.authority.reachable_depth(actor) {
-            Some(depth) => format!("WoT-depth-default (reachable-depth {depth} satisfies threshold 0)"),
+            Some(depth) => {
+                format!("WoT-depth-default (reachable-depth {depth} satisfies threshold 0)")
+            }
             None => "(unreachable; no authority to exercise)".to_owned(),
         }
     }
@@ -711,12 +1359,17 @@ impl WebAuthContext {
             predicate,
             scope: scope.to_owned(),
             epoch,
-            sig: TrustSig::by(issuer),
-        };
+            sig: TrustSig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
+        let _ = &issuer;
         let cid = self.trust.issue_attest(attest)?;
-        let proof = self.trust.verify(&cid).map_err(|_| TrustError::CapacityNotHeld {
-            issuer: self.trust.genesis().clone(),
-        })?;
+        let proof = self
+            .trust
+            .verify(&cid)
+            .map_err(|_| TrustError::CapacityNotHeld {
+                issuer: self.trust.genesis().clone(),
+            })?;
         Ok((cid, proof))
     }
 
@@ -794,8 +1447,10 @@ impl WebAuthContext {
             predicate: Predicate::new(TOPOLOGY_ATTEST_ACTION, label.resource()),
             scope: scope.to_owned(),
             epoch,
-            sig: TrustSig::by(issuer),
-        };
+            sig: TrustSig::sign_as(NodeId::from(""), b""),
+        }
+        .signed_by_issuer();
+        let _ = &issuer;
         let cid = self.trust.issue_attest(attest.clone())?;
         let assignment = TopologyAssignment::Attested {
             attest: Box::new(attest),
@@ -866,7 +1521,12 @@ impl WebAuthContext {
     ) -> (Vec<(NodeId, Option<String>)>, bool) {
         let assignments: Vec<(NodeId, Option<String>)> = nodes
             .iter()
-            .map(|n| (n.clone(), self.topology.placement(n).at(tier).map(str::to_owned)))
+            .map(|n| {
+                (
+                    n.clone(),
+                    self.topology.placement(n).at(tier).map(str::to_owned),
+                )
+            })
             .collect();
         let domains = self.topology.domains_at(tier, nodes);
         let warn = nodes.len() >= 2 && domains.len() < 2;
@@ -953,7 +1613,8 @@ impl WebAuthContext {
         // already-emitted resource event is ever discarded here — asserted by
         // rebuilding only while the plane's event log is still empty.
         let resource_root = self.resource_authority.owner().clone();
-        self.resource_authority.issue_edge(resource_root, subject, level);
+        self.resource_authority
+            .issue_edge(resource_root, subject, level);
         if self.resource_platform.event_count() == 0 {
             self.resource_platform = Platform::new(
                 resource_registry(),
@@ -1017,13 +1678,9 @@ impl WebAuthContext {
     }
 
     fn workload_body(&self, name: &str, image: &str, replicas: i64) -> Crd {
-        Crd::new(
-            &self.resource_api,
-            WORKLOAD_KIND,
-            CrdMetadata::new(name),
-        )
-        .with_spec("image", CrdValue::String(image.to_owned()))
-        .with_spec("replicas", CrdValue::Integer(replicas))
+        Crd::new(&self.resource_api, WORKLOAD_KIND, CrdMetadata::new(name))
+            .with_spec("image", CrdValue::String(image.to_owned()))
+            .with_spec("replicas", CrdValue::Integer(replicas))
     }
 
     /// `apply` (ACT): declarative upsert of a workload, emitting exactly one
@@ -1038,9 +1695,13 @@ impl WebAuthContext {
     ) -> Result<String, ResourceError> {
         let body = self.workload_body(name, image, replicas);
         let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
-        plane
+        let applied = plane
             .apply(actor, RESOURCE_CAP, body)
-            .map(|applied| format!("{}", applied.event.0))
+            .map(|applied| format!("{}", applied.event.0))?;
+        // Drive the real workload-runtime reconcile (fetch-by-CID + admit +
+        // supervised spawn) toward the just-declared manifest state.
+        self.drive_reconcile(name);
+        Ok(applied)
     }
 
     /// `edit` (ACT): apply an edited workload body (here, a new image) as one
@@ -1071,9 +1732,16 @@ impl WebAuthContext {
         replicas: i64,
     ) -> Result<String, ResourceError> {
         let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
-        plane
-            .scale(actor, RESOURCE_CAP, &Address::new(WORKLOAD_KIND, name), replicas)
-            .map(|applied| format!("{}", applied.event.0))
+        let applied = plane
+            .scale(
+                actor,
+                RESOURCE_CAP,
+                &Address::new(WORKLOAD_KIND, name),
+                replicas,
+            )
+            .map(|applied| format!("{}", applied.event.0))?;
+        self.drive_reconcile(name);
+        Ok(applied)
     }
 
     /// `rollout restart` (ACT): bump the workload's `pillar.dev/restarted-at`
@@ -1132,10 +1800,46 @@ impl WebAuthContext {
             .get(&self.resource_api, WORKLOAD_KIND, name)
             .is_some()
         {
+            // When a real reconciler is wired, reach the workload's REAL live
+            // replicas (real pids + bound ports) rather than a stub formatter.
+            if let Some(shared) = &self.workload_reconciler {
+                if let Ok(mut reconciler) = shared.lock() {
+                    let replicas: Vec<_> = reconciler
+                        .observe_all()
+                        .into_iter()
+                        .filter(|r| r.workload == name)
+                        .collect();
+                    if !replicas.is_empty() {
+                        let lines: Vec<String> = replicas
+                            .iter()
+                            .map(|r| {
+                                format!(
+                                    "{what} {WORKLOAD_KIND}/{name} node={} pid={} port={} digest={}",
+                                    r.node, r.pid, r.port, r.image_digest
+                                )
+                            })
+                            .collect();
+                        return Ok(lines.join("\n"));
+                    }
+                }
+            }
             Ok(format!("{what} {WORKLOAD_KIND}/{name}"))
         } else {
             Err(ResourceError::NotFound(Address::new(WORKLOAD_KIND, name)))
         }
+    }
+
+    /// The black-box replica oracle body: one `REPLICA` line per live replica
+    /// across every reconciled workload (real pid + real bound port + the
+    /// content-addressed image digest), or `REPLICAS 0` when no reconciler is
+    /// wired / nothing is running. Served at `GET /portal/resource/replicas`.
+    pub fn resource_replicas(&self) -> String {
+        if let Some(shared) = &self.workload_reconciler {
+            if let Ok(mut reconciler) = shared.lock() {
+                return reconciler.render_oracle();
+            }
+        }
+        "REPLICAS 0".to_owned()
     }
 
     /// Test-only: admit `subject` into the LOGIN custody authority ONLY (so it
@@ -1280,6 +1984,7 @@ impl WebAuthContext {
         self.name_registry.lookup(name)
     }
 
+    /// Create a cell, enforcing name-registry uniqueness.
     pub fn create_cell(&mut self, cell: NodeId) -> Result<(), BootstrapError> {
         self.bootstrap
             .create_cell_checked(cell.clone(), self.name_registry.as_ref())?;
@@ -1444,11 +2149,64 @@ pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
 /// identifier is embedded in this public source.
 const LANDING_PAGE: &str = include_str!("web_login.html");
 
-/// A parsed HTTP request: method, path, and body.
+/// The Yew + WebAssembly portal's static asset bundle, EMBEDDED into this one
+/// `pillar` binary at compile time (`include_bytes!`) — the SECOND stage of the
+/// two-stage frontend build. Stage 1 (`nix build .#pillar-frontend`, flake.nix)
+/// compiles crate `pillar-frontend` with `trunk` into wasm/js/css; `build.rs`
+/// resolves that bundle's directory into the `PILLAR_FRONTEND_DIST` compile-time
+/// env var (the nix `pillar` build points it at stage 1's store path; a plain
+/// `cargo build`/`cargo test` falls back to the committed `src/frontend_dist/`).
+/// The running node serves these from memory — no filesystem dependency, and
+/// NO npm/Node anywhere in the build.
+const FRONTEND_WASM: &[u8] = include_bytes!(concat!(
+    env!("PILLAR_FRONTEND_DIST"),
+    "/pillar-frontend_bg.wasm"
+));
+const FRONTEND_JS: &[u8] =
+    include_bytes!(concat!(env!("PILLAR_FRONTEND_DIST"), "/pillar-frontend.js"));
+const FRONTEND_CSS: &[u8] = include_bytes!(concat!(env!("PILLAR_FRONTEND_DIST"), "/portal.css"));
+
+/// The correct `Content-Type` for a served static frontend asset, keyed by the
+/// request path's file extension. The three asset kinds the two-stage bundle
+/// ships each get their PROPER MIME type: `application/wasm` (the module a
+/// browser streaming-compiles — a wrong type here makes the browser refuse the
+/// wasm), `text/javascript` (the wasm-bindgen JS glue), and `text/css` (the
+/// portal base stylesheet). Returns `None` for an unmapped path so the router
+/// can 404 rather than serve an asset under a guessed type.
+fn frontend_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
+    match path {
+        "/assets/pillar-frontend_bg.wasm" => Some((FRONTEND_WASM, "application/wasm")),
+        "/assets/pillar-frontend.js" => Some((FRONTEND_JS, "text/javascript")),
+        "/assets/portal.css" => Some((FRONTEND_CSS, "text/css")),
+        _ => None,
+    }
+}
+
+/// Build a static-asset response: the embedded bytes served verbatim under the
+/// correct MIME `content_type`, with no session token.
+fn asset_response(bytes: &'static [u8], content_type: &'static str) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type,
+        session_token: None,
+        body: String::new(),
+        bytes: Some(bytes.to_vec()),
+    }
+}
+
+/// A parsed HTTP request: method, path, body, and the OPTIONAL asserted HTTP
+/// ingest API version ([`API_VERSION_HEADER`]).
 struct HttpRequest {
     method: String,
     path: String,
     body: String,
+    /// The raw `X-Pillar-Api-Version` header value the client sent, if any.
+    /// `None` means the request asserted no version — served backward-
+    /// compatibly at [`API_VERSION`]. `Some` is validated by
+    /// [`dispatch_http`] (parsed, then bounds-checked against
+    /// `[MIN_API_VERSION, API_VERSION]`).
+    api_version: Option<String>,
 }
 
 /// Read and parse one HTTP/1.1 request from `reader`. Returns `None` on a
@@ -1464,6 +2222,7 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
     let path = parts.next()?.to_owned();
 
     let mut content_length = 0usize;
+    let mut api_version = None;
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
@@ -1477,6 +2236,13 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.trim().eq_ignore_ascii_case(API_VERSION_HEADER) {
+                // Retain the raw value verbatim; legibility (parse) and
+                // supported-window checks are `dispatch_http`'s job so it can
+                // distinguish a malformed value (400) from a stamped-but-
+                // unknown FUTURE version (505) — the two failure modes the
+                // shared `pillar_crypto::VersionError` keeps distinct.
+                api_version = Some(value.trim().to_owned());
             }
         }
     }
@@ -1489,7 +2255,12 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
         }
     }
 
-    Some(HttpRequest { method, path, body })
+    Some(HttpRequest {
+        method,
+        path,
+        body,
+        api_version,
+    })
 }
 
 /// An HTTP response to write back.
@@ -1499,23 +2270,35 @@ struct HttpResponse {
     content_type: &'static str,
     session_token: Option<String>,
     body: String,
+    /// A BINARY response body (e.g. the embedded `pillar-frontend_bg.wasm`
+    /// static asset), served verbatim instead of `body` when present. Text
+    /// responses leave this `None` and use the UTF-8 `body`; a static-asset
+    /// route serving non-UTF-8 bytes (wasm) sets this so the bytes are written
+    /// unaltered. Exactly one of the two carries the payload.
+    bytes: Option<Vec<u8>>,
 }
 
 impl HttpResponse {
     fn write_to(&self, stream: &mut TcpStream) -> std::io::Result<()> {
+        let body_bytes: &[u8] = match &self.bytes {
+            Some(b) => b.as_slice(),
+            None => self.body.as_bytes(),
+        };
         let mut head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}: {}\r\nConnection: close\r\n",
             self.status,
             self.reason,
             self.content_type,
-            self.body.len(),
+            body_bytes.len(),
+            API_VERSION_HEADER,
+            API_VERSION,
         );
         if let Some(token) = &self.session_token {
             head.push_str(&format!("X-Pillar-Session: {token}\r\n"));
         }
         head.push_str("\r\n");
         stream.write_all(head.as_bytes())?;
-        stream.write_all(self.body.as_bytes())?;
+        stream.write_all(body_bytes)?;
         stream.flush()
     }
 }
@@ -1534,174 +2317,391 @@ fn handle_connection(mut stream: TcpStream, ctx: &mut WebAuthContext) {
 }
 
 /// Map an HTTP request onto the portal action, preserving the auth gate.
+/// How a [`RouteSpec`]'s path matches an incoming request path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathMatch {
+    /// Matches only the exact path.
+    Exact(&'static str),
+    /// Matches any path starting with this prefix.
+    Prefix(&'static str),
+}
+
+impl PathMatch {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            PathMatch::Exact(p) => path == *p,
+            PathMatch::Prefix(p) => path.starts_with(p),
+        }
+    }
+
+    /// The literal path/prefix text this matcher was built from.
+    #[must_use]
+    pub fn text(&self) -> &'static str {
+        match self {
+            PathMatch::Exact(p) | PathMatch::Prefix(p) => p,
+        }
+    }
+}
+
+type RouteHandler = fn(&mut WebAuthContext, &SocketAddr, &HttpRequest) -> HttpResponse;
+
+/// One registered HTTP route: an (HTTP method, path matcher) pair plus the
+/// handler that serves it. [`ROUTES`] is the SINGLE source of truth the real
+/// router ([`dispatch_http`]) dispatches from AND that a surface-inventory
+/// emitter walks — there is no separate hand-maintained route catalog to
+/// drift out of sync with what is actually served.
+#[derive(Clone, Copy)]
+pub struct RouteSpec {
+    /// The HTTP method this route answers (`"GET"`, `"POST"`, ...).
+    pub method: &'static str,
+    /// How the request path must match.
+    pub path: PathMatch,
+    handler: RouteHandler,
+}
+
+impl RouteSpec {
+    /// This route's path/prefix text (see [`PathMatch::text`]).
+    #[must_use]
+    pub fn path_text(&self) -> &'static str {
+        self.path.text()
+    }
+}
+
+fn dispatch_landing(
+    _ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type: "text/html; charset=utf-8",
+        session_token: None,
+        body: LANDING_PAGE.to_owned(),
+        bytes: None,
+    }
+}
+
+/// `GET /surface-inventory`: emit the `pillar-integration/v1` machine-readable
+/// inventory of every external surface this node serves — the portal
+/// counterpart of the `pillar surface-inventory` CLI verb, so an external
+/// black-box caller can obtain the real inventory from a RUNNING node over
+/// HTTP and drive the portal-cli-parity assertion. Served unauthenticated,
+/// like the landing page: it reveals only the shape of the public surface.
+fn dispatch_surface_inventory(
+    _ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type: "application/json",
+        session_token: None,
+        body: crate::surface_inventory::emit_json(),
+        bytes: None,
+    }
+}
+
+fn dispatch_bootstrap_status_route(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
+    // BOOTSTRAPPED only once the first USER exists — not merely the
+    // cell. A cell-created-but-no-user node is still FRESH so the
+    // portal keeps showing the (atomic) bootstrap form; reporting
+    // BOOTSTRAPPED on a cell alone is exactly what stranded the
+    // operator (the login form showed but no user could log in).
+    let status = if ctx.bootstrap().initial_user().is_some() {
+        BootstrapStatus::Bootstrapped
+    } else {
+        BootstrapStatus::Fresh
+    };
+    text_response(200, "OK", status.to_wire().to_owned())
+}
+
+fn dispatch_bootstrap_create_cell(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let BootstrapCreateCellRequest { cell_id } =
+        BootstrapCreateCellRequest::from_body(&request.body);
+    if cell_id.is_empty() {
+        return text_response(400, "Bad Request", "MISSING cell id".to_owned());
+    }
+    match ctx.create_cell(NodeId::from(cell_id.as_str())) {
+        Ok(()) => text_response(200, "OK", "CELL-CREATED".to_owned()),
+        Err(BootstrapError::CellNameInUse) => text_response(
+            409,
+            "Conflict",
+            format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
+        ),
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+    }
+}
+
+fn dispatch_bootstrap_name_check(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    // INLINE, live cell-name uniqueness for the web UI: resolve the
+    // proposed name through the SAME peer-sourced `name_registry` the
+    // create-cell step validates against, so the operator sees an "in
+    // use" hint BEFORE submit. Best-effort: an unreachable / free name
+    // reports FREE (never blocks a create on a network hiccup).
+    let name = query_value(&request.path, "name").unwrap_or("").trim();
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    match ctx.name_status(&NodeId::from(name)) {
+        CellNameStatus::Claimed => {
+            text_response(200, "OK", format!("IN-USE {CELL_NAME_IN_USE_MESSAGE}"))
+        }
+        CellNameStatus::Free => text_response(200, "OK", "FREE".to_owned()),
+    }
+}
+
+fn dispatch_bootstrap_create_user(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    // Body: the shared `BootstrapCreateUserRequest` wire framing
+    // "<handle>\n<password>" — the operator's chosen unlock factor
+    // for the new user, escrowed atomically (see
+    // `bootstrap_create_first_user`) so login works immediately.
+    let BootstrapCreateUserRequest { handle, password } =
+        BootstrapCreateUserRequest::from_body(&request.body);
+    if handle.is_empty() || password.is_empty() {
+        return text_response(400, "Bad Request", "MISSING handle-or-password".to_owned());
+    }
+    match ctx.bootstrap_create_first_user(&handle, &password) {
+        Ok(()) => text_response(200, "OK", format!("USER-CREATED {handle}")),
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+    }
+}
+
+fn dispatch_bootstrap_create(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    // Body: the shared `BootstrapCreateRequest` wire framing
+    // "<cell_id>\n<handle>\n<password>" — the ONE atomic bootstrap
+    // action the portal uses (cell + first user together, so a
+    // reload between steps can never strand a cell with no first
+    // user). See `bootstrap_cell_and_first_user`.
+    let BootstrapCreateRequest {
+        cell_id,
+        handle,
+        password,
+    } = BootstrapCreateRequest::from_body(&request.body);
+    if cell_id.is_empty() || handle.is_empty() || password.is_empty() {
+        return text_response(
+            400,
+            "Bad Request",
+            "MISSING cell-handle-or-password".to_owned(),
+        );
+    }
+    match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
+        Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
+        Err(BootstrapError::CellNameInUse) => text_response(
+            409,
+            "Conflict",
+            format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
+        ),
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
+    }
+}
+
+fn dispatch_nonce(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    _req: &HttpRequest,
+) -> HttpResponse {
+    let nonce = ctx.verifier.issue_nonce(u64::MAX);
+    text_response(
+        200,
+        "OK",
+        NonceResponse {
+            id: nonce.id(),
+            expiry: nonce.expiry(),
+        }
+        .to_wire(),
+    )
+}
+
+/// Every HTTP route this portal actually serves — the real router
+/// ([`dispatch_http`]) dispatches from this exact table, so a route added or
+/// removed here is added or removed from what is served AND from what a
+/// surface-inventory emitter observes, by construction.
+pub static ROUTES: &[RouteSpec] = &[
+    RouteSpec { method: "GET", path: PathMatch::Exact("/"), handler: dispatch_landing },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/surface-inventory"), handler: dispatch_surface_inventory },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/status"), handler: dispatch_bootstrap_status_route },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create-cell"), handler: dispatch_bootstrap_create_cell },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/name-check"), handler: dispatch_bootstrap_name_check },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create-user"), handler: dispatch_bootstrap_create_user },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/create"), handler: dispatch_bootstrap_create },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/nonce"), handler: dispatch_nonce },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/login"), handler: |ctx, _peer, request| dispatch_login(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/register/begin"), handler: |ctx, _peer, request| dispatch_webauthn_register_begin(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/register/finish"), handler: |ctx, _peer, request| dispatch_webauthn_register_finish(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/authenticate/begin"), handler: |ctx, _peer, request| dispatch_webauthn_authenticate_begin(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/webauthn/authenticate/finish"), handler: |ctx, _peer, request| dispatch_webauthn_authenticate_finish(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/node"), handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, true) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/user"), handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, false) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/bootstrap/request/list"), handler: |ctx, _peer, _request| dispatch_request_list(ctx) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/approve"), handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, true) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/bootstrap/request/reject"), handler: |ctx, _peer, request| dispatch_request_decide(ctx, request, false) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/status"), handler: |ctx, _peer, request| dispatch_portal_status(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/layout"), handler: |ctx, _peer, request| dispatch_layout_store(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/layout"), handler: |ctx, _peer, request| dispatch_layout_get(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/identity"), handler: |ctx, _peer, request| dispatch_identity_view(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/enroll"), handler: |ctx, _peer, request| dispatch_identity_enroll(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/rotate"), handler: |ctx, _peer, request| dispatch_identity_rotate(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/identity/recover"), handler: |ctx, _peer, request| dispatch_identity_recover(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/domains"), handler: |ctx, _peer, request| dispatch_domain_view(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/members"), handler: |ctx, _peer, request| dispatch_members_view(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/members/add"), handler: |ctx, peer, request| dispatch_members_add(ctx, peer, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/members/role"), handler: |ctx, _peer, request| dispatch_members_role(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/sessions"), handler: |ctx, _peer, request| dispatch_sessions_view(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/sessions/revoke"), handler: |ctx, _peer, request| dispatch_sessions_revoke(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/sessions/revoke-all"), handler: |ctx, _peer, request| dispatch_sessions_revoke_all(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/attestations/build"), handler: |ctx, _peer, request| dispatch_attestation_build(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Exact("/portal/trust-graph"), handler: |ctx, _peer, request| dispatch_trust_graph_view(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/kinds"), handler: |ctx, _peer, request| dispatch_obs_live_kinds(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/explore"), handler: |ctx, _peer, request| dispatch_obs_live_explore(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/query"), handler: |ctx, _peer, request| dispatch_obs_live_query(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/recording"), handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/alert"), handler: |ctx, _peer, request| dispatch_obs_live_alert(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/dashboard"), handler: |ctx, _peer, request| dispatch_obs_live_dashboard(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/tree"), handler: |ctx, _peer, request| dispatch_topology_tree(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/mismatches"), handler: |ctx, _peer, request| dispatch_topology_mismatches(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/declare"), handler: |ctx, _peer, request| dispatch_topology_label_declare(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/attest"), handler: |ctx, _peer, request| dispatch_topology_label_attest(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/failure-domain"), handler: |ctx, _peer, request| dispatch_topology_failure_domain(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/facet"), handler: |ctx, _peer, request| dispatch_topology_facet(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/migrate"), handler: |ctx, _peer, request| dispatch_custody_migrate(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/rotate"), handler: |ctx, _peer, request| dispatch_custody_rotate(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/seal"), handler: |ctx, _peer, request| dispatch_custody_seal(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/custody/revoke"), handler: |ctx, _peer, request| dispatch_custody_revoke(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/get"), handler: |ctx, _peer, request| dispatch_resource_get(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/describe"), handler: |ctx, _peer, request| dispatch_resource_describe(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/dry-run"), handler: |ctx, _peer, request| dispatch_resource_dry_run(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/logs"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Logs) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/exec"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Exec) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/forward"), handler: |ctx, _peer, request| dispatch_resource_runtime(ctx, request, RuntimeReach::Forward) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/resource/replicas"), handler: |ctx, _peer, _request| dispatch_resource_replicas(ctx) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/apply"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Apply) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/edit"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Edit) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/scale"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Scale) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/rollout"), handler: |ctx, _peer, request| dispatch_resource_act(ctx, request, ResourceAct::Rollout) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/cronjob/apply"), handler: |ctx, _peer, request| dispatch_cronjob_apply(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/resource/cronjob/delete"), handler: |ctx, _peer, request| dispatch_cronjob_delete(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/explore"), handler: |ctx, _peer, request| dispatch_obs_explore(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/query"), handler: |ctx, _peer, request| dispatch_obs_query(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/dashboard"), handler: |ctx, _peer, request| dispatch_obs_dashboard(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/swarm"), handler: |ctx, _peer, request| dispatch_swarm_view(ctx, request) },
+    RouteSpec { method: "POST", path: PathMatch::Exact("/portal/swarm/generate"), handler: dispatch_swarm_generate },
+];
+
+/// The real, currently-served HTTP route table — the exact data
+/// [`dispatch_http`] dispatches from. A surface-inventory emitter reads this
+/// (not a hand-maintained catalog) so an added/removed route is
+/// added/removed from the inventory automatically.
+#[must_use]
+pub fn http_routes() -> &'static [RouteSpec] {
+    ROUTES
+}
+
+/// Map an HTTP request onto the portal action, preserving the auth gate.
+/// `GET /portal/swarm?token=<session>` — the Swarm panel's read-only view of
+/// which physical libp2p swarm THIS node is running on: a
+/// `SWARM <kind> <fingerprint>` line plus one `SEED <multiaddr>` line per
+/// configured seed. Reads only; signs nothing; keeps no state. A private
+/// swarm's key is the join credential and is NEVER exposed here — only its
+/// non-secret fingerprint. To retrieve a private key inspect the key file with
+/// the CLI `pillar swarm show --swarm-key <path> --secret`.
+fn dispatch_swarm_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let mut body = format!(
+        "SWARM {} {}\n",
+        ctx.swarm_kind.tag(),
+        ctx.swarm_fingerprint
+    );
+    for seed in &ctx.swarm_seeds {
+        body.push_str(&format!("SEED {seed}\n"));
+    }
+    text_response(200, "OK", body)
+}
+
+/// `POST /portal/swarm/generate` — mint a fresh PRIVATE swarm key. Body:
+/// `<token>`. STATELESS: the node persists nothing and does NOT switch onto the
+/// minted key — it simply returns `KEY <key>` (the join credential to save to a
+/// file and distribute out-of-band) plus `FINGERPRINT <fp>`, once, over the
+/// authenticated portal (the same trust boundary the CLI `generate` prints it
+/// on). Boot a node onto it with `pillar node run --swarm-key <file>
+/// --seed-node <addr>`. Gated on an admitted session and the shared
+/// non-loopback signing guard.
+fn dispatch_swarm_generate(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = request.body.lines().next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let key = SwarmKey::generate();
+    text_response(
+        200,
+        "OK",
+        format!("KEY {}\nFINGERPRINT {}\n", key.root_secret(), key.fingerprint()),
+    )
+}
+
 fn dispatch_http(
     ctx: &mut WebAuthContext,
     peer: &SocketAddr,
     request: &HttpRequest,
 ) -> HttpResponse {
     let path = request.path.split('?').next().unwrap_or(&request.path);
-    match (request.method.as_str(), path) {
-        ("GET", "/") => HttpResponse {
-            status: 200,
-            reason: "OK",
-            content_type: "text/html; charset=utf-8",
-            session_token: None,
-            body: LANDING_PAGE.to_owned(),
-        },
-        ("GET", "/bootstrap/status") => {
-            // BOOTSTRAPPED only once the first USER exists — not merely the
-            // cell. A cell-created-but-no-user node is still FRESH so the
-            // portal keeps showing the (atomic) bootstrap form; reporting
-            // BOOTSTRAPPED on a cell alone is exactly what stranded the
-            // operator (the login form showed but no user could log in).
-            let status = if ctx.bootstrap().initial_user().is_some() {
-                "BOOTSTRAPPED"
-            } else {
-                "FRESH"
-            };
-            text_response(200, "OK", status.to_owned())
-        }
-        ("POST", "/bootstrap/create-cell") => {
-            let cell = request.body.trim();
-            if cell.is_empty() {
-                return text_response(400, "Bad Request", "MISSING cell id".to_owned());
-            }
-            match ctx.create_cell(NodeId::from(cell)) {
-                Ok(()) => text_response(200, "OK", "CELL-CREATED".to_owned()),
-                Err(BootstrapError::CellNameInUse) => text_response(
-                    409,
-                    "Conflict",
-                    format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
-                ),
-                Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
-            }
-        }
-        ("GET", p) if p == "/bootstrap/name-check" => {
-            // INLINE, live cell-name uniqueness for the web UI: resolve the
-            // proposed name through the SAME peer-sourced `name_registry` the
-            // create-cell step validates against, so the operator sees an "in
-            // use" hint BEFORE submit. Best-effort: an unreachable / free name
-            // reports FREE (never blocks a create on a network hiccup).
-            let name = query_value(&request.path, "name").unwrap_or("").trim();
-            if name.is_empty() {
-                return text_response(400, "Bad Request", "MISSING name".to_owned());
-            }
-            match ctx.name_status(&NodeId::from(name)) {
-                CellNameStatus::Claimed => {
-                    text_response(200, "OK", format!("IN-USE {CELL_NAME_IN_USE_MESSAGE}"))
-                }
-                CellNameStatus::Free => text_response(200, "OK", "FREE".to_owned()),
-            }
-        }
-        ("POST", "/bootstrap/create-user") => {
-            // Body: "<handle>\n<password>" — the operator's chosen unlock
-            // factor for the new user, escrowed atomically (see
-            // `bootstrap_create_first_user`) so login works immediately.
-            let mut lines = request.body.lines();
-            let handle = lines.next().unwrap_or("").trim();
-            let password = lines.next().unwrap_or("").trim();
-            if handle.is_empty() || password.is_empty() {
-                return text_response(400, "Bad Request", "MISSING handle-or-password".to_owned());
-            }
-            match ctx.bootstrap_create_first_user(handle, password) {
-                Ok(()) => text_response(200, "OK", format!("USER-CREATED {handle}")),
-                Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
-            }
-        }
-        ("POST", "/bootstrap/create") => {
-            // Body: "<cell>\n<handle>\n<password>" — the ONE atomic bootstrap
-            // action the portal uses (cell + first user together, so a reload
-            // between steps can never strand a cell with no first user). See
-            // `bootstrap_cell_and_first_user`.
-            let mut lines = request.body.lines();
-            let cell = lines.next().unwrap_or("").trim();
-            let handle = lines.next().unwrap_or("").trim();
-            let password = lines.next().unwrap_or("").trim();
-            if cell.is_empty() || handle.is_empty() || password.is_empty() {
-                return text_response(
-                    400,
-                    "Bad Request",
-                    "MISSING cell-handle-or-password".to_owned(),
-                );
-            }
-            match ctx.bootstrap_cell_and_first_user(NodeId::from(cell), handle, password) {
-                Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
-                Err(BootstrapError::CellNameInUse) => text_response(
-                    409,
-                    "Conflict",
-                    format!("DENIED {CELL_NAME_IN_USE_MESSAGE}"),
-                ),
-                Err(e) => text_response(409, "Conflict", format!("DENIED {e:?}")),
-            }
-        }
-        ("GET", "/nonce") => {
-            let nonce = ctx.verifier.issue_nonce(u64::MAX);
-            text_response(
-                200,
-                "OK",
-                format!("NONCE {} {}", nonce.id(), nonce.expiry()),
-            )
-        }
-        ("POST", "/login") => dispatch_login(ctx, request),
-        ("POST", "/bootstrap/request/node") => dispatch_request_submit(ctx, request, true),
-        ("POST", "/bootstrap/request/user") => dispatch_request_submit(ctx, request, false),
-        ("GET", "/bootstrap/request/list") => dispatch_request_list(ctx),
-        ("POST", "/bootstrap/request/approve") => dispatch_request_decide(ctx, request, true),
-        ("POST", "/bootstrap/request/reject") => dispatch_request_decide(ctx, request, false),
-        ("GET", "/portal/status") => dispatch_portal_status(ctx, request),
-        ("POST", "/portal/layout") => dispatch_layout_store(ctx, request),
-        ("GET", "/portal/layout") => dispatch_layout_get(ctx, request),
-        ("GET", "/portal/identity") => dispatch_identity_view(ctx, request),
-        ("POST", "/portal/identity/enroll") => dispatch_identity_enroll(ctx, request),
-        ("POST", "/portal/identity/rotate") => dispatch_identity_rotate(ctx, request),
-        ("POST", "/portal/identity/recover") => dispatch_identity_recover(ctx, request),
-        ("GET", "/portal/domains") => dispatch_domain_view(ctx, request),
-        ("GET", "/portal/members") => dispatch_members_view(ctx, request),
-        ("POST", "/portal/members/add") => dispatch_members_add(ctx, peer, request),
-        ("POST", "/portal/members/role") => dispatch_members_role(ctx, request),
-        ("GET", "/portal/sessions") => dispatch_sessions_view(ctx, request),
-        ("POST", "/portal/sessions/revoke") => dispatch_sessions_revoke(ctx, request),
-        ("POST", "/portal/sessions/revoke-all") => dispatch_sessions_revoke_all(ctx, request),
-        ("POST", "/portal/attestations/build") => dispatch_attestation_build(ctx, request),
-        ("GET", "/portal/trust-graph") => dispatch_trust_graph_view(ctx, request),
-        ("GET", p) if p.starts_with("/portal/topology/tree") => dispatch_topology_tree(ctx, request),
-        ("GET", p) if p.starts_with("/portal/topology/mismatches") => {
-            dispatch_topology_mismatches(ctx, request)
-        }
-        ("POST", "/portal/topology/label/declare") => dispatch_topology_label_declare(ctx, request),
-        ("POST", "/portal/topology/label/attest") => dispatch_topology_label_attest(ctx, request),
-        ("GET", p) if p.starts_with("/portal/topology/failure-domain") => {
-            dispatch_topology_failure_domain(ctx, request)
-        }
-        ("GET", p) if p.starts_with("/portal/topology/facet") => dispatch_topology_facet(ctx, request),
-        ("POST", "/portal/custody/migrate") => dispatch_custody_migrate(ctx, request),
-        ("POST", "/portal/custody/rotate") => dispatch_custody_rotate(ctx, request),
-        ("POST", "/portal/custody/seal") => dispatch_custody_seal(ctx, request),
-        ("POST", "/portal/custody/revoke") => dispatch_custody_revoke(ctx, request),
-        ("GET", p) if p.starts_with("/portal/resource/get") => dispatch_resource_get(ctx, request),
-        ("GET", p) if p.starts_with("/portal/resource/describe") => {
-            dispatch_resource_describe(ctx, request)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/dry-run") => {
-            dispatch_resource_dry_run(ctx, request)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/logs") => {
-            dispatch_resource_runtime(ctx, request, RuntimeReach::Logs)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/exec") => {
-            dispatch_resource_runtime(ctx, request, RuntimeReach::Exec)
-        }
-        ("GET", p) if p.starts_with("/portal/resource/forward") => {
-            dispatch_resource_runtime(ctx, request, RuntimeReach::Forward)
-        }
-        ("POST", "/portal/resource/apply") => dispatch_resource_act(ctx, request, ResourceAct::Apply),
-        ("POST", "/portal/resource/edit") => dispatch_resource_act(ctx, request, ResourceAct::Edit),
-        ("POST", "/portal/resource/scale") => dispatch_resource_act(ctx, request, ResourceAct::Scale),
-        ("POST", "/portal/resource/rollout") => {
-            dispatch_resource_act(ctx, request, ResourceAct::Rollout)
-        }
-        _ => text_response(404, "Not Found", "not found".to_owned()),
+    // Validate the OPTIONAL request-side API-version assertion BEFORE routing.
+    // A request without the header is accepted (backward compatible) and served
+    // at `API_VERSION`. A present header is checked with the shared
+    // `pillar_crypto` primitive, which keeps the two failure modes distinct:
+    //   * a malformed (illegible) value  → 400 Bad Request (a parse error),
+    //   * a legible-but-unknown FUTURE (or retired) version → 505 HTTP Version
+    //     Not Supported — a DISTINCT status from a 404/parse/malformed path so
+    //     a newer client is told precisely which API version was rejected.
+    if let Some(err) = check_request_api_version(request) {
+        return err;
     }
+    for route in ROUTES {
+        if route.method == request.method && route.path.matches(path) {
+            return (route.handler)(ctx, peer, request);
+        }
+    }
+    // The Yew + WebAssembly portal's embedded static assets (wasm/js/css),
+    // each served under its correct MIME type (see `frontend_asset`) — a
+    // catch-all fallback, not an individually inventoried route.
+    if request.method == "GET" {
+        if let Some((bytes, content_type)) = frontend_asset(path) {
+            return asset_response(bytes, content_type);
+        }
+    }
+    text_response(404, "Not Found", "not found".to_owned())
 }
 
 /// Extract `key`'s value from `path`'s query string (`GET /x?a=1&b=2`), if
@@ -1717,6 +2717,30 @@ fn query_value<'a>(path: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Map a `kind=<...>` query-param token to its [`SignalKind`], for the
+/// observability explore/query endpoints.
+fn parse_signal_kind(s: &str) -> Option<SignalKind> {
+    match s {
+        "metric" => Some(SignalKind::Metric),
+        "log" => Some(SignalKind::Log),
+        "trace" => Some(SignalKind::TraceSpan),
+        "profile" => Some(SignalKind::ProfileSample),
+        "metadata" => Some(SignalKind::MetadataSample),
+        _ => None,
+    }
+}
+
+/// The stable text tag for a [`SignalKind`] the observability views render.
+fn signal_kind_tag(kind: SignalKind) -> &'static str {
+    match kind {
+        SignalKind::Metric => "metric",
+        SignalKind::Log => "log",
+        SignalKind::TraceSpan => "trace",
+        SignalKind::ProfileSample => "profile",
+        SignalKind::MetadataSample => "metadata",
+    }
 }
 
 /// Which runtime-reach verb a `/portal/resource/{logs,exec,forward}` request is.
@@ -1806,6 +2830,15 @@ fn dispatch_resource_dry_run(ctx: &WebAuthContext, request: &HttpRequest) -> Htt
 /// `logs`/`exec`/`port-forward`: `GET
 /// /portal/resource/{logs,exec,forward}?token=<s>&name=<n>[&cmd=…|&port=…]`.
 /// Reaches a RUNNING workload's runtime — signs nothing.
+/// The black-box replica oracle: `GET /portal/resource/replicas`. Deliberately
+/// UNAUTHENTICATED (like the readiness probe) — it exposes only real pids,
+/// bound ports, and content-addressed image digests, no secrets — so an
+/// external harness can observe the running workload replicas without linking a
+/// pillar crate.
+fn dispatch_resource_replicas(ctx: &WebAuthContext) -> HttpResponse {
+    text_response(200, "OK", ctx.resource_replicas())
+}
+
 fn dispatch_resource_runtime(
     ctx: &WebAuthContext,
     request: &HttpRequest,
@@ -1893,6 +2926,66 @@ fn dispatch_resource_act(
     }
 }
 
+/// `POST /portal/resource/cronjob/apply` — the production admission route for
+/// a `CronJob`/`Job` manifest (body `<token>\n<name>\n<schedule-secs>\n
+/// <command-path>`). Requires an admitted session; on success drives
+/// [`WebAuthContext::resource_apply_cronjob`], which both records the signed
+/// manifest act AND, when a scheduler runtime is wired, registers the job
+/// into the LIVE `SchedulerRuntime` so it actually fires on schedule.
+fn dispatch_cronjob_apply(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let name = lines.next().unwrap_or("").trim().to_owned();
+    let schedule_secs: f64 = lines.next().unwrap_or("").trim().parse().unwrap_or(0.0);
+    let command = lines.next().unwrap_or("").trim().to_owned();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    let actor = session.subject.clone();
+    match ctx.resource_apply_cronjob(&actor, &name, schedule_secs, &command) {
+        Ok(cid) => text_response(
+            200,
+            "OK",
+            format!("EVENT {cid}\nEVENTS {}", ctx.resource_event_count()),
+        ),
+        Err(ResourceError::Apply(crate::ApplyError::Unauthorized { .. })) => {
+            text_response(403, "Forbidden", "DENIED unauthorized".to_owned())
+        }
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e}")),
+    }
+}
+
+/// `POST /portal/resource/cronjob/delete` — the manifest-removal counterpart
+/// of [`dispatch_cronjob_apply`] (body `<token>\n<name>`): tombstones the
+/// `CronJob` manifest and deregisters `name` from the live `SchedulerRuntime`
+/// (if wired) so a deleted CronJob stops firing.
+fn dispatch_cronjob_delete(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let name = lines.next().unwrap_or("").trim().to_owned();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    let actor = session.subject.clone();
+    match ctx.resource_delete_cronjob(&actor, CRONJOB_KIND, &name) {
+        Ok(cid) => text_response(
+            200,
+            "OK",
+            format!("EVENT {cid}\nEVENTS {}", ctx.resource_event_count()),
+        ),
+        Err(ResourceError::Apply(crate::ApplyError::Unauthorized { .. })) => {
+            text_response(403, "Forbidden", "DENIED unauthorized".to_owned())
+        }
+        Err(e) => text_response(409, "Conflict", format!("DENIED {e}")),
+    }
+}
+
 /// The real authenticated portal's identity/reachability + lease-holder tile:
 /// `GET /portal/status?token=<session>`. Requires an admitted session — an
 /// unauthenticated (or unknown/expired-token) request is refused, exactly
@@ -1935,7 +3028,7 @@ fn dispatch_layout_store(ctx: &mut WebAuthContext, request: &HttpRequest) -> Htt
     text_response(
         200,
         "OK",
-        format!("LAYOUT-CID {} TIP {}", cid.0, ctx.layout_tip()),
+        format!("LAYOUT-CID {} TIP {}", cid, ctx.layout_tip()),
     )
 }
 
@@ -1951,10 +3044,10 @@ fn dispatch_layout_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRespo
     let Some(cid_raw) = query_value(&request.path, "cid") else {
         return text_response(400, "Bad Request", "MISSING cid".to_owned());
     };
-    let Ok(cid) = cid_raw.parse::<u64>() else {
+    let Some(cid) = OpId::from_hex(cid_raw) else {
         return text_response(400, "Bad Request", "BAD cid".to_owned());
     };
-    match ctx.get_layout(OpId(cid)) {
+    match ctx.get_layout(&cid) {
         Some((signer, content)) => {
             text_response(200, "OK", format!("SIGNER {signer}\nCONTENT {content}"))
         }
@@ -2226,7 +3319,10 @@ fn trust_error_reason(e: &TrustError) -> String {
         }
         TrustError::UnknownTarget(cid) => format!("unknown-target-{}", cid.0),
         TrustError::NotAQuotaPredicate => "not-a-quota-predicate".to_owned(),
-        TrustError::QuotaExceeded { requested, remaining } => {
+        TrustError::QuotaExceeded {
+            requested,
+            remaining,
+        } => {
             format!("quota-exceeded-{requested}-remaining-{remaining}")
         }
     }
@@ -2254,7 +3350,11 @@ fn dispatch_attestation_build(ctx: &mut WebAuthContext, request: &HttpRequest) -
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     }
-    if issuer.is_empty() || subject.is_empty() || action.is_empty() || resource.is_empty() || scope.is_empty()
+    if issuer.is_empty()
+        || subject.is_empty()
+        || action.is_empty()
+        || resource.is_empty()
+        || scope.is_empty()
     {
         return text_response(400, "Bad Request", "MISSING field".to_owned());
     }
@@ -2296,7 +3396,11 @@ fn dispatch_attestation_build(ctx: &mut WebAuthContext, request: &HttpRequest) -
             }
             text_response(200, "OK", body)
         }
-        Err(e) => text_response(403, "Forbidden", format!("DENIED {}", trust_error_reason(&e))),
+        Err(e) => text_response(
+            403,
+            "Forbidden",
+            format!("DENIED {}", trust_error_reason(&e)),
+        ),
     }
 }
 
@@ -2309,9 +3413,175 @@ fn dispatch_trust_graph_view(ctx: &WebAuthContext, request: &HttpRequest) -> Htt
     }
     let mut body = String::new();
     for e in ctx.trust_graph_edges() {
-        body.push_str(&format!("EDGE {} -> {} LABEL {}\n", e.from.0, e.to.0, e.label));
+        body.push_str(&format!(
+            "EDGE {} -> {} LABEL {}\n",
+            e.from.0, e.to.0, e.label
+        ));
     }
     text_response(200, "OK", body)
+}
+
+/// The observability explore view: `GET
+/// /portal/obs/explore?token=<s>&kind=metric|log|trace|profile|metadata`.
+/// Requires an admitted session (an unauthenticated request is refused, like
+/// every other read endpoint). Renders every held signal of `kind` as a
+/// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` line. A pure view — signs
+/// nothing.
+fn dispatch_obs_explore(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(kind) = parse_signal_kind(query_value(&request.path, "kind").unwrap_or("metric"))
+    else {
+        return text_response(400, "Bad Request", "BAD kind".to_owned());
+    };
+    text_response(200, "OK", ctx.observability_explore(kind))
+}
+
+/// The observability per-kind query view: `GET
+/// /portal/obs/query?token=<s>&kind=<k>[&filter=<f>]`. Requires an admitted
+/// session. `filter` is a plain substring match (metric/log/trace) or an
+/// entity-id prefix (metadata); for `profile` an optional numeric `filter`
+/// picks the `top <n>` sample count. A pure view — signs nothing.
+fn dispatch_obs_query(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(kind) = parse_signal_kind(query_value(&request.path, "kind").unwrap_or("metric"))
+    else {
+        return text_response(400, "Bad Request", "BAD kind".to_owned());
+    };
+    let filter = query_value(&request.path, "filter").filter(|f| !f.is_empty());
+    text_response(200, "OK", ctx.observability_query(kind, filter))
+}
+
+/// Save an observability dashboard: `POST /portal/obs/dashboard`, body
+/// `<token>\n<name>: <spec>`. Requires an admitted session. Persists the
+/// dashboard as ONE signed, content-addressed streaming-DB resource (the SAME
+/// no-server-side-database path the UI-layout store uses), returning its CID
+/// and the dashboard log's new streaming tip — `OBS-DASHBOARD-CID <cid> TIP
+/// <tip>`.
+fn dispatch_obs_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let rest = lines.collect::<Vec<_>>().join("\n");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let Some((name, spec)) = rest.split_once(": ") else {
+        return text_response(400, "Bad Request", "MISSING name-spec".to_owned());
+    };
+    let (name, spec) = (name.trim(), spec.trim());
+    if name.is_empty() {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    }
+    let (cid, tip) = ctx.save_observability_dashboard(&session.subject.to_string(), name, spec);
+    text_response(200, "OK", format!("OBS-DASHBOARD-CID {cid} TIP {tip}"))
+}
+
+/// Live-store per-kind counts: `GET /portal/obs/live/kinds?token=<s>`.
+/// Requires an admitted session and an attached live substrate. A pure view.
+fn dispatch_obs_live_kinds(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_kinds() {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store explore: `GET /portal/obs/live/explore?token=<s>&kind=<k>`.
+/// Requires an admitted session and an attached live substrate. A pure view.
+fn dispatch_obs_live_explore(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(kind) = parse_signal_kind(query_value(&request.path, "kind").unwrap_or("metric"))
+    else {
+        return text_response(400, "Bad Request", "BAD kind".to_owned());
+    };
+    match ctx.live_obs_explore(kind) {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store PSL query: `POST /portal/obs/live/query`, body
+/// `<token>\n<psl-query-text>`. Requires an admitted session + live substrate.
+/// A pure read — signs nothing.
+fn dispatch_obs_live_query(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_psl(&rest) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store recording-rule register+evaluate: `POST
+/// /portal/obs/live/recording`, body `<token>\n<id>|<kind>|<psl>|<emit>`.
+/// Evaluates the rule on the node's real scheduler engine over the live store,
+/// writing derived metrics back into it. Requires an admitted session + live
+/// substrate.
+fn dispatch_obs_live_recording(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_recording(rest.trim()) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store alert register+evaluate: `POST /portal/obs/live/alert`, body
+/// `<token>\n<id>|<psl>|<gt|lt>|<threshold>`. Fires notifications for every
+/// group tripping the predicate over the live store. Requires an admitted
+/// session + live substrate.
+fn dispatch_obs_live_alert(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_alert(rest.trim()) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Live-store dashboard materialization: `POST /portal/obs/live/dashboard`,
+/// body `<token>\n<name>=<psl>\n<name>=<psl>...`. Renders each panel's real
+/// matched signals off the live store. Requires an admitted session + live
+/// substrate. A pure read.
+fn dispatch_obs_live_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_dashboard_materialize(&rest) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Split a `<token>\n<rest...>` request body into the first-line token and the
+/// remaining body (the shared framing every `/portal/obs/live/*` POST uses).
+fn split_token_body(body: &str) -> (String, String) {
+    match body.split_once('\n') {
+        Some((tok, rest)) => (tok.trim().to_owned(), rest.to_owned()),
+        None => (body.trim().to_owned(), String::new()),
+    }
 }
 
 /// The topology explorer tree: `GET
@@ -2374,10 +3644,7 @@ fn dispatch_topology_label_declare(
 /// (`capacity-spec` is `self` or `<role>@<scope>`, exactly like the
 /// attestation builder). Emits ONE signed `topology:label` attest event;
 /// refused (403) if `issuer` does not hold the declared capacity.
-fn dispatch_topology_label_attest(
-    ctx: &mut WebAuthContext,
-    request: &HttpRequest,
-) -> HttpResponse {
+fn dispatch_topology_label_attest(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let mut lines = request.body.lines();
     let token = lines.next().unwrap_or("").trim();
     let issuer = lines.next().unwrap_or("").trim();
@@ -2390,7 +3657,11 @@ fn dispatch_topology_label_attest(
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     }
-    if issuer.is_empty() || subject.is_empty() || tier.is_empty() || value.is_empty() || scope.is_empty()
+    if issuer.is_empty()
+        || subject.is_empty()
+        || tier.is_empty()
+        || value.is_empty()
+        || scope.is_empty()
     {
         return text_response(400, "Bad Request", "MISSING field".to_owned());
     }
@@ -2419,7 +3690,11 @@ fn dispatch_topology_label_attest(
         scope,
     ) {
         Ok(cid) => text_response(200, "OK", format!("ATTESTED CID {}", cid.0)),
-        Err(e) => text_response(403, "Forbidden", format!("DENIED {}", trust_error_reason(&e))),
+        Err(e) => text_response(
+            403,
+            "Forbidden",
+            format!("DENIED {}", trust_error_reason(&e)),
+        ),
     }
 }
 
@@ -2428,10 +3703,7 @@ fn dispatch_topology_label_attest(
 /// Computes each named node's replica spread across `tier` and warns when
 /// 2+ replicas land in the SAME failure domain (e.g. the same rack). A pure
 /// view — signs nothing.
-fn dispatch_topology_failure_domain(
-    ctx: &WebAuthContext,
-    request: &HttpRequest,
-) -> HttpResponse {
+fn dispatch_topology_failure_domain(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let token = query_value(&request.path, "token").unwrap_or("");
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
@@ -2563,23 +3835,206 @@ fn dispatch_custody_revoke(ctx: &mut WebAuthContext, request: &HttpRequest) -> H
     }
 }
 
+/// The challenge TTL for a WebAuthn ceremony (seconds). A minted challenge is
+/// single-use AND time-bounded: it expires this many logical ticks after it is
+/// issued (`ChallengeFreshness`).
+const WEBAUTHN_CHALLENGE_TTL: u64 = 300;
+
+/// Resolve the (session, cell) a WebAuthn ceremony's challenge is bound to from
+/// a presented login-session token. `Err` is a 401 the caller returns verbatim.
+/// The cell scope is the admitted session's subject, so a challenge minted for
+/// one principal can never be finished under another (`ChallengeBinding`).
+fn webauthn_ceremony_scope(
+    ctx: &WebAuthContext,
+    token: &str,
+) -> Result<(String, String), HttpResponse> {
+    match ctx.login_sessions.get(token) {
+        Some(session) => Ok((token.to_owned(), session.subject.to_string())),
+        None => Err(text_response(
+            401,
+            "Unauthorized",
+            "DENIED not-authenticated".to_owned(),
+        )),
+    }
+}
+
+/// Render an [`RpError`] as the portal's fail-closed text response.
+fn webauthn_rp_error(err: &RpError) -> HttpResponse {
+    let (status, reason, msg): (u16, &'static str, &str) = match err {
+        RpError::StaleChallenge => (400, "Bad Request", "stale-challenge"),
+        RpError::ChallengeBinding => (403, "Forbidden", "challenge-binding"),
+        RpError::UnknownCredential => (404, "Not Found", "unknown-credential"),
+        RpError::Revoked => (403, "Forbidden", "revoked"),
+        RpError::SignCountRegression => (409, "Conflict", "sign-count-regression"),
+        RpError::Crypto(_) => (401, "Unauthorized", "assertion-verification-failed"),
+    };
+    text_response(status, reason, format!("DENIED {msg}"))
+}
+
+/// `POST /webauthn/register/begin` — mint a fresh, single-use, time-bounded
+/// registration challenge bound to the caller's session/cell. Body:
+/// `<session-token>\n<user-handle>`. Returns `CHALLENGE <b64url> <rp_id>
+/// <user_handle>` (a `pillar_web_api::WebAuthnRegisterChallenge` in text form).
+fn dispatch_webauthn_register_begin(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let user_handle = lines.next().unwrap_or("").trim();
+    if user_handle.is_empty() {
+        return text_response(400, "Bad Request", "MISSING user-handle".to_owned());
+    }
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let now = ctx.session_clock;
+    let challenge = ctx
+        .webauthn_rp
+        .begin(&session, &cell, now, WEBAUTHN_CHALLENGE_TTL);
+    let b64 = pillar_crypto::webauthn::base64url_encode(&challenge);
+    text_response(
+        200,
+        "OK",
+        format!("CHALLENGE {b64} {} {user_handle}", ctx.origin_rp_id()),
+    )
+}
+
+/// `POST /webauthn/register/finish` — verify + persist the attested credential.
+/// Body: `<session-token>\n<user-handle>\n<challenge-b64url>\n<attestation-object-b64url>`.
+fn dispatch_webauthn_register_finish(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let user_handle = lines.next().unwrap_or("").trim();
+    let challenge_b64 = lines.next().unwrap_or("").trim();
+    let attestation_b64 = lines.next().unwrap_or("").trim();
+    if user_handle.is_empty() || challenge_b64.is_empty() || attestation_b64.is_empty() {
+        return text_response(
+            400,
+            "Bad Request",
+            "MISSING register-finish-field".to_owned(),
+        );
+    }
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let (Ok(challenge), Ok(attestation)) = (
+        pillar_crypto::webauthn::base64url_decode(challenge_b64),
+        pillar_crypto::webauthn::base64url_decode(attestation_b64),
+    ) else {
+        return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
+    };
+    let now = ctx.session_clock;
+    // A per-credential PRF salt: a real, credential-scoped random-ish salt
+    // derived from the challenge (which is itself a fresh content-address).
+    let mut prf_salt = [0u8; 32];
+    let src =
+        pillar_crypto::content::content_address(&challenge).expect("content_address is infallible");
+    let src = src.as_bytes();
+    prf_salt.copy_from_slice(&src[src.len() - 32..]);
+    match ctx.webauthn_rp.register_finish(
+        &session,
+        &cell,
+        now,
+        &challenge,
+        &attestation,
+        prf_salt,
+        user_handle,
+    ) {
+        Ok(record) => {
+            let cred_b64 = pillar_crypto::webauthn::base64url_encode(&record.credential_id);
+            text_response(200, "OK", format!("REGISTERED {cred_b64}"))
+        }
+        Err(e) => webauthn_rp_error(&e),
+    }
+}
+
+/// `POST /webauthn/authenticate/begin` — mint a fresh, single-use, time-bounded
+/// assertion challenge bound to the caller's session/cell. Body:
+/// `<session-token>`. Returns `CHALLENGE <b64url>`.
+fn dispatch_webauthn_authenticate_begin(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = request.body.lines().next().unwrap_or("").trim();
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let now = ctx.session_clock;
+    let challenge = ctx
+        .webauthn_rp
+        .begin(&session, &cell, now, WEBAUTHN_CHALLENGE_TTL);
+    let b64 = pillar_crypto::webauthn::base64url_encode(&challenge);
+    text_response(200, "OK", format!("CHALLENGE {b64}"))
+}
+
+/// `POST /webauthn/authenticate/finish` — verify the assertion and derive the
+/// operational-key-unlock secret. Body:
+/// `<session-token>\n<challenge-b64url>\n<credential-id-b64url>\n
+///  <authenticator-data-b64url>\n<client-data-json-b64url>\n<signature-b64url>\n
+///  <prf-output-b64url>`.
+/// Returns `UNLOCKED <unlock-secret-b64url>` on success. The unlock secret
+/// never leaves the server observably in a real deployment; it is returned here
+/// so the ceremony's REAL derivation is testable end to end.
+fn dispatch_webauthn_authenticate_finish(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let challenge_b64 = lines.next().unwrap_or("").trim();
+    let cred_b64 = lines.next().unwrap_or("").trim();
+    let ad_b64 = lines.next().unwrap_or("").trim();
+    let cdj_b64 = lines.next().unwrap_or("").trim();
+    let sig_b64 = lines.next().unwrap_or("").trim();
+    let prf_b64 = lines.next().unwrap_or("").trim();
+    let (session, cell) = match webauthn_ceremony_scope(ctx, token) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let dec = pillar_crypto::webauthn::base64url_decode;
+    let (Ok(challenge), Ok(cred), Ok(ad), Ok(cdj), Ok(sig), Ok(prf)) = (
+        dec(challenge_b64),
+        dec(cred_b64),
+        dec(ad_b64),
+        dec(cdj_b64),
+        dec(sig_b64),
+        dec(prf_b64),
+    ) else {
+        return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
+    };
+    let now = ctx.session_clock;
+    match ctx.webauthn_rp.authenticate_finish(
+        &session, &cell, now, &challenge, &cred, &ad, &cdj, &sig, &prf,
+    ) {
+        Ok(unlock) => {
+            let b64 = pillar_crypto::webauthn::base64url_encode(&unlock);
+            text_response(200, "OK", format!("UNLOCKED {b64}"))
+        }
+        Err(e) => webauthn_rp_error(&e),
+    }
+}
+
 /// Drive one node-side custody login: parse the TWO fields (identifier +
 /// password), issue nothing here (the client already fetched a nonce), and let
 /// the node resolve+strip+unlock+sign+admit SERVER-SIDE.
 fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
-    // Body: "<identifier>\n<password>\n<nonce_id>". The client fetched the
-    // nonce via GET /nonce and echoes its id so the server can bind the login
-    // to that exact challenge; the password + identifier are the two human
+    // Body: the shared `pillar_web_api::LoginRequest` wire framing
+    // "<identifier>\n<password>\n<nonce_id>". The client fetched the nonce
+    // via GET /nonce and echoes its id so the server can bind the login to
+    // that exact challenge; the password + identifier are the two human
     // fields. The CID is NEVER in the body — the node resolves it.
-    let mut lines = request.body.lines();
-    let identifier = lines.next().unwrap_or("").trim();
-    let password = lines.next().unwrap_or("").trim();
-    let nonce_id: u64 = lines
-        .next()
-        .unwrap_or("")
-        .trim()
-        .parse()
-        .unwrap_or(u64::MAX);
+    let LoginRequest {
+        identifier,
+        password,
+        nonce_id,
+    } = LoginRequest::from_body(&request.body);
 
     if identifier.is_empty() || password.is_empty() {
         return text_response(401, "Unauthorized", "DENIED missing-field".to_owned());
@@ -2589,7 +4044,7 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
     let actor = ctx.actor.clone();
     match ctx
         .verifier
-        .admit(identifier, password, nonce_id, 0, &authority, &actor)
+        .admit(&identifier, &password, nonce_id, 0, &authority, &actor)
     {
         Ok(session) => {
             let handle = session.handle.clone();
@@ -2599,7 +4054,8 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
                 reason: "OK",
                 content_type: "text/plain; charset=utf-8",
                 session_token: Some(token),
-                body: format!("OK {handle}\n"),
+                body: LoginResponse { handle }.to_wire(),
+                bytes: None,
             }
         }
         Err(e) => {
@@ -2743,6 +4199,49 @@ fn login_reason(e: &NodeCustodyError) -> &'static str {
     }
 }
 
+/// Validate a request's OPTIONAL [`API_VERSION_HEADER`] assertion, returning
+/// the DISTINCT error response to short-circuit on when it is unacceptable, or
+/// `None` when the request may proceed (no header, or a supported version).
+///
+/// The two rejections are deliberately different HTTP statuses so a client can
+/// tell them apart — mirroring the [`pillar_crypto::VersionError`] split:
+///
+/// * an illegible value (`VersionError::Malformed`, or not a `vN`/`N` number)
+///   → `400 Bad Request`, a PARSE error, the same family as any other
+///   malformed-request refusal; and
+/// * a legible but out-of-window version (`VersionError::Unsupported`, e.g. a
+///   FUTURE `v2` this build does not know, or a retired one) → `505 HTTP
+///   Version Not Supported`, NAMING the unsupported version — distinct from a
+///   404/parse/normal-response path.
+fn check_request_api_version(request: &HttpRequest) -> Option<HttpResponse> {
+    let raw = request.api_version.as_deref()?;
+    // Accept both the `Display` form (`v1`) and a bare number (`1`), so a
+    // client may echo back exactly what a response advertised.
+    let digits = raw
+        .strip_prefix('v')
+        .or_else(|| raw.strip_prefix('V'))
+        .unwrap_or(raw);
+    let Ok(n) = digits.parse::<u16>() else {
+        // Illegible: a parse error (400), NOT the unsupported-version case.
+        return Some(text_response(
+            400,
+            "Bad Request",
+            format!("MALFORMED api version header {raw:?}"),
+        ));
+    };
+    let found = pillar_crypto::SurfaceVersion(n);
+    match found.check_supported(MIN_API_VERSION, API_VERSION) {
+        Ok(()) => None,
+        Err(_) => Some(text_response(
+            505,
+            "HTTP Version Not Supported",
+            format!(
+                "UNSUPPORTED api version {found} (this build supports {MIN_API_VERSION}..={API_VERSION})"
+            ),
+        )),
+    }
+}
+
 fn text_response(status: u16, reason: &'static str, mut body: String) -> HttpResponse {
     if !body.ends_with('\n') {
         body.push('\n');
@@ -2753,6 +4252,7 @@ fn text_response(status: u16, reason: &'static str, mut body: String) -> HttpRes
         content_type: "text/plain; charset=utf-8",
         session_token: None,
         body,
+        bytes: None,
     }
 }
 
@@ -2800,6 +4300,7 @@ mod tests {
                 method: "GET".into(),
                 path: path.into(),
                 body: String::new(),
+                api_version: None,
             },
         )
     }
@@ -2812,8 +4313,73 @@ mod tests {
                 method: "POST".into(),
                 path: path.into(),
                 body: body.into(),
+                api_version: None,
             },
         )
+    }
+
+    // A GET carrying an explicit `X-Pillar-Api-Version` assertion.
+    fn get_with_api_version(ctx: &mut WebAuthContext, path: &str, version: &str) -> HttpResponse {
+        dispatch_http(
+            ctx,
+            &remote_peer(),
+            &HttpRequest {
+                method: "GET".into(),
+                path: path.into(),
+                body: String::new(),
+                api_version: Some(version.into()),
+            },
+        )
+    }
+
+    // The two-stage frontend build's static-asset surface: each embedded Yew
+    // + WebAssembly bundle asset is served at its `/assets/...` path under its
+    // CORRECT MIME type with a non-empty body. This FAILS without the
+    // static-asset route + MIME map wired into `dispatch_http`.
+    #[test]
+    fn frontend_wasm_asset_serves_correct_mime_and_non_empty_body() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+
+        let wasm = get(&mut ctx, "/assets/pillar-frontend_bg.wasm");
+        assert_eq!(wasm.status, 200, "wasm asset must be served");
+        assert_eq!(
+            wasm.content_type, "application/wasm",
+            "wasm asset must carry the application/wasm MIME type"
+        );
+        let wasm_bytes = wasm.bytes.expect("wasm served as binary bytes");
+        assert!(!wasm_bytes.is_empty(), "wasm asset body must be non-empty");
+        // A real WebAssembly module starts with the `\0asm` magic.
+        assert_eq!(
+            &wasm_bytes[0..4],
+            b"\0asm",
+            "served wasm asset must be a real WebAssembly module"
+        );
+
+        let js = get(&mut ctx, "/assets/pillar-frontend.js");
+        assert_eq!(js.status, 200);
+        assert_eq!(js.content_type, "text/javascript");
+        assert!(
+            !js.bytes.expect("js served as bytes").is_empty(),
+            "js glue asset body must be non-empty"
+        );
+
+        let css = get(&mut ctx, "/assets/portal.css");
+        assert_eq!(css.status, 200);
+        assert_eq!(css.content_type, "text/css");
+        assert!(
+            !css.bytes.expect("css served as bytes").is_empty(),
+            "css asset body must be non-empty"
+        );
+
+        // An unmapped asset path 404s rather than serving under a guessed type.
+        let missing = get(&mut ctx, "/assets/does-not-exist.bin");
+        assert_eq!(missing.status, 404);
     }
 
     #[test]
@@ -2864,7 +4430,11 @@ mod tests {
         // POST /portal/members/add WITH the token → 200, one signed,
         // decider-authorized event with provenance (signer, exercised
         // authority, event CID).
-        let act_resp = post(&mut ctx, "/portal/members/add", &format!("{token}\ncarol\nmember"));
+        let act_resp = post(
+            &mut ctx,
+            "/portal/members/add",
+            &format!("{token}\ncarol\nmember"),
+        );
         assert_eq!(
             act_resp.status, 200,
             "authenticated signed act: {}",
@@ -2872,7 +4442,11 @@ mod tests {
         );
         assert!(act_resp.body.contains("MEMBER carol ROLE member"));
         assert!(act_resp.body.contains("SIGNER"), "got: {}", act_resp.body);
-        assert!(act_resp.body.contains("EVENT-CID"), "got: {}", act_resp.body);
+        assert!(
+            act_resp.body.contains("EVENT-CID"),
+            "got: {}",
+            act_resp.body
+        );
         assert!(
             act_resp.body.contains("EXERCISED-AUTHORITY"),
             "got: {}",
@@ -2961,6 +4535,114 @@ mod tests {
     }
 
     #[test]
+    fn every_response_carries_the_current_api_version_header() {
+        // The HTTP ingest API's OWN version stamp is advertised on EVERY
+        // response — asserted against served raw response bytes, so a client
+        // (or Ingress) always learns the API version it was served at. This is
+        // independent of any message/event version the body carries.
+        use std::io::Read as _;
+
+        let listener = bind(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0).expect("bind non-loopback");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let handle = std::thread::spawn(move || {
+            let (mut ctx, _subkey) = provisioned_ctx();
+            let stream = listener
+                .incoming()
+                .next()
+                .expect("one connection")
+                .expect("accept");
+            super::handle_connection(stream, &mut ctx);
+        });
+
+        let connect = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
+        let mut client = TcpStream::connect(connect).expect("connect");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: pillar.example.com\r\n\r\n")
+            .expect("write request");
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).expect("read response");
+        handle.join().expect("server thread");
+
+        let expected = format!("{API_VERSION_HEADER}: {API_VERSION}");
+        assert_eq!(
+            expected, "X-Pillar-Api-Version: v1",
+            "the advertised header line is the stable v1 stamp"
+        );
+        assert!(
+            raw.lines().any(|l| l.trim_end() == expected),
+            "every response must carry `{expected}`, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn a_request_without_the_api_version_header_is_served_normally() {
+        // Backward compatibility: a request that asserts NO API version is
+        // accepted and served at the current version (the `get`/`post` helpers
+        // send `api_version: None`).
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get(&mut ctx, "/bootstrap/status");
+        assert_eq!(
+            resp.status, 200,
+            "a header-less request is served backward-compatibly"
+        );
+    }
+
+    #[test]
+    fn a_future_api_version_is_rejected_distinctly_from_a_404_or_parse_path() {
+        // A legible-but-unknown FUTURE version (`v2`) is Unsupported — a
+        // DISTINCT 505, NAMING the version — never confused with a 404
+        // (unknown route) or a 400 (malformed request/parse) path.
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get_with_api_version(&mut ctx, "/bootstrap/status", "v2");
+        assert_eq!(
+            resp.status, 505,
+            "a future API version yields the distinct unsupported-version status"
+        );
+        assert!(
+            resp.body.contains("UNSUPPORTED") && resp.body.contains("v2"),
+            "the body must name the unsupported API version, got: {}",
+            resp.body
+        );
+        // Distinct from an unknown-route 404 …
+        let not_found = get(&mut ctx, "/no-such-route");
+        assert_eq!(not_found.status, 404);
+        assert_ne!(
+            resp.status, not_found.status,
+            "unsupported-version must NOT be the 404 path"
+        );
+        // … and distinct from a normal (accepted) served response.
+        let ok = get_with_api_version(&mut ctx, "/bootstrap/status", "v1");
+        assert_eq!(ok.status, 200, "the CURRENT version is accepted");
+        assert_ne!(resp.status, ok.status);
+    }
+
+    #[test]
+    fn a_malformed_api_version_header_is_a_parse_error_not_the_unsupported_case() {
+        // A garbage header value is a PARSE error (400) — the malformed
+        // family — deliberately distinct from the stamped-but-unknown-future
+        // (505) case above.
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let resp = get_with_api_version(&mut ctx, "/bootstrap/status", "not-a-version");
+        assert_eq!(
+            resp.status, 400,
+            "an illegible API version header is a parse error (400)"
+        );
+        assert!(
+            resp.body.contains("MALFORMED"),
+            "the body must flag the malformed header, got: {}",
+            resp.body
+        );
+        // And it is NOT the 505 unsupported-version status.
+        let future = get_with_api_version(&mut ctx, "/bootstrap/status", "v2");
+        assert_eq!(future.status, 505);
+        assert_ne!(
+            resp.status, future.status,
+            "malformed (400) and unsupported-version (505) must be distinct"
+        );
+    }
+
+    #[test]
     fn a_wrong_password_surfaces_a_clear_unlock_failed_message() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let nonce_resp = get(&mut ctx, "/nonce");
@@ -3026,7 +4708,11 @@ mod tests {
         assert_eq!(get(&mut ctx, "/bootstrap/status").body.trim(), "FRESH");
 
         // Cannot create a user before the cell.
-        let early = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
+        let early = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("spencer\n{PASSWORD}"),
+        );
         assert_eq!(early.status, 409);
         assert!(early.body.contains("NoCellYet"), "got: {}", early.body);
 
@@ -3036,7 +4722,11 @@ mod tests {
         assert!(cell.body.contains("CELL-CREATED"));
 
         // (b) create the first user — consumes the one-shot capability.
-        let user = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
+        let user = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("spencer\n{PASSWORD}"),
+        );
         assert_eq!(user.status, 200);
         assert!(user.body.contains("USER-CREATED spencer"));
 
@@ -3048,7 +4738,11 @@ mod tests {
         assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
 
         // A SECOND cell-key create-user is refused (capability spent).
-        let second = post(&mut ctx, "/bootstrap/create-user", &format!("second-user\n{PASSWORD}"));
+        let second = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("second-user\n{PASSWORD}"),
+        );
         assert_eq!(second.status, 409);
         assert!(
             second.body.contains("CapabilitySpent"),
@@ -3075,12 +4769,22 @@ mod tests {
 
         let cell = post(&mut ctx, "/bootstrap/create-cell", "cell-genesis");
         assert_eq!(cell.status, 200);
-        let user = post(&mut ctx, "/bootstrap/create-user", &format!("spencer\n{PASSWORD}"));
+        let user = post(
+            &mut ctx,
+            "/bootstrap/create-user",
+            &format!("spencer\n{PASSWORD}"),
+        );
         assert_eq!(user.status, 200, "got: {}", user.body);
 
         // Log in as the just-created user with NO further offer provisioning.
         let nonce_resp = get(&mut ctx, "/nonce");
-        let id: u64 = nonce_resp.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let id: u64 = nonce_resp
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let login = post(&mut ctx, "/login", &format!("spencer\n{PASSWORD}\n{id}"));
         assert_eq!(
             login.status, 200,
@@ -3093,12 +4797,17 @@ mod tests {
         // unlock-failed, never the no-offer mode — proving the offer really
         // is present and the failure mode is unlock-specific.
         let nonce_resp2 = get(&mut ctx, "/nonce");
-        let id2: u64 = nonce_resp2.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let id2: u64 = nonce_resp2
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let bad = post(&mut ctx, "/login", &format!("spencer\nwrong\n{id2}"));
         assert_eq!(bad.status, 401);
         assert!(bad.body.contains("unlock-failed"), "got: {}", bad.body);
     }
-
 
     #[test]
     fn a_bootstrapped_node_reports_bootstrapped_directly() {
@@ -3171,7 +4880,11 @@ mod tests {
             &format!("spencer-cell\nspencer\n{PASSWORD}"),
         );
         assert_eq!(done.status, 200, "got: {}", done.body);
-        assert!(done.body.contains("BOOTSTRAPPED spencer"), "got: {}", done.body);
+        assert!(
+            done.body.contains("BOOTSTRAPPED spencer"),
+            "got: {}",
+            done.body
+        );
         assert_eq!(
             get(&mut ctx, "/bootstrap/status").body.trim(),
             "BOOTSTRAPPED"
@@ -3180,7 +4893,13 @@ mod tests {
 
         // The just-created user logs in immediately (offer escrowed atomically).
         let nonce = get(&mut ctx, "/nonce");
-        let id: u64 = nonce.body.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let id: u64 = nonce
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let login = post(&mut ctx, "/login", &format!("spencer\n{PASSWORD}\n{id}"));
         assert_eq!(login.status, 200, "got: {}", login.body);
     }
@@ -3204,7 +4923,11 @@ mod tests {
             &format!("spencer-cell\nspencer\n{PASSWORD}"),
         );
         assert_eq!(done.status, 200, "got: {}", done.body);
-        assert!(done.body.contains("BOOTSTRAPPED spencer"), "got: {}", done.body);
+        assert!(
+            done.body.contains("BOOTSTRAPPED spencer"),
+            "got: {}",
+            done.body
+        );
         assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
     }
 
@@ -3212,9 +4935,192 @@ mod tests {
     fn login_alice(ctx: &mut WebAuthContext) -> String {
         let nonce = get(ctx, "/nonce");
         let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
-        let login = post(ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nonce_id}"));
+        let login = post(
+            ctx,
+            "/login",
+            &format!("alice@pillar\n{PASSWORD}\n{nonce_id}"),
+        );
         assert_eq!(login.status, 200, "login body: {}", login.body);
         login.session_token.expect("session token")
+    }
+
+    // ---- WebAuthn RP ceremony (real browser-driven relying-party path) ----
+
+    // A test Ed25519 authenticator: returns (attestation_object, secret, cose).
+    fn webauthn_authenticator(
+        label: &str,
+        credential_id: &[u8],
+        sign_count: u32,
+    ) -> (Vec<u8>, pillar_crypto::SigningSecretKey, Vec<u8>) {
+        let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(
+            &pillar_crypto::Seed::from_bytes(label.as_bytes().to_vec()),
+        )
+        .unwrap();
+        let cose = pillar_crypto::webauthn::ed25519_public_key_to_cose(&public).unwrap();
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&[0u8; 32]);
+        auth_data.push(0x40 | 0x01); // AT + UP
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        auth_data.extend_from_slice(&cose);
+        use ciborium::value::Value;
+        let att = Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text("none".into())),
+            (Value::Text("attStmt".into()), Value::Map(vec![])),
+            (Value::Text("authData".into()), Value::Bytes(auth_data)),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&att, &mut out).unwrap();
+        (out, secret, cose)
+    }
+
+    // Produce an assertion (authData, clientDataJSON, signature) for a challenge.
+    fn webauthn_assertion(
+        secret: &pillar_crypto::SigningSecretKey,
+        challenge: &[u8],
+        sign_count: u32,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use sha2::{Digest, Sha256};
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://pillar.local"}}"#,
+            pillar_crypto::webauthn::base64url_encode(challenge)
+        )
+        .into_bytes();
+        let mut ad = Vec::new();
+        ad.extend_from_slice(&[0u8; 32]);
+        ad.push(0x01);
+        ad.extend_from_slice(&sign_count.to_be_bytes());
+        let mut signed = ad.clone();
+        signed.extend_from_slice(&Sha256::digest(&cdj));
+        let sig = pillar_crypto::sign::sign(secret, &signed).unwrap();
+        (ad, cdj, sig.as_bytes().to_vec())
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        pillar_crypto::webauthn::base64url_encode(bytes)
+    }
+
+    // Extract the CHALLENGE token from a `CHALLENGE <b64> ...` OK body.
+    fn challenge_of(resp: &HttpResponse) -> Vec<u8> {
+        assert_eq!(resp.status, 200, "begin failed: {}", resp.body);
+        let b = resp
+            .body
+            .split_whitespace()
+            .nth(1)
+            .expect("challenge field");
+        pillar_crypto::webauthn::base64url_decode(b).expect("b64 challenge")
+    }
+
+    #[test]
+    fn webauthn_full_ceremony_registers_then_authenticates_and_unlocks() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let (att, secret, _cose) = webauthn_authenticator("browser-auth", b"cred-web", 0);
+
+        // register/begin -> register/finish
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        let reg = post(
+            &mut ctx,
+            "/webauthn/register/finish",
+            &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+        );
+        assert_eq!(reg.status, 200, "register-finish: {}", reg.body);
+        assert!(reg.body.starts_with("REGISTERED"), "got: {}", reg.body);
+
+        // authenticate/begin -> authenticate/finish (real signature, sign_count 4)
+        let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &token));
+        let (ad, cdj, sig) = webauthn_assertion(&secret, &ch2, 4);
+        let auth = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{token}\n{}\n{}\n{}\n{}\n{}\n{}",
+                b64(&ch2),
+                b64(b"cred-web"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&sig),
+                b64(b"hardware-prf-output")
+            ),
+        );
+        assert_eq!(auth.status, 200, "authenticate-finish: {}", auth.body);
+        assert!(auth.body.starts_with("UNLOCKED"), "got: {}", auth.body);
+        // The unlock secret is the REAL HKDF-derived, credential-bound secret.
+        let got =
+            pillar_crypto::webauthn::base64url_decode(auth.body.split_whitespace().nth(1).unwrap())
+                .unwrap();
+        let expected =
+            pillar_crypto::webauthn::derive_unlock_secret(b"hardware-prf-output", b"cred-web")
+                .unwrap();
+        assert_eq!(
+            got,
+            expected.to_vec(),
+            "unlock secret is the real derivation"
+        );
+        assert_ne!(got, vec![0u8; 32], "unlock secret is not a placeholder");
+    }
+
+    #[test]
+    fn webauthn_forged_assertion_is_rejected_by_the_endpoint() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let (att, _secret, _cose) = webauthn_authenticator("browser-auth", b"cred-web", 0);
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/webauthn/register/finish",
+                &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+            )
+            .status,
+            200
+        );
+        // A DIFFERENT authenticator forges the assertion.
+        let (_a2, mallory, _c2) = webauthn_authenticator("mallory", b"cred-x", 0);
+        let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &token));
+        let (ad, cdj, forged) = webauthn_assertion(&mallory, &ch2, 4);
+        let auth = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{token}\n{}\n{}\n{}\n{}\n{}\n{}",
+                b64(&ch2),
+                b64(b"cred-web"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&forged),
+                b64(b"hardware-prf-output")
+            ),
+        );
+        assert_eq!(
+            auth.status, 401,
+            "forged assertion must be refused: {}",
+            auth.body
+        );
+    }
+
+    #[test]
+    fn webauthn_begin_requires_an_admitted_session() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let resp = post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            "not-a-real-token\nalice@pillar",
+        );
+        assert_eq!(
+            resp.status, 401,
+            "an unauthenticated ceremony must be refused"
+        );
     }
 
     #[test]
@@ -3225,13 +5131,20 @@ mod tests {
             post(&mut ctx, "/bootstrap/request/node", "new-node").status,
             409
         );
-        assert_eq!(post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status, 200);
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status,
+            200
+        );
 
         // Submit a node request carrying identifying info.
         let body = "new-node\n12D3KooWpeer\npillar 0.0.0\nlinux\nbafy-nodekey\ntpm\npub=/ip4/203.0.113.7/tcp/4001\nlabel=edge";
         let submitted = post(&mut ctx, "/bootstrap/request/node", body);
         assert_eq!(submitted.status, 200);
-        assert!(submitted.body.starts_with("REQUEST "), "got: {}", submitted.body);
+        assert!(
+            submitted.body.starts_with("REQUEST "),
+            "got: {}",
+            submitted.body
+        );
         let id = submitted.body.trim_start_matches("REQUEST ").trim();
 
         // It shows up in the pending list.
@@ -3239,29 +5152,60 @@ mod tests {
         assert!(list.body.contains("node new-node"), "got: {}", list.body);
 
         // Approving without authentication is refused.
-        let unauth = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\nnot-a-token"));
+        let unauth = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\nnot-a-token"),
+        );
         assert_eq!(unauth.status, 401);
 
         // Authenticated approval seals the cell key and returns its CID.
         let token = login_alice(&mut ctx);
-        let approved = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        let approved = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\n{token}"),
+        );
         assert_eq!(approved.status, 200, "got: {}", approved.body);
-        assert!(approved.body.contains("APPROVED bafy-cellkey-"), "got: {}", approved.body);
+        assert!(
+            approved.body.contains("APPROVED bafy-cellkey-"),
+            "got: {}",
+            approved.body
+        );
 
         // The request is terminal: a second decision is refused.
-        let again = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        let again = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\n{token}"),
+        );
         assert_eq!(again.status, 409);
     }
 
     #[test]
     fn user_bootstrap_request_approval_escrows_and_returns_no_cell_key() {
         let (mut ctx, _subkey) = provisioned_ctx();
-        assert_eq!(post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status, 200);
-        let submitted = post(&mut ctx, "/bootstrap/request/user", "new-user\npassword\nlabel=ops");
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/create-cell", "spencer-cell").status,
+            200
+        );
+        let submitted = post(
+            &mut ctx,
+            "/bootstrap/request/user",
+            "new-user\npassword\nlabel=ops",
+        );
         assert_eq!(submitted.status, 200);
-        let id = submitted.body.trim_start_matches("REQUEST ").trim().to_owned();
+        let id = submitted
+            .body
+            .trim_start_matches("REQUEST ")
+            .trim()
+            .to_owned();
         let token = login_alice(&mut ctx);
-        let approved = post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\n{token}"));
+        let approved = post(
+            &mut ctx,
+            "/bootstrap/request/approve",
+            &format!("{id}\n{token}"),
+        );
         assert_eq!(approved.status, 200, "got: {}", approved.body);
         assert!(approved.body.contains("ESCROWED"), "got: {}", approved.body);
     }
@@ -3274,7 +5218,11 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let resp = get(&mut ctx, "/portal/status?token=not-a-token");
         assert_eq!(resp.status, 401);
-        assert!(resp.body.contains("not-authenticated"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("not-authenticated"),
+            "got: {}",
+            resp.body
+        );
     }
 
     // Once admitted, the portal renders node/identity status (PeerId, listen
@@ -3292,18 +5240,30 @@ mod tests {
 
         let resp = get(&mut ctx, &format!("/portal/status?token={token}"));
         assert_eq!(resp.status, 200, "got: {}", resp.body);
-        assert!(resp.body.contains("PEER-ID 12D3KooWThisNode"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("PEER-ID 12D3KooWThisNode"),
+            "got: {}",
+            resp.body
+        );
         assert!(
             resp.body.contains("LISTEN /ip4/0.0.0.0/tcp/4001"),
             "got: {}",
             resp.body
         );
         assert!(resp.body.contains("PEER-COUNT 2"), "got: {}", resp.body);
-        assert!(resp.body.contains("PEERS peer-a,peer-b"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("PEERS peer-a,peer-b"),
+            "got: {}",
+            resp.body
+        );
         assert!(resp.body.contains("UPTIME-SECS"), "got: {}", resp.body);
         // A solo node self-grants its lease at construction, so it reports
         // itself ("owner") as holder out of the box.
-        assert!(resp.body.contains("LEASE-HOLDER owner"), "got: {}", resp.body);
+        assert!(
+            resp.body.contains("LEASE-HOLDER owner"),
+            "got: {}",
+            resp.body
+        );
     }
 
     // A UI-persisted layout is a signed, content-addressed resource riding the
@@ -3318,28 +5278,59 @@ mod tests {
 
         // Unauthenticated view/enroll is refused.
         assert_eq!(get(&mut ctx, "/portal/identity?token=nope").status, 401);
-        assert_eq!(post(&mut ctx, "/portal/identity/enroll", "nope\nwork").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/identity/enroll", "nope\nwork").status,
+            401
+        );
 
         let cid_before = ctx.identity_log().cid().0.clone();
 
-        let enrolled = post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        let enrolled = post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
         assert_eq!(enrolled.status, 200, "got: {}", enrolled.body);
-        assert!(enrolled.body.contains("DOMAIN work KEY"), "got: {}", enrolled.body);
+        assert!(
+            enrolled.body.contains("DOMAIN work KEY"),
+            "got: {}",
+            enrolled.body
+        );
 
         // A second enroll for the SAME domain is refused — one subkey per
         // domain.
-        let dup = post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        let dup = post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
         assert_eq!(dup.status, 409, "got: {}", dup.body);
 
         let view = get(&mut ctx, &format!("/portal/identity?token={token}"));
         assert_eq!(view.status, 200, "got: {}", view.body);
-        assert!(view.body.contains(&format!("CID {cid_before}")), "got: {}", view.body);
-        assert!(view.body.contains("DOMAIN work KEY"), "must show the per-domain key: {}", view.body);
+        assert!(
+            view.body.contains(&format!("CID {cid_before}")),
+            "got: {}",
+            view.body
+        );
+        assert!(
+            view.body.contains("DOMAIN work KEY"),
+            "must show the per-domain key: {}",
+            view.body
+        );
 
         // rotate-primary preserves the identity CID.
-        let rotated = post(&mut ctx, "/portal/identity/rotate", &format!("{token}\nprimary-2"));
+        let rotated = post(
+            &mut ctx,
+            "/portal/identity/rotate",
+            &format!("{token}\nprimary-2"),
+        );
         assert_eq!(rotated.status, 200, "got: {}", rotated.body);
-        assert!(rotated.body.contains(&format!("CID {cid_before}")), "got: {}", rotated.body);
+        assert!(
+            rotated.body.contains(&format!("CID {cid_before}")),
+            "got: {}",
+            rotated.body
+        );
         assert_eq!(ctx.identity_log().cid().0, cid_before);
         assert_eq!(ctx.identity_log().head_generation(), 1);
 
@@ -3347,7 +5338,11 @@ mod tests {
         // authorized by the genesis recovery key (never the current primary).
         let recovered = post(&mut ctx, "/portal/identity/recover", token.as_str());
         assert_eq!(recovered.status, 200, "got: {}", recovered.body);
-        assert!(recovered.body.contains(&format!("CID {cid_before}")), "got: {}", recovered.body);
+        assert!(
+            recovered.body.contains(&format!("CID {cid_before}")),
+            "got: {}",
+            recovered.body
+        );
         assert_eq!(ctx.identity_log().head_generation(), 2);
         assert_eq!(ctx.identity_log().cid().0, cid_before);
     }
@@ -3359,61 +5354,176 @@ mod tests {
     fn domain_grouping_view_lists_cells_and_signs_nothing() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
+        post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
 
         assert_eq!(get(&mut ctx, "/portal/domains?token=nope").status, 401);
         let view = get(&mut ctx, &format!("/portal/domains?token={token}"));
         assert_eq!(view.status, 200, "got: {}", view.body);
-        assert!(view.body.contains("DOMAIN work CELLS"), "must list the domain's cells: {}", view.body);
+        assert!(
+            view.body.contains("DOMAIN work CELLS"),
+            "must list the domain's cells: {}",
+            view.body
+        );
         assert!(view.body.contains("work-cell-1"), "got: {}", view.body);
 
         // Property: no domain-signing/granting/coordinating route exists.
-        assert_eq!(post(&mut ctx, "/portal/domains/sign", &format!("{token}\nwork")).status, 404);
-        assert_eq!(post(&mut ctx, "/portal/domains/grant", &format!("{token}\nwork")).status, 404);
-        assert_eq!(post(&mut ctx, "/portal/domains/coordinate", &format!("{token}\nwork")).status, 404);
+        assert_eq!(
+            post(&mut ctx, "/portal/domains/sign", &format!("{token}\nwork")).status,
+            404
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/domains/grant", &format!("{token}\nwork")).status,
+            404
+        );
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/portal/domains/coordinate",
+                &format!("{token}\nwork")
+            )
+            .status,
+            404
+        );
     }
 
-    // User/member management: add/invite/role changes are signed acts
+    // The Swarm panel is read-only inspection + stateless keygen: `show` the
+    // node's running swarm, `generate` a fresh private key. It NEVER repoints
+    // the running node and keeps no state.
+    #[test]
+    fn swarm_panel_shows_running_swarm_and_generates_keys_over_the_portal() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        // A running node reports which swarm it is on (default: public).
+        ctx = ctx.with_swarm_info(
+            pillar_swarm::SwarmKind::Public,
+            pillar_swarm::SwarmKey::public().fingerprint(),
+            vec!["/ip4/192.0.2.5/tcp/4001/p2p/12D3KooWExample".to_owned()],
+        );
+        let token = login_alice(&mut ctx);
+
+        // Unauthenticated show is refused; generate is peer-gated (a bad
+        // session on a non-loopback peer is 403).
+        assert_eq!(get(&mut ctx, "/portal/swarm").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/swarm/generate", "bad-token").status,
+            403
+        );
+
+        // Show reports the running swarm's kind + fingerprint + seeds.
+        let shown = get(&mut ctx, &format!("/portal/swarm?token={token}"));
+        assert_eq!(shown.status, 200, "got: {}", shown.body);
+        assert!(
+            shown.body.contains(&format!(
+                "SWARM public {}",
+                pillar_swarm::SwarmKey::public().fingerprint()
+            )),
+            "got: {}",
+            shown.body
+        );
+        assert!(shown.body.contains("SEED /ip4/192.0.2.5/tcp/4001"), "got: {}", shown.body);
+
+        // Generate mints a fresh PRIVATE key + fingerprint, statelessly.
+        let g = post(&mut ctx, "/portal/swarm/generate", &token);
+        assert_eq!(g.status, 200, "got: {}", g.body);
+        assert!(g.body.contains("KEY pillar-swarm/v1:"), "got: {}", g.body);
+        assert!(g.body.contains("FINGERPRINT "), "got: {}", g.body);
+        // Extract the minted key and confirm it parses to a private swarm.
+        let key_line = g.body.lines().find(|l| l.starts_with("KEY ")).expect("KEY line");
+        let key = pillar_swarm::SwarmKey::parse(&key_line["KEY ".len()..]).expect("parse");
+        assert_eq!(key.kind(), pillar_swarm::SwarmKind::Private);
+
+        // STATELESS: generating did not repoint the running node — show still
+        // reports the public swarm, and two generates never collide.
+        let shown2 = get(&mut ctx, &format!("/portal/swarm?token={token}"));
+        assert!(shown2.body.contains("SWARM public"), "got: {}", shown2.body);
+        let g2 = post(&mut ctx, "/portal/swarm/generate", &token);
+        assert_ne!(g.body, g2.body, "each generate mints a distinct key");
+    }
+
     // (unauthorized refused); the identity view also renders the
     // multi-domain view (one global identity across its domains/cells).
     #[test]
     fn member_management_signed_acts_and_multi_domain_view() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-
         // Unauthorized add/role-change is refused. `/portal/members/add` is
         // gated first through the non-loopback signing-action peer gate (a
         // bad/absent session on a non-loopback peer is always 403), then
         // through the decider; `/portal/members/role` has no peer gate, so
         // an unauthenticated caller reads 401.
-        assert_eq!(post(&mut ctx, "/portal/members/add", "bad-token\nbob\nmember").status, 403);
-        assert_eq!(post(&mut ctx, "/portal/members/role", "bad-token\nbob\nadmin").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/members/add", "bad-token\nbob\nmember").status,
+            403
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/members/role", "bad-token\nbob\nadmin").status,
+            401
+        );
 
-        let added = post(&mut ctx, "/portal/members/add", &format!("{token}\nbob\nmember"));
+        let added = post(
+            &mut ctx,
+            "/portal/members/add",
+            &format!("{token}\nbob\nmember"),
+        );
         assert_eq!(added.status, 200, "got: {}", added.body);
-        assert!(added.body.contains("MEMBER bob ROLE member"), "got: {}", added.body);
+        assert!(
+            added.body.contains("MEMBER bob ROLE member"),
+            "got: {}",
+            added.body
+        );
         // The real signed-action surface: provenance is rendered — signer,
         // the exercised WoT authority, and the emitted event's CID.
         assert!(added.body.contains("SIGNER"), "got: {}", added.body);
         assert!(added.body.contains("EVENT-CID"), "got: {}", added.body);
-        assert!(added.body.contains("EXERCISED-AUTHORITY"), "got: {}", added.body);
+        assert!(
+            added.body.contains("EXERCISED-AUTHORITY"),
+            "got: {}",
+            added.body
+        );
 
         let listed = get(&mut ctx, &format!("/portal/members?token={token}"));
         assert_eq!(listed.status, 200, "got: {}", listed.body);
-        assert!(listed.body.contains("MEMBER bob ROLE member"), "got: {}", listed.body);
+        assert!(
+            listed.body.contains("MEMBER bob ROLE member"),
+            "got: {}",
+            listed.body
+        );
 
-        let role_changed = post(&mut ctx, "/portal/members/role", &format!("{token}\nbob\nadmin"));
+        let role_changed = post(
+            &mut ctx,
+            "/portal/members/role",
+            &format!("{token}\nbob\nadmin"),
+        );
         assert_eq!(role_changed.status, 200, "got: {}", role_changed.body);
-        assert!(role_changed.body.contains("MEMBER bob ROLE admin"), "got: {}", role_changed.body);
+        assert!(
+            role_changed.body.contains("MEMBER bob ROLE admin"),
+            "got: {}",
+            role_changed.body
+        );
 
         // Role change on an unknown member is refused.
-        let unknown = post(&mut ctx, "/portal/members/role", &format!("{token}\nghost\nadmin"));
+        let unknown = post(
+            &mut ctx,
+            "/portal/members/role",
+            &format!("{token}\nghost\nadmin"),
+        );
         assert_eq!(unknown.status, 404, "got: {}", unknown.body);
 
         // Multi-domain view: one global identity across multiple domains,
         // each with its own per-domain key.
-        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nwork"));
-        post(&mut ctx, "/portal/identity/enroll", &format!("{token}\nhome"));
+        post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nwork"),
+        );
+        post(
+            &mut ctx,
+            "/portal/identity/enroll",
+            &format!("{token}\nhome"),
+        );
         let view = get(&mut ctx, &format!("/portal/identity?token={token}"));
         assert!(view.body.contains("DOMAIN work KEY"), "got: {}", view.body);
         assert!(view.body.contains("DOMAIN home KEY"), "got: {}", view.body);
@@ -3429,21 +5539,35 @@ mod tests {
     fn perform_signed_act_authorizes_wot_reachable_subjects_and_refuses_unreachable_ones() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        let session = ctx.login_session_for(&token).cloned().expect("admitted session");
+        let session = ctx
+            .login_session_for(&token)
+            .cloned()
+            .expect("admitted session");
         let admitted = session.subject.clone();
 
         let before = ctx.act_log.len();
         let event = ctx
             .perform_signed_act(&admitted, "portal:members:write", "MEMBER-ADD bob member")
             .expect("an admitted (WoT-reachable) subject is authorized");
-        assert_eq!(ctx.act_log.len(), before + 1, "exactly one signed event emitted");
-        assert!(ctx.exercised_authority(&admitted).contains("WoT-depth-default"));
+        assert_eq!(
+            ctx.act_log.len(),
+            before + 1,
+            "exactly one signed event emitted"
+        );
+        assert!(ctx
+            .exercised_authority(&admitted)
+            .contains("WoT-depth-default"));
         let _ = event;
 
         let stranger = NodeId::from("never-admitted-stranger");
         let before = ctx.act_log.len();
-        let refused = ctx.perform_signed_act(&stranger, "portal:members:write", "MEMBER-ADD ghost member");
-        assert_eq!(refused, Err(stranger.clone()), "an unreachable subject is refused");
+        let refused =
+            ctx.perform_signed_act(&stranger, "portal:members:write", "MEMBER-ADD ghost member");
+        assert_eq!(
+            refused,
+            Err(stranger.clone()),
+            "an unreachable subject is refused"
+        );
         assert_eq!(ctx.act_log.len(), before, "a refused act emits no event");
         assert_eq!(
             ctx.exercised_authority(&stranger),
@@ -3457,16 +5581,46 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let resp = get(&mut ctx, "/");
         let body = &resp.body;
-        assert!(body.contains("id=\"identity-tile\""), "must render the identity tile");
-        assert!(body.contains("id=\"identity-domain-input\""), "must offer enroll --domain");
-        assert!(body.contains("id=\"identity-rotate-btn\""), "must offer rotate-primary");
-        assert!(body.contains("id=\"identity-recover-btn\""), "must offer recover");
-        assert!(body.contains("id=\"identity-domain-keys\""), "must show per-domain keys");
-        assert!(body.contains("id=\"domain-tile\""), "must render the domain grouping view");
-        assert!(body.contains("id=\"members-tile\""), "must render user/member management");
-        assert!(body.contains("id=\"member-add-form\""), "must offer add/invite");
-        assert!(body.contains("id=\"sessions-tile\""), "must render the session-management panel");
-        assert!(body.contains("id=\"session-list\""), "must render the active-sessions list");
+        assert!(
+            body.contains("id=\"identity-tile\""),
+            "must render the identity tile"
+        );
+        assert!(
+            body.contains("id=\"identity-domain-input\""),
+            "must offer enroll --domain"
+        );
+        assert!(
+            body.contains("id=\"identity-rotate-btn\""),
+            "must offer rotate-primary"
+        );
+        assert!(
+            body.contains("id=\"identity-recover-btn\""),
+            "must offer recover"
+        );
+        assert!(
+            body.contains("id=\"identity-domain-keys\""),
+            "must show per-domain keys"
+        );
+        assert!(
+            body.contains("id=\"domain-tile\""),
+            "must render the domain grouping view"
+        );
+        assert!(
+            body.contains("id=\"members-tile\""),
+            "must render user/member management"
+        );
+        assert!(
+            body.contains("id=\"member-add-form\""),
+            "must offer add/invite"
+        );
+        assert!(
+            body.contains("id=\"sessions-tile\""),
+            "must render the session-management panel"
+        );
+        assert!(
+            body.contains("id=\"session-list\""),
+            "must render the active-sessions list"
+        );
         assert!(
             body.contains("id=\"signout-everywhere-btn\""),
             "must offer sign-out-everywhere"
@@ -3483,7 +5637,6 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
 
-
         // Unauthenticated store is refused.
         let refused = post(&mut ctx, "/portal/layout", "bad-token\n{\"widgets\":[]}");
         assert_eq!(refused.status, 401);
@@ -3495,14 +5648,12 @@ mod tests {
             &format!("{token}\n{{\"widgets\":[\"peers\",\"inbox\"]}}"),
         );
         assert_eq!(stored.status, 200, "got: {}", stored.body);
-        assert!(stored.body.starts_with("LAYOUT-CID "), "got: {}", stored.body);
-        let cid: u64 = stored
-            .body
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
+        assert!(
+            stored.body.starts_with("LAYOUT-CID "),
+            "got: {}",
+            stored.body
+        );
+        let cid: String = stored.body.split_whitespace().nth(1).unwrap().to_owned();
         // The streaming tip (Merkle root) advanced once the op was appended.
         assert_ne!(ctx.layout_tip(), tip_before);
 
@@ -3516,7 +5667,9 @@ mod tests {
         assert_eq!(fetched.status, 200, "got: {}", fetched.body);
         assert!(fetched.body.contains("SIGNER"), "got: {}", fetched.body);
         assert!(
-            fetched.body.contains("CONTENT {\"widgets\":[\"peers\",\"inbox\"]}"),
+            fetched
+                .body
+                .contains("CONTENT {\"widgets\":[\"peers\",\"inbox\"]}"),
             "got: {}",
             fetched.body
         );
@@ -3530,19 +5683,33 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let resp = get(&mut ctx, "/");
         let body = &resp.body;
-        assert!(body.contains("id=\"inbox-list\""), "must render an inbox list container");
+        assert!(
+            body.contains("id=\"inbox-list\""),
+            "must render an inbox list container"
+        );
         assert!(
             body.contains("/bootstrap/request/list"),
             "must fetch the pending request list"
         );
         assert!(
-            body.contains("/bootstrap/request/approve") && body.contains("/bootstrap/request/reject"),
+            body.contains("/bootstrap/request/approve")
+                && body.contains("/bootstrap/request/reject"),
             "must dispatch Approve/Reject through the existing endpoints"
         );
-        assert!(body.contains("Approve") && body.contains("Reject"), "got: {}", body);
+        assert!(
+            body.contains("Approve") && body.contains("Reject"),
+            "got: {}",
+            body
+        );
         // The identity/peer/lease-holder tile is also rendered.
-        assert!(body.contains("id=\"portal-peer-id\""), "must render node identity");
-        assert!(body.contains("id=\"portal-lease-holder\""), "must render lease holder");
+        assert!(
+            body.contains("id=\"portal-peer-id\""),
+            "must render node identity"
+        );
+        assert!(
+            body.contains("id=\"portal-lease-holder\""),
+            "must render lease holder"
+        );
     }
 
     // The shipped bootstrap flow + status semantics still pass unchanged —
@@ -3593,7 +5760,9 @@ mod tests {
         assert_eq!(taken.status, 200, "got: {}", taken.body);
         assert!(taken.body.starts_with("IN-USE"), "got: {}", taken.body);
         assert!(
-            taken.body.contains("cell name already in use — choose another"),
+            taken
+                .body
+                .contains("cell name already in use — choose another"),
             "got: {}",
             taken.body
         );
@@ -3628,7 +5797,10 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let body = get(&mut ctx, "/").body;
         // The pending-state helper exists and gates double-submit + re-enables.
-        assert!(body.contains("withPending"), "must have a pending-state wrapper");
+        assert!(
+            body.contains("withPending"),
+            "must have a pending-state wrapper"
+        );
         assert!(
             body.contains("aria-busy") && body.contains("guard double-submit"),
             "must set a busy state and guard against double-submit"
@@ -3685,8 +5857,7 @@ mod tests {
         // The inbox approval explainer, describing the attestation the approval
         // signs.
         assert!(
-            body.contains("What happens next")
-                && body.contains("signs an attestation"),
+            body.contains("What happens next") && body.contains("signs an attestation"),
             "the approval act must render a what-happens-next explainer"
         );
         assert!(
@@ -3719,7 +5890,9 @@ mod tests {
             listed.body
         );
         assert!(
-            listed.body.contains(&format!("SESSION {first} NODE this-node")),
+            listed
+                .body
+                .contains(&format!("SESSION {first} NODE this-node")),
             "must render the node/domain the session was issued on: {}",
             listed.body
         );
@@ -3736,7 +5909,9 @@ mod tests {
         let listed2 = get(&mut ctx, &format!("/portal/sessions?token={first}"));
         assert!(
             listed2.body.contains(&format!("SESSION {second} "))
-                && listed2.body.contains(&format!("SESSION {second} NODE this-node ISSUED"))
+                && listed2
+                    .body
+                    .contains(&format!("SESSION {second} NODE this-node ISSUED"))
                 && listed2
                     .body
                     .lines()
@@ -3760,33 +5935,66 @@ mod tests {
 
         // The victim session currently admits a bearer action.
         assert_eq!(
-            post(&mut ctx, "/portal/members/add", &format!("{victim}\ndan\nmember")).status,
+            post(
+                &mut ctx,
+                "/portal/members/add",
+                &format!("{victim}\ndan\nmember")
+            )
+            .status,
             200
         );
 
         // Unauthorized revoke attempt (bad caller token) is refused.
         assert_eq!(
-            post(&mut ctx, "/portal/sessions/revoke", &format!("bad-token\n{victim}")).status,
+            post(
+                &mut ctx,
+                "/portal/sessions/revoke",
+                &format!("bad-token\n{victim}")
+            )
+            .status,
             401
         );
         // Revoking an unknown id is refused.
         assert_eq!(
-            post(&mut ctx, "/portal/sessions/revoke", &format!("{survivor}\nno-such-id")).status,
+            post(
+                &mut ctx,
+                "/portal/sessions/revoke",
+                &format!("{survivor}\nno-such-id")
+            )
+            .status,
             404
         );
 
-        let revoked = post(&mut ctx, "/portal/sessions/revoke", &format!("{survivor}\n{victim}"));
+        let revoked = post(
+            &mut ctx,
+            "/portal/sessions/revoke",
+            &format!("{survivor}\n{victim}"),
+        );
         assert_eq!(revoked.status, 200, "got: {}", revoked.body);
-        assert!(revoked.body.contains(&format!("REVOKED {victim}")), "got: {}", revoked.body);
+        assert!(
+            revoked.body.contains(&format!("REVOKED {victim}")),
+            "got: {}",
+            revoked.body
+        );
 
         // The revoked session's bearer actions now fail closed.
         assert_eq!(
-            post(&mut ctx, "/portal/members/add", &format!("{victim}\neve\nmember")).status,
+            post(
+                &mut ctx,
+                "/portal/members/add",
+                &format!("{victim}\neve\nmember")
+            )
+            .status,
             403
         );
         // The surviving sibling session is untouched.
         assert_eq!(
-            post(&mut ctx, "/portal/members/add", &format!("{survivor}\nfrank\nmember")).status,
+            post(
+                &mut ctx,
+                "/portal/members/add",
+                &format!("{survivor}\nfrank\nmember")
+            )
+            .status,
             200
         );
 
@@ -3809,7 +6017,10 @@ mod tests {
         let three = login_alice(&mut ctx);
 
         // Unauthorized revoke-all attempt is refused.
-        assert_eq!(post(&mut ctx, "/portal/sessions/revoke-all", "bad-token").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/sessions/revoke-all", "bad-token").status,
+            401
+        );
 
         let resp = post(&mut ctx, "/portal/sessions/revoke-all", &one);
         assert_eq!(resp.status, 200, "got: {}", resp.body);
@@ -3817,7 +6028,12 @@ mod tests {
 
         for token in [&one, &two, &three] {
             assert_eq!(
-                post(&mut ctx, "/portal/members/add", &format!("{token}\ngrace\nmember")).status,
+                post(
+                    &mut ctx,
+                    "/portal/members/add",
+                    &format!("{token}\ngrace\nmember")
+                )
+                .status,
                 403,
                 "every session must fail closed after sign-out-everywhere"
             );
@@ -3864,7 +6080,11 @@ mod tests {
             "sentence must render the full proof chain back to genesis: {}",
             built.body
         );
-        assert!(built.body.contains("CHAIN "), "must render the CID chain: {}", built.body);
+        assert!(
+            built.body.contains("CHAIN "),
+            "must render the CID chain: {}",
+            built.body
+        );
     }
 
     // An attestation the signer lacks capacity for is refused
@@ -3929,16 +6149,35 @@ mod tests {
 
         // Unauthorized attempts are refused for every custody act.
         assert_eq!(
-            post(&mut ctx, "/portal/custody/migrate", "bad\nalice\nnode-2\ncid-2").status,
+            post(
+                &mut ctx,
+                "/portal/custody/migrate",
+                "bad\nalice\nnode-2\ncid-2"
+            )
+            .status,
             401
         );
-        assert_eq!(post(&mut ctx, "/portal/custody/rotate", "bad\nalice\ncid-3").status, 401);
-        assert_eq!(post(&mut ctx, "/portal/custody/seal", "bad\nalice").status, 401);
-        assert_eq!(post(&mut ctx, "/portal/custody/revoke", "bad\nalice").status, 401);
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/rotate", "bad\nalice\ncid-3").status,
+            401
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/seal", "bad\nalice").status,
+            401
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/custody/revoke", "bad\nalice").status,
+            401
+        );
 
         // Rotate/seal on an unknown handle is refused (no custody record yet).
         assert_eq!(
-            post(&mut ctx, "/portal/custody/rotate", &format!("{token}\nalice\ncid-3")).status,
+            post(
+                &mut ctx,
+                "/portal/custody/rotate",
+                &format!("{token}\nalice\ncid-3")
+            )
+            .status,
             404
         );
         assert_eq!(
@@ -3953,8 +6192,15 @@ mod tests {
             &format!("{token}\nalice\nnode-2\ncid-2"),
         );
         assert_eq!(migrated.status, 200, "got: {}", migrated.body);
-        assert!(migrated.body.contains("MIGRATED alice"), "got: {}", migrated.body);
-        assert_eq!(ctx.custody_of("alice").unwrap().holder, NodeId::from("node-2"));
+        assert!(
+            migrated.body.contains("MIGRATED alice"),
+            "got: {}",
+            migrated.body
+        );
+        assert_eq!(
+            ctx.custody_of("alice").unwrap().holder,
+            NodeId::from("node-2")
+        );
 
         // Rotate now succeeds against the existing record.
         let rotated = post(
@@ -3971,11 +6217,20 @@ mod tests {
         assert!(ctx.custody_of("alice").unwrap().sealed);
 
         // Revoke drops the record; a second revoke is refused (already gone).
-        let revoked = post(&mut ctx, "/portal/custody/revoke", &format!("{token}\nalice"));
+        let revoked = post(
+            &mut ctx,
+            "/portal/custody/revoke",
+            &format!("{token}\nalice"),
+        );
         assert_eq!(revoked.status, 200, "got: {}", revoked.body);
         assert!(ctx.custody_of("alice").is_none());
         assert_eq!(
-            post(&mut ctx, "/portal/custody/revoke", &format!("{token}\nalice")).status,
+            post(
+                &mut ctx,
+                "/portal/custody/revoke",
+                &format!("{token}\nalice")
+            )
+            .status,
             404
         );
     }
@@ -4000,39 +6255,210 @@ mod tests {
 
         // An empty get is a view: zero events.
         let before = ctx.resource_event_count();
-        let empty = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
+        let empty = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=Workload"),
+        );
         assert_eq!(empty.status, 200, "got: {}", empty.body);
-        assert!(empty.body.contains("EVENTS 0"), "a view signs nothing: {}", empty.body);
+        assert!(
+            empty.body.contains("EVENTS 0"),
+            "a view signs nothing: {}",
+            empty.body
+        );
         assert_eq!(ctx.resource_event_count(), before);
 
         // apply → exactly one event.
-        let applied = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        let applied = post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
         assert_eq!(applied.status, 200, "got: {}", applied.body);
         assert!(applied.body.starts_with("EVENT "), "got: {}", applied.body);
         assert_eq!(ctx.resource_event_count(), 1, "one act, one event");
 
         // get now lists the workload, still signing nothing.
-        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
-        assert!(listed.body.contains("Workload/web replicas=1"), "got: {}", listed.body);
-        assert!(listed.body.contains("EVENTS 1"), "a view added no event: {}", listed.body);
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=Workload"),
+        );
+        assert!(
+            listed.body.contains("Workload/web replicas=1"),
+            "got: {}",
+            listed.body
+        );
+        assert!(
+            listed.body.contains("EVENTS 1"),
+            "a view added no event: {}",
+            listed.body
+        );
         assert_eq!(ctx.resource_event_count(), 1);
 
         // edit → one more event.
-        let edited = post(&mut ctx, "/portal/resource/edit", &format!("{token}\nweb\napp:v2"));
+        let edited = post(
+            &mut ctx,
+            "/portal/resource/edit",
+            &format!("{token}\nweb\napp:v2"),
+        );
         assert_eq!(edited.status, 200, "got: {}", edited.body);
         assert_eq!(ctx.resource_event_count(), 2);
 
         // scale → one more event, and the view reflects the new replica count.
-        let scaled = post(&mut ctx, "/portal/resource/scale", &format!("{token}\nweb\n5"));
+        let scaled = post(
+            &mut ctx,
+            "/portal/resource/scale",
+            &format!("{token}\nweb\n5"),
+        );
         assert_eq!(scaled.status, 200, "got: {}", scaled.body);
         assert_eq!(ctx.resource_event_count(), 3);
-        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=Workload"));
-        assert!(listed.body.contains("Workload/web replicas=5"), "got: {}", listed.body);
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=Workload"),
+        );
+        assert!(
+            listed.body.contains("Workload/web replicas=5"),
+            "got: {}",
+            listed.body
+        );
 
         // rollout → one more event.
-        let rolled = post(&mut ctx, "/portal/resource/rollout", &format!("{token}\nweb\n"));
+        let rolled = post(
+            &mut ctx,
+            "/portal/resource/rollout",
+            &format!("{token}\nweb\n"),
+        );
         assert_eq!(rolled.status, 200, "got: {}", rolled.body);
         assert_eq!(ctx.resource_event_count(), 4);
+    }
+
+    // scheduler-apply-admission-registration: a `CronJob` manifest applied
+    // through the REAL production admission route (`POST
+    // /portal/resource/cronjob/apply`) — NOT the `PILLAR_TEST_CRONJOB` rig
+    // hook — is (1) recorded as exactly one decider-authorized signed event,
+    // through the SAME schema-validated resource-plane apply path a Workload
+    // apply rides (schema-checked against the REAL built-in `CronJob` schema
+    // from `pillar_manifest::builtin`), and (2) registered into the LIVE
+    // `SchedulerRuntime` wired via `with_scheduler_runtime`, such that a due
+    // tick ACTUALLY spawns a real child process (a real pid) and the run is
+    // observable in the runtime's real run history — proving the production
+    // apply -> admit -> schedule -> run path end to end.
+    #[tokio::test]
+    async fn a_cronjob_manifest_applied_via_the_real_admission_route_actually_runs() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        let scheduler_runtime = std::sync::Arc::new(std::sync::Mutex::new(
+            pillar_controller::SchedulerRuntime::new(pillar_manifest::scheduler::Scheduler::new(
+                pillar_topology::TierHierarchy::default(),
+            )),
+        ));
+        ctx = ctx.with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime));
+
+        // A real, verified executable on disk — exactly the "verified image
+        // bytes" a production CronJob's `command` names. It exits 0 fast so
+        // the tick window below observes a real completed run.
+        let dir = std::env::temp_dir().join(format!(
+            "pillar-cronjob-admission-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp script dir");
+        let script_path = dir.join("job.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
+
+        // Unauthenticated apply is refused — no event, no registration.
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/portal/resource/cronjob/apply",
+                &format!("nope\nbackup\n0\n{}", script_path.display()),
+            )
+            .status,
+            401
+        );
+
+        // apply via the REAL admission route (no PILLAR_TEST_CRONJOB env var
+        // anywhere in this test) -> exactly one signed event.
+        let before = ctx.resource_event_count();
+        let applied = post(
+            &mut ctx,
+            "/portal/resource/cronjob/apply",
+            &format!("{token}\nbackup\n0\n{}", script_path.display()),
+        );
+        assert_eq!(applied.status, 200, "got: {}", applied.body);
+        assert!(applied.body.starts_with("EVENT "), "got: {}", applied.body);
+        assert_eq!(ctx.resource_event_count(), before + 1, "one act, one event");
+
+        // The manifest is admitted into the resource plane's view like any
+        // other built-in-kind object.
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=CronJob"),
+        );
+        assert!(
+            listed.body.contains("CronJob/backup"),
+            "got: {}",
+            listed.body
+        );
+
+        // The manifest was registered into the LIVE scheduler runtime (the
+        // SAME instance the node's real tick loop drives) — a real tick fires
+        // it as a real child process, whose real exit the reap tick observes.
+        {
+            let mut runtime = scheduler_runtime.lock().unwrap();
+            let fired = runtime
+                .tick(std::time::Instant::now())
+                .await
+                .expect("tick fires the due job");
+            assert_eq!(
+                fired,
+                vec!["backup".to_owned()],
+                "the applied manifest must actually be scheduled and fire"
+            );
+            assert!(
+                runtime.has_live_child("backup"),
+                "a REAL child process must be supervised"
+            );
+            let pid = runtime.run_history()[0].pid.expect("a real OS pid");
+            assert!(pid > 0, "a real pid the kernel scheduled");
+
+            // Wait for the real process to actually exit, then reap.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let reaped = runtime.reap().await.expect("reap");
+            assert_eq!(
+                reaped,
+                vec![("backup".to_owned(), true)],
+                "the real child's real exit must be reported"
+            );
+        }
+
+        // Deleting the manifest via the real admission route deregisters the
+        // job: a further tick never fires it again, even though its schedule
+        // (period 0) is always immediately due.
+        let deleted = post(
+            &mut ctx,
+            "/portal/resource/cronjob/delete",
+            &format!("{token}\nbackup"),
+        );
+        assert_eq!(deleted.status, 200, "got: {}", deleted.body);
+        {
+            let mut runtime = scheduler_runtime.lock().unwrap();
+            let fired = runtime
+                .tick(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+                .expect("tick");
+            assert!(
+                fired.is_empty(),
+                "a deleted CronJob manifest must never fire again"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // An UNAUTHORIZED act (a session whose admitted subject the decider
@@ -4064,13 +6490,25 @@ mod tests {
         );
         let nonce = get(&mut ctx, "/nonce");
         let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
-        let login = post(&mut ctx, "/login", &format!("stranger@pillar\n{PASSWORD}\n{nonce_id}"));
+        let login = post(
+            &mut ctx,
+            "/login",
+            &format!("stranger@pillar\n{PASSWORD}\n{nonce_id}"),
+        );
         assert_eq!(login.status, 200, "got: {}", login.body);
         let token = login.session_token.expect("session token");
 
         let before = ctx.resource_event_count();
-        let refused = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
-        assert_eq!(refused.status, 403, "an unauthorized act must be refused: {}", refused.body);
+        let refused = post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
+        assert_eq!(
+            refused.status, 403,
+            "an unauthorized act must be refused: {}",
+            refused.body
+        );
         assert_eq!(
             ctx.resource_event_count(),
             before,
@@ -4089,12 +6527,24 @@ mod tests {
         let before = ctx.resource_event_count();
         let preview = get(&mut ctx, &format!("/portal/resource/dry-run?token={token}"));
         assert_eq!(preview.status, 200, "got: {}", preview.body);
-        assert!(preview.body.contains("PREDICTED ALLOW"), "got: {}", preview.body);
-        assert_eq!(ctx.resource_event_count(), before, "a dry-run signs nothing");
+        assert!(
+            preview.body.contains("PREDICTED ALLOW"),
+            "got: {}",
+            preview.body
+        );
+        assert_eq!(
+            ctx.resource_event_count(),
+            before,
+            "a dry-run signs nothing"
+        );
 
         // The ENFORCED act then succeeds — the predicted ALLOW matches the
         // enforced outcome (the debug_assert in the handler also checks this).
-        let applied = post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        let applied = post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
         assert_eq!(applied.status, 200, "predicted==enforced: {}", applied.body);
     }
 
@@ -4104,21 +6554,41 @@ mod tests {
     fn describe_renders_provenance_signer_authority_and_event_cid() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
 
         let desc = get(
             &mut ctx,
             &format!("/portal/resource/describe?token={token}&kind=Workload&name=web"),
         );
         assert_eq!(desc.status, 200, "got: {}", desc.body);
-        assert!(desc.body.contains("Signer:"), "provenance signer: {}", desc.body);
-        assert!(desc.body.contains("Event-CID:"), "provenance event CID: {}", desc.body);
+        assert!(
+            desc.body.contains("Signer:"),
+            "provenance signer: {}",
+            desc.body
+        );
+        assert!(
+            desc.body.contains("Event-CID:"),
+            "provenance event CID: {}",
+            desc.body
+        );
         // The signer is the admitted portal subject (the authority that signed).
-        assert!(desc.body.contains("op-subkey-alice"), "signer identity: {}", desc.body);
+        assert!(
+            desc.body.contains("op-subkey-alice"),
+            "signer identity: {}",
+            desc.body
+        );
 
         // Unauthenticated describe is refused.
         assert_eq!(
-            get(&mut ctx, "/portal/resource/describe?token=nope&kind=Workload&name=web").status,
+            get(
+                &mut ctx,
+                "/portal/resource/describe?token=nope&kind=Workload&name=web"
+            )
+            .status,
             401
         );
     }
@@ -4129,18 +6599,35 @@ mod tests {
     fn logs_exec_forward_reach_a_running_workload() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
-        post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1"));
+        post(
+            &mut ctx,
+            "/portal/resource/apply",
+            &format!("{token}\nweb\napp:v1"),
+        );
         let events_after_apply = ctx.resource_event_count();
 
-        let logs = get(&mut ctx, &format!("/portal/resource/logs?token={token}&name=web"));
+        let logs = get(
+            &mut ctx,
+            &format!("/portal/resource/logs?token={token}&name=web"),
+        );
         assert_eq!(logs.status, 200, "got: {}", logs.body);
-        assert!(logs.body.contains("LOGS Workload/web"), "got: {}", logs.body);
+        assert!(
+            logs.body.contains("LOGS Workload/web"),
+            "got: {}",
+            logs.body
+        );
 
-        let exec = get(&mut ctx, &format!("/portal/resource/exec?token={token}&name=web&cmd=sh"));
+        let exec = get(
+            &mut ctx,
+            &format!("/portal/resource/exec?token={token}&name=web&cmd=sh"),
+        );
         assert_eq!(exec.status, 200, "got: {}", exec.body);
         assert!(exec.body.contains("EXEC sh"), "got: {}", exec.body);
 
-        let fwd = get(&mut ctx, &format!("/portal/resource/forward?token={token}&name=web&port=8080"));
+        let fwd = get(
+            &mut ctx,
+            &format!("/portal/resource/forward?token={token}&name=web&port=8080"),
+        );
         assert_eq!(fwd.status, 200, "got: {}", fwd.body);
         assert!(fwd.body.contains("FORWARD 8080"), "got: {}", fwd.body);
 
@@ -4149,10 +6636,17 @@ mod tests {
 
         // A missing workload is refused; unauthenticated reach is refused.
         assert_eq!(
-            get(&mut ctx, &format!("/portal/resource/logs?token={token}&name=ghost")).status,
+            get(
+                &mut ctx,
+                &format!("/portal/resource/logs?token={token}&name=ghost")
+            )
+            .status,
             404
         );
-        assert_eq!(get(&mut ctx, "/portal/resource/logs?token=nope&name=web").status, 401);
+        assert_eq!(
+            get(&mut ctx, "/portal/resource/logs?token=nope&name=web").status,
+            401
+        );
     }
 
     // The resource UI is polymorphic over an IDENTITY kind too, using the SAME
@@ -4165,7 +6659,10 @@ mod tests {
         // identity object directly through the shared plane substrate.
         let sub = ctx.identity_actor_for_test();
         ctx.apply_identity_for_test(&sub, "alice");
-        let listed = get(&mut ctx, &format!("/portal/resource/get?token={token}&kind=User"));
+        let listed = get(
+            &mut ctx,
+            &format!("/portal/resource/get?token={token}&kind=User"),
+        );
         assert_eq!(listed.status, 200, "got: {}", listed.body);
         assert!(listed.body.contains("User/alice"), "got: {}", listed.body);
     }
@@ -4185,21 +6682,34 @@ mod tests {
             &format!("{token}\nworkload-grid: [web, db]"),
         );
         assert_eq!(stored.status, 200, "got: {}", stored.body);
-        assert!(stored.body.contains("LAYOUT-CID "), "content address: {}", stored.body);
-        assert!(stored.body.contains(" TIP "), "streaming tip: {}", stored.body);
+        assert!(
+            stored.body.contains("LAYOUT-CID "),
+            "content address: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains(" TIP "),
+            "streaming tip: {}",
+            stored.body
+        );
         let cid = stored
             .body
             .split_whitespace()
             .nth(1)
             .expect("cid token")
             .to_owned();
-        let fetched = get(
-            &mut ctx,
-            &format!("/portal/layout?token={token}&cid={cid}"),
-        );
+        let fetched = get(&mut ctx, &format!("/portal/layout?token={token}&cid={cid}"));
         assert_eq!(fetched.status, 200, "got: {}", fetched.body);
-        assert!(fetched.body.contains("SIGNER "), "signed by its author: {}", fetched.body);
-        assert!(fetched.body.contains("workload-grid"), "content preserved: {}", fetched.body);
+        assert!(
+            fetched.body.contains("SIGNER "),
+            "signed by its author: {}",
+            fetched.body
+        );
+        assert!(
+            fetched.body.contains("workload-grid"),
+            "content preserved: {}",
+            fetched.body
+        );
     }
 
     // The topology explorer renders the derived tier tree (config-ordered
@@ -4209,15 +6719,24 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
 
-        assert_eq!(get(&mut ctx, "/portal/topology/tree?token=nope").status, 401);
+        assert_eq!(
+            get(&mut ctx, "/portal/topology/tree?token=nope").status,
+            401
+        );
 
         ctx.topology_declare(
             NodeId::from("node-a"),
-            vec![TopologyLabel::new("rack", "r1"), TopologyLabel::new("zone", "z1")],
+            vec![
+                TopologyLabel::new("rack", "r1"),
+                TopologyLabel::new("zone", "z1"),
+            ],
         );
         ctx.topology_declare(
             NodeId::from("node-b"),
-            vec![TopologyLabel::new("rack", "r2"), TopologyLabel::new("zone", "z1")],
+            vec![
+                TopologyLabel::new("rack", "r2"),
+                TopologyLabel::new("zone", "z1"),
+            ],
         );
         ctx.topology_register_node("node-a", "ok", 10);
         ctx.topology_register_node("node-b", "degraded", 20);
@@ -4227,10 +6746,15 @@ mod tests {
             &format!("/portal/topology/tree?token={token}&rollup-tier=rack"),
         );
         assert_eq!(view.status, 200, "got: {}", view.body);
-        assert!(view.body.starts_with("TIERS region,zone,site,room,cage,rack,chassis,node"));
+        assert!(view
+            .body
+            .starts_with("TIERS region,zone,site,room,cage,rack,chassis,node"));
         assert!(
-            view.body.contains("NODE node-a PATH rack=r1,zone=z1 HEALTH ok CAPACITY 10")
-                || view.body.contains("NODE node-a PATH zone=z1,rack=r1 HEALTH ok CAPACITY 10"),
+            view.body
+                .contains("NODE node-a PATH rack=r1,zone=z1 HEALTH ok CAPACITY 10")
+                || view
+                    .body
+                    .contains("NODE node-a PATH zone=z1,rack=r1 HEALTH ok CAPACITY 10"),
             "got: {}",
             view.body
         );
@@ -4239,8 +6763,16 @@ mod tests {
             "got: {}",
             view.body
         );
-        assert!(view.body.contains("ROLLUP rack r1=10\n"), "got: {}", view.body);
-        assert!(view.body.contains("ROLLUP rack r2=20\n"), "got: {}", view.body);
+        assert!(
+            view.body.contains("ROLLUP rack r1=10\n"),
+            "got: {}",
+            view.body
+        );
+        assert!(
+            view.body.contains("ROLLUP rack r2=20\n"),
+            "got: {}",
+            view.body
+        );
     }
 
     // The label editor emits signed label/attestation events — the attested
@@ -4275,20 +6807,26 @@ mod tests {
             &format!("{token}\nowner\ncell-authority@cell-b\n\nnode-7\nrack\nr7\ncell-b"),
         );
         assert_eq!(attested.status, 200, "got: {}", attested.body);
-        assert!(attested.body.starts_with("ATTESTED CID "), "got: {}", attested.body);
+        assert!(
+            attested.body.starts_with("ATTESTED CID "),
+            "got: {}",
+            attested.body
+        );
 
         // The attested label is now the trust-graph's edge too (reuses the
         // SAME attest primitive, no new signing plane).
         let graph = get(&mut ctx, &format!("/portal/trust-graph?token={token}"));
         assert!(
-            graph.body.contains("EDGE owner -> node-7 ")
-                && graph.body.contains("rack=r7"),
+            graph.body.contains("EDGE owner -> node-7 ") && graph.body.contains("rack=r7"),
             "got: {}",
             graph.body
         );
 
         // The mismatch view surfaces the declared-vs-attested disagreement.
-        let mismatches = get(&mut ctx, &format!("/portal/topology/mismatches?token={token}"));
+        let mismatches = get(
+            &mut ctx,
+            &format!("/portal/topology/mismatches?token={token}"),
+        );
         assert_eq!(mismatches.status, 200, "got: {}", mismatches.body);
         assert!(
             mismatches
@@ -4316,9 +6854,21 @@ mod tests {
             &format!("/portal/topology/failure-domain?token={token}&tier=rack&nodes=a,b"),
         );
         assert_eq!(warned.status, 200, "got: {}", warned.body);
-        assert!(warned.body.contains("REPLICA a rack=r1"), "got: {}", warned.body);
-        assert!(warned.body.contains("REPLICA b rack=r1"), "got: {}", warned.body);
-        assert!(warned.body.contains("WARN same-rack"), "got: {}", warned.body);
+        assert!(
+            warned.body.contains("REPLICA a rack=r1"),
+            "got: {}",
+            warned.body
+        );
+        assert!(
+            warned.body.contains("REPLICA b rack=r1"),
+            "got: {}",
+            warned.body
+        );
+        assert!(
+            warned.body.contains("WARN same-rack"),
+            "got: {}",
+            warned.body
+        );
 
         // a, c span distinct racks: no warning.
         let ok = get(
@@ -4381,6 +6931,180 @@ mod tests {
             fetched.body.contains("topology-dashboard"),
             "got: {}",
             fetched.body
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-feature UI CONFIRMATION suite (one test per banked `ui-*` task).
+    //
+    // Retargeted (yew-panel-migration) off the static `web_login.html`
+    // fixture onto the real Yew-served build: these assert the COMPILED
+    // `wasm32-unknown-unknown` binary of `pillar-frontend` (the crate that
+    // mounts `pillar_web_frontend::router::Shell`, which in turn renders one
+    // `Panel` per `pillar_web_frontend::panels::ALL_PANELS` entry) embeds
+    // every banked feature's endpoint(s) as a real string literal. An
+    // endpoint that exists server-side but is never fetched by a panel is
+    // invisible to the user, so asserting the dispatch handler alone is not
+    // enough -- each test asserts the ACTUAL Yew build's wasm binary
+    // contains the feature's `/portal/*`/`/bootstrap/*` endpoint path. Not
+    // fakeable with a dead `<div>`: the fetch URL literal only ends up in the
+    // compiled wasm if a `Panel`/`PanelAction` really wires it
+    // (`crates/pillar-web-frontend/src/panels.rs`).
+    // ---------------------------------------------------------------------
+
+    /// Builds `pillar-frontend` for `wasm32-unknown-unknown` exactly once
+    /// (subsequent calls reuse the cached binary contents) and returns its
+    /// wasm bytes, lossily decoded to UTF-8 -- string literals compiled into
+    /// wasm land verbatim in the binary's data section, so a plain substring
+    /// search over the lossy decode is a real, non-fakeable proof that the
+    /// literal is embedded (mirrors the old `assert_ui_wires`' substring
+    /// search over the served HTML page, just against the new build
+    /// artifact).
+    fn built_frontend_wasm() -> &'static str {
+        use std::sync::OnceLock;
+        static WASM_TEXT: OnceLock<String> = OnceLock::new();
+        WASM_TEXT.get_or_init(|| {
+            let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let frontend_dir = manifest_dir
+                .parent()
+                .expect("crates/ parent")
+                .join("pillar-frontend");
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--target", "wasm32-unknown-unknown"])
+                .current_dir(&frontend_dir)
+                .status()
+                .expect(
+                    "failed to invoke cargo to build pillar-frontend for \
+                     wasm32-unknown-unknown -- is the wasm32-unknown-unknown \
+                     target installed? `rustup target add \
+                     wasm32-unknown-unknown`",
+                );
+            assert!(
+                status.success(),
+                "pillar-frontend failed to build for wasm32-unknown-unknown"
+            );
+            let wasm_path =
+                frontend_dir.join("target/wasm32-unknown-unknown/debug/pillar_frontend.wasm");
+            let bytes = std::fs::read(&wasm_path).unwrap_or_else(|e| {
+                panic!("failed to read built wasm at {}: {e}", wasm_path.display())
+            });
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    }
+
+    // Assert the compiled Yew wasm build contains every one of `needles`.
+    fn assert_ui_wires(feature: &str, needles: &[&str]) {
+        let wasm_text = built_frontend_wasm();
+        for n in needles {
+            assert!(
+                wasm_text.contains(n),
+                "the built Yew portal UI is missing the {feature} feature: \
+                 pillar-frontend's compiled wasm does not embed `{n}` -- the \
+                 endpoint may exist server-side but no panel ever fetches it \
+                 (see crates/pillar-web-frontend/src/panels.rs)"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_confirms_request_inbox_panel() {
+        assert_ui_wires(
+            "request-inbox",
+            &["/bootstrap/request/list", "inbox-approve", "inbox-reject"],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_identity_panel() {
+        assert_ui_wires(
+            "identity",
+            &[
+                "/portal/identity",
+                "/portal/identity/enroll",
+                "/portal/identity/rotate",
+                "/portal/identity/recover",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_domain_panel() {
+        assert_ui_wires("domain", &["/portal/domains"]);
+    }
+
+    #[test]
+    fn ui_confirms_member_management_panel() {
+        assert_ui_wires(
+            "member-management",
+            &["/portal/members", "/portal/members/add"],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_session_management_panel() {
+        assert_ui_wires(
+            "session-management",
+            &[
+                "/portal/sessions",
+                "/portal/sessions/revoke",
+                "/portal/sessions/revoke-all",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_trust_and_key_builder_panel() {
+        assert_ui_wires(
+            "trust-and-key-builders",
+            &[
+                "/portal/trust-graph",
+                "/portal/attestations/build",
+                "/portal/custody/rotate",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_resource_workload_panel() {
+        assert_ui_wires(
+            "resource-workload",
+            &[
+                "/portal/resource/get",
+                "/portal/resource/apply",
+                "/portal/resource/dry-run",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_topology_explorer_panel() {
+        assert_ui_wires(
+            "topology-explorer",
+            &[
+                "/portal/topology/tree",
+                "/portal/topology/label/attest",
+                "/portal/topology/failure-domain",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_observability_panel() {
+        assert_ui_wires(
+            "observability",
+            &[
+                "/portal/obs/explore",
+                "/portal/obs/query",
+                "/portal/obs/dashboard",
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_confirms_swarm_panel() {
+        assert_ui_wires(
+            "swarm",
+            &["/portal/swarm", "/portal/swarm/generate"],
         );
     }
 }

@@ -9,21 +9,140 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # fmt + clippy + test all run through the flake devShell (`nix develop`), so
+  # they share ONE reproducible toolchain pinned by flake.lock (rustfmt / clippy
+  # / cargo from nixpkgs). The HARDWARE custody backends (tss-esapi, cryptoki,
+  # ctap-hid-fido2) are opt-in Cargo features that are OFF here: this lane never
+  # compiles the bindgen crates (tss-esapi-sys, cryptoki-sys), their libclang
+  # build-time requirement, or the native libs (tpm2-tss, hidapi) — it stays
+  # lean. HSM compilation is validated separately by the `hsm-build` job below
+  # and by the distribution image build (`build-image.yaml`, which builds
+  # `-p pillar-cli --features hsm`).
   rust:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/git/bash/coreutils
+    env:
+      # The nixery shell image has no /etc/passwd entry or writable /root for
+      # the runner uid; point HOME at a dir Actions provisions writable.
+      HOME: /github/home
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          # actions/checkout needs a node runtime this image lacks; bare-clone
+          # instead. github's git-over-HTTP wants the token as the basic-auth
+          # password, so embed it as x-access-token in the URL.
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          # Flakes on; disable build-users-group since this single-container CI
+          # has no nixbld users provisioned (same as the image-build workflow).
+          printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > ~/.config/nix/nix.conf
+          # nix's home/user resolution consults getpwuid; the image has no
+          # passwd entry for the runner uid, so add one.
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+
       - name: rustfmt
-        run: cargo fmt --all -- --check
+        run: nix develop -c bash -c 'cargo fmt --all -- --check'
+
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: nix develop -c bash -c 'cargo clippy --workspace --all-targets -- -D warnings'
+
       - name: test
-        run: cargo test --all
+        run: nix develop -c bash -c 'cargo test --all'
+
+  # Dedicated guard that the OPT-IN hardware custody backends still compile and
+  # lint cleanly, so the main distribution (which ships them via
+  # `-p pillar-cli --features hsm`) can never silently break. Scoped to
+  # pillar-crypto with `--features hsm` — the only crate carrying feature-gated
+  # device code — so it compiles the three HSM crates ONCE rather than the whole
+  # workspace under `--all-features`. Kept out of the `rust` lane above so the
+  # everyday fmt/clippy/test path stays free of the bindgen/native-lib cost.
+  hsm-build:
+    name: hsm feature compile guard
+    runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/git/bash/coreutils
+    env:
+      HOME: /github/home
+    steps:
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > ~/.config/nix/nix.conf
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+
+      - name: clippy (hsm features)
+        run: nix develop -c bash -c 'cargo clippy -p pillar-crypto --features hsm --all-targets -- -D warnings'
+
+      - name: test (hsm features)
+        run: nix develop -c bash -c 'cargo test -p pillar-crypto --features hsm'
+
+  # The MERGE-BLOCKING feature-realness gate (ROI Priority 0, "The hard gate:
+  # feature-realness, enforced at merge"). A dedicated, REQUIRED status check so
+  # a model-as-feature offender cannot merge: the static realness scan (a no-op
+  # reconcile that reports success, a stand-in/placeholder payload used as real
+  # data, or a modeled run/fetch/bind/resolve/forward with no real syscall) plus
+  # the plan-level verb-claim/attempts=0 lints, all pinned RED-then-GREEN by the
+  # crate's own fixtures. Kept as its OWN job (not just folded into the `rust`
+  # test lane) so branch protection can require it by name and it fails loudly.
+  feature-realness-gate:
+    name: feature-realness gate (merge-blocking)
+    runs-on: ubuntu-latest
+    container:
+      image: nixery.dev/shell/nix/git/bash/coreutils
+    env:
+      HOME: /github/home
+    steps:
+      - name: Checkout pillar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          git config --global --add safe.directory "$(pwd)"
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Enable nix flakes
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/nix
+          printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' > ~/.config/nix/nix.conf
+          if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+            echo "root:x:0:0:root:${HOME}:/bin/sh" >> /etc/passwd
+          fi
+
+      - name: feature-realness gate
+        run: nix develop -c bash -c 'cargo test -p pillar-realness-gate'
 
   tlc:
     name: TLA+ model check

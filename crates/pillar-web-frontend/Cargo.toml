@@ -1,0 +1,115 @@
+# pillar-web-frontend — the pillar web portal's design system + component
+# library.
+#
+# This crate is the canonical portal-frontend package (`cargo test -p
+# pillar-web-frontend` is the definition-of-done for every Yew-foundation
+# task). It is DELIBERATELY host-testable: the design system is expressed as
+# pure Rust that builds `stylist` (CSS-in-Rust) `Style` values from a set of
+# design tokens, so the emitted, scoped CSS can be asserted on the native
+# target with a plain `cargo test` — no browser, no wasm runner, no npm/Node.
+#
+# The Yew (client-side-rendered) components that consume these styles compile on
+# both the native host (behind the default `yew` feature, so they typecheck in
+# CI) and `wasm32-unknown-unknown` (where `trunk`/`wasm-bindgen` bundle them for
+# the actual portal — that bundling lives in the separate, workspace-excluded
+# `pillar-frontend` crate). Nothing here embeds an infrastructure identifier.
+[package]
+name = "pillar-web-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "pillar web portal design system + Yew component library"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["yew"]
+# The Yew component wrappers around the design-system styles. On by default so
+# `cargo test -p pillar-web-frontend` typechecks the components on the host; the
+# wasm bundle build turns them into real DOM.
+yew = [
+    "dep:yew",
+    "dep:yew-router",
+    "dep:web-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:gloo-net",
+    "dep:base64",
+]
+
+[dependencies]
+# The real PSL structured-AST builder/parser (`pillar_observability::psl`) and
+# the metadata-index typeahead source (`pillar_observability::metadata_index`)
+# the Explore query builders compose against — never a second, parallel query
+# model or a fabricated autofill list.
+pillar-observability = { path = "../pillar-observability" }
+# The built-in resource-definition schema registry (`pillar_manifest::builtin`)
+# a Dashboard resource validates against, and the `Crd`/`Metadata` body a
+# Dashboard renders to — a Dashboard is one of the natively-registered
+# `BuiltinKind`s, so it reuses the SAME schema/validation path a third-party
+# CRD does rather than inventing a parallel manifest model.
+pillar-manifest = { path = "../pillar-manifest" }
+# stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
+# `parser` feature lets us build a `Style` from a raw CSS &str on the NATIVE
+# target (host `cargo test`), which is what makes the design system host-
+# testable; `yew` wires the styling into Yew components.
+stylist = { version = "0.13", features = ["parser", "yew"] }
+yew = { version = "0.21", features = ["csr"], optional = true }
+# yew-router provides the client-side router (BrowserRouter/Switch) the app
+# shell uses to dispatch between panels; the auth guard sits in front of its
+# Switch to redirect an unauthenticated request for a protected route to the
+# login screen.
+yew-router = { version = "0.18", optional = true }
+# web-sys + wasm-bindgen back the Card's mouse-tracking spotlight (reading the
+# element rect and writing the `--spot-x/--spot-y` custom properties), and
+# (with the WebAuthn features below) the real `navigator.credentials`
+# register/sign-in ceremony. Optional, pulled in only with the `yew` feature;
+# the design-system tests do not need them. wasm-bindgen is pinned to the
+# flake's `wasm-bindgen-cli` version.
+web-sys = { version = "0.3", optional = true, features = [
+    "DomRect",
+    "CssStyleDeclaration",
+    "HtmlElement",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Window",
+    "Navigator",
+    "CredentialsContainer",
+    "Credential",
+    "CredentialCreationOptions",
+    "CredentialRequestOptions",
+    "PublicKeyCredential",
+    "PublicKeyCredentialCreationOptions",
+    "PublicKeyCredentialRequestOptions",
+    "PublicKeyCredentialRpEntity",
+    "PublicKeyCredentialUserEntity",
+    "PublicKeyCredentialParameters",
+    "PublicKeyCredentialType",
+    "AuthenticatorResponse",
+    "AuthenticatorAttestationResponse",
+    "AuthenticatorAssertionResponse",
+    "AuthenticationExtensionsClientOutputs",
+] }
+wasm-bindgen = { version = "=0.2.121", optional = true }
+# Bridges the JS `fetch` `Promise` to a Rust `Future` for the panels' list/
+# primary-action round trips (`crate::panels`), and awaits the `Promise`s
+# `navigator.credentials.create()/get()` return.
+wasm-bindgen-futures = { version = "0.4", optional = true }
+# `js_sys::{Array, Object, Reflect, Uint8Array}` build the WebAuthn options
+# objects and read back the attestation/assertion `ArrayBuffer` fields.
+js-sys = { version = "0.3", optional = true }
+# The real `POST /webauthn/*` transport (`BrowserTransport`).
+gloo-net = { version = "0.4", optional = true }
+# base64url encode/decode for the RP's wire challenge/credential fields.
+base64 = { version = "0.22", optional = true }
+
+[lints]
+workspace = true

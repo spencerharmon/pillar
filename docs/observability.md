@@ -152,6 +152,14 @@ a second gossip protocol, or a second authority/RBAC decider for
 observability signals — any such need is a bug in this design, not a license
 to fork.
 
+## Querying signals: PSL
+
+Signals materialized by this design are queried through **PSL**, Pillar's
+built-in query language — see
+[`query-languages/psl.md`](query-languages/psl.md) for the compact-text and
+structured surfaces, the `select`/`where`/`range`/`correlate` grammar, and a
+worked example against the correlation spine described above.
+
 ## Spec
 
 [`specs/Observability.tla`](../specs/Observability.tla) /

@@ -31,10 +31,9 @@
 
 pub mod key_login;
 pub mod node_custody;
+pub mod webauthn;
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, TcpListener};
 
 use pillar_manifest::{Crd, Value};
@@ -84,7 +83,11 @@ impl AuthMode {
     /// [`AuthError::NotLocalhost`] if the peer is not loopback;
     /// [`AuthError::SecondFactorRequired`] in [`AuthMode::SecondFactor`] mode
     /// when `second_factor` is absent or does not match.
-    pub fn authorize(&self, peer: &SocketAddr, second_factor: Option<&str>) -> Result<(), AuthError> {
+    pub fn authorize(
+        &self,
+        peer: &SocketAddr,
+        second_factor: Option<&str>,
+    ) -> Result<(), AuthError> {
         if !peer.ip().is_loopback() {
             return Err(AuthError::NotLocalhost);
         }
@@ -114,12 +117,29 @@ impl From<&str> for PasskeyCredential {
     }
 }
 
-fn deterministic_digest(parts: &[&str]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+/// A real, collision-resistant digest over `parts`, backed by the shared
+/// [`pillar_crypto::content::content_address`] primitive (a 256-bit SHA2-256
+/// multihash today) rather than a non-cryptographic `DefaultHasher`. The
+/// parts are length-prefixed before hashing so distinct field boundaries can
+/// never alias (`["ab","c"]` and `["a","bc"]` hash differently), then the
+/// wide digest bytes are rendered as lowercase hex.
+///
+/// The output is `>= 64` hex chars (>= 256 bits): the content address is at
+/// least 32 bytes wide by contract, plus a multihash `<code><len>` prefix.
+fn deterministic_digest(parts: &[&str]) -> String {
+    let mut preimage = Vec::new();
     for part in parts {
-        part.hash(&mut hasher);
+        let bytes = part.as_bytes();
+        preimage.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        preimage.extend_from_slice(bytes);
     }
-    hasher.finish()
+    let address =
+        pillar_crypto::content::content_address(&preimage).expect("content_address is infallible");
+    address
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A passkey/WebAuthn authenticator relying party: registers credentials and
@@ -136,7 +156,7 @@ fn deterministic_digest(parts: &[&str]) -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct PasskeyAuthenticator {
     // credential id -> the public verifier derived at registration time.
-    credentials: HashMap<PasskeyCredential, u64>,
+    credentials: HashMap<PasskeyCredential, String>,
 }
 
 impl PasskeyAuthenticator {
@@ -150,7 +170,11 @@ impl PasskeyAuthenticator {
     /// given the authenticator's private secret. Only the resulting
     /// [`PasskeyCredential`] and its derived public verifier are retained;
     /// the secret itself is never stored server-side.
-    pub fn register(&mut self, credential: impl Into<PasskeyCredential>, secret: &str) -> PasskeyCredential {
+    pub fn register(
+        &mut self,
+        credential: impl Into<PasskeyCredential>,
+        secret: &str,
+    ) -> PasskeyCredential {
         let credential = credential.into();
         let verifier = deterministic_digest(&["pillar-passkey-register", &credential.0, secret]);
         self.credentials.insert(credential.clone(), verifier);
@@ -172,11 +196,11 @@ impl PasskeyAuthenticator {
     /// verifies regardless of secret.
     #[must_use]
     pub fn assert(&self, credential: &PasskeyCredential, challenge: &str, response: &str) -> bool {
-        let Some(&verifier) = self.credentials.get(credential) else {
+        let Some(verifier) = self.credentials.get(credential) else {
             return false;
         };
-        let expected = deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()]);
-        response == expected.to_string()
+        let expected = deterministic_digest(&["pillar-passkey-assert", challenge, verifier]);
+        response == expected
     }
 
     /// Compute the response an authenticator holding `secret` for
@@ -185,7 +209,7 @@ impl PasskeyAuthenticator {
     #[must_use]
     pub fn sign_challenge(credential: &PasskeyCredential, secret: &str, challenge: &str) -> String {
         let verifier = deterministic_digest(&["pillar-passkey-register", &credential.0, secret]);
-        deterministic_digest(&["pillar-passkey-assert", challenge, &verifier.to_string()]).to_string()
+        deterministic_digest(&["pillar-passkey-assert", challenge, &verifier])
     }
 }
 
@@ -252,7 +276,12 @@ pub fn declared_second_factor_provider(manifest: &Crd) -> Option<&str> {
 /// verifies `presented` against it. `false` if the manifest declares no
 /// provider, or names one that is not registered.
 #[must_use]
-pub fn second_factor_honored(providers: &SecondFactorProviders, manifest: &Crd, user: &str, presented: &str) -> bool {
+pub fn second_factor_honored(
+    providers: &SecondFactorProviders,
+    manifest: &Crd,
+    user: &str,
+    presented: &str,
+) -> bool {
     match declared_second_factor_provider(manifest) {
         Some(name) => providers.verify(name, user, presented),
         None => false,
@@ -303,10 +332,15 @@ pub fn authorize_signing_action(
         return Err(AuthError::NotLocalhost);
     }
     let verified = match gate {
-        SigningGate::Passkey { authenticator, credential } => authenticator.assert(credential, challenge, presented),
-        SigningGate::ExternalProvider { providers, manifest, user } => {
-            second_factor_honored(providers, manifest, user, presented)
-        }
+        SigningGate::Passkey {
+            authenticator,
+            credential,
+        } => authenticator.assert(credential, challenge, presented),
+        SigningGate::ExternalProvider {
+            providers,
+            manifest,
+            user,
+        } => second_factor_honored(providers, manifest, user, presented),
     };
     if verified {
         Ok(())
@@ -488,8 +522,8 @@ mod tests {
 
     #[test]
     fn bind_web_binds_a_non_loopback_address_on_an_ephemeral_port() {
-        let listener =
-            bind_web(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0).expect("bind an ephemeral non-loopback port");
+        let listener = bind_web(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
+            .expect("bind an ephemeral non-loopback port");
         let addr = listener.local_addr().expect("local_addr");
         assert!(!addr.ip().is_loopback());
     }
@@ -504,7 +538,10 @@ mod tests {
 
     #[test]
     fn loopback_signing_action_keeps_the_bootstrap_exemption_even_without_a_session() {
-        assert_eq!(authorize_nonloopback_signing_action(&loopback(8080), None), Ok(()));
+        assert_eq!(
+            authorize_nonloopback_signing_action(&loopback(8080), None),
+            Ok(())
+        );
     }
 
     #[test]
@@ -536,7 +573,15 @@ mod tests {
         actor.refresh(&authority);
 
         let session = verifier
-            .admit(&nonce, &signature, &subkey, issuer.origin(), 0, &authority, &actor)
+            .admit(
+                &nonce,
+                &signature,
+                &subkey,
+                issuer.origin(),
+                0,
+                &authority,
+                &actor,
+            )
             .expect("admitted");
 
         assert_eq!(
@@ -548,17 +593,22 @@ mod tests {
     #[test]
     fn passkey_registration_and_assertion_gates_a_signing_action() {
         let mut authenticator = PasskeyAuthenticator::new();
-        let credential = authenticator.register(PasskeyCredential::from("cred-1"), "authenticator-secret");
+        let credential =
+            authenticator.register(PasskeyCredential::from("cred-1"), "authenticator-secret");
         assert!(authenticator.is_registered(&credential));
 
         let challenge = "sign-node-42";
-        let response = PasskeyAuthenticator::sign_challenge(&credential, "authenticator-secret", challenge);
+        let response =
+            PasskeyAuthenticator::sign_challenge(&credential, "authenticator-secret", challenge);
 
         let gate = SigningGate::Passkey {
             authenticator: &authenticator,
             credential: &credential,
         };
-        assert_eq!(authorize_signing_action(&loopback(8080), &gate, challenge, &response), Ok(()));
+        assert_eq!(
+            authorize_signing_action(&loopback(8080), &gate, challenge, &response),
+            Ok(())
+        );
     }
 
     #[test]
@@ -608,6 +658,104 @@ mod tests {
         );
     }
 
+    /// The passkey verifier/response digest must be a REAL cryptographic
+    /// digest — at least 256 bits wide (>= 64 hex chars). A 64-bit
+    /// `DefaultHasher` (16 hex chars) would fail this.
+    #[test]
+    fn passkey_digest_is_at_least_256_bits_wide() {
+        let digest = PasskeyAuthenticator::sign_challenge(
+            &PasskeyCredential::from("cred-width"),
+            "secret",
+            "challenge",
+        );
+        assert!(
+            digest.len() >= 64,
+            "a passkey digest must be >= 256 bits (>= 64 hex chars), got {} hex chars",
+            digest.len()
+        );
+    }
+
+    /// Adversarial fixtures: distinct credential/secret/challenge inputs must
+    /// never collide to the same response digest. A non-cryptographic
+    /// stand-in (or a field-boundary aliasing bug) would collide here.
+    #[test]
+    fn distinct_passkey_inputs_never_collide() {
+        let mut digests = std::collections::HashSet::new();
+        let creds = ["a", "b", "ab", "cred-x", "cred-y"];
+        let secrets = ["s", "secret", "se", "cret"];
+        let challenges = ["c", "chal", "ch", "al"];
+        let mut count = 0usize;
+        for cred in creds {
+            for secret in secrets {
+                for challenge in challenges {
+                    let d = PasskeyAuthenticator::sign_challenge(
+                        &PasskeyCredential::from(cred),
+                        secret,
+                        challenge,
+                    );
+                    assert!(
+                        digests.insert(d),
+                        "collision for cred={cred:?} secret={secret:?} challenge={challenge:?}"
+                    );
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(digests.len(), count, "every distinct input must be unique");
+    }
+
+    /// A field-boundary aliasing adversary: `["ab","c"]` vs `["a","bc"]` must
+    /// not produce the same digest. Length-prefixing the parts guarantees it;
+    /// naive concatenation would collide. This asserts the digest is bound to
+    /// the real, length-delimited field structure.
+    #[test]
+    fn passkey_digest_resists_field_boundary_aliasing() {
+        let d1 = PasskeyAuthenticator::sign_challenge(
+            &PasskeyCredential::from("ab"),
+            "c",
+            "shared-challenge",
+        );
+        let d2 = PasskeyAuthenticator::sign_challenge(
+            &PasskeyCredential::from("a"),
+            "bc",
+            "shared-challenge",
+        );
+        assert_ne!(d1, d2, "field-boundary aliasing must not collide");
+    }
+
+    /// The digest must be produced by the real shared content-addressing
+    /// primitive (a >=256-bit SHA2-256 multihash), not `DefaultHasher`. We
+    /// pin the exact hex a `sign_challenge` invocation yields so a regression
+    /// back to a non-cryptographic hash (which produces different, narrower
+    /// output) fails loudly.
+    #[test]
+    fn passkey_digest_matches_the_real_content_primitive() {
+        // Recompute the same preimage `deterministic_digest` builds, run it
+        // through the real primitive directly, and confirm they agree.
+        let cred = PasskeyCredential::from("cred-pin");
+        let secret = "pin-secret";
+        let challenge = "pin-challenge";
+        let response = PasskeyAuthenticator::sign_challenge(&cred, secret, challenge);
+
+        let verifier = deterministic_digest(&["pillar-passkey-register", &cred.0, secret]);
+        let expected = deterministic_digest(&["pillar-passkey-assert", challenge, &verifier]);
+        assert_eq!(response, expected);
+
+        // And the primitive underneath is the crypto crate's content address,
+        // not a std hasher.
+        let mut preimage = Vec::new();
+        for part in ["pillar-passkey-assert", challenge, &verifier] {
+            let bytes = part.as_bytes();
+            preimage.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            preimage.extend_from_slice(bytes);
+        }
+        let address =
+            pillar_crypto::content::content_address(&preimage).expect("content address");
+        let hex: String = address.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(response, hex, "digest must come from content_address");
+        assert!(address.len() >= 32, "content address must be >= 256 bits");
+    }
+
     struct StubTotpProvider {
         expected_code: String,
     }
@@ -628,7 +776,10 @@ mod tests {
             SECOND_FACTOR_PROVIDER_FIELD,
             Value::String("stub-totp".to_owned()),
         );
-        assert_eq!(declared_second_factor_provider(&manifest), Some("stub-totp"));
+        assert_eq!(
+            declared_second_factor_provider(&manifest),
+            Some("stub-totp")
+        );
 
         let mut providers = SecondFactorProviders::new();
         providers.register(Box::new(StubTotpProvider {

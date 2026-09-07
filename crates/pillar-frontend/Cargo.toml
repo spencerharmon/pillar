@@ -1,0 +1,38 @@
+# pillar-frontend — the Yew + WebAssembly portal foundation.
+#
+# This crate is DELIBERATELY EXCLUDED from the root cargo workspace (see the
+# root `Cargo.toml` `[workspace] exclude`): it targets `wasm32-unknown-unknown`
+# and carries its own dependency closure (yew, stylist, wasm-bindgen) with its
+# OWN `Cargo.lock`, so the native `pillar` binary build never pulls the wasm
+# toolchain surface into its lockfile. The static asset bundle (wasm/js/css)
+# `trunk` produces from this crate is what the two-stage nix build embeds into
+# the one `pillar` binary via `include_bytes!` — there is NO npm/Node anywhere.
+[package]
+name = "pillar-frontend"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "pillar web portal — Yew + WebAssembly single-page foundation"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Yew is the portal framework (operator-chosen) — needed here only for
+# `yew::Renderer` at the wasm entrypoint below.
+yew = { version = "0.21", features = ["csr"] }
+# wasm-bindgen is pinned EXACTLY to the version the flake's nixpkgs ships as
+# `wasm-bindgen-cli` (0.2.121): trunk runs that CLI over this crate's wasm and
+# refuses a version mismatch, so the two MUST agree for the offline nix build.
+wasm-bindgen = "=0.2.121"
+# The portal's design system + app shell (auth session, router, panels) —
+# this crate's job is only to mount `pillar_web_frontend::router::Shell` to
+# the wasm entrypoint; every panel/route/component lives in that crate so it
+# stays host-testable there (see that crate's docs).
+pillar-web-frontend = { path = "../pillar-web-frontend" }
+
+[profile.release]
+# Small, deterministic wasm: optimize for size and strip.
+opt-level = "s"
+lto = true

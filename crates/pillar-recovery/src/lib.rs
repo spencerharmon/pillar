@@ -31,7 +31,6 @@
 use std::collections::{BTreeSet, HashSet};
 
 use pillar_core::NodeId;
-use pillar_key_distribution::SealedArtifact;
 use pillar_net::blob::{BlobDigest, BlobStore};
 use pillar_rbac::Capability;
 use pillar_wot_authority::WotAuthority;
@@ -189,20 +188,20 @@ impl BackupBlob {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwarmBackup {
     digest: BlobDigest,
-    sealed: SealedArtifact,
+    sealed_to: BTreeSet<NodeId>,
 }
 
 impl SwarmBackup {
     /// The content address of the stored ciphertext.
     #[must_use]
     pub fn digest(&self) -> BlobDigest {
-        self.digest
+        self.digest.clone()
     }
 
     /// Whether `node` is within the federation-restricted seal.
     #[must_use]
     pub fn is_sealed_to(&self, node: &NodeId) -> bool {
-        self.sealed.is_sealed_to(node)
+        self.sealed_to.contains(node)
     }
 }
 
@@ -220,10 +219,7 @@ pub fn store_backup(
         return Err(RecoveryError::NotSealedToRequester);
     }
     let digest = store.insert(blob.to_bytes());
-    Ok(SwarmBackup {
-        digest,
-        sealed: SealedArtifact::new(digest, sealed_to),
-    })
+    Ok(SwarmBackup { digest, sealed_to })
 }
 
 /// Fetch and decode the [`BackupBlob`] `swarm` addresses, refusing any
@@ -239,7 +235,7 @@ pub fn fetch_backup(
         return Err(RecoveryError::NotSealedToRequester);
     }
     let bytes = store
-        .get(swarm.digest)
+        .get(&swarm.digest)
         .ok_or(RecoveryError::ArtifactNotFound)?;
     BackupBlob::from_bytes(bytes).ok_or(RecoveryError::ArtifactNotFound)
 }
@@ -445,7 +441,8 @@ impl RecoveryLedger {
         if regranted.is_empty() {
             return Err(RecoveryError::NothingToRecover);
         }
-        self.last_recovery.insert(subject.clone(), regranted.clone());
+        self.last_recovery
+            .insert(subject.clone(), regranted.clone());
         Ok(regranted)
     }
 
@@ -480,7 +477,8 @@ impl RecoveryLedger {
         let revouch_result = if vouchers.is_empty() {
             None
         } else {
-            self.social_revouch(subject, vouchers, authority, min_k).ok()
+            self.social_revouch(subject, vouchers, authority, min_k)
+                .ok()
         };
 
         if !blob_ok && revouch_result.is_none() {
@@ -494,7 +492,8 @@ impl RecoveryLedger {
         if regranted.is_empty() {
             return Err(RecoveryError::NothingToRecover);
         }
-        self.last_recovery.insert(subject.clone(), regranted.clone());
+        self.last_recovery
+            .insert(subject.clone(), regranted.clone());
         Ok(regranted)
     }
 }
@@ -559,9 +558,7 @@ impl RecoveryPlan {
                 RecoveryMechanism::ShamirSplit => {
                     "   - Shamir k-of-n social split across trusted peers/cells\n"
                 }
-                RecoveryMechanism::SocialRevouch => {
-                    "   - social re-vouch over the web of trust\n"
-                }
+                RecoveryMechanism::SocialRevouch => "   - social re-vouch over the web of trust\n",
             };
             out.push_str(line);
         }
@@ -606,7 +603,10 @@ mod tests {
         let key = RecoveryKey(0xDEAD_BEEF_1234_5678);
         let wrong_key = RecoveryKey(0x1111_1111_1111_1111);
         let blob = BackupBlob::seal(&payload, key);
-        assert_eq!(blob.decrypt(wrong_key), Err(RecoveryError::WrongRecoveryKey));
+        assert_eq!(
+            blob.decrypt(wrong_key),
+            Err(RecoveryError::WrongRecoveryKey)
+        );
     }
 
     #[test]
@@ -814,15 +814,7 @@ mod tests {
         let authority = WotAuthority::new(node("owner"), 4);
 
         let regranted = ledger
-            .total_device_loss_recover(
-                &subject,
-                &shares[..3],
-                3,
-                Some(key),
-                &[],
-                &authority,
-                2,
-            )
+            .total_device_loss_recover(&subject, &shares[..3], 3, Some(key), &[], &authority, 2)
             .unwrap();
         assert_eq!(regranted, [cap("deploy")].into_iter().collect());
     }

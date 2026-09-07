@@ -17,12 +17,13 @@
 //!   links to the observed tips of OTHER authors (the cross-author causal /
 //!   happens-before edges).
 //!
-//! The signature and the collision-resistant hash are modelled with the same
-//! dependency-free stand-ins the rest of the crate graph uses (see
-//! `pillar_identity`): [`Signature`] asserts a *verified* PGP signature over
-//! an event's content digest, and content addresses are the streamdb content
-//! hash. This crate refines the AP integrity structure of the append log; the
-//! CP total order is supplied elsewhere (the coordination core).
+//! The signature is backed by real `pillar_crypto` ed25519 sign/verify (see
+//! [`author_signing_keypair`]) and the collision-resistant hash is the real
+//! streamdb content address: [`Signature`] asserts a *verified* ed25519
+//! signature over an event's content digest, and content addresses are the
+//! streamdb content hash. This crate refines the AP integrity structure of
+//! the append log; the CP total order is supplied elsewhere (the
+//! coordination core).
 //!
 //! The type mirrors, and its tests encode, the TLC-proven invariants of
 //! `EventDAG.tla`:
@@ -46,7 +47,9 @@ use pillar_streamdb::{content_address, OpLog};
 use serde::{Deserialize, Serialize};
 
 pub mod antientropy;
+pub mod audit;
 pub use antientropy::LogDigest;
+pub use audit::{AuditEntry, AuditRecord};
 
 /// The fingerprint of an event author's OpenPGP identity. An event is authored
 /// by exactly one author (the `auth` field of `EventDAG.tla`).
@@ -57,8 +60,49 @@ pub struct Author(pub String);
 /// content. Mirrors `Id(a, n)` in the spec, whose `UniquePerAuthorSeq`
 /// theorem makes the content address a faithful surrogate for a
 /// collision-resistant hash of the full event content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct EventId(pub u64);
+///
+/// Backed by a real cryptographic content address (SHA2-256 multihash) via
+/// [`pillar_streamdb::content_address`] — NOT a 64-bit checksum. A
+/// non-cryptographic id would let an adversary forge a distinct event content
+/// sharing an [`EventId`], collapsing the `UniquePerAuthorSeq` guarantee.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EventId(pub pillar_streamdb::OpId);
+
+impl EventId {
+    /// The raw multihash bytes of this content address.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl Serialize for EventId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.as_bytes().to_vec().serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for EventId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(d)?;
+        Ok(EventId(pillar_streamdb::OpId(
+            pillar_crypto::ContentId::from_bytes(bytes),
+        )))
+    }
+}
+
+// `EventId` keys `BTreeMap`/`BTreeSet`, so it needs a total order. `OpId`
+// (hence `ContentId`) is opaque and not `Ord`; order lexicographically by the
+// multihash bytes — a pure, content-derived, node-independent order.
+impl PartialOrd for EventId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for EventId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
 
 /// The signed content of an event: author, per-author sequence number, the
 /// `prev` hash-link (the same-author chain edge; `None` for a genesis event),
@@ -93,7 +137,7 @@ impl EventContent {
     /// `None` for a genesis (`seq == 0`) event.
     #[must_use]
     pub fn prev(&self) -> Option<EventId> {
-        self.prev
+        self.prev.clone()
     }
 
     /// The set of cross-author `parents` hash-links (observed tips of other
@@ -113,8 +157,8 @@ impl EventContent {
     /// cross-author parent. These are exactly the happens-before edges.
     fn links(&self) -> BTreeSet<EventId> {
         let mut links = self.parents.clone();
-        if let Some(p) = self.prev {
-            links.insert(p);
+        if let Some(p) = &self.prev {
+            links.insert(p.clone());
         }
         links
     }
@@ -127,25 +171,26 @@ impl EventContent {
         b.extend_from_slice(&(self.author.0.len() as u64).to_le_bytes());
         b.extend_from_slice(self.author.0.as_bytes());
         b.extend_from_slice(&self.seq.to_le_bytes());
-        match self.prev {
+        match &self.prev {
             Some(p) => {
                 b.push(1);
-                b.extend_from_slice(&p.0.to_le_bytes());
+                b.extend_from_slice(p.as_bytes());
             }
             None => b.push(0),
         }
         b.extend_from_slice(&(self.parents.len() as u64).to_le_bytes());
         // BTreeSet iterates in sorted order — canonical regardless of insert order.
         for p in &self.parents {
-            b.extend_from_slice(&p.0.to_le_bytes());
+            b.extend_from_slice(p.as_bytes());
         }
         b.extend_from_slice(&self.payload);
         b
     }
 
-    /// The content digest — the raw 64-bit content address of this content.
-    fn digest(&self) -> u64 {
-        content_address(&self.canonical_bytes())
+    /// The content digest — the raw cryptographic content address (SHA2-256
+    /// multihash bytes) of this content.
+    fn digest(&self) -> pillar_streamdb::OpId {
+        pillar_streamdb::OpId(content_address(&self.canonical_bytes()))
     }
 
     /// The content-addressed identity of this event.
@@ -153,41 +198,118 @@ impl EventContent {
     pub fn id(&self) -> EventId {
         EventId(self.digest())
     }
+
+    /// Build content OUTSIDE the normal `append`/`ingest` authoring path, for
+    /// a caller that must construct a deliberately forged/tampered fixture —
+    /// e.g. the pillar-integration harness's crypto-realness oracle, which
+    /// proves the audit view refuses to render a wrong-key-signed or
+    /// tampered-after-signing event as legitimate. An ordinary writer should
+    /// use [`EventLog::append`] instead; this constructor bypasses none of
+    /// the log's OWN invariants — only [`EventLog::insert_unchecked`]
+    /// (paired with this) skips `ingest`'s validation, and even then the
+    /// audit view still authenticates every entry independently.
+    #[must_use]
+    pub fn for_fixture(
+        author: Author,
+        seq: u64,
+        prev: Option<EventId>,
+        parents: BTreeSet<EventId>,
+        payload: Vec<u8>,
+    ) -> Self {
+        EventContent {
+            author,
+            seq,
+            prev,
+            parents,
+            payload,
+        }
+    }
 }
 
-/// A *verified* OpenPGP signature over an [`EventContent`] by its author — the
-/// dependency-free stand-in for a real PGP signature packet (the same
-/// modelling `pillar_identity::Signature` uses).
+/// Deterministically derive an author's real ed25519 signing keypair from
+/// its stable identifier.
+///
+/// This crate has no out-of-band keystore, so — mirroring the same
+/// seed-derived-keypair convention `pillar_identity::login::backend_keypair`
+/// uses for its own fixture identities — the keypair is derived from the
+/// author's name via a domain-separated seed
+/// ([`pillar_crypto::sign::signing_keypair_from_seed`]). A real deployment
+/// may instead draw the seed from an OS CSPRNG / an enrolled identity's
+/// actual key; either way the signature itself is genuine ed25519, not a
+/// dependency-free stand-in.
+fn author_signing_keypair(
+    author: &Author,
+) -> (pillar_crypto::SigningPublicKey, pillar_crypto::SigningSecretKey) {
+    let seed = pillar_crypto::Seed::from_bytes(
+        format!("pillar-eventlog/author-signing-seed::{}", author.0).into_bytes(),
+    );
+    pillar_crypto::sign::signing_keypair_from_seed(&seed)
+        .expect("deterministic seed-derived ed25519 keygen never fails")
+}
+
+/// A *verified* ed25519 signature over an [`EventContent`] by its author —
+/// backed by real `pillar_crypto` sign/verify (see
+/// [`author_signing_keypair`]), not a dependency-free stand-in.
 ///
 /// Constructing one via [`Signature::sign`] asserts the author signed the
-/// content's digest. [`Signature::verifies`] recomputes the content digest and
-/// checks it still matches: if any field of the content was rewritten after
-/// signing, the digest changes and the signature no longer verifies —
-/// tamper-evidence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// content's digest with their real ed25519 secret key.
+/// [`Signature::verifies`] recomputes the content digest and cryptographically
+/// verifies the signature against it with the author's derived public key: if
+/// any field of the content was rewritten after signing, the digest changes
+/// and verification fails; a signature forged without the author's secret key
+/// likewise fails, even if it happens to name the right digest —
+/// tamper-evidence AND authenticity.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature {
     author: Author,
-    signed_digest: u64,
+    signature: pillar_crypto::Signature,
+}
+
+impl Serialize for Signature {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (&self.author, self.signature.as_bytes()).serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let (author, bytes): (Author, Vec<u8>) = Deserialize::deserialize(d)?;
+        Ok(Signature {
+            author,
+            signature: pillar_crypto::Signature::from_bytes(bytes),
+        })
+    }
 }
 
 impl Signature {
-    /// Sign `content` as `author`, binding the signature to the content's
-    /// current digest.
+    /// Sign `content` as `author`: derive the author's real ed25519 secret
+    /// key ([`author_signing_keypair`]) and sign the content's current
+    /// digest with it.
     #[must_use]
     pub fn sign(author: &Author, content: &EventContent) -> Self {
+        let (_public, secret) = author_signing_keypair(author);
+        let digest = content.digest();
+        let signature = pillar_crypto::sign::sign(&secret, digest.as_bytes())
+            .expect("ed25519 signing over a fixed-length digest never fails");
         Signature {
             author: author.clone(),
-            signed_digest: content.digest(),
+            signature,
         }
     }
 
-    /// Whether this signature verifies against `content`: it must have been
-    /// issued by the content's own author AND still cover the content's
-    /// (recomputed) digest. A rewritten link or payload changes the digest and
-    /// fails this check.
+    /// Whether this signature verifies against `content`: it must be a
+    /// genuine ed25519 signature, by the content's own author's derived
+    /// secret key, over the content's (recomputed) digest. A rewritten link
+    /// or payload changes the digest and fails this check; a forged
+    /// signature by a non-author also fails (asymmetry — the public key
+    /// alone cannot forge).
     #[must_use]
     pub fn verifies(&self, content: &EventContent) -> bool {
-        self.author == content.author && self.signed_digest == content.digest()
+        if self.author != content.author {
+            return false;
+        }
+        let (public, _secret) = author_signing_keypair(&self.author);
+        let digest = content.digest();
+        pillar_crypto::sign::verify(&public, digest.as_bytes(), &self.signature).is_ok()
     }
 
     /// The author who issued this signature.
@@ -195,16 +317,79 @@ impl Signature {
     pub fn author(&self) -> &Author {
         &self.author
     }
+
+    /// Build a deliberately mislabeled signature: relabel a REAL signature
+    /// (e.g. genuinely produced by [`Signature::sign`] under a DIFFERENT
+    /// author's own secret key) as having been issued by `claimed_author`,
+    /// without holding `claimed_author`'s secret key. This is exactly the
+    /// forged-key impersonation attempt the crypto-realness oracle proves
+    /// [`Signature::verifies`] refuses (the claimed author's derived public
+    /// key can never validate signature bytes produced by a different
+    /// secret key) — a caller building a real fixture, never a shortcut
+    /// around the real check.
+    #[must_use]
+    pub fn relabel_for_fixture(claimed_author: Author, genuine_signature: &Signature) -> Self {
+        Signature {
+            author: claimed_author,
+            signature: genuine_signature.signature.clone(),
+        }
+    }
 }
 
-/// A fully-formed, signed event: its content plus its author's PGP signature.
+/// A fully-formed, signed event: its content plus its author's PGP signature,
+/// carrying an explicit event-envelope schema version stamp
+/// ([`Event::SCHEMA_VERSION`]).
+///
+/// The stamp lives on the ENVELOPE, deliberately OUTSIDE the hashed
+/// [`EventContent`], so an envelope-schema revision never perturbs any existing
+/// [`EventId`] (content addresses are unchanged) while still letting a reader
+/// reject an envelope stamped with a version it does not understand — distinctly
+/// from a parse/tamper failure. This is the event-envelope surface of ROI P1's
+/// independent per-surface versioning; it advances independently of every other
+/// surface's stamp.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
+    /// The event-envelope schema version this event is stamped with.
+    #[serde(default = "Event::default_schema_version")]
+    schema_version: pillar_crypto::SurfaceVersion,
     content: EventContent,
     signature: Signature,
 }
 
 impl Event {
+    /// The event-envelope schema version this build authors and understands.
+    /// The event-envelope surface's own independent version line.
+    pub const SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+    /// The lowest event-envelope schema version this build still accepts on
+    /// ingest.
+    pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+    fn default_schema_version() -> pillar_crypto::SurfaceVersion {
+        Event::SCHEMA_VERSION
+    }
+
+    /// The event-envelope schema version stamped on this event.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        self.schema_version
+    }
+
+    /// Assemble an event from already-signed content, stamped with the current
+    /// envelope schema version. Used by the local-authoring path, by tests
+    /// exercising ingest, and by a caller building a deliberately forged/
+    /// tampered fixture (paired with [`EventContent::for_fixture`] and
+    /// [`EventLog::insert_unchecked`]) to prove the audit view refuses to
+    /// render it as legitimate.
+    #[must_use]
+    pub fn stamped(content: EventContent, signature: Signature) -> Self {
+        Event {
+            schema_version: Event::SCHEMA_VERSION,
+            content,
+            signature,
+        }
+    }
+
     /// The signed content of this event.
     #[must_use]
     pub fn content(&self) -> &EventContent {
@@ -251,6 +436,13 @@ pub enum EventError {
     /// event that is not present — a dangling / non-cross-author causal edge
     /// (`ParentsCrossAuthorAndExist`).
     DanglingParent,
+    /// The event's envelope carries a schema version this build does not
+    /// understand (below [`Event::MIN_SCHEMA_VERSION`] or above
+    /// [`Event::SCHEMA_VERSION`]). Distinct from [`EventError::TamperedSignature`]/
+    /// [`EventError::IdMismatch`] (a corrupt/forged event): here the envelope
+    /// parsed cleanly but is stamped for a version — typically a newer peer's —
+    /// that this build cannot interpret.
+    UnsupportedSchemaVersion(pillar_crypto::VersionError),
 }
 
 /// The append-only, content-addressed event DAG: the grow-only set of
@@ -293,20 +485,20 @@ impl EventLog {
 
     /// Whether the log already holds `id`.
     #[must_use]
-    pub fn contains(&self, id: EventId) -> bool {
-        self.events.contains_key(&id)
+    pub fn contains(&self, id: &EventId) -> bool {
+        self.events.contains_key(id)
     }
 
     /// Borrow a held event by id.
     #[must_use]
-    pub fn get(&self, id: EventId) -> Option<&Event> {
-        self.events.get(&id)
+    pub fn get(&self, id: &EventId) -> Option<&Event> {
+        self.events.get(id)
     }
 
     /// The current tip (latest event id) of `author`, if it has published.
     #[must_use]
     pub fn tip(&self, author: &Author) -> Option<EventId> {
-        self.tip.get(author).copied()
+        self.tip.get(author).cloned()
     }
 
     /// Author `author` appends `payload` as its next event, building the
@@ -320,12 +512,12 @@ impl EventLog {
     /// construction and it never fails.
     pub fn append(&mut self, author: &Author, payload: impl Into<Vec<u8>>) -> EventId {
         let seq = self.height.get(author).copied().unwrap_or(0);
-        let prev = self.tip.get(author).copied();
+        let prev = self.tip.get(author).cloned();
         let parents: BTreeSet<EventId> = self
             .tip
             .iter()
             .filter(|(a, _)| *a != author)
-            .map(|(_, id)| *id)
+            .map(|(_, id)| id.clone())
             .collect();
         let content = EventContent {
             author: author.clone(),
@@ -335,7 +527,7 @@ impl EventLog {
             payload: payload.into(),
         };
         let signature = Signature::sign(author, &content);
-        let event = Event { content, signature };
+        let event = Event::stamped(content, signature);
         // ingest cannot fail for a locally-authored, correctly-linked event.
         self.ingest(event)
             .expect("locally authored event is always valid")
@@ -357,6 +549,13 @@ impl EventLog {
     /// Returns the event's [`EventId`] on success, or the specific
     /// [`EventError`] that refused it.
     pub fn ingest(&mut self, event: Event) -> Result<EventId, EventError> {
+        // Envelope-schema gate: reject a stamped-but-unknown envelope version
+        // (e.g. a newer peer's) distinctly from a corrupt/tampered event.
+        event
+            .schema_version
+            .check_supported(Event::MIN_SCHEMA_VERSION, Event::SCHEMA_VERSION)
+            .map_err(EventError::UnsupportedSchemaVersion)?;
+
         let id = event.content.id();
 
         // Dedup: an already-held event is idempotent (re-broadcast is a no-op).
@@ -377,7 +576,7 @@ impl EventLog {
         let seq = event.content.seq;
 
         // Same-author chain link + gap detection.
-        match event.content.prev {
+        match &event.content.prev {
             None => {
                 if seq != 0 {
                     return Err(EventError::MalformedChainLink);
@@ -396,11 +595,11 @@ impl EventLog {
                 // The prev link must be exactly the (author, seq-1)
                 // predecessor, which must be present — this is both gap
                 // detection and prev-link integrity.
-                let expected = self.tip.get(&author).copied();
+                let expected = self.tip.get(&author);
                 if expected != Some(prev_id) {
                     return Err(EventError::GapOrBrokenPrev);
                 }
-                match self.events.get(&prev_id) {
+                match self.events.get(prev_id) {
                     Some(p) if p.content.author == author && p.content.seq == seq - 1 => {}
                     _ => return Err(EventError::GapOrBrokenPrev),
                 }
@@ -420,9 +619,9 @@ impl EventLog {
         // record the event and advance the author's chain.
         self.store.append(event.content.canonical_bytes());
         self.height.insert(author.clone(), seq + 1);
-        self.tip.insert(author.clone(), id);
-        self.by_seq.insert((author, seq), id);
-        self.events.insert(id, event);
+        self.tip.insert(author.clone(), id.clone());
+        self.by_seq.insert((author, seq), id.clone());
+        self.events.insert(id.clone(), event);
         Ok(id)
     }
 
@@ -430,14 +629,14 @@ impl EventLog {
     /// `parents` hash-links backward (the transitive happens-before predecessor
     /// set). `id` itself is not included.
     #[must_use]
-    pub fn ancestors(&self, id: EventId) -> BTreeSet<EventId> {
+    pub fn ancestors(&self, id: &EventId) -> BTreeSet<EventId> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<EventId> = Vec::new();
-        if let Some(ev) = self.events.get(&id) {
+        if let Some(ev) = self.events.get(id) {
             stack.extend(ev.content.links());
         }
         while let Some(cur) = stack.pop() {
-            if !seen.insert(cur) {
+            if !seen.insert(cur.clone()) {
                 continue;
             }
             if let Some(ev) = self.events.get(&cur) {
@@ -452,8 +651,49 @@ impl EventLog {
     /// hash-links, and (per `CausalMonotone`) is a strict partial order —
     /// irreflexive, asymmetric, and transitive — so the DAG is acyclic.
     #[must_use]
-    pub fn happens_before(&self, a: EventId, b: EventId) -> bool {
-        self.ancestors(b).contains(&a)
+    pub fn happens_before(&self, a: &EventId, b: &EventId) -> bool {
+        self.ancestors(b).contains(a)
+    }
+
+    /// The authors that have published at least one event — the chains this log
+    /// holds. Used by the audit view to enumerate the log deterministically.
+    pub(crate) fn chain_authors(&self) -> Vec<Author> {
+        self.height.keys().cloned().collect()
+    }
+
+    /// The contiguous chain height (next unheld seq) held for `author`; 0 if the
+    /// author has no events. Because `NoGaps` holds, the author's events are
+    /// exactly seq `0 .. chain_height`.
+    pub(crate) fn chain_height(&self, author: &Author) -> u64 {
+        self.height.get(author).copied().unwrap_or(0)
+    }
+
+    /// Insert a fully-formed event into the store WITHOUT running ingest's
+    /// integrity checks — used by tests, and by the pillar-integration
+    /// harness's crypto-realness oracle, to model a forged/tampered event
+    /// that slipped into a replica's store (paired with
+    /// [`EventContent::for_fixture`] / [`Signature::relabel_for_fixture`]),
+    /// so the audit view can be shown to still refuse to render it as
+    /// legitimate. An ordinary writer always goes through [`EventLog::append`]
+    /// or [`EventLog::ingest`], both of which DO enforce every invariant;
+    /// this bypass exists solely to construct the deliberately-invalid
+    /// fixture the audit view must independently reject.
+    pub fn insert_unchecked(&mut self, event: Event) {
+        let id = event.content.id();
+        let author = event.content.author.clone();
+        let seq = event.content.seq;
+        // Advance chain bookkeeping so the audit-view enumeration visits it,
+        // without asserting any of ingest's invariants.
+        let next = self.height.get(&author).copied().unwrap_or(0).max(seq + 1);
+        self.height.insert(author.clone(), next);
+        self.by_seq.insert((author, seq), id.clone());
+        self.events.insert(id, event);
+    }
+
+    /// Test-only alias retained for the existing in-crate fixture tests.
+    #[cfg(test)]
+    pub(crate) fn insert_unchecked_for_test(&mut self, event: Event) {
+        self.insert_unchecked(event);
     }
 }
 
@@ -474,7 +714,7 @@ mod tests {
         let mut log = EventLog::new();
 
         let g = log.append(&alice, b"genesis".to_vec());
-        let e1 = log.get(g).unwrap().clone();
+        let e1 = log.get(&g).unwrap().clone();
         assert_eq!(log.len(), 1);
 
         // Re-broadcasting the very same event is idempotent.
@@ -496,7 +736,7 @@ mod tests {
         };
         assert_eq!(
             dup_content.id(),
-            g,
+            g.clone(),
             "identical content must share the content id"
         );
 
@@ -505,7 +745,7 @@ mod tests {
             payload: b"different".to_vec(),
             ..dup_content
         };
-        assert_ne!(other.id(), g);
+        assert_ne!(other.id(), g.clone());
     }
 
     /// `NoGaps`: an event at `seq n > 0` is refused unless its `n-1`
@@ -521,12 +761,12 @@ mod tests {
         let content = EventContent {
             author: alice.clone(),
             seq: 2,
-            prev: Some(g),
+            prev: Some(g.clone()),
             parents: BTreeSet::new(),
             payload: b"seq2".to_vec(),
         };
         let signature = Signature::sign(&alice, &content);
-        let gapped = Event { content, signature };
+        let gapped = Event::stamped(content, signature);
 
         assert_eq!(log.ingest(gapped), Err(EventError::GapOrBrokenPrev));
         assert_eq!(log.len(), 1, "a gapped event must not be admitted");
@@ -536,17 +776,12 @@ mod tests {
         let c2 = EventContent {
             author: alice.clone(),
             seq: 2,
-            prev: Some(s1),
+            prev: Some(s1.clone()),
             parents: BTreeSet::new(),
             payload: b"seq2".to_vec(),
         };
         let sig2 = Signature::sign(&alice, &c2);
-        assert!(log
-            .ingest(Event {
-                content: c2,
-                signature: sig2
-            })
-            .is_ok());
+        assert!(log.ingest(Event::stamped(c2, sig2)).is_ok());
     }
 
     /// `PrevLinkIntegrity`: a rewritten (tampered) hash-link breaks the
@@ -560,8 +795,8 @@ mod tests {
 
         // Take the genuine seq-1 event, then rewrite its prev link to point at
         // itself (history tampering) while keeping the original signature.
-        let mut tampered = log.get(s1).unwrap().clone();
-        tampered.content.prev = Some(s1);
+        let mut tampered = log.get(&s1).unwrap().clone();
+        tampered.content.prev = Some(s1.clone());
 
         assert!(
             !tampered.is_authentic(),
@@ -570,8 +805,92 @@ mod tests {
 
         // A fresh log that has seq0 must still reject the tampered seq1.
         let mut log2 = EventLog::new();
-        log2.ingest(log.get(g).unwrap().clone()).unwrap();
+        log2.ingest(log.get(&g).unwrap().clone()).unwrap();
         assert_eq!(log2.ingest(tampered), Err(EventError::TamperedSignature));
+    }
+
+    /// A real ed25519 keypair signs an event, and the resulting signature
+    /// verifies via genuine `pillar_crypto` sign/verify — no dependency-free
+    /// stand-in remains.
+    #[test]
+    fn real_keypair_signs_and_verifies_the_envelope() {
+        let alice = author("alice");
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 0,
+            prev: None,
+            parents: BTreeSet::new(),
+            payload: b"hello".to_vec(),
+        };
+        let signature = Signature::sign(&alice, &content);
+
+        // The signature bytes are a genuine ed25519 detached signature (64
+        // bytes), not a stand-in digest copy.
+        assert_eq!(
+            signature.signature.as_bytes().len(),
+            64,
+            "must be a real ed25519 signature, not a stand-in"
+        );
+        assert!(
+            signature.verifies(&content),
+            "a genuine signature by the content's own author must verify"
+        );
+
+        let (public, _secret) = author_signing_keypair(&alice);
+        assert!(
+            pillar_crypto::sign::verify(&public, content.digest().as_bytes(), &signature.signature)
+                .is_ok(),
+            "the signature must verify directly against pillar_crypto::sign::verify too"
+        );
+    }
+
+    /// A forged event signature — one produced by a different author's key,
+    /// or hand-rolled bytes claiming to be alice's — is rejected both by
+    /// direct verification and by `EventLog::ingest` (the anti-entropy-sync
+    /// ingest path).
+    #[test]
+    fn forged_event_signature_is_rejected_by_ingest() {
+        let alice = author("alice");
+        let mallory = author("mallory");
+        let mut log = EventLog::new();
+        let g = log.append(&alice, b"seq0".to_vec());
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 1,
+            prev: Some(g),
+            parents: BTreeSet::new(),
+            payload: b"seq1".to_vec(),
+        };
+
+        // Forge #1: sign the SAME content with a different author's secret
+        // key, then claim it was alice's signature.
+        let mallory_sig_over_alice_content = Signature::sign(&mallory, &content);
+        let forged = Signature {
+            author: alice.clone(),
+            signature: mallory_sig_over_alice_content.signature,
+        };
+        assert!(
+            !forged.verifies(&content),
+            "a signature produced by a non-author's key must not verify, even \
+             relabelled with the victim's author id"
+        );
+        let event = Event::stamped(content.clone(), forged);
+        assert_eq!(
+            log.ingest(event),
+            Err(EventError::TamperedSignature),
+            "ingest must reject a forged signature"
+        );
+
+        // Forge #2: arbitrary bytes are not a valid signature at all.
+        let garbage = Signature {
+            author: alice.clone(),
+            signature: pillar_crypto::Signature::from_bytes(vec![0u8; 64]),
+        };
+        assert!(!garbage.verifies(&content));
+        assert_eq!(
+            log.ingest(Event::stamped(content, garbage)),
+            Err(EventError::TamperedSignature)
+        );
     }
 
     /// `ParentsCrossAuthorAndExist`: a parent link to a same-author event, or
@@ -587,13 +906,13 @@ mod tests {
         let content = EventContent {
             author: alice.clone(),
             seq: 1,
-            prev: Some(g),
-            parents: BTreeSet::from([g]),
+            prev: Some(g.clone()),
+            parents: BTreeSet::from([g.clone()]),
             payload: b"seq1".to_vec(),
         };
         let signature = Signature::sign(&alice, &content);
         assert_eq!(
-            log.ingest(Event { content, signature }),
+            log.ingest(Event::stamped(content, signature)),
             Err(EventError::DanglingParent)
         );
 
@@ -601,13 +920,15 @@ mod tests {
         let content = EventContent {
             author: alice.clone(),
             seq: 1,
-            prev: Some(g),
-            parents: BTreeSet::from([EventId(0xdead_beef)]),
+            prev: Some(g.clone()),
+            parents: BTreeSet::from([EventId(pillar_streamdb::OpId(
+                pillar_crypto::content::content_address(b"absent-parent").unwrap(),
+            ))]),
             payload: b"seq1".to_vec(),
         };
         let signature = Signature::sign(&alice, &content);
         assert_eq!(
-            log.ingest(Event { content, signature }),
+            log.ingest(Event::stamped(content, signature)),
             Err(EventError::DanglingParent)
         );
     }
@@ -629,13 +950,13 @@ mod tests {
         let a1 = log.append(&alice, b"a1".to_vec()); // prev a0, parents {b0}
 
         // Sanity: the cross-author edges were actually built.
-        assert!(log.get(b0).unwrap().content.parents().contains(&a0));
-        assert!(log.get(a1).unwrap().content.parents().contains(&b0));
+        assert!(log.get(&b0).unwrap().content.parents().contains(&a0));
+        assert!(log.get(&a1).unwrap().content.parents().contains(&b0));
 
-        let all = [a0, b0, a1];
+        let all = [a0.clone(), b0.clone(), a1.clone()];
 
         // Irreflexive: nothing happens-before itself.
-        for &x in &all {
+        for x in &all {
             assert!(
                 !log.happens_before(x, x),
                 "happens-before must be irreflexive"
@@ -643,13 +964,13 @@ mod tests {
         }
 
         // Known edges of the causal order.
-        assert!(log.happens_before(a0, b0));
-        assert!(log.happens_before(b0, a1));
-        assert!(log.happens_before(a0, a1)); // transitive: a0 -> b0 -> a1
+        assert!(log.happens_before(&a0, &b0));
+        assert!(log.happens_before(&b0, &a1));
+        assert!(log.happens_before(&a0, &a1)); // transitive: a0 -> b0 -> a1
 
         // Asymmetric: no pair is ordered both ways.
-        for &x in &all {
-            for &y in &all {
+        for x in &all {
+            for y in &all {
                 if log.happens_before(x, y) {
                     assert!(
                         !log.happens_before(y, x),
@@ -660,9 +981,9 @@ mod tests {
         }
 
         // Transitive over the whole set.
-        for &x in &all {
-            for &y in &all {
-                for &z in &all {
+        for x in &all {
+            for y in &all {
+                for z in &all {
                     if log.happens_before(x, y) && log.happens_before(y, z) {
                         assert!(
                             log.happens_before(x, z),
@@ -671,6 +992,53 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Event-envelope version stamp: a locally-authored event carries the
+    /// current schema version, and an envelope stamped with an unknown FUTURE
+    /// version is refused by ingest — distinctly from a tamper/parse failure —
+    /// while the CID of the wrapped content is unchanged by the envelope stamp.
+    #[test]
+    fn unknown_future_envelope_version_is_rejected_distinctly() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+        let g = log.append(&alice, b"seq0".to_vec());
+        // The locally-authored event is stamped with the current version.
+        assert_eq!(log.get(&g).unwrap().schema_version(), Event::SCHEMA_VERSION);
+
+        // Author a valid seq-1 event, then re-stamp its envelope to a future
+        // version. Its content (and thus its CID) is untouched.
+        let content = EventContent {
+            author: alice.clone(),
+            seq: 1,
+            prev: Some(g.clone()),
+            parents: BTreeSet::new(),
+            payload: b"seq1".to_vec(),
+        };
+        let signature = Signature::sign(&alice, &content);
+        let expected_id = content.id();
+        let mut future = Event::stamped(content, signature);
+        future.schema_version = pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1);
+
+        // The envelope stamp did not perturb the content address.
+        assert_eq!(
+            future.id(),
+            expected_id,
+            "envelope stamp must not change CID"
+        );
+        // The signature still verifies (the stamp is outside the signed content).
+        assert!(future.is_authentic());
+
+        // Ingest refuses it as an unsupported version, NOT as tamper/gap.
+        match log.ingest(future) {
+            Err(EventError::UnsupportedSchemaVersion(
+                pillar_crypto::VersionError::Unsupported { found, .. },
+            )) => assert_eq!(
+                found,
+                pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1)
+            ),
+            other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
         }
     }
 }

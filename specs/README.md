@@ -17,6 +17,7 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `CoordinationCore.tla` | `AtMostOneHolderPerEpoch`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-coordination` (CP resource class) | `docs/consistency-model.md` |
 | `Registration.tla` | `AdmissionRequiresAuthorizedChain`, `NoAmbientAuthority`, `TypeOK` | `crates/pillar-identity` (PGP key hierarchy: USER_PRIMARY -> NODE_SUBKEY + REGISTRATION; node-join handshake) | ROI P1 identity/PGP |
 | `StreamingDB.tla` | `NoLostWrite`, `LogSubsetOfWritten`, `DeterministicMerkleRoot`, `PerPartitionOrder`, `MonotonicLog`, `Convergence` (`<>[]`), + composed `AtMostOneHolderPerEpoch` | AP state substrate (append-only content-addressed Merkle-CRDT op-log) | `docs/consistency-model.md` |
+| `StreamdbIpfsStore.tla` | `ContentAddressCorrect`, `HeadSequenceMonotonic`, `HeadSignedByOwner`, `AnchorsOnlyToDHT`, `PinnedSubsetOfStore`, `StoreSubsetOfWritten`, `BackfillReconverges` (`<>[]`), `TypeOK` | durable content-object store surface the streaming DB rides (IPFS/libp2p plugin, pillar's private swarm OFF the public DHT): put/get by CID, pin, provide public anchors to the DHT, IPNS-format signed/seq-numbered/TTL mutable head scoped by visibility class; refines `StreamingDB.tla` | ROI P1 durable streaming-DB persistence (2026-08-31 audit correction) |
 | `EventDAG.tla` | `UniquePerAuthorSeq`, `NoGaps`, `PrevLinkIntegrity`, `ParentsCrossAuthorAndExist`, `CausalMonotone`, `TypeOK` | event order & integrity substrate (PGP-signed events in a hash-linked Merkle DAG: per-author linear chain + cross-author causal partial order + content-addressed dedup) | ROI P1 event order & integrity |
 | `IPAM.tla` | `NoDoubleAllocation`, `GrantsAreFenced`, `TypeOK` | `crates/pillar-ipam` (IPv4/IPv6 allocation from a delegated pool) | ROI P3 distributed-authority |
 | `WoTAuthority.tla` | `NoActionAfterRevocation`, `FailClosedUnderStaleView`, `TypeOK`, `CaughtUpBounded` | Web-of-Trust authority & RBAC (`wot-authority-impl`, `rbac-decider`): owner-anchored bounded-depth tsig reachability, 3 revocation kinds, revoke-before-act | ROI P1 WoT authority |
@@ -26,6 +27,9 @@ invariants, model failures as actions, let TLC explore every reachable state.
 | `KeyDistribution.tla` | `TypeOK`, `SealedMatchesAllowlist`, `BiDirectionalConsent`, `FailClosedRevocation`, `CrossOwnerGate`, `EscrowTypeBound`, `NoRootEscrow`, `OpaqueConfidentiality` | key distribution & the offer system (conceptually extends `IdentityLogin.tla`'s device-subkey model): L0 sealed-artifact transport, L1 bi-directional offer/accept admission, L2 tag-based policy auto-distribution, escrow type-bound to operational keys only + OPAQUE-shaped confidentiality, cross-owner(-cell) offer explicit-confirmation gate | ROI P1 key distribution & the offer system |
 | `Cells.tla` | `TypeOK`, `VisibilitySound`, `ForwardSecrecyOnLeave`, `AtomicRotation`, `GrantScopeRespected`, `NamePtrResolves` | cells & confidentiality (conceptually extends `WoTAuthority.tla` + `KeyDistribution.tla`): public/cell-encrypted/recipient-sealed (per-node/per-cell/per-user) visibility classes, offer-system cell membership, cross-cell user-access grants (read-only/read-write, all-or-tags), group-key rotation with forward secrecy on member-leave atomic against writers, IPNS-format cell naming pointer | ROI P1 cells & confidentiality |
 | `TrustArtifacts.tla` | `VerificationTerminates`, `CapacityHeldAtSigning`, `RevocationHonorsEpoch`, `QuotaNeverDoubleSpent`, `TypeOK` | trust artifacts: certify / trust / attest / revoke (extends `WoTAuthority.tla` + `GlobalIdentity.tla`): four separate content-addressed signed artifact types (never one overloaded sign), capacity always explicit (self or role@scope), owner-anchored bounded-depth capacity walk gated at issuance (CapacityHeldAtSigning, not deferred to a later verifier), epoch-stamped fail-closed revocation, quota-as-budget with a CP-fenced reservation ledger | ROI P1 trust artifacts: certify / trust / attest / revoke |
+| `PillarUDP.tla` | `TypeOK`, `ExactlyOnceProcessing`, `BoundedTotalDatagrams`, `NoForwardingLoops`, `AntiAmplificationBound`, + liveness `Reachability` (`<>`) | pillar-UDP transport (multipath spray/forward over a lossy-link graph covering non-node client<->cell, intra-cell node<->node, and inter-cell cell<->cell) | ROI P2 load balancing, ingress & the pillar-UDP protocol |
+| `VersioningCompat.tla` | `TypeOK`, `N1WindowHonored`, `NoOrphanedMember`, `NegotiationRefusesIncompatible`, + liveness `IndependentVersioning`, `RollingCoexistence`, `SwarmNeverPartitioned` (`<>`) | version-stamp seams (event-envelope, materialized-view, pillar message, HTTP ingest API, pillar-UDP protocol, trust-artifact/attestation, sealed-artifact envelope, manifest/declared-object schema), the compat-negotiation contract + N-1+ window, and cell-aware/swarm-aware migration; gates `version-stamps-impl`, `sealed-artifact-self-describing-impl`, `compat-negotiation-impl`, `cell-aware-migration-impl` | ROI P1 versioning, compatibility & safe rollout |
+| `PillarIntegration.tla` | `TypeOK`, `NoDoubleCountedClaim`, `NoStateSkipsTeardown`, `Gate1_NoOrphan`, `Gate2_CoveredIsProven`, `Gate3_NoExpiredSkip`, `NoSharedFixtureState`, `TeardownReleasesFixtures`, `NoResidueWhenSealed` (+ ASSUMEs `ClaimsTargetRealSurface`, `ScenarioNamesRealOracle`) | the integration-conformance RIG contract: scenario lifecycle (declared→running→oracleAsserted→tornDown), surface-inventory↔scenario-declaration relation, coverage Gates 1-3, fixture isolation + idempotent-teardown + leak detection. Paired with `schema_roundtrip_test.py` (schema parse/re-serialise round-trip). Gates every other `pillar-integration` task | ROI pillar-integration: the conformance rig that demands working code |
 
 ## Running the checker
 
@@ -36,6 +40,13 @@ invariants, model failures as actions, let TLC explore every reachable state.
 Requires a JVM (17+) and `tla2tools.jar`. `check.sh` locates the jar via, in
 order: `$TLA_TOOLS_JAR`, `~/.local/lib/tla/tla2tools.jar`, or downloads the
 pinned release into `./.tools/` (the path CI uses).
+
+After the TLA+ specs, `check.sh` also runs the `pillar-integration` rig's
+schema round-trip test (`python3 schema_roundtrip_test.py`, stdlib-only): it
+parses the fixture surface-inventory + scenario-declaration document
+(`fixtures/rig-schema.json`), re-serialises it through the canonical serialiser,
+and asserts equality — the executable half of the `PillarIntegration.tla`
+contract.
 
 ## Notes
 
@@ -59,6 +70,23 @@ pinned release into `./.tools/` (the path CI uses).
   — weak fairness is insufficient because an adversarial partition leaves a
   deliverable gossip step enabled only intermittently. TLC is run with
   `-deadlock` (quiescence at the semilattice top is an expected idle state).
+- `StreamdbIpfsStore` models the DURABLE content-object store surface the
+  streaming DB rides — the IPFS/libp2p plugin's own surface (non-negotiable #5:
+  the plugin OWNS content-addressing; the streaming DB never re-implements it on
+  local disk). Per the 2026-08-31 audit ROI correction the durable store MUST be
+  IPFS on pillar's private libp2p swarm, OFF the public DHT — not a hand-rolled
+  local-fs store. It refines `StreamingDB.tla` (adds the durable content-object +
+  IPNS-format mutable-head layer beneath the AP op-log) and proves: content
+  addressing is collision-free/deterministic (`ContentAddressCorrect`), a
+  published head's sequence only advances (`HeadSequenceMonotonic`) and is signed
+  by its owner (`HeadSignedByOwner`), ONLY public anchor objects ever reach the
+  DHT while cell/sealed heads travel the private swarm's pubsub
+  (`AnchorsOnlyToDHT`), and a missing-but-reachable segment is eventually
+  backfilled under a lossy link (`BackfillReconverges`, `<>[]`, under **strong**
+  per-pair fairness of backfill + healing, the same discipline as `StreamingDB`/
+  `AntiEntropy`). `-deadlock`: saturation (every object put/held, heads at
+  `MaxSeq`) is expected quiescence, not a fault. Spec only — the plugin's real
+  implementation is a refinement of this machine-checked contract.
 - `EventDAG` is **safety-only** (`-deadlock`): a state where every author's
   chain has saturated is expected quiescence, not a fault (the `ReBroadcast`
   self-loop also keeps the model deadlock-free). It ADOPTS the git / CT / SSB /
@@ -126,3 +154,53 @@ pinned release into `./.tools/` (the path CI uses).
   (stable membership, no pending write/rotation) is expected idle, not a fault.
   The per-node-vs-per-cell cost/security posture is spelled out in
   `docs/cells-confidentiality.md`.
+- `VersioningCompat` abstracts the eight real independently-versioned seams
+  (event-envelope, materialized-view, pillar message, HTTP ingest API,
+  pillar-UDP protocol, trust-artifact/attestation, sealed-artifact envelope,
+  manifest/declared-object schema) as a generic `Surfaces` set of >= 2 seams,
+  so `IndependentVersioning` proves no forced lockstep between distinct
+  seams without eight near-identical copies of the same state machine. Peers
+  are partitioned into two cells (a federation of one multi-member cell plus
+  one single-member cell, enough to exercise both intra-cell and cross-cell
+  negotiation); each peer catches up ONE (peer, surface) version at a time
+  (rolling, never a stop-the-world jump), a release (`Bump`) is guarded so it
+  never pushes an already-lagging peer outside the N-version compat window
+  (`N1WindowHonored`), same-cell members are proven to stay within 2N of each
+  other as a direct corollary (`NoOrphanedMember`), and a negotiation attempt
+  between two peers is proven to link iff they are truly within the window
+  and refuse iff they are truly not (`NegotiationRefusesIncompatible`,
+  checked at the exact moment of every attempt via a scalar "last outcome"
+  record rather than a growing ledger, to keep the state space finite).
+  Liveness: a cell transiently holds members at different versions of the
+  same surface is reachable (`RollingCoexistence` -- rolling upgrades can
+  never all land in the same atomic step) and a cross-cell/federation pair
+  that was refused eventually re-negotiates successfully once both sides
+  catch up (`SwarmNeverPartitioned`), under weak fairness of `Bump`,
+  `RollingUpgrade`, and `Negotiate`. No `-deadlock` flag: `Negotiate` is
+  always enabled for every pair, so the model never deadlocks. Spec only --
+  gates `version-stamps-impl`, `sealed-artifact-self-describing-impl`,
+  `compat-negotiation-impl`, and `cell-aware-migration-impl` before any Rust
+  for this line lands.
+- `PillarIntegration` is the formal contract for the whole
+  integration-conformance RIG — the gate every OTHER `pillar-integration` task
+  builds against, so it lands first. It models the scenario lifecycle as a
+  strict state machine `declared -> running -> oracleAsserted -> tornDown`
+  (plus a `skipped` side-state with an un-skip edge). Teardown is
+  UNCONDITIONAL: both the pass path (`TearDownPass`, from `oracleAsserted`) and
+  the fail path (`TearDownFail`, straight from `running`) reach `tornDown`, and
+  `NoStateSkipsTeardown`/`TeardownReleasesFixtures`/`NoResidueWhenSealed` prove
+  no reachable state leaves a torn-down (or, at seal, any) scenario holding a
+  fixture — even the failed ones. A scenario's oracle claim is counted EXACTLY
+  once (`OracleAssert` is guarded `proven=FALSE`; `NoDoubleCountedClaim`). The
+  three coverage gates are invariants: Gate 1 no-orphan-surface
+  (`Gate1_NoOrphan`, evaluated at seal), Gate 2 DONE-requires-a-green-scenario
+  (`Gate2_CoveredIsProven` — a surface is `covered` only via a proven scenario
+  that claims it), Gate 3 no-skip-creep-past-a-deadline (`Gate3_NoExpiredSkip`
+  + a `Tick` guard that cannot advance the clock past a standing skip deadline).
+  Fixture isolation is enforced at `Start` and re-checked by
+  `NoSharedFixtureState` (no two running scenarios share a resource). The
+  surface-inventory↔scenario-declaration relation is pinned by the ASSUMEs
+  `ClaimsTargetRealSurface`/`ScenarioNamesRealOracle` and, executably, by
+  `schema_roundtrip_test.py`. Safety-only (`-deadlock`): the sealed terminal
+  state (all torn down, rig sealed) is expected quiescence. Spec + schema test
+  only — no rig code trusted until both are green.

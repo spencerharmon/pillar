@@ -321,8 +321,9 @@ mod tests {
             predicate: Predicate::new("compute:schedule", "cell-b/*").with_quota(amount),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
+            sig: Sig::sign_as(NodeId::from(""), b""),
         }
+        .signed_by_issuer()
     }
 
     /// A plain boolean attestation (no quota component).
@@ -335,8 +336,9 @@ mod tests {
             predicate: Predicate::new("stream:append", "cell-b/*"),
             scope: "cell-b".to_owned(),
             epoch: 0,
-            sig: Sig::by(n("owner")),
+            sig: Sig::sign_as(NodeId::from(""), b""),
         }
+        .signed_by_issuer()
     }
 
     /// Drive a quorum (2 of 3) of voters to back `candidate` for the ledger's

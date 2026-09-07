@@ -7,6 +7,7 @@ Cargo.lock linguist-generated
 specs/.tools/
 specs/states/
 specs/*_TTrace_*.tla
+specs/*_TTrace_*.bin
 specs/*.old
 
 # Editors / OS

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pillar-core",
+    "crates/pillar-crypto",
     "crates/pillar-controller",
     "crates/pillar-eventlog",
     "crates/pillar-coordination",
@@ -10,6 +11,8 @@ members = [
     "crates/pillar-identity",
     "crates/pillar-net",
     "crates/pillar-streamdb",
+    "crates/pillar-ipfs",
+    "crates/pillar-swarm",
     "crates/pillar-observability",
     "crates/pillar-wot-authority",
     "crates/pillar-rbac",
@@ -19,9 +22,22 @@ members = [
     "crates/pillar-recovery",
     "crates/pillar-cli",
     "crates/pillar-web",
+    "crates/pillar-web-frontend",
+    "crates/pillar-web-api",
     "crates/pillar-trust-artifacts",
     "crates/pillar-quota-ledger",
     "crates/pillar-topology",
+    "crates/pillar-upgrade-gate",
+    "crates/pillar-realness-gate",
+    "crates/pillar-surface-inventory",
+    "crates/pillar-e2e",
+    "crates/pillar-blob-provider",
+]
+# pillar-frontend targets wasm32-unknown-unknown and carries the yew/stylist/
+# wasm-bindgen closure with its OWN Cargo.lock; excluding it keeps the wasm
+# toolchain surface out of the native `pillar` binary's lockfile and build.
+exclude = [
+    "crates/pillar-frontend",
 ]
 
 [workspace.package]

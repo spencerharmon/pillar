@@ -10,9 +10,9 @@
 //! - **causal-parents** — the content-addresses of the manifests this one
 //!   causally follows, so a manifest is a node on the same merkle-DAG the
 //!   [`pillar_eventlog`] rides (a hash-linked, tamper-evident history);
-//! - **content-hash** — the canonical content address of the CRD body, using
-//!   the identical [`pillar_streamdb::content_address`] every other Pillar
-//!   layer uses;
+//! - **content-hash** — the canonical content address of the CRD body, a real
+//!   collision-resistant cryptographic multihash (SHA2-256 via
+//!   [`pillar_crypto::content::content_address`]), NOT a checksum;
 //! - **capability-scope** — the set of capabilities this signed intent claims
 //!   authority over.
 //!
@@ -30,13 +30,48 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use pillar_streamdb::content_address;
+use pillar_crypto::content::content_address;
+use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
+use pillar_crypto::{Seed, Signature, SigningPublicKey, SigningSecretKey};
 
-/// The content-address of a manifest body — the same 64-bit content address
-/// [`pillar_streamdb`] derives for every other Pillar artifact. Two nodes
-/// holding the same CRD body necessarily agree on its [`ContentHash`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ContentHash(pub u64);
+pub mod admission;
+pub mod apply;
+pub mod bgp_lb;
+pub mod builtin;
+pub mod gitops;
+pub mod ingress;
+pub mod network_policy;
+pub mod scheduler;
+pub mod serialize;
+pub mod service_route_dns;
+pub mod tls_cert;
+
+/// The content-address of a manifest body — a real collision-resistant
+/// cryptographic multihash (SHA2-256, self-describing `<code><len><digest>`
+/// bytes) produced by [`pillar_crypto::content::content_address`], the SAME
+/// content-address primitive every other Pillar layer uses. Two nodes holding
+/// the same CRD body necessarily agree on its [`ContentHash`]; a single-bit
+/// change to the body flips it, and finding two distinct bodies with the same
+/// hash is cryptographically infeasible (it is NOT a 64-bit checksum).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContentHash(pub Vec<u8>);
+
+impl ContentHash {
+    /// Borrow the raw multihash bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// A capability a signed intent claims authority over (an opaque scope string,
 /// e.g. `net/route`, `ipam/allocate`). Held as an ordered set so the envelope
@@ -176,7 +211,12 @@ impl Crd {
     /// The content address of this CRD body.
     #[must_use]
     pub fn content_hash(&self) -> ContentHash {
-        ContentHash(content_address(&self.canonical_bytes()))
+        // SHA2-256 multihash over the canonical body bytes. `content_address`
+        // is infallible for an in-memory buffer; a real error would be a bug in
+        // the crypto layer, so surface it loudly rather than silently masking.
+        let cid = content_address(&self.canonical_bytes())
+            .expect("content_address over an in-memory buffer cannot fail");
+        ContentHash(cid.into_bytes())
     }
 }
 
@@ -310,6 +350,17 @@ impl SchemaRegistry {
             .get(&(crd.api_version.clone(), crd.kind.clone()))
     }
 
+    /// Every `(apiVersion, kind)` currently registered — the real,
+    /// currently-served manifest-kind surface. A surface-inventory emitter
+    /// reads this (not a hand-maintained catalog), so a schema registered or
+    /// deregistered here is added or removed from the inventory by
+    /// construction.
+    pub fn kinds(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.schemas
+            .keys()
+            .map(|(api_version, kind)| (api_version.as_str(), kind.as_str()))
+    }
+
     /// Validate a CRD body against its registered schema.
     ///
     /// # Errors
@@ -380,19 +431,24 @@ impl fmt::Display for SchemaError {
 
 impl std::error::Error for SchemaError {}
 
-/// A *verified* signature over an [`Envelope`]'s binding — the dependency-free
-/// stand-in for a real OpenPGP signature packet (the same modelling
-/// [`pillar_identity::Signature`] and [`pillar_eventlog`] use).
+/// A **real ed25519 signature** over an [`Envelope`]'s binding — a detached
+/// asymmetric signature, not a self-recomputable digest. Verification uses only
+/// the recorded verifying (public) key, so holding it cannot forge a signature
+/// (the asymmetry [`pillar_crypto::sign`] guarantees).
 ///
-/// The signature is bound to the envelope's **binding digest**: the CRD body's
+/// The signature is bound to the envelope's **binding message**: the CRD body's
 /// content-hash together with the signer, the causal-parents, and the
-/// capability-scope. Rewriting any of those after signing changes the digest
+/// capability-scope. Rewriting any of those after signing changes the message
 /// and the signature no longer verifies — tamper-evidence over the whole
 /// signed intent, not just the CRD body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManifestSignature {
     signer: String,
-    signed_digest: u64,
+    /// The ed25519 verifying key the signature checks against, bound to the
+    /// signer identity (derived deterministically from it).
+    verifying_key: SigningPublicKey,
+    /// The detached ed25519 signature over the binding message.
+    signature: Signature,
 }
 
 impl ManifestSignature {
@@ -400,6 +456,12 @@ impl ManifestSignature {
     #[must_use]
     pub fn signer(&self) -> &str {
         &self.signer
+    }
+
+    /// The ed25519 verifying (public) key this signature checks against.
+    #[must_use]
+    pub fn verifying_key(&self) -> &SigningPublicKey {
+        &self.verifying_key
     }
 }
 
@@ -412,38 +474,78 @@ pub struct Envelope {
     causal_parents: BTreeSet<ContentHash>,
     content_hash: ContentHash,
     capability_scope: BTreeSet<Capability>,
+    schema_version: pillar_crypto::SurfaceVersion,
     body: Crd,
     signature: ManifestSignature,
 }
 
 impl Envelope {
-    /// Compute the binding digest over the envelope fields that the signature
-    /// covers: content-hash + signer + sorted causal-parents + sorted
-    /// capability-scope. Pure and canonical.
-    fn binding_digest(
-        content_hash: ContentHash,
+    /// The current manifest-envelope SCHEMA version this build produces and is
+    /// the newest it can interpret. This is the manifest surface's OWN
+    /// independent version line — distinct from `Crd::api_version`, which is
+    /// the Kubernetes `apiVersion` of the DECLARED object, not the pillar
+    /// envelope's schema stamp. It advances independently of every other
+    /// surface's stamp (the `IndependentVersioning` property).
+    pub const SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+    /// The oldest manifest-envelope SCHEMA version this build still accepts.
+    /// Envelopes stamped below this — or above [`Envelope::SCHEMA_VERSION`] —
+    /// are rejected by [`Envelope::check_schema_version`] as
+    /// [`pillar_crypto::VersionError::Unsupported`], distinct from a malformed
+    /// or bad-signature failure.
+    pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+
+    /// Compute the **binding message** the signature covers: schema-version +
+    /// content-hash + signer + sorted causal-parents + sorted capability-scope.
+    /// Pure and canonical — the exact bytes fed to ed25519 sign/verify. The
+    /// schema-version stamp is folded in so it is signature-covered: rewriting
+    /// the stamp after signing breaks verification.
+    fn binding_message(
+        schema_version: pillar_crypto::SurfaceVersion,
+        content_hash: &ContentHash,
         signer: &str,
         parents: &BTreeSet<ContentHash>,
         scope: &BTreeSet<Capability>,
-    ) -> u64 {
+    ) -> Vec<u8> {
         let mut b = Vec::new();
-        b.extend_from_slice(&content_hash.0.to_le_bytes());
+        b.extend_from_slice(b"pillar-manifest/envelope-binding-v1");
+        b.extend_from_slice(&schema_version.to_be_bytes());
+        b.extend_from_slice(&(content_hash.0.len() as u64).to_le_bytes());
+        b.extend_from_slice(&content_hash.0);
         push_str(&mut b, signer);
         b.extend_from_slice(&(parents.len() as u64).to_le_bytes());
         for p in parents {
-            b.extend_from_slice(&p.0.to_le_bytes());
+            b.extend_from_slice(&(p.0.len() as u64).to_le_bytes());
+            b.extend_from_slice(&p.0);
         }
         b.extend_from_slice(&(scope.len() as u64).to_le_bytes());
         for c in scope {
             push_str(&mut b, &c.0);
         }
-        content_address(&b)
+        b
+    }
+
+    /// Derive the ed25519 signing keypair bound to a `signer` identity.
+    ///
+    /// The signer string IS the key material: a domain-separated seed derives a
+    /// real ed25519 keypair deterministically (so two nodes signing as the same
+    /// identity produce a verifiable signature, and re-import is stable),
+    /// through [`pillar_crypto::sign::signing_keypair_from_seed`]. A production
+    /// deployment binds `signer` to an operator-held secret key instead; the
+    /// contract — a real asymmetric signature whose forgery is infeasible from
+    /// the public key alone — is identical.
+    fn keypair_for_signer(signer: &str) -> (SigningPublicKey, SigningSecretKey) {
+        let mut seed_material = Vec::new();
+        seed_material.extend_from_slice(b"pillar-manifest/signer-key-v1/");
+        seed_material.extend_from_slice(signer.as_bytes());
+        let seed = Seed::from_bytes(seed_material);
+        signing_keypair_from_seed(&seed).expect("ed25519 keygen from seed cannot fail")
     }
 
     /// Import a plain CRD by **signing it into an envelope**: derive the body's
     /// content-hash, attach the causal-parents and capability-scope, and bind a
-    /// signature by `signer`. This is how a plain Kubernetes CRD becomes a
-    /// Pillar signed-intent — the superset direction.
+    /// real ed25519 signature by `signer`. This is how a plain Kubernetes CRD
+    /// becomes a Pillar signed-intent — the superset direction.
     #[must_use]
     pub fn import(
         body: Crd,
@@ -455,17 +557,26 @@ impl Envelope {
         let content_hash = body.content_hash();
         let causal_parents: BTreeSet<ContentHash> = causal_parents.into_iter().collect();
         let capability_scope: BTreeSet<Capability> = capability_scope.into_iter().collect();
-        let signed_digest =
-            Self::binding_digest(content_hash, &signer, &causal_parents, &capability_scope);
+        let message = Self::binding_message(
+            Self::SCHEMA_VERSION,
+            &content_hash,
+            &signer,
+            &causal_parents,
+            &capability_scope,
+        );
+        let (verifying_key, secret) = Self::keypair_for_signer(&signer);
+        let signature = sign(&secret, &message).expect("ed25519 signing cannot fail");
         Envelope {
             signer: signer.clone(),
             causal_parents,
             content_hash,
             capability_scope,
+            schema_version: Self::SCHEMA_VERSION,
             body,
             signature: ManifestSignature {
                 signer,
-                signed_digest,
+                verifying_key,
+                signature,
             },
         }
     }
@@ -499,13 +610,34 @@ impl Envelope {
     /// The content-hash the envelope records for its body.
     #[must_use]
     pub fn content_hash(&self) -> ContentHash {
-        self.content_hash
+        self.content_hash.clone()
     }
 
     /// The capability-scope this signed intent claims.
     #[must_use]
     pub fn capability_scope(&self) -> &BTreeSet<Capability> {
         &self.capability_scope
+    }
+
+    /// The manifest-envelope SCHEMA version this envelope is stamped with —
+    /// the pillar surface's own version line, NOT the CRD body's Kubernetes
+    /// `apiVersion`.
+    #[must_use]
+    pub fn schema_version(&self) -> pillar_crypto::SurfaceVersion {
+        self.schema_version
+    }
+
+    /// Verify the stamped schema-version is one this build can interpret, i.e.
+    /// within `[MIN_SCHEMA_VERSION, SCHEMA_VERSION]`.
+    ///
+    /// # Errors
+    /// [`pillar_crypto::VersionError::Unsupported`] if the stamp is older or
+    /// newer than this build supports — distinct from a malformed or
+    /// bad-signature failure so a newer-peer envelope is a negotiable
+    /// version mismatch rather than corruption.
+    pub fn check_schema_version(&self) -> Result<(), pillar_crypto::VersionError> {
+        self.schema_version
+            .check_supported(Self::MIN_SCHEMA_VERSION, Self::SCHEMA_VERSION)
     }
 
     /// The signature over this manifest's binding.
@@ -518,27 +650,58 @@ impl Envelope {
     ///
     /// 1. the recorded `content_hash` still equals the body's recomputed
     ///    content address (the body was not rewritten after sealing), and
-    /// 2. the signature was issued by the recorded signer AND still covers the
-    ///    envelope's recomputed binding digest (no field — body, signer,
-    ///    parents, or scope — was tampered after signing).
+    /// 2. the verifying key is the one bound to the recorded signer, AND the
+    ///    real ed25519 signature verifies over the envelope's recomputed
+    ///    binding message (no field — schema-version, body, signer, parents,
+    ///    or scope — was tampered after signing). Verification is asymmetric:
+    ///    it uses only the public key, so a forged signature is
+    ///    cryptographically infeasible.
+    ///
+    /// Note this is authenticity/integrity only; it does NOT gate on whether
+    /// the stamped schema-version is one this build supports — that is
+    /// [`Envelope::check_schema_version`], a distinct decision so an unknown
+    /// version is rejected separately from a bad signature.
     #[must_use]
     pub fn verify(&self) -> bool {
         if self.body.content_hash() != self.content_hash {
             return false;
         }
-        let expected = Self::binding_digest(
-            self.content_hash,
+        if self.signature.signer != self.signer {
+            return false;
+        }
+        // The verifying key MUST be the one bound to the claimed signer — a
+        // forged envelope cannot swap in a key it controls and still name the
+        // real signer.
+        let (expected_key, _) = Self::keypair_for_signer(&self.signer);
+        if self.signature.verifying_key != expected_key {
+            return false;
+        }
+        let message = Self::binding_message(
+            self.schema_version,
+            &self.content_hash,
             &self.signer,
             &self.causal_parents,
             &self.capability_scope,
         );
-        self.signature.signer == self.signer && self.signature.signed_digest == expected
+        verify(
+            &self.signature.verifying_key,
+            &message,
+            &self.signature.signature,
+        )
+        .is_ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A distinct test content-hash — a real multihash over a label, so parent
+    /// hashes are the same shape real bodies produce.
+    fn ch(n: u64) -> ContentHash {
+        let cid = content_address(format!("test-parent-{n}").as_bytes()).expect("address");
+        ContentHash(cid.into_bytes())
+    }
 
     fn route_schema() -> Schema {
         Schema::new("pillar.dev/v1", "Route")
@@ -569,7 +732,7 @@ mod tests {
     fn envelope_to_crd_to_envelope_round_trip_is_stable() {
         let crd = route_crd();
         let scope = [Capability::from("net/route")];
-        let parents = [ContentHash(42)];
+        let parents = [ch(42)];
         let env = Envelope::import(crd, "AAAA-FPR", parents, scope);
 
         // Render to a plain CRD, then re-import with the SAME envelope fields.
@@ -577,7 +740,7 @@ mod tests {
         let reimported = Envelope::import(
             rendered,
             env.signer(),
-            env.causal_parents().iter().copied(),
+            env.causal_parents().iter().cloned(),
             env.capability_scope().iter().cloned(),
         );
         assert_eq!(reimported, env);
@@ -587,10 +750,10 @@ mod tests {
     #[test]
     fn re_rendering_an_imported_crd_reproduces_the_original() {
         let crd = route_crd();
-        let env = Envelope::import(crd.clone(), "AAAA-FPR", [ContentHash(7)], []);
+        let env = Envelope::import(crd.clone(), "AAAA-FPR", [ch(7)], []);
         // CRD import re-renders: import(render(env)) yields the same body twice.
         assert_eq!(env.render(), crd);
-        let env2 = Envelope::import(env.render(), "AAAA-FPR", [ContentHash(7)], []);
+        let env2 = Envelope::import(env.render(), "AAAA-FPR", [ch(7)], []);
         assert_eq!(env2.render(), crd);
         assert_eq!(env2, env);
     }
@@ -661,7 +824,7 @@ mod tests {
         let env = Envelope::import(
             route_crd(),
             "AAAA-FPR",
-            [ContentHash(1), ContentHash(2)],
+            [ch(1), ch(2)],
             [Capability::from("net/route")],
         );
         assert!(env.verify());
@@ -695,9 +858,9 @@ mod tests {
 
     #[test]
     fn tampering_the_causal_parents_breaks_the_signature() {
-        let env = Envelope::import(route_crd(), "AAAA-FPR", [ContentHash(1)], []);
+        let env = Envelope::import(route_crd(), "AAAA-FPR", [ch(1)], []);
         let mut tampered = env.clone();
-        tampered.causal_parents.insert(ContentHash(9999));
+        tampered.causal_parents.insert(ch(9999));
         assert!(!tampered.verify());
     }
 
@@ -707,6 +870,46 @@ mod tests {
         let mut tampered = env.clone();
         tampered.signer = "BBBB-FPR".into();
         assert!(!tampered.verify());
+    }
+
+    #[test]
+    fn the_content_hash_is_a_real_sha256_multihash_not_a_checksum() {
+        // A sha2-256 multihash is `<0x12><0x20><32-byte digest>` = 34 bytes,
+        // never a 8-byte little-endian u64 checksum.
+        let crd = route_crd();
+        let ch = crd.content_hash();
+        assert_eq!(ch.as_bytes().len(), 34, "sha2-256 multihash is 34 bytes");
+        assert_eq!(ch.as_bytes()[0], 0x12, "multicodec sha2-256");
+        assert_eq!(ch.as_bytes()[1], 0x20, "32-byte digest length");
+    }
+
+    #[test]
+    fn a_forged_signature_from_a_foreign_key_cannot_be_substituted() {
+        // Real asymmetry: an attacker who re-signs the SAME binding message
+        // with their OWN key and swaps in their verifying key must NOT verify,
+        // because the verifying key is bound to the claimed signer identity.
+        let env = Envelope::import(route_crd(), "AAAA-FPR", [], [Capability::from("net/route")]);
+        assert!(env.verify());
+
+        let message = Envelope::binding_message(
+            env.schema_version,
+            &env.content_hash,
+            &env.signer,
+            &env.causal_parents,
+            &env.capability_scope,
+        );
+        let (foreign_pub, foreign_secret) = Envelope::keypair_for_signer("MALLORY-FPR");
+        let foreign_sig = sign(&foreign_secret, &message).expect("sign");
+
+        let mut forged = env.clone();
+        // Attacker forges a valid signature under their own key but still
+        // claims to be AAAA-FPR.
+        forged.signature.verifying_key = foreign_pub;
+        forged.signature.signature = foreign_sig;
+        assert!(
+            !forged.verify(),
+            "a signature under a foreign key must not verify for the claimed signer"
+        );
     }
 
     #[test]
@@ -734,5 +937,58 @@ mod tests {
         let a = route_crd();
         let b = route_crd().with_spec("metric", Value::Integer(200));
         assert_ne!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn an_imported_envelope_is_stamped_with_the_current_schema_version() {
+        let env = Envelope::import(route_crd(), "AAAA-FPR", [], []);
+        assert_eq!(env.schema_version(), Envelope::SCHEMA_VERSION);
+        // The current version is one this build supports.
+        assert_eq!(env.check_schema_version(), Ok(()));
+    }
+
+    #[test]
+    fn a_stamped_but_unknown_future_schema_version_is_rejected_distinctly() {
+        // A cleanly-constructed envelope carrying a FUTURE schema version is
+        // Unsupported — NOT Malformed — so the compatibility layer treats a
+        // newer peer as negotiable rather than as corruption.
+        let mut env = Envelope::import(route_crd(), "AAAA-FPR", [], []);
+        let future = pillar_crypto::SurfaceVersion(Envelope::SCHEMA_VERSION.0 + 1);
+        env.schema_version = future;
+        let err = env.check_schema_version().unwrap_err();
+        assert_eq!(
+            err,
+            pillar_crypto::VersionError::Unsupported {
+                found: future,
+                min: Envelope::MIN_SCHEMA_VERSION,
+                max: Envelope::SCHEMA_VERSION,
+            }
+        );
+        assert_ne!(err, pillar_crypto::VersionError::Malformed);
+    }
+
+    #[test]
+    fn tampering_the_schema_version_breaks_the_signature() {
+        // The stamp is folded into the binding message, so rewriting it after
+        // signing invalidates the ed25519 signature — it is signature-covered.
+        let env = Envelope::import(route_crd(), "AAAA-FPR", [], []);
+        assert!(env.verify());
+        let mut tampered = env.clone();
+        tampered.schema_version = pillar_crypto::SurfaceVersion(Envelope::SCHEMA_VERSION.0 + 1);
+        assert!(!tampered.verify());
+    }
+
+    #[test]
+    fn a_normally_imported_envelope_still_verifies_after_the_stamp_fold() {
+        // Regression: folding the schema-version stamp into binding_message
+        // must not break the ordinary sign/verify path.
+        let env = Envelope::import(
+            route_crd(),
+            "AAAA-FPR",
+            [ch(1), ch(2)],
+            [Capability::from("net/route")],
+        );
+        assert!(env.verify());
+        assert_eq!(env.check_schema_version(), Ok(()));
     }
 }

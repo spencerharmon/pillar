@@ -793,7 +793,9 @@ mod tests {
         let before_len = log.len();
 
         let mut domains = DomainCli::new();
-        domains.new_domain("example.com", vec!["10.0.0.1:8080".into()]).unwrap();
+        domains
+            .new_domain("example.com", vec!["10.0.0.1:8080".into()])
+            .unwrap();
         assert_eq!(domains.show("example.com").unwrap().cells, BTreeSet::new());
 
         domains.add_cell("example.com", "cellA").unwrap();
@@ -934,7 +936,10 @@ mod tests {
         assert!(peers.dial("peerA").unwrap());
         assert!(peers.ping("peerA").unwrap());
         assert!(!peers.dial("peerB").unwrap());
-        assert_eq!(peers.dial("ghost"), Err(PeerError::NoSuchPeer("ghost".into())));
+        assert_eq!(
+            peers.dial("ghost"),
+            Err(PeerError::NoSuchPeer("ghost".into()))
+        );
     }
 
     // ---- lease: acquire/release round-trips pillar-coordination ----
@@ -981,19 +986,17 @@ mod tests {
     #[test]
     fn request_approve_node_returns_sealed_cell_key_cid() {
         let mut requests = RequestCli::new(n("cellA"), [n("m1")]);
-        let id = requests.submit_node(
-            n("newnode"),
-            node_identity(),
-            CustodyKind::Password,
-            vec![],
-        );
+        let id = requests.submit_node(n("newnode"), node_identity(), CustodyKind::Password, vec![]);
         assert_eq!(requests.ls().len(), 1);
 
         let sealed = requests.approve(id, &n("m1")).unwrap();
         let sealed = sealed.expect("a node approval seals the cell key");
         assert_eq!(sealed.sealed_to, n("newnode"));
         assert_eq!(sealed.sealed_by, n("m1"));
-        assert!(sealed.cid.starts_with("bafy-"), "the CID is content-addressed");
+        assert!(
+            sealed.cid.starts_with("bafy-"),
+            "the CID is content-addressed"
+        );
 
         // No longer pending, and it is discoverable via describe.
         assert!(requests.ls().is_empty());
@@ -1003,12 +1006,7 @@ mod tests {
     #[test]
     fn request_reject_delivers_no_key_material() {
         let mut requests = RequestCli::new(n("cellA"), [n("m1")]);
-        let id = requests.submit_node(
-            n("newnode"),
-            node_identity(),
-            CustodyKind::Password,
-            vec![],
-        );
+        let id = requests.submit_node(n("newnode"), node_identity(), CustodyKind::Password, vec![]);
         requests.reject(id, &n("m1")).unwrap();
         assert_eq!(requests.queue().sealed_cell_key(id), None);
         assert!(requests.ls().is_empty());
@@ -1017,12 +1015,7 @@ mod tests {
     #[test]
     fn request_approve_reject_refuse_an_unauthorized_member() {
         let mut requests = RequestCli::new(n("cellA"), [n("m1")]);
-        let id = requests.submit_node(
-            n("newnode"),
-            node_identity(),
-            CustodyKind::Password,
-            vec![],
-        );
+        let id = requests.submit_node(n("newnode"), node_identity(), CustodyKind::Password, vec![]);
         assert_eq!(
             requests.approve(id, &n("mallory")),
             Err(RequestError::NotAuthorizedMember)

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!--
+  trunk entrypoint for the pillar portal. `trunk build` compiles the
+  pillar-frontend crate to wasm, runs wasm-bindgen, injects the wasm/js hashed
+  asset links here, and bundles the stylist-emitted CSS — all with NO npm/Node.
+  The `data-trunk rel="rust"` link makes this crate the wasm bundle source.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pillar portal</title>
+    <link rel="stylesheet" href="/portal.css" integrity="sha384-aFSFoujkj0nWfEkUjhUFuItA6LxNT13iO9zeoNTqUArobhhwdRTqlCvHKS1Xu1/J"/>
+    
+<script type="module">
+import init, * as bindings from '/pillar-frontend.js';
+const wasm = await init({ module_or_path: '/pillar-frontend_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+  <link rel="modulepreload" href="/pillar-frontend.js" crossorigin="anonymous" integrity="sha384-MWTCwmsY18xEbxbO6q6gBV7a1rU3i3Rcr0vJtbaLIUH2pnHqs/FTI15SOoeQyDFD"><link rel="preload" href="/pillar-frontend_bg.wasm" crossorigin="anonymous" integrity="sha384-YzpqtCGS++A9jiAyBGnVxI+v/XQxj/E4MsnT0cnXUQEWbxp4acxBeSLItjsR6Egk" as="fetch" type="application/wasm"></head>
+  <body></body>
+</html>

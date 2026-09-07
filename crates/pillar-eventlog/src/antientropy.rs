@@ -104,7 +104,7 @@ impl EventLog {
             let peer_height = digest.height(author);
             for seq in peer_height..local_height {
                 if let Some(id) = self.by_seq.get(&(author.clone(), seq)) {
-                    missing.insert(*id);
+                    missing.insert(id.clone());
                 }
             }
         }
@@ -117,7 +117,7 @@ impl EventLog {
         let mut emitted: BTreeSet<EventId> = BTreeSet::new();
         let mut visiting: BTreeSet<EventId> = BTreeSet::new();
         for id in &missing {
-            self.emit_in_causal_order(*id, &missing, &mut emitted, &mut visiting, &mut ordered);
+            self.emit_in_causal_order(id, &missing, &mut emitted, &mut visiting, &mut ordered);
         }
         ordered
     }
@@ -128,33 +128,33 @@ impl EventLog {
     /// keeps the walk linear).
     fn emit_in_causal_order(
         &self,
-        id: EventId,
+        id: &EventId,
         missing: &BTreeSet<EventId>,
         emitted: &mut BTreeSet<EventId>,
         visiting: &mut BTreeSet<EventId>,
         ordered: &mut Vec<Event>,
     ) {
-        if emitted.contains(&id) || !visiting.insert(id) {
+        if emitted.contains(id) || !visiting.insert(id.clone()) {
             return;
         }
-        if let Some(event) = self.events.get(&id) {
+        if let Some(event) = self.events.get(id) {
             // Recurse into causal predecessors that are themselves in the
             // missing set, so they are emitted first.
             if let Some(prev) = event.content().prev() {
                 if missing.contains(&prev) {
-                    self.emit_in_causal_order(prev, missing, emitted, visiting, ordered);
+                    self.emit_in_causal_order(&prev, missing, emitted, visiting, ordered);
                 }
             }
             for parent in event.content().parents() {
                 if missing.contains(parent) {
-                    self.emit_in_causal_order(*parent, missing, emitted, visiting, ordered);
+                    self.emit_in_causal_order(parent, missing, emitted, visiting, ordered);
                 }
             }
-            if emitted.insert(id) {
+            if emitted.insert(id.clone()) {
                 ordered.push(event.clone());
             }
         }
-        visiting.remove(&id);
+        visiting.remove(id);
     }
 
     /// Apply one anti-entropy sync round: pull from `sender` every event this
@@ -210,7 +210,7 @@ mod tests {
     /// Every id a replica holds, for asserting two logs hold the identical
     /// reachable event set (`AllConverged`).
     fn id_set(log: &EventLog) -> BTreeSet<EventId> {
-        log.events.keys().copied().collect()
+        log.events.keys().cloned().collect()
     }
 
     /// `CausallyClosed`: a replica never holds `(a, seq)` without also holding
@@ -220,12 +220,12 @@ mod tests {
             let c = event.content();
             if let Some(prev) = c.prev() {
                 assert!(
-                    log.contains(prev),
+                    log.contains(&prev),
                     "held event missing its prev (causal predecessor)"
                 );
             }
             for parent in c.parents() {
-                assert!(log.contains(*parent), "held event missing a parent link");
+                assert!(log.contains(parent), "held event missing a parent link");
             }
         }
     }

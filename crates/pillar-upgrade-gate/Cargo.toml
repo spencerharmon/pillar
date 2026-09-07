@@ -1,0 +1,24 @@
+[package]
+name = "pillar-upgrade-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The upgrade acceptance gate (ROI P1 'the gate that makes continuous bumps safe'): a CI test that boots the NEW binary against a fixture of REAL captured cell state — produced by an earlier stage running a prior-version build against a scratch cell — and asserts, together, that identity is intact, a real user still logs in, the streaming DB rehydrates to the SAME view root, trust artifacts still verify, an old-algorithm sealed cell key still decrypts, and the N-1 compat matrix holds. GREEN is the promotion criterion for the image the cluster follows; RED blocks promotion."
+
+# This crate is a pure acceptance-gate harness: it ships no runtime code, only
+# the fixture-producing "prior-version build" simulation (lib) and the gate
+# assertions (integration tests). It depends on every ROI-P1 surface crate so
+# the gate exercises the real APIs a shipped `pillar` binary carries.
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-crypto = { path = "../pillar-crypto", default-features = false }
+pillar-eventlog = { path = "../pillar-eventlog" }
+pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-identity = { path = "../pillar-identity" }
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+pillar-cells = { path = "../pillar-cells" }
+
+[lints]
+workspace = true

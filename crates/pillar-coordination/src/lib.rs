@@ -10,6 +10,24 @@
 //!
 //! This crate models the decision logic only; distribution of grants over the
 //! streaming DB / gossip layer is a separate component.
+//!
+//! # Trust boundary (grant authenticity is inherited, not established here)
+//!
+//! A [`grant`](LeaseRegister::grant) is an authority-bearing assertion by one
+//! node (`voter`) about another (`candidate`). This register does **not**
+//! authenticate it: `voter` is taken on trust. `AtMostOneHolderPerEpoch`
+//! therefore rests on a precondition the register cannot enforce itself — that
+//! every grant it records was **authenticated upstream as a signed event on the
+//! streaming database** (`pillar-crypto` signing at the event layer), and the
+//! register is a fold of those already-verified events. There must be **no
+//! out-of-log grant path** that feeds an unauthenticated `voter` into
+//! [`grant`](LeaseRegister::grant): a peer able to forge a grant from another
+//! voter could manufacture a majority and acquire an epoch it never won,
+//! silently breaking the quorum-intersection safety the TLA+ proof assumes.
+//! (The proof shows the quorum *logic* is sound *given* honest, authenticated
+//! voters; it cannot see a forged voter id.) If a direct peer-to-peer grant
+//! path is ever added, grants must become signed claims verified via
+//! `pillar-crypto` before being counted, and this crate takes that dependency.
 
 use std::collections::HashMap;
 
@@ -56,6 +74,12 @@ impl LeaseRegister {
     }
 
     /// Record `voter`'s grant of `epoch` to `candidate`.
+    ///
+    /// # Safety precondition (see the crate-level Trust boundary)
+    /// The caller MUST have authenticated this grant — i.e. `voter` is the true
+    /// origin, established by folding a signed grant event from the streaming
+    /// DB. This register trusts `voter` and does not verify it; feeding an
+    /// unauthenticated grant here breaks `AtMostOneHolderPerEpoch`.
     ///
     /// # Errors
     /// Returns [`GrantError::StaleEpoch`] if the voter has already granted at an

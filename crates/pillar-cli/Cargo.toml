@@ -20,23 +20,43 @@ pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-rbac = { path = "../pillar-rbac" }
 pillar-identity = { path = "../pillar-identity" }
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+pillar-topology = { path = "../pillar-topology" }
 pillar-key-distribution = { path = "../pillar-key-distribution" }
 pillar-web = { path = "../pillar-web" }
+pillar-web-api = { path = "../pillar-web-api" }
 pillar-net = { path = "../pillar-net" }
 pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-swarm = { path = "../pillar-swarm" }
 pillar-controller = { path = "../pillar-controller" }
 pillar-coordination = { path = "../pillar-coordination" }
 pillar-observability = { path = "../pillar-observability" }
-pillar-topology = { path = "../pillar-topology" }
 pillar-cells = { path = "../pillar-cells" }
+pillar-crypto = { path = "../pillar-crypto", default-features = false }
 libp2p = { version = "0.56", features = ["ed25519"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Default keeps the everyday `cargo build -p pillar-cli` / `cargo test --all`
+# fast — no HSM bindgen crates or native libs. The deployed node turns them on:
+# the flake builds `-p pillar-cli --features hsm`, so every shipped `pillar`
+# binary carries every popular hardware custody backend.
+default = []
+hsm = ["pillar-crypto/hsm", "passkey"]
+# CLI-driven CTAP2 WebAuthn ceremonies (registration/assertion) over ctap-hid
+# against a locally attached hardware authenticator — `pillar webauthn
+# register|login`. Folded into `hsm` (every deployed node build) and
+# available standalone for a WebAuthn-only build.
+passkey = ["pillar-crypto/passkey"]
 
 [dev-dependencies]
 tempfile = "3"
+ciborium = "0.2"
+sha2 = "0.10"
 
 [lints]
 workspace = true

@@ -1,0 +1,8 @@
+# Pin the trunk build to the wasm target so `trunk build` needs no extra flag.
+[build]
+target = "index.html"
+dist = "dist"
+# STABLE, un-hashed output filenames: the two-stage nix build embeds these
+# assets into the pillar binary via `include_bytes!`, which needs a fixed path
+# (a content-hash in the name would change every build and break the embed).
+filehash = false

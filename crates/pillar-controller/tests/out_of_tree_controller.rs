@@ -18,7 +18,7 @@ use pillar_controller::{
 use pillar_coordination::LeaseRegister;
 use pillar_core::{Epoch, NodeId, SideEffect};
 use pillar_identity::capability::{Capability, CapabilityRegistry};
-use pillar_identity::{NodeSubkey, Registry, Signature, UserPrimary};
+use pillar_identity::{NodeSubkey, PrimaryKeypair, Registry};
 use pillar_streamdb::Stream;
 
 /// The capability an out-of-tree config-sync controller requires — chosen
@@ -73,12 +73,14 @@ fn sync(admitted: Admitted<ConfigResource>) -> SyncedConfig {
 /// out-of-tree crate has no access to it).
 fn admitted_identity() -> (Registry, NodeSubkey, NodeSubkey) {
     let mut reg = Registry::new();
-    let primary = UserPrimary::from("op-primary");
+    let primary = PrimaryKeypair::from_secret_seed(&pillar_crypto::Seed::from_bytes(
+        b"pillar-out-of-tree-op-primary".to_vec(),
+    ));
     let controller = NodeSubkey::from("config-controller-node");
     let foreign = NodeSubkey::from("foreign-node");
-    reg.register(primary.clone());
-    reg.issue_subkey(Signature::new(controller.clone(), primary.clone()));
-    reg.issue_subkey(Signature::new(foreign.clone(), primary));
+    reg.register(primary.primary());
+    assert!(reg.issue_subkey(primary.certify(&controller)));
+    assert!(reg.issue_subkey(primary.certify(&foreign)));
     reg.handshake(&controller).unwrap();
     reg.handshake(&foreign).unwrap();
     (reg, controller, foreign)

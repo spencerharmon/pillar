@@ -35,29 +35,72 @@
 //! caBLE ([`crate::key_login`]) remains ONLY the untrusted/foreign-node path;
 //! passkey/WebAuthn stays an optional stronger unlock factor.
 //!
-//! This crate carries no real crypto (same convention as [`crate::key_login`]
-//! and every other crypto-shaped model in this codebase): the argon2id KDF,
-//! the node-seal AEAD, and the signature are deterministic stand-ins so the
-//! PROTOCOL — a node that holds a key only where sealed, unlocks it
-//! server-side, and admits through the one shared authority — is modelled
-//! precisely.
+//! ## Real cryptography (ROI non-negotiable #7)
+//!
+//! This crate now runs the SAME real primitives [`pillar_crypto`] wires
+//! everywhere else in the codebase — never a `DefaultHasher`/`SipHash`
+//! stand-in and never a bare integer-equality "AEAD":
+//! * [`pillar_crypto::kdf::derive_key`] — memory-hard **argon2id**, the
+//!   high-cost last line that turns the user's password into the symmetric
+//!   key protecting the operational-key material at rest.
+//! * [`pillar_crypto::aead::seal_symmetric`] /
+//!   [`pillar_crypto::aead::open_symmetric`] — **ChaCha20/XChaCha20-Poly1305**
+//!   AEAD, used TWICE in a real nested envelope: the password-derived key
+//!   seals the plaintext operational-key material (the "inner" layer), and
+//!   the node's own derived key then node-seals that inner ciphertext (the
+//!   "outer" layer) — an unsealed node literally cannot decrypt the inner
+//!   ciphertext, and a wrong password fails AEAD authentication rather than
+//!   comparing two integers.
+//! * [`pillar_crypto::sign::signing_keypair_from_seed`] /
+//!   [`pillar_crypto::sign::sign`] / [`pillar_crypto::sign::verify`] — real
+//!   **ed25519** signing over the challenge nonce with the material the node
+//!   recovers server-side; the node verifies only against the WoT-registered
+//!   public key, exactly like [`crate::key_login`].
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use pillar_core::NodeId;
+use pillar_crypto::{aead, kdf, sign};
+use pillar_crypto::{Ciphertext, KdfParams, Salt, Seed, SigningPublicKey, SymmetricKey};
 use pillar_identity::NodeSubkey;
+use pillar_key_distribution::{
+    Artifact, ArtifactId, ArtifactKind, CellId, KeyDistributionLedger, RecordKey,
+    UserId as KdUserId,
+};
 use pillar_wot_authority::{ActError, FencedActor, WotAuthority};
 
 use crate::key_login::{Nonce, Origin, Signature};
 
-fn digest(parts: &[&str]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for part in parts {
-        part.hash(&mut hasher);
-    }
-    hasher.finish()
+/// The argon2id work parameters protecting the password-locked operational
+/// key at rest. Same OWASP-ish starting point [`KdfParams::default`] ships,
+/// matching [`crate::key_login`].
+fn kdf_params() -> KdfParams {
+    KdfParams::default()
+}
+
+/// Derive the per-subkey argon2id salt for the PASSWORD layer. Bound to the
+/// subkey's own (public, non-secret) identity so distinct subkeys never
+/// share a salt even under the same password.
+fn subkey_salt(subkey: &NodeSubkey) -> Salt {
+    Salt::from_bytes(format!("pillar-node-custody/pw-salt-v1/{}", subkey.0).into_bytes())
+}
+
+/// The ed25519 signing-seed derivation domain tag: binds the seed to the
+/// subkey's own identity as well as the recovered plaintext secret, mirroring
+/// [`crate::key_login`]'s `subkey_seed`.
+fn subkey_seed(subkey: &NodeSubkey, secret: &str) -> Seed {
+    Seed::from_bytes(format!("pillar-node-custody/seed-v1/{}/{secret}", subkey.0).into_bytes())
+}
+
+/// Derive the node's own AEAD key for the OUTER node-seal layer, from the
+/// node's private secret and its own (public) [`NodeId`] — a real memory-hard
+/// KDF, exactly as the password layer uses, but keyed by the node's secret
+/// rather than a user password.
+fn node_seal_key(node: &NodeId, node_secret: &str) -> SymmetricKey {
+    let salt =
+        Salt::from_bytes(format!("pillar-node-custody/node-seal-salt-v1/{node}").into_bytes());
+    kdf::derive_key(node_secret.as_bytes(), &salt, &kdf_params())
+        .expect("argon2id derivation with valid params never fails")
 }
 
 /// A content id (CID) addressing an opaque, node-sealed key-offer blob in the
@@ -100,19 +143,25 @@ impl NodeKey {
 
     /// Strip the node-seal off `blob`, recovering the inner
     /// (still password-locked) operational-key ciphertext — but ONLY if this
-    /// node is in the blob's sealed-to set. A node not sealed to cannot
-    /// unseal (returns `None`), so the operational key never lands on an
-    /// unsealed foreign node (`UntrustedNodeNeverHoldsKey`).
+    /// node is in the blob's sealed-to set AND holds the matching node
+    /// secret: the outer layer is a REAL AEAD open (ChaCha20/XChaCha20-
+    /// Poly1305) keyed by this node's own argon2id-derived seal key, so a
+    /// node not sealed to it (or lacking the right secret) fails AEAD
+    /// authentication and returns `None` — the operational key never lands
+    /// on an unsealed foreign node (`UntrustedNodeNeverHoldsKey`).
     #[must_use]
-    fn unseal(&self, blob: &SealedOffer) -> Option<u64> {
+    fn unseal(&self, blob: &SealedOffer) -> Option<Ciphertext> {
         if !blob.sealed_to.contains(&self.node) {
             return None;
         }
-        // The node-seal stand-in: the inner ciphertext XORed with this node's
-        // derived seal material. Only a node in `sealed_to` — and holding the
-        // matching node secret — recovers the inner ciphertext.
-        let seal_material = digest(&["pillar-node-seal-v1", &self.node.to_string(), &self.secret]);
-        Some(blob.node_sealed ^ seal_material)
+        let seal_key = node_seal_key(&self.node, &self.secret);
+        let inner = aead::open_symmetric(
+            &seal_key,
+            &blob.node_sealed,
+            b"pillar-node-custody/node-seal-v1",
+        )
+        .ok()?;
+        Some(Ciphertext::from_bytes(inner))
     }
 }
 
@@ -126,20 +175,23 @@ pub struct SealedOffer {
     /// login is verified against.
     subkey: NodeSubkey,
     /// The node-sealed ciphertext: the password-locked operational-key
-    /// material, further sealed to the allow-listed node keys.
-    node_sealed: u64,
+    /// material (itself a real AEAD ciphertext), further AEAD-sealed to the
+    /// allow-listed node keys.
+    node_sealed: Ciphertext,
     /// The nodes the cell has sealed this offer to (the access control).
     sealed_to: std::collections::BTreeSet<NodeId>,
 }
 
 impl SealedOffer {
     /// Seal a fresh offer for `subkey`: the operational key is locked under
-    /// `password` (the high-cost argon2id last line) and then node-sealed to
-    /// every node in `sealed_to`. `secret` is the plaintext operational-key
-    /// material (never retained). The node seal for THIS stand-in is keyed by
-    /// a single node's material; a real deployment seals per-node — here we
-    /// model the common case of one trusted node per offer, which is all the
-    /// login path exercises.
+    /// `password` (the high-cost argon2id-derived AEAD key — the "inner"
+    /// layer) and then node-sealed (a second, independent AEAD layer keyed
+    /// by the trusted node's own argon2id-derived material — the "outer"
+    /// layer) to every node in `sealed_to`. `secret` is the plaintext
+    /// operational-key material (never retained in the blob). The node seal
+    /// for THIS stand-in is keyed by a single node's material; a real
+    /// deployment seals per-node — here we model the common case of one
+    /// trusted node per offer, which is all the login path exercises.
     #[must_use]
     pub fn seal(
         subkey: NodeSubkey,
@@ -149,17 +201,24 @@ impl SealedOffer {
         sealed_to: impl IntoIterator<Item = NodeId>,
     ) -> Self {
         let sealed_to: std::collections::BTreeSet<NodeId> = sealed_to.into_iter().collect();
-        // Inner: the password-locked operational-key ciphertext (argon2id).
-        let inner = argon2id(password, &subkey, secret);
-        // Outer: node-seal it with the trusted node's derived material.
-        let seal_material = digest(&[
-            "pillar-node-seal-v1",
-            &node_key.node.to_string(),
-            &node_key.secret,
-        ]);
+        // Inner: the password-locked operational-key ciphertext (argon2id KEK
+        // + a real AEAD seal — never a bare digest).
+        let pw_key = kdf::derive_key(password.as_bytes(), &subkey_salt(&subkey), &kdf_params())
+            .expect("argon2id derivation with valid params never fails");
+        let inner =
+            aead::seal_symmetric(&pw_key, secret.as_bytes(), b"pillar-node-custody/inner-v1")
+                .expect("chacha20poly1305 sealing of valid input never fails");
+        // Outer: node-seal it with the trusted node's own derived AEAD key.
+        let node_key_mat = node_seal_key(&node_key.node, &node_key.secret);
+        let outer = aead::seal_symmetric(
+            &node_key_mat,
+            inner.as_bytes(),
+            b"pillar-node-custody/node-seal-v1",
+        )
+        .expect("chacha20poly1305 sealing of valid input never fails");
         SealedOffer {
             subkey,
-            node_sealed: inner ^ seal_material,
+            node_sealed: outer,
             sealed_to,
         }
     }
@@ -178,23 +237,24 @@ impl SealedOffer {
     }
 }
 
-/// The high-cost argon2id KDF (deterministic stand-in, per the crate's
-/// no-real-crypto convention) — the "high-cost last line" that turns a
-/// password + the operational-key material into the locked ciphertext. In a
-/// real node this runs SERVER-SIDE now (node-side custody), not in a browser.
-fn argon2id(password: &str, subkey: &NodeSubkey, secret: &str) -> u64 {
-    digest(&["pillar-argon2id-v1", password, &subkey.0, secret])
-}
-
 /// The cell DB view a node needs to resolve node-side custody logins: it maps
 /// a user IDENTIFIER (`user@domain` / `username` / genesis CID) to the CID of
-/// that user's key-offer blob, and each CID to the node-sealed [`SealedOffer`]
-/// blob. This is the "CID → sealed blob" resolution the ROI requires the node
-/// to do so the USER never supplies the CID.
+/// that user's key-offer blob and to the [`RecordKey`] the REAL
+/// `pillar_key_distribution` ledger tracks admission under, and each CID to
+/// the node-sealed [`SealedOffer`] blob. This is the "CID → sealed blob"
+/// resolution the ROI requires the node to do so the USER never supplies the
+/// CID — and it is never treated as present unless the ledger's OWN
+/// bi-directional offer/accept/admit admission actually holds for the
+/// record (see [`NodeCustodyVerifier::admit`]), so a real ledger
+/// [`KeyDistributionLedger::revoke_offer`] fails the resolution closed
+/// exactly like every other consumer of that ledger.
 #[derive(Clone, Debug, Default)]
 pub struct NodeCellDb {
     /// user identifier -> the CID of that user's key offer.
     identifier_to_cid: HashMap<String, Cid>,
+    /// user identifier -> the key-distribution ledger record this offer is
+    /// admitted (or revoked) under.
+    identifier_to_record: HashMap<String, RecordKey>,
     /// CID -> the node-sealed offer blob.
     offers: HashMap<Cid, SealedOffer>,
     /// user identifier -> the human handle to greet them by on the portal.
@@ -211,17 +271,20 @@ impl NodeCellDb {
 
     /// Record a user's offer: `identifier` (any of the accepted identifier
     /// forms) resolves to `cid`, which addresses `offer`; the user is greeted
-    /// by `handle`.
+    /// by `handle`. `record` is the REAL key-distribution ledger record this
+    /// offer's admission is tracked under.
     pub fn put_offer(
         &mut self,
         identifier: impl Into<String>,
         handle: impl Into<String>,
         cid: Cid,
+        record: RecordKey,
         offer: SealedOffer,
     ) {
         let identifier = identifier.into();
         self.identifier_to_cid
             .insert(identifier.clone(), cid.clone());
+        self.identifier_to_record.insert(identifier.clone(), record);
         self.handles.insert(identifier, handle.into());
         self.offers.insert(cid, offer);
     }
@@ -231,6 +294,13 @@ impl NodeCellDb {
     #[must_use]
     pub fn resolve_cid(&self, identifier: &str) -> Option<&Cid> {
         self.identifier_to_cid.get(identifier)
+    }
+
+    /// The key-distribution ledger record this identifier's offer is tracked
+    /// under, if any.
+    #[must_use]
+    pub fn record_for(&self, identifier: &str) -> Option<&RecordKey> {
+        self.identifier_to_record.get(identifier)
     }
 
     /// The node-sealed offer blob for a CID.
@@ -253,36 +323,38 @@ impl NodeCellDb {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredOperationalKey {
     subkey: NodeSubkey,
-    verifier: u64,
+    verifier: SigningPublicKey,
 }
 
 impl RegisteredOperationalKey {
     /// Register the public half of the operational key sealed in `offer`,
     /// given the `password` and plaintext `secret` it was sealed under.
     #[must_use]
-    pub fn register(subkey: NodeSubkey, password: &str, secret: &str) -> Self {
-        RegisteredOperationalKey {
-            verifier: argon2id(password, &subkey, secret),
-            subkey,
-        }
+    pub fn register(subkey: NodeSubkey, _password: &str, secret: &str) -> Self {
+        let seed = subkey_seed(&subkey, secret);
+        let (verifier, _secret_key) = sign::signing_keypair_from_seed(&seed)
+            .expect("ed25519 keygen from valid seed never fails");
+        RegisteredOperationalKey { subkey, verifier }
     }
 
     fn verify(&self, nonce: &Nonce, signature: &Signature) -> bool {
-        let expected = sign_material(self.verifier, nonce);
-        *signature == expected
+        let sig = pillar_crypto::Signature::from_bytes(signature.to_wire().to_vec());
+        sign::verify(&self.verifier, &nonce.signing_material_public(), &sig).is_ok()
     }
 }
 
-/// The signature the node produces server-side over the challenge nonce with
-/// the unlocked operational-key material — mirrors
+/// Sign the challenge nonce SERVER-SIDE with the unlocked operational-key
+/// material — a real ed25519 signature derived from the SAME seed the
+/// registered verifier's public key came from, mirroring
 /// [`crate::key_login::AuthSubkey::sign_nonce`]'s framing so the same public
 /// verifier checks it.
-fn sign_material(material: u64, nonce: &Nonce) -> Signature {
-    Signature::from_wire(digest(&[
-        "pillar-web-login-sig",
-        &material.to_string(),
-        &nonce.signing_material_public(),
-    ]))
+fn sign_material(subkey: &NodeSubkey, secret: &str, nonce: &Nonce) -> Signature {
+    let seed = subkey_seed(subkey, secret);
+    let (_public, secret_key) =
+        sign::signing_keypair_from_seed(&seed).expect("ed25519 keygen from valid seed never fails");
+    let sig = sign::sign(&secret_key, &nonce.signing_material_public())
+        .expect("ed25519 signing over valid input never fails");
+    Signature::from_wire(sig.into_bytes())
 }
 
 /// Why a node-side custody login was refused. The failure modes surface as
@@ -323,21 +395,20 @@ pub struct NodeCustodySession {
 }
 
 /// Unlock the operational key SERVER-SIDE given the node-stripped inner
-/// ciphertext and the user's password. Returns the recovered signing material
-/// only on the right password (the recomputed argon2id must reproduce the
-/// stripped ciphertext), else `None` — a wrong password yields no usable key.
+/// ciphertext and the user's password: re-derives the argon2id key and opens
+/// the AEAD-sealed operational-key material. Returns the recovered plaintext
+/// bytes only on the right password (the AEAD open must authenticate), else
+/// `None` — a wrong password fails AEAD authentication rather than an
+/// integer-equality check, so it yields no usable key at all (never a subtly
+/// wrong one).
 #[must_use]
 fn unlock_operational_key(
-    inner_ciphertext: u64,
+    inner_ciphertext: &Ciphertext,
     subkey: &NodeSubkey,
     password: &str,
-    secret: &str,
-) -> Option<u64> {
-    let material = argon2id(password, subkey, secret);
-    if material != inner_ciphertext {
-        return None;
-    }
-    Some(material)
+) -> Option<Vec<u8>> {
+    let pw_key = kdf::derive_key(password.as_bytes(), &subkey_salt(subkey), &kdf_params()).ok()?;
+    aead::open_symmetric(&pw_key, inner_ciphertext, b"pillar-node-custody/inner-v1").ok()
 }
 
 /// The node-side custody login verifier: holds this node's node key, its view
@@ -348,37 +419,59 @@ fn unlock_operational_key(
 pub struct NodeCustodyVerifier {
     node_key: NodeKey,
     cell_db: NodeCellDb,
-    /// The plaintext operational-key material per CID, needed only to model
-    /// the server-side unlock (a real node re-derives this from the stripped
-    /// ciphertext; here the stand-in KDF needs the secret to recompute).
-    secrets: HashMap<Cid, String>,
     registered: HashMap<NodeSubkey, RegisteredOperationalKey>,
     issued: HashMap<u64, Nonce>,
     consumed: std::collections::HashSet<u64>,
     origin: Origin,
+    /// The REAL `pillar_key_distribution` bi-directional offer/accept/admit
+    /// ledger this node's offers are resolved through — the same engine
+    /// `key-distribution-offer-impl`'s `pillar offer` CLI family drives.
+    /// [`NodeCellDb`] never stands in for admission on its own: a CID/blob
+    /// pair is resolvable ONLY once this ledger's `is_admitted` holds for the
+    /// record, so [`KeyDistributionLedger::revoke_offer`]'s fail-closed
+    /// revocation is real here too (see
+    /// [`NodeCustodyVerifier::revoke_offer_for`]).
+    ledger: KeyDistributionLedger,
 }
 
 impl NodeCustodyVerifier {
     /// A verifier for a node holding `node_key`, serving the origin `origin`,
-    /// with an empty cell DB.
+    /// with an empty cell DB and a fresh key-distribution ledger with this
+    /// node as the only node ("foreign nodes" empty — the login path never
+    /// exercises cross-owner cells).
     #[must_use]
     pub fn new(node_key: NodeKey, origin: impl Into<Origin>) -> Self {
         NodeCustodyVerifier {
             node_key,
             cell_db: NodeCellDb::new(),
-            secrets: HashMap::new(),
             registered: HashMap::new(),
             issued: HashMap::new(),
             consumed: std::collections::HashSet::new(),
             origin: origin.into(),
+            ledger: KeyDistributionLedger::new(std::collections::BTreeSet::new()),
         }
     }
 
-    /// Give this node an offer to custody: record it in the cell DB under
-    /// `identifier`/`cid`, register the operational key's public verifier, and
-    /// retain the plaintext `secret` so the server-side unlock stand-in can
-    /// re-derive the material. In a real node the label + offer arrive via
-    /// `pillar_key_distribution`; this is the login path's view of that state.
+    /// This node's origin, as a key-distribution [`CellId`] — the single
+    /// cell every offer this node custodies is distributed through.
+    fn home_cell(&self) -> CellId {
+        CellId::from(self.origin.0.as_str())
+    }
+
+    /// Give this node an offer to custody: really OFFER + ACCEPT + ADMIT the
+    /// record through the REAL [`KeyDistributionLedger`] (the SAME
+    /// bi-directional admission `key-distribution-offer-impl`'s `pillar
+    /// offer seal`/`resolve` CLI already drives — never a second, divergent
+    /// admission path), seal the operational key to THIS node, and register
+    /// its public verifier. The plaintext `secret` is NEVER retained
+    /// server-side — the real AEAD unlock recovers it from the sealed offer
+    /// at login time.
+    ///
+    /// # Panics
+    ///
+    /// If the ledger refuses the offer/accept/admit sequence (e.g. the same
+    /// `identifier`+`cid` is provisioned twice) — a provisioning-time
+    /// programming error, not a runtime login condition.
     pub fn provision_offer(
         &mut self,
         identifier: impl Into<String>,
@@ -388,24 +481,26 @@ impl NodeCustodyVerifier {
         password: &str,
         secret: &str,
     ) {
-        let offer = SealedOffer::seal(
-            subkey.clone(),
+        let this_node = self.node_key.node().clone();
+        self.admit_offer_via_ledger(
+            identifier,
+            handle,
+            cid,
+            subkey,
             password,
             secret,
-            &self.node_key,
-            std::iter::once(self.node_key.node().clone()),
+            &self.node_key.clone(),
+            std::iter::once(this_node),
         );
-        self.registered.insert(
-            subkey.clone(),
-            RegisteredOperationalKey::register(subkey, password, secret),
-        );
-        self.secrets.insert(cid.clone(), secret.to_owned());
-        self.cell_db.put_offer(identifier, handle, cid, offer);
     }
 
     /// Provision an offer whose blob is sealed to a DIFFERENT node than this
-    /// one (so this node cannot strip it) — used to model the `NoCustody`
-    /// path where the cell sealed the key to some other node.
+    /// one (so this node cannot strip it) — used to exercise the `NoCustody`
+    /// path where the cell sealed the key to some other node. The ledger
+    /// admission is still real: the record IS admitted (this node CAN
+    /// resolve the CID/blob), the crypto seal is simply to a node other than
+    /// this one, exactly mirroring a real cell that allow-listed a different
+    /// node.
     #[allow(clippy::too_many_arguments)]
     pub fn provision_offer_sealed_elsewhere(
         &mut self,
@@ -419,19 +514,98 @@ impl NodeCustodyVerifier {
         other_secret: &str,
     ) {
         let other_key = NodeKey::new(other_node.clone(), other_secret);
-        let offer = SealedOffer::seal(
-            subkey.clone(),
+        self.admit_offer_via_ledger(
+            identifier,
+            handle,
+            cid,
+            subkey,
             password,
             secret,
             &other_key,
             std::iter::once(other_node),
         );
+    }
+
+    /// The shared real-resolution path both provisioning entry points route
+    /// through: register the cell + user + artifact with the REAL
+    /// [`KeyDistributionLedger`], run its bi-directional `offer`/`accept`/
+    /// `admit` sequence, seal the operational key, and record the CID ->
+    /// blob mapping under the resulting [`RecordKey`] — the ONE resolver, no
+    /// duplicate modeled admission logic between the "sealed here" and
+    /// "sealed elsewhere" provisioning shapes.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_offer_via_ledger(
+        &mut self,
+        identifier: impl Into<String>,
+        handle: impl Into<String>,
+        cid: Cid,
+        subkey: NodeSubkey,
+        password: &str,
+        secret: &str,
+        seal_with: &NodeKey,
+        sealed_to: impl IntoIterator<Item = NodeId>,
+    ) {
+        let identifier = identifier.into();
+        let cell = self.home_cell();
+        let user = KdUserId::from(identifier.as_str());
+        let artifact_id = ArtifactId::from(cid.0.as_str());
+        let record = RecordKey {
+            user: user.clone(),
+            cell: cell.clone(),
+            artifact: artifact_id.clone(),
+        };
+
+        self.ledger.cell_mut(cell.clone()).add_user(user);
+        self.ledger
+            .register_artifact(Artifact::new(artifact_id, ArtifactKind::Operational));
+        for node in sealed_to
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            self.ledger
+                .add_node_to_allowlist(&cell, node)
+                .expect("cell was just registered above");
+        }
+        self.ledger
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
+            .expect("fresh (user, cell, artifact) record is never already offered/admitted");
+        self.ledger
+            .accept(&record)
+            .expect("just-offered record is always acceptable");
+        self.ledger
+            .admit(&record)
+            .expect("offered + accepted, non-cross-owner record always admits");
+
+        let offer = SealedOffer::seal(
+            subkey.clone(),
+            password,
+            secret,
+            seal_with,
+            self.ledger.seal_of(&record),
+        );
         self.registered.insert(
             subkey.clone(),
             RegisteredOperationalKey::register(subkey, password, secret),
         );
-        self.secrets.insert(cid.clone(), secret.to_owned());
-        self.cell_db.put_offer(identifier, handle, cid, offer);
+        self.cell_db
+            .put_offer(identifier, handle, cid, record, offer);
+    }
+
+    /// Revoke a previously-provisioned offer through the REAL
+    /// [`KeyDistributionLedger::revoke_offer`] — fail-closed, exactly as
+    /// every other `pillar_key_distribution` consumer observes: after this,
+    /// `identifier` resolves to no admitted offer (`has_offer_for` is
+    /// `false`, [`Self::admit`] returns [`NodeCustodyError::NoOfferForUser`])
+    /// even though the sealed blob and CID mapping remain in the cell DB — a
+    /// live demonstration this path is no longer a modeled stand-in.
+    pub fn revoke_offer_for(&mut self, identifier: &str) {
+        if let Some(record) = self.cell_db.record_for(identifier).cloned() {
+            let _ = self.ledger.revoke_offer(&record);
+        }
     }
 
     /// This node's origin.
@@ -450,12 +624,18 @@ impl NodeCustodyVerifier {
 
     /// Whether this node can resolve an offer for `identifier` at all (used to
     /// surface the "no offer for this user / node unlabelled" message before
-    /// asking for a password).
+    /// asking for a password). Requires the REAL key-distribution ledger to
+    /// still consider the record admitted — a revoked offer reports `false`
+    /// here even though the sealed blob is still physically present.
     #[must_use]
     pub fn has_offer_for(&self, identifier: &str) -> bool {
         self.cell_db
             .resolve_cid(identifier)
             .is_some_and(|cid| self.cell_db.offer_for(cid).is_some())
+            && self
+                .cell_db
+                .record_for(identifier)
+                .is_some_and(|record| self.ledger.is_admitted(record))
     }
 
     /// Admit a NODE-SIDE custody login. The user supplied only `identifier`
@@ -485,10 +665,22 @@ impl NodeCustodyVerifier {
         authority: &WotAuthority,
         actor: &FencedActor,
     ) -> Result<NodeCustodySession, NodeCustodyError> {
-        // Step 1: resolve the offer server-side (the user never gave a CID).
+        // Step 1: resolve the offer server-side (the user never gave a CID) —
+        // through the REAL key-distribution ledger's admission, not a bare
+        // presence check: a record whose offer was revoked
+        // (`KeyDistributionLedger::revoke_offer`) reports no offer here even
+        // though its blob and CID mapping are still physically in the cell
+        // DB, so revocation fails this path closed exactly like every other
+        // ledger consumer.
         let Some(cid) = self.cell_db.resolve_cid(identifier).cloned() else {
             return Err(NodeCustodyError::NoOfferForUser);
         };
+        let Some(record) = self.cell_db.record_for(identifier) else {
+            return Err(NodeCustodyError::NoOfferForUser);
+        };
+        if !self.ledger.is_admitted(record) {
+            return Err(NodeCustodyError::NoOfferForUser);
+        }
         let Some(offer) = self.cell_db.offer_for(&cid).cloned() else {
             return Err(NodeCustodyError::NoOfferForUser);
         };
@@ -498,15 +690,18 @@ impl NodeCustodyVerifier {
             .unwrap_or(identifier)
             .to_owned();
 
-        // Step 2: strip the node seal — only if the cell sealed to this node.
+        // Step 2: strip the node seal — only if the cell sealed to this node
+        // (a real AEAD open; an unsealed/foreign node fails authentication).
         let Some(inner) = self.node_key.unseal(&offer) else {
             return Err(NodeCustodyError::NoCustody);
         };
 
-        // Step 3: unlock the operational key server-side (argon2id last line).
-        let secret = self.secrets.get(&cid).cloned().unwrap_or_default();
-        let Some(material) = unlock_operational_key(inner, offer.subkey(), password, &secret)
-        else {
+        // Step 3: unlock the operational key server-side — a real argon2id
+        // KEK + AEAD open; a wrong password fails AEAD authentication.
+        let Some(material) = unlock_operational_key(&inner, offer.subkey(), password) else {
+            return Err(NodeCustodyError::UnlockFailed);
+        };
+        let Ok(secret) = String::from_utf8(material) else {
             return Err(NodeCustodyError::UnlockFailed);
         };
 
@@ -523,7 +718,7 @@ impl NodeCustodyVerifier {
         if nonce.expiry() <= clock {
             return Err(NodeCustodyError::BadNonce);
         }
-        let signature = sign_material(material, &nonce);
+        let signature = sign_material(offer.subkey(), &secret, &nonce);
         let Some(registered) = self.registered.get(offer.subkey()) else {
             return Err(NodeCustodyError::UnlockFailed);
         };
@@ -698,6 +893,50 @@ mod tests {
     }
 
     #[test]
+    fn revoking_the_offer_through_the_real_ledger_fails_the_login_closed() {
+        // The offer resolution path routes through the REAL
+        // `pillar_key_distribution::KeyDistributionLedger` admission, not a
+        // bare local presence check: revoking the offer through that real
+        // ledger must fail both `has_offer_for` and `admit` closed, even
+        // though the sealed blob and CID mapping are still physically
+        // present in the cell DB. This is exactly the modeled seam the ROI
+        // requires killed — a stand-in offer store could never observe a
+        // real ledger revocation.
+        let (mut v, subkey) = provisioned();
+        assert!(v.has_offer_for("alice@pillar"));
+
+        v.revoke_offer_for("alice@pillar");
+
+        assert!(
+            !v.has_offer_for("alice@pillar"),
+            "a revoked offer must no longer resolve"
+        );
+        let (auth, actor) = chained(&subkey);
+        let nonce = v.issue_nonce(10);
+        assert_eq!(
+            v.admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor),
+            Err(NodeCustodyError::NoOfferForUser),
+            "a revoked real-ledger offer must fail closed, not stand-in success"
+        );
+    }
+
+    #[test]
+    fn a_real_stored_offer_resolves_and_unlocks_through_the_real_ledger() {
+        // The positive case for the same real-resolution path: a genuinely
+        // admitted offer (offer+accept+admit all really run against
+        // `KeyDistributionLedger`) resolves and unlocks correctly end to
+        // end.
+        let (mut v, subkey) = provisioned();
+        assert!(v.has_offer_for("alice@pillar"));
+        let (auth, actor) = chained(&subkey);
+        let nonce = v.issue_nonce(10);
+        let session = v
+            .admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+            .expect("a real, admitted offer must resolve and unlock");
+        assert_eq!(session.subject, subkey.node_id());
+    }
+
+    #[test]
     fn replayed_nonce_is_rejected_on_second_use() {
         let (mut v, subkey) = provisioned();
         let (auth, actor) = chained(&subkey);
@@ -725,7 +964,7 @@ mod tests {
                 &node_key(),
                 std::iter::once(NodeId::from("this-node")),
             );
-            let blob = format!("{}", offer.node_sealed);
+            let blob = format!("{:?}", offer.node_sealed);
             assert!(
                 !blob.contains(&password),
                 "password leaked into blob: {blob}"
@@ -735,5 +974,71 @@ mod tests {
                 "plaintext key leaked into blob: {blob}"
             );
         }
+    }
+
+    #[test]
+    fn forged_signature_is_rejected_by_the_registered_verifier() {
+        // The registered verifier holds only the real ed25519 PUBLIC key
+        // derived from (subkey, secret). A signature produced from a
+        // DIFFERENT secret (i.e. forged without knowing the right unlocked
+        // material) must never verify — this is the real asymmetric
+        // signature property, not a bare digest equality.
+        let subkey = NodeSubkey::from("op-subkey-forge-test");
+        let registered = RegisteredOperationalKey::register(subkey.clone(), PASSWORD, SECRET);
+        let origin: Origin = ORIGIN.into();
+        let nonce = Nonce::mint(0, origin, 10);
+
+        // A signature forged with the WRONG secret material.
+        let forged = sign_material(&subkey, "wrong-operational-key-material", &nonce);
+        assert!(
+            !registered.verify(&nonce, &forged),
+            "a signature produced from the wrong unlocked material must not verify"
+        );
+
+        // The genuine signature over the SAME nonce still verifies.
+        let genuine = sign_material(&subkey, SECRET, &nonce);
+        assert!(
+            registered.verify(&nonce, &genuine),
+            "the genuine signature over the registered secret must verify"
+        );
+    }
+
+    #[test]
+    fn unlock_is_a_real_aead_round_trip_that_rejects_tampering() {
+        // The password-locked "inner" layer is a real AEAD ciphertext: it
+        // round-trips under the right password, and any tampering with the
+        // ciphertext bytes is caught by AEAD authentication (never a u64
+        // equality that silently "succeeds" on the wrong bytes reinterpreted
+        // as a number).
+        let subkey = NodeSubkey::from("op-subkey-aead-test");
+        let pw_key =
+            kdf::derive_key(PASSWORD.as_bytes(), &subkey_salt(&subkey), &kdf_params()).unwrap();
+        let inner =
+            aead::seal_symmetric(&pw_key, SECRET.as_bytes(), b"pillar-node-custody/inner-v1")
+                .expect("seal must succeed");
+
+        // Round-trip: the right password recovers the exact plaintext.
+        let recovered = unlock_operational_key(&inner, &subkey, PASSWORD)
+            .expect("correct password must unlock");
+        assert_eq!(recovered, SECRET.as_bytes());
+
+        // Tamper a single byte of the ciphertext: AEAD authentication must
+        // fail closed, never silently return corrupted material.
+        let mut tampered_bytes = inner.clone().into_bytes();
+        let last = tampered_bytes.len() - 1;
+        tampered_bytes[last] ^= 0x01;
+        let tampered = Ciphertext::from_bytes(tampered_bytes);
+        assert_eq!(
+            unlock_operational_key(&tampered, &subkey, PASSWORD),
+            None,
+            "tampered ciphertext must fail AEAD authentication"
+        );
+
+        // Wrong password must also fail (different KEK, AEAD open fails).
+        assert_eq!(
+            unlock_operational_key(&inner, &subkey, "wrong password"),
+            None,
+            "wrong password must not unlock the operational key"
+        );
     }
 }
