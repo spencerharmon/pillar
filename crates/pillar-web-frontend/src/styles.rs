@@ -295,7 +295,7 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
             color: {text};
             text-decoration: none;
             font-size: 0.9rem;
-            transition: {transition};
+            {transition}
         }}
         .console-navlink:hover {{ background-color: {surface_overlay}; text-decoration: none; }}
         .console-navlink.is-active {{
@@ -361,7 +361,7 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
             padding: 0.45rem 0.7rem;
             font-size: 0.9rem;
             cursor: pointer;
-            transition: {transition};
+            {transition}
         }}
         .obs-tab:hover {{ color: {text}; }}
         .obs-tab.is-active {{ color: {text}; border-bottom-color: {accent}; }}
@@ -461,7 +461,7 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .ds-tab {{
             background: none; border: none; border-bottom: 2px solid transparent;
             color: {muted}; padding: 0.5rem 0.85rem; cursor: pointer; font-size: 0.85rem;
-            font-weight: 550; transition: {transition};
+            font-weight: 550; {transition}
         }}
         .ds-tab:hover {{ color: {text}; }}
         .ds-tab.is-active {{ color: {text}; border-bottom-color: {accent}; }}
@@ -472,7 +472,7 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         }}
         .wizard-step {{
             color: {muted}; padding: 0.25rem 0.6rem; border-radius: 999px;
-            border: 1px solid {border}; transition: {transition};
+            border: 1px solid {border}; {transition}
         }}
         .wizard-step.is-done {{ color: {text}; border-color: {accent}; opacity: 0.75; }}
         .wizard-step.is-active {{ color: {text}; border-color: {accent}; background: {glow}; font-weight: 600; }}
@@ -890,4 +890,28 @@ pub fn combobox(theme: &Theme, motion: Motion) -> Style {
         transition = transition,
     );
     Style::new(css).expect("combobox css parses")
+}
+
+#[cfg(test)]
+mod global_parse_tests {
+    use super::*;
+    use crate::theme::{Motion, Theme};
+
+    /// The global stylesheet is fed to stylist's `<Global>` at runtime, whose
+    /// parser is far stricter than a browser's. A rule stylist rejects panics
+    /// the whole app on mount (a blank page), and no `format!`/contains test
+    /// catches it. So parse the real sheet exactly as the app does.
+    #[test]
+    fn global_stylesheet_parses_in_stylist() {
+        for motion in [Motion::Full, Motion::Reduced] {
+            let css = global(&Theme::dark(), motion);
+            if let Err(e) = stylist::Style::new(css.clone()) {
+                // Surface the offending region to make the failure actionable.
+                for (i, line) in css.lines().enumerate() {
+                    eprintln!("{:4} | {}", i + 1, line);
+                }
+                panic!("global() css rejected by stylist ({motion:?}): {e}");
+            }
+        }
+    }
 }
