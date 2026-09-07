@@ -19,6 +19,7 @@ pub mod auth;
 pub mod console;
 pub mod dashboard;
 pub mod drilldown;
+pub mod drilldown_live;
 pub mod explore;
 pub mod obs_console;
 pub mod panels;

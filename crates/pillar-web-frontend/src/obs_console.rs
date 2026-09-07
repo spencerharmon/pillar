@@ -149,6 +149,8 @@ mod yew_impl {
         recording_request_body, DashPanel, KindCount,
     };
     use crate::auth::use_auth;
+    use crate::drilldown::DrilldownPanel;
+    use crate::drilldown_live::{build_drilldowns, parse_correlate_response};
     use crate::portal::{get_url, http, input_value, ObservabilityTile};
     use crate::primitives::{Chart, ChartKind, DataTable, StatCard, Tabs};
     use wasm_bindgen_futures::spawn_local;
@@ -159,15 +161,17 @@ mod yew_impl {
     enum Tab {
         Overview,
         Explore,
+        Drilldown,
         Dashboards,
         Rules,
         Alerts,
     }
 
     impl Tab {
-        const ALL: [Tab; 5] = [
+        const ALL: [Tab; 6] = [
             Tab::Overview,
             Tab::Explore,
+            Tab::Drilldown,
             Tab::Dashboards,
             Tab::Rules,
             Tab::Alerts,
@@ -176,6 +180,7 @@ mod yew_impl {
             match self {
                 Tab::Overview => "Overview",
                 Tab::Explore => "Explore",
+                Tab::Drilldown => "Drilldown",
                 Tab::Dashboards => "Dashboards",
                 Tab::Rules => "Recording rules",
                 Tab::Alerts => "Alerts",
@@ -228,6 +233,7 @@ mod yew_impl {
         let body = match *tab {
             Tab::Overview => render_overview(&counts),
             Tab::Explore => html! { <ObservabilityTile /> },
+            Tab::Drilldown => html! { <DrilldownTab /> },
             Tab::Dashboards => html! { <DashboardsTab /> },
             Tab::Rules => html! { <RulesTab /> },
             Tab::Alerts => html! { <AlertsTab /> },
@@ -264,6 +270,70 @@ mod yew_impl {
                     <Chart values={bars} kind={ChartKind::Bar} width={480.0} height={120.0} />
                 </div>
             </>
+        }
+    }
+
+    /// The Drilldown tab: runs a correlate PSL query against the live store and
+    /// reconstructs a real [`Drilldown`](crate::drilldown::Drilldown) per anchor
+    /// from the server's `SIGNAL`/`GROUP` response, mounting the shared
+    /// `DrilldownPanel` with the node's actual correlated signals. No
+    /// client-side store, no fabrication.
+    #[function_component(DrilldownTab)]
+    fn drilldown_tab() -> Html {
+        let auth = use_auth();
+        let query = use_state(|| "correlate: metric".to_owned());
+        let drills = use_state(Vec::new);
+        let msg = use_state(|| None::<String>);
+
+        let on_query = {
+            let query = query.clone();
+            Callback::from(move |e: InputEvent| query.set(input_value(&e)))
+        };
+        let run = {
+            let (auth, query, drills, msg) =
+                (auth.clone(), query.clone(), drills.clone(), msg.clone());
+            Callback::from(move |_: MouseEvent| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let body = format!("{token}\n{}", *query);
+                let (drills, msg) = (drills.clone(), msg.clone());
+                spawn_local(async move {
+                    match http("POST", "/portal/obs/live/query", Some(&body)).await {
+                        Ok(r) if r.ok() => {
+                            let built = build_drilldowns(&parse_correlate_response(&r.body));
+                            if built.is_empty() {
+                                msg.set(Some(
+                                    "No correlated drilldowns for that query.".to_owned(),
+                                ));
+                            } else {
+                                msg.set(None);
+                            }
+                            drills.set(built);
+                        }
+                        Ok(r) => msg.set(Some(r.body.trim().to_owned())),
+                        Err(_) => msg.set(Some("request failed".to_owned())),
+                    }
+                });
+            })
+        };
+
+        html! {
+            <div class="res-change">
+                <div class="res-toolbar">
+                    <input class="ds-table__filter" type="text"
+                           placeholder="correlate PSL query"
+                           value={(*query).clone()} oninput={on_query} />
+                    <button class="ds-tab" onclick={run}>{ "Drill down" }</button>
+                </div>
+                <p class="ds-empty">{ "Runs psl_correlate over the live store and pivots \
+                    each metric anchor into its correlated logs, traces, profiles, and \
+                    metadata." }</p>
+                if let Some(m) = &*msg {
+                    <p class="obs-msg">{ m }</p>
+                }
+                { for drills.iter().map(|d| html! { <DrilldownPanel drilldown={d.clone()} /> }) }
+            </div>
         }
     }
 
