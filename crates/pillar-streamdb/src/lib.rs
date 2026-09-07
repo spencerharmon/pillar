@@ -49,7 +49,9 @@ pub use store::{
 };
 
 pub mod ipfs_backend;
-pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, IpfsBackend, NativeIpfsBackend};
+pub use ipfs_backend::IpfsBackend;
+#[cfg(feature = "ipfs")]
+pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, NativeIpfsBackend};
 
 mod ipfs_persist;
 pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};

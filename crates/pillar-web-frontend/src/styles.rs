@@ -10,6 +10,225 @@
 use crate::theme::{Motion, Theme};
 use stylist::Style;
 
+/// The portal-wide **global stylesheet**, built from the same [`Theme`] tokens
+/// as every scoped component style so the "Linear/modern" dark aesthetic is
+/// applied uniformly to the whole app — the authenticated dashboard panels
+/// (`portal.rs`) AND the login/bootstrap entry surface (`portal_entry.rs`),
+/// both of which render semantic class names (`.portal`, `.tile`,
+/// `.pillar-login`, `.member-row`, …) rather than per-component scoped
+/// classes. Mounted once at the app [`crate::router::Shell`] via
+/// `stylist::yew::Global`, it dresses those bare class names in the design
+/// tokens (near-black layered surfaces, the indigo accent, multi-layer
+/// shadows/glows, focus-glow inputs, accent buttons) so no panel renders
+/// unstyled.
+///
+/// The interactive transition is gated on [`Motion`] exactly like the scoped
+/// builders (empty under [`Motion::Reduced`]); an additional
+/// `@media (prefers-reduced-motion: reduce)` guard also disables transitions
+/// and animations live at the browser level (covering the scoped component
+/// styles too), which is the required `prefers-reduced-motion` fallback.
+///
+/// Returns raw CSS (not a scoped [`Style`]) because a global sheet must NOT be
+/// scoped under a generated class — the caller hands it to
+/// `stylist::yew::Global`.
+#[must_use]
+pub fn global(theme: &Theme, motion: Motion) -> String {
+    let transition = motion.transition(&theme.micro_transition());
+    format!(
+        r#"
+        html, body {{
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            background-color: {surface_base};
+            color: {text};
+            font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                Roboto, Helvetica, Arial, sans-serif;
+            font-size: 15px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+        }}
+        * {{ box-sizing: border-box; }}
+
+        a {{ color: {accent}; text-decoration: none; }}
+        a:hover {{ color: {accent_hover}; text-decoration: underline; }}
+
+        h1, h2, h3 {{
+            color: {text};
+            font-weight: 650;
+            letter-spacing: -0.01em;
+        }}
+        h2 {{ font-size: 1.4rem; margin: 0 0 0.25rem; }}
+        h3 {{ font-size: 1.05rem; margin: 0 0 0.75rem; }}
+
+        /* ---- Form controls (themed like the Input/Button component styles) ---- */
+        input, select, textarea {{
+            width: 100%;
+            box-sizing: border-box;
+            font: inherit;
+            color: {text};
+            background-color: {surface_base};
+            border: 1px solid {border};
+            border-radius: {radius};
+            padding: 0.55rem 0.75rem;
+            {transition}
+        }}
+        input::placeholder {{ color: {muted}; }}
+        input:focus, select:focus, textarea:focus {{
+            outline: none;
+            border-color: {accent};
+            box-shadow: 0 0 0 3px {glow};
+        }}
+        button {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            font: inherit;
+            font-weight: 600;
+            line-height: 1;
+            padding: 0.55rem 0.95rem;
+            border-radius: {radius};
+            border: 1px solid {accent};
+            background-color: {accent};
+            color: #ffffff;
+            cursor: pointer;
+            {transition}
+        }}
+        button:hover {{ background-color: {accent_hover}; transform: translateY(-1px); }}
+        button:active {{ transform: translateY(0); }}
+        button:disabled {{ opacity: 0.5; cursor: not-allowed; transform: none; }}
+        button:focus-visible {{ outline: 2px solid {accent}; outline-offset: 2px; }}
+
+        /* ---- Auth surfaces: login + bootstrap, a centered raised card ---- */
+        .pillar-login, .pillar-bootstrap {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.55rem;
+            max-width: 26rem;
+            width: calc(100% - 2rem);
+            margin: 7vh auto;
+            padding: 1.75rem;
+            background-color: {surface_raised};
+            border: 1px solid {border};
+            border-radius: {radius};
+            box-shadow: {shadow_resting};
+        }}
+        .pillar-login h2 {{ margin: 0 0 0.5rem; }}
+        .pillar-login label, .pillar-bootstrap label {{
+            font-size: 0.8rem;
+            color: {muted};
+            margin-top: 0.35rem;
+        }}
+        .step {{ font-size: 1.15rem; font-weight: 650; margin-bottom: 0.4rem; }}
+        .pillar-loading {{ color: {muted}; text-align: center; margin: 22vh auto; }}
+
+        /* ---- Dashboard: a responsive grid of raised tiles ---- */
+        .portal {{
+            max-width: 1120px;
+            margin: 0 auto;
+            padding: 2rem 1.25rem 4rem;
+            display: grid;
+            gap: 1rem;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            align-items: start;
+        }}
+        .portal > h2, .portal > .who, .portal > .signout {{ grid-column: 1 / -1; }}
+        .who {{ color: {muted}; margin: 0 0 0.5rem; }}
+
+        .tile {{
+            background-color: {surface_raised};
+            border: 1px solid {border};
+            border-radius: {radius};
+            box-shadow: {shadow_resting};
+            color: {text};
+            padding: 1.25rem;
+            {transition}
+        }}
+        .tile:hover {{ box-shadow: {shadow_elevated}; border-color: {glow}; }}
+
+        /* ---- List rows across every panel ---- */
+        .member-row, .resource-row, .row, .obs-row, .trust-edge, .attest-line,
+        .domain-row, .topology-fd-row, .topology-mismatch, .identity-domain-key,
+        .session-row, .result {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.85rem;
+            padding: 0.4rem 0.55rem;
+            margin: 0.3rem 0;
+            border-radius: 6px;
+            background-color: {surface_base};
+            border: 1px solid {border};
+            word-break: break-word;
+        }}
+        .topology-mismatch {{ border-color: rgba(248, 113, 113, 0.4); }}
+        .current-marker {{ color: {accent}; }}
+
+        /* ---- Messages, hints, explainers ---- */
+        .msg {{ margin: 0.5rem 0 0; font-size: 0.9rem; }}
+        .msg.ok, .field-hint.ok {{ color: #4ade80; }}
+        .msg.err, .field-hint.err, .error {{ color: #f87171; }}
+        .hint, .explainer, .field-hint, .pillar-login__fallback-hint {{
+            color: {muted};
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }}
+        .explainer {{
+            background-color: {surface_base};
+            border: 1px solid {border};
+            border-radius: {radius};
+            padding: 0.75rem;
+            margin-top: 0.5rem;
+        }}
+        .explainer strong {{ color: {text}; }}
+
+        /* ---- Copy control + sign-out (quiet, secondary surface) ---- */
+        .copyable {{ color: {text}; }}
+        .copy-btn {{
+            background-color: transparent;
+            border-color: {border};
+            color: {muted};
+            padding: 0.12rem 0.5rem;
+            font-size: 0.75rem;
+        }}
+        .copy-btn:hover {{ color: {text}; background-color: {surface_overlay}; }}
+        .copy-btn.copied {{ color: {accent}; }}
+        .signout {{
+            background-color: {surface_overlay};
+            border-color: {border};
+            color: {text};
+            width: fit-content;
+            margin-top: 0.5rem;
+        }}
+        .signout:hover {{ background-color: {surface_raised}; }}
+
+        /* ---- Security-key controls ---- */
+        .pillar-security-key {{ display: flex; flex-wrap: wrap; gap: 0.5rem; }}
+        .pillar-security-key__error {{ color: #f87171; width: 100%; margin: 0.25rem 0 0; }}
+
+        /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
+        @media (prefers-reduced-motion: reduce) {{
+            *, *::before, *::after {{
+                transition: none !important;
+                animation: none !important;
+            }}
+        }}
+        "#,
+        surface_base = theme.surface_base,
+        surface_raised = theme.surface_raised,
+        surface_overlay = theme.surface_overlay,
+        border = theme.border_subtle,
+        radius = theme.radius,
+        text = theme.text_primary,
+        muted = theme.text_muted,
+        accent = theme.accent,
+        accent_hover = theme.accent_hover,
+        glow = theme.accent_glow,
+        shadow_resting = theme.shadow_resting,
+        shadow_elevated = theme.shadow_elevated,
+        transition = transition,
+    )
+}
+
 /// A card surface with a mouse-tracking spotlight. The spotlight is a radial
 /// gradient positioned from two CSS custom properties (`--spot-x`/`--spot-y`)
 /// the component updates on `mousemove`; under reduced motion the tracking

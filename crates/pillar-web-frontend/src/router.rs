@@ -19,6 +19,10 @@ use crate::portal::Portal;
 #[cfg(feature = "yew")]
 use crate::portal_entry::PortalEntry;
 #[cfg(feature = "yew")]
+use crate::theme::{Motion, Theme};
+#[cfg(feature = "yew")]
+use stylist::yew::Global;
+#[cfg(feature = "yew")]
 use yew::prelude::*;
 #[cfg(feature = "yew")]
 use yew_router::prelude::*;
@@ -89,16 +93,30 @@ fn guarded(props: &GuardedProps) -> Html {
 }
 
 #[cfg(feature = "yew")]
-/// The application shell: an [`AuthProvider`] wrapping a `yew_router`
-/// `BrowserRouter`/`Switch` gated by [`guard`]. Every panel mounts under this.
+/// The application shell: the design-system `Theme`/`Motion` context (so every
+/// component resolves the real tokens), the portal-wide [`crate::styles::global`]
+/// stylesheet mounted once via `stylist::yew::Global` (so the bare-class
+/// dashboard/login markup is themed), and an [`AuthProvider`] wrapping a
+/// `yew_router` `BrowserRouter`/`Switch` gated by [`guard`]. Every panel mounts
+/// under this.
 #[function_component(Shell)]
 pub fn shell() -> Html {
+    // The dark theme + full motion are the app defaults; the global sheet's
+    // `@media (prefers-reduced-motion: reduce)` guard honors the OS preference
+    // live for both the global and the scoped component styles.
+    let theme = Theme::dark();
+    let motion = Motion::Full;
     html! {
-        <AuthProvider>
-            <BrowserRouter>
-                <Switch<Route> render={switch} />
-            </BrowserRouter>
-        </AuthProvider>
+        <ContextProvider<Theme> context={theme}>
+            <ContextProvider<Motion> context={motion}>
+                <Global css={crate::styles::global(&theme, motion)} />
+                <AuthProvider>
+                    <BrowserRouter>
+                        <Switch<Route> render={switch} />
+                    </BrowserRouter>
+                </AuthProvider>
+            </ContextProvider<Motion>>
+        </ContextProvider<Theme>>
     }
 }
 
