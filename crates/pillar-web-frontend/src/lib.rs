@@ -16,6 +16,10 @@
 //! classes, so the visual language is defined exactly once.
 
 pub mod auth;
+pub mod dashboard;
+pub mod drilldown;
+pub mod explore;
+pub mod panels;
 pub mod portal;
 pub mod portal_entry;
 pub mod router;
@@ -27,6 +31,14 @@ pub mod webauthn;
 pub mod components;
 
 pub use auth::{AuthAction, AuthSession};
+pub use dashboard::{render_panel_persisted, CellId, Dashboard, Panel, PeerId};
+pub use explore::{
+    build_log_query, build_metadata_query, build_metric_query, build_profile_query,
+    build_trace_query, correlate_candidates, correlate_candidates_logs,
+    correlate_candidates_metadata, correlate_candidates_traces, label_key_options,
+    label_value_options, profile_correlate_candidates, LogFilter, LOG_KIND, METADATA_KIND,
+    METRIC_KIND, PROFILE_KIND, TRACE_KIND,
+};
 pub use router::Route;
 pub use styles::ButtonVariant;
 pub use theme::{Motion, Theme};
@@ -34,6 +46,13 @@ pub use webauthn::{authenticate, register, CeremonyError, CredentialCeremony, Rp
 
 #[cfg(feature = "yew")]
 pub use auth::{use_auth, AuthContext, AuthProvider};
+#[cfg(feature = "yew")]
+pub use explore::{
+    ExploreBuilder, ExploreBuilderProps, ExploreLogsBuilder, ExploreMetadataBuilder,
+    ExploreProfilesBuilder, ExploreTracesBuilder,
+};
+#[cfg(feature = "yew")]
+pub use drilldown::DrilldownPanel;
 #[cfg(feature = "yew")]
 pub use portal::Portal;
 #[cfg(feature = "yew")]

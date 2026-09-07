@@ -1013,7 +1013,34 @@ impl WebAuthContext {
         Some(Ok(body))
     }
 
-    /// Register + evaluate a recording rule over the LIVE store in one shot
+    /// The metric-name typeahead for the Explore `select:` builders, one name
+    /// per line, read from the LIVE store's real [`pillar_observability::
+    /// MetadataIndex`] projection — never a fabricated catalog. `None` when no
+    /// live substrate is attached.
+    pub fn live_obs_metric_names(&self) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        Some(sub.metadata_index().metric_names().join("\n"))
+    }
+
+    /// The label-KEY typeahead for the Explore `where:` builders, one key per
+    /// line, from the real live-store metadata index. `None` when no live
+    /// substrate is attached.
+    pub fn live_obs_label_keys(&self) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        Some(sub.metadata_index().label_keys().join("\n"))
+    }
+
+    /// The label-VALUE typeahead for a given `key`, one value per line, from
+    /// the real live-store metadata index. An unknown key yields an empty
+    /// body (never a fabricated value list — the index's own contract). `None`
+    /// when no live substrate is attached.
+    pub fn live_obs_label_values(&self, key: &str) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        Some(sub.metadata_index().label_values(key).join("\n"))
+    }
     /// (the black-box driver's "install this rule and fire it" action): parse
     /// `spec` as `<rule-id>|<kind>|<psl-query>|<emit-name>`, register it, then
     /// evaluate it now, returning `RULE <id> FIRED <bool> EMITTED <n>` plus the
@@ -2606,6 +2633,10 @@ pub static ROUTES: &[RouteSpec] = &[
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/recording"), handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/alert"), handler: |ctx, _peer, request| dispatch_obs_live_alert(ctx, request) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/obs/live/dashboard"), handler: |ctx, _peer, request| dispatch_obs_live_dashboard(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/query"), handler: |ctx, _peer, request| dispatch_obs_live_query_get(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/metric-names"), handler: |ctx, _peer, request| dispatch_obs_live_metric_names(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/label-keys"), handler: |ctx, _peer, request| dispatch_obs_live_label_keys(ctx, request) },
+    RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/obs/live/label-values"), handler: |ctx, _peer, request| dispatch_obs_live_label_values(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/tree"), handler: |ctx, _peer, request| dispatch_topology_tree(ctx, request) },
     RouteSpec { method: "GET", path: PathMatch::Prefix("/portal/topology/mismatches"), handler: |ctx, _peer, request| dispatch_topology_mismatches(ctx, request) },
     RouteSpec { method: "POST", path: PathMatch::Exact("/portal/topology/label/declare"), handler: |ctx, _peer, request| dispatch_topology_label_declare(ctx, request) },
@@ -3602,6 +3633,91 @@ fn dispatch_obs_live_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) 
     }
 }
 
+/// Live-store PSL query, GET variant: `GET /portal/obs/live/query?query=<psl
+/// url-encoded>&token=<s>`. The shape the Yew Explore builders' `Run` submits
+/// (they compose the PSL text client-side and fetch it as a query param). The
+/// `query` param is percent-decoded, then run exactly like the POST variant.
+/// Requires an admitted session + live substrate. A pure read.
+fn dispatch_obs_live_query_get(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let psl = percent_decode(query_value(&request.path, "query").unwrap_or(""));
+    match ctx.live_obs_psl(&psl) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Metric-name typeahead: `GET /portal/obs/live/metric-names?token=<s>` — the
+/// real live-store metric names, one per line, for the Explore `select:`
+/// autofill. Requires an admitted session + live substrate.
+fn dispatch_obs_live_metric_names(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_metric_names() {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Label-key typeahead: `GET /portal/obs/live/label-keys?token=<s>` — the real
+/// live-store label keys, one per line, for the Explore `where:` autofill.
+/// Requires an admitted session + live substrate.
+fn dispatch_obs_live_label_keys(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_label_keys() {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Label-value typeahead: `GET /portal/obs/live/label-values?key=<k>&token=<s>`
+/// — the real live-store values for `key`, one per line, for the Explore
+/// `where:` value autofill. An unknown key yields an empty body (never a
+/// fabricated list). Requires an admitted session + live substrate.
+fn dispatch_obs_live_label_values(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let key = percent_decode(query_value(&request.path, "key").unwrap_or(""));
+    match ctx.live_obs_label_values(&key) {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Percent-decode a query-param value (`%20` → space, etc.) — the inverse of
+/// the Yew Explore builder's `urlencode`. Unrecognized `%` sequences are left
+/// verbatim; `+` is NOT treated as a space (the encoder emits `%20`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Split a `<token>\n<rest...>` request body into the first-line token and the
 /// remaining body (the shared framing every `/portal/obs/live/*` POST uses).
 fn split_token_body(body: &str) -> (String, String) {
@@ -4288,6 +4404,29 @@ mod tests {
     use super::*;
     use pillar_identity::NodeSubkey;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn percent_decode_inverts_the_explore_builders_urlencode() {
+        // The Yew Explore builder percent-encodes the composed PSL text before
+        // fetching it as `?query=`; the GET dispatcher must decode it back to
+        // the exact text `parse_psl` expects.
+        let psl = "select: metrics(name = ingest_bandwidth), logs where: cell = \
+                   testpillarcell range: now-1d correlate: { window: 1s, anchor: metrics }";
+        let encoded: String = psl
+            .chars()
+            .map(|c| match c {
+                c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') => {
+                    c.to_string()
+                }
+                other => format!("%{:02X}", other as u32),
+            })
+            .collect();
+        assert_eq!(percent_decode(&encoded), psl);
+        // A plain value round-trips unchanged; a stray/short `%` is left as-is.
+        assert_eq!(percent_decode("cell"), "cell");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("100%"), "100%");
+    }
 
     const PASSWORD: &str = "correct horse battery staple";
     const SECRET: &str = "operational-key-material";

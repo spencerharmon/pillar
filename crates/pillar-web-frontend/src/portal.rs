@@ -444,6 +444,10 @@ pub(crate) use yew_impl::{http, input_value};
 mod yew_impl {
     use super::*;
     use crate::auth::{use_auth, AuthAction, AuthContext};
+    use crate::explore::{
+        ExploreBuilder, ExploreLogsBuilder, ExploreMetadataBuilder, ExploreProfilesBuilder,
+        ExploreTracesBuilder,
+    };
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::{spawn_local, JsFuture};
     use web_sys::{
@@ -1906,6 +1910,40 @@ mod yew_impl {
                 </div>
                 <div id="obs-list">
                     { for rows.iter().map(|r| html! { <p class="obs-row">{ r.clone() }</p> }) }
+                </div>
+                <div id="obs-guided-builder" class="obs-builder">
+                    <label>{ "Guided PSL query builder" }</label>
+                    <p class="hint">{ "select/where fields autofill from the live metadata index; \
+                        the Correlate panel pivots to the other signal kinds within a window. \
+                        Same builder, one per signal kind (switch it with the selector above)." }</p>
+                    {
+                        // The kind selector above chooses which guided builder
+                        // to mount — the ROI's "same builder, five entry points."
+                        // All fetch the REAL live-store typeahead + query
+                        // endpoints (see web_serve.rs `/portal/obs/live/*`).
+                        match (*kind).as_str() {
+                            "log" => html! { <ExploreLogsBuilder
+                                label_keys_path="/portal/obs/live/label-keys"
+                                label_values_path="/portal/obs/live/label-values"
+                                query_path="/portal/obs/live/query" /> },
+                            "trace" => html! { <ExploreTracesBuilder
+                                label_keys_path="/portal/obs/live/label-keys"
+                                label_values_path="/portal/obs/live/label-values"
+                                query_path="/portal/obs/live/query" /> },
+                            "profile" => html! { <ExploreProfilesBuilder
+                                label_keys_path="/portal/obs/live/label-keys"
+                                label_values_path="/portal/obs/live/label-values"
+                                query_path="/portal/obs/live/query" /> },
+                            "metadata" => html! { <ExploreMetadataBuilder
+                                label_keys_path="/portal/obs/live/label-keys"
+                                label_values_path="/portal/obs/live/label-values"
+                                query_path="/portal/obs/live/query" /> },
+                            _ => html! { <ExploreBuilder
+                                label_keys_path="/portal/obs/live/label-keys"
+                                label_values_path="/portal/obs/live/label-values"
+                                query_path="/portal/obs/live/query" /> },
+                        }
+                    }
                 </div>
                 <label>{ "Save a dashboard" }</label>
                 <input id="obs-dashboard-name" r#type="text" placeholder="name" value={(*dash_name).clone()} oninput={on_name} />

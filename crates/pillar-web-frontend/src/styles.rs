@@ -205,6 +205,53 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .pillar-security-key {{ display: flex; flex-wrap: wrap; gap: 0.5rem; }}
         .pillar-security-key__error {{ color: #f87171; width: 100%; margin: 0.25rem 0 0; }}
 
+        /* ---- Observability guided PSL builders (explore.rs markup) ---- */
+        .obs-builder {{ margin-top: 0.75rem; }}
+        [data-panel^="explore-"] {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+            padding: 0.85rem;
+            background-color: {surface_base};
+            border: 1px solid {border};
+            border-radius: {radius};
+        }}
+        [data-panel^="explore-"] h2 {{ font-size: 1rem; margin: 0; }}
+        [data-role="predicate-builder"] {{ display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }}
+        [data-role="predicate-builder"] input {{ width: auto; flex: 1 1 8rem; }}
+        [data-panel="correlate"] {{
+            padding: 0.5rem 0;
+            border: none;
+            background: transparent;
+        }}
+        [data-panel="correlate"] h3 {{ font-size: 0.85rem; color: {muted}; margin: 0 0 0.3rem; }}
+        [data-role="correlate-kind"] {{
+            background-color: {surface_overlay};
+            border-color: {border};
+            color: {text};
+            margin-right: 0.35rem;
+        }}
+        [data-role="correlate-kind"]:hover {{ background-color: {surface_raised}; }}
+        [data-role="predicate-rows"], [data-role="results"] {{
+            list-style: none;
+            margin: 0.25rem 0 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }}
+        [data-role="predicate-rows"] li, [data-role="results"] li {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.82rem;
+            padding: 0.3rem 0.45rem;
+            border-radius: 6px;
+            background-color: {surface_raised};
+            border: 1px solid {border};
+            word-break: break-word;
+        }}
+        [data-role="run-query"] {{ align-self: flex-start; }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{

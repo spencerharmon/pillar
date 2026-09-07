@@ -58,6 +58,8 @@ pillar-web-api = { path = "../pillar-web-api", default-features = false }
 # Dashboard renders to — a Dashboard is one of the natively-registered
 # `BuiltinKind`s, so it reuses the SAME schema/validation path a third-party
 # CRD does rather than inventing a parallel manifest model.
+pillar-observability = { path = "../pillar-observability" }
+pillar-manifest = { path = "../pillar-manifest" }
 # stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
 # `parser` feature lets us build a `Style` from a raw CSS &str on the NATIVE
 # target (host `cargo test`), which is what makes the design system host-

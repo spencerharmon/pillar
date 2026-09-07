@@ -199,6 +199,18 @@ impl LiveObservabilitySubstrate {
             .collect()
     }
 
+    /// A [`MetadataIndex`] projected from the live store's currently-held
+    /// signal set — the REAL typeahead source the Explore query builders'
+    /// `select`/`where` autofill reads (metric names, label keys, label
+    /// VALUES). It holds no signals of its own and fabricates nothing: an
+    /// unknown key yields an empty value list, per the index's own
+    /// anti-fabrication contract. Rebuilt on demand so it always reflects the
+    /// current held set (retention-correct, never a drifting side catalog).
+    #[must_use]
+    pub fn metadata_index(&self) -> crate::metadata_index::MetadataIndex {
+        crate::metadata_index::MetadataIndex::from_store(&self.store)
+    }
+
     /// How many signals of `kind` the live store currently holds — the
     /// black-box "was this kind really ingested?" probe.
     #[must_use]
