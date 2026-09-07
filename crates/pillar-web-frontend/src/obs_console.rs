@@ -149,6 +149,7 @@ mod yew_impl {
         recording_request_body, DashPanel, KindCount,
     };
     use crate::auth::use_auth;
+    use crate::components::data_table::{Column, DataTable};
     use crate::portal::{get_url, http, input_value, ObservabilityTile};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
@@ -333,26 +334,34 @@ mod yew_impl {
         }
     }
 
-    /// Render one materialized dashboard panel as a titled signal table.
+    /// Render one materialized dashboard panel as a titled signal table,
+    /// rendered through the shared [`DataTable`] component library primitive
+    /// (the sortable/filterable console table) — the first real consumer of the
+    /// Phase 1 library, mapping each [`DashSignal`] onto the signal/kind/payload
+    /// columns.
     fn render_panel(panel: &DashPanel) -> Html {
+        let columns = vec![
+            Column::text("signal"),
+            Column::text("kind"),
+            Column::unsortable("payload"),
+        ];
+        let rows: Vec<Vec<String>> = panel
+            .signals
+            .iter()
+            .map(|s| vec![s.id.clone(), s.kind.clone(), s.payload.clone()])
+            .collect();
         html! {
             <section class="obs-panel" data-panel={panel.name.clone()}>
                 <h4>{ format!("{} ({})", panel.name, panel.count) }</h4>
                 if panel.signals.is_empty() {
                     <p class="obs-empty">{ "No signals matched." }</p>
                 } else {
-                    <table class="obs-table">
-                        <thead><tr><th>{ "signal" }</th><th>{ "kind" }</th><th>{ "payload" }</th></tr></thead>
-                        <tbody>
-                            { for panel.signals.iter().map(|s| html! {
-                                <tr>
-                                    <td>{ s.id.clone() }</td>
-                                    <td>{ s.kind.clone() }</td>
-                                    <td class="obs-payload">{ s.payload.clone() }</td>
-                                </tr>
-                            }) }
-                        </tbody>
-                    </table>
+                    <DataTable
+                        columns={columns}
+                        rows={rows}
+                        page_size={25}
+                        class={classes!("obs-table")}
+                    />
                 }
             </section>
         }
@@ -549,6 +558,26 @@ mod yew_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mount-audit (anti-facade DoD): the observability console must actually
+    /// CONSUME the Phase 1 component library — this file references
+    /// `crate::components::data_table::{Column, DataTable}` and renders the
+    /// materialized-panel table through `DataTable`. We assert that on the
+    /// module's own source so the library can never silently regress back to a
+    /// hand-rolled `<table>` (an orphaned library with zero call sites is the
+    /// exact facade failure this ROI bans).
+    #[test]
+    fn obs_console_consumes_the_datatable_component() {
+        let src = include_str!("obs_console.rs");
+        assert!(
+            src.contains("crate::components::data_table"),
+            "obs_console.rs no longer imports the components::data_table library"
+        );
+        assert!(
+            src.contains("<DataTable"),
+            "obs_console.rs no longer renders the shared DataTable primitive"
+        );
+    }
 
     #[test]
     fn kind_counts_parse_the_backend_line_format() {
