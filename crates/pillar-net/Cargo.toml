@@ -61,5 +61,14 @@ pillar-topology = { path = "../pillar-topology" }
 # this crate for the UDP dataplane, above.)
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 
+[features]
+# Gates the acceptance-tier integration test
+# (`tests/pillar_udp_preferred_transport.rs`), which stands up real libp2p
+# swarms over real sockets to prove the corrected transport posture end to
+# end. Off by default so a plain `cargo test` stays unit-tier; the
+# acceptance-e2e CHECKS.md stub always invokes `--features acceptance`
+# explicitly.
+acceptance = []
+
 [lints]
 workspace = true
