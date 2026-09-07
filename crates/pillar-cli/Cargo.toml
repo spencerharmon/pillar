@@ -52,6 +52,13 @@ hsm = ["pillar-crypto/hsm", "passkey"]
 # register|login`. Folded into `hsm` (every deployed node build) and
 # available standalone for a WebAuthn-only build.
 passkey = ["pillar-crypto/passkey"]
+# Opt-in acceptance gate for black-box integration tests that stand the real
+# node web surface up on a real TCP socket and drive it over real HTTP (never
+# an in-process call). Off by default so a plain `cargo test -p pillar-cli` /
+# `cargo test --all` stays a fast unit run; the `acceptance-e2e` CHECKS.md stub
+# always invokes `--features acceptance` explicitly. The `tests/portal_swarm_surface`
+# suite is `#![cfg(feature = "acceptance")]`-gated on this.
+acceptance = []
 
 [dev-dependencies]
 tempfile = "3"
