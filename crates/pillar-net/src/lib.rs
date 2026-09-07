@@ -176,6 +176,15 @@ pub struct EventBehaviour {
     /// a node whose best-effort gossipsub feed had a gap, multiplexed over the
     /// SAME connections as gossipsub/kademlia/identify.
     pub op_sync: request_response::cbor::Behaviour<opsync::OpSyncRequest, opsync::OpSyncResponse>,
+    /// Optional UPnP/NAT-PMP port mapping. A [`Toggle`]: disabled
+    /// (`Toggle::from(None)`) leaves it entirely inert, so an
+    /// [`EventBehaviour`] with UPnP off behaves exactly as before. Enabled (a
+    /// public/seed node behind a home NAT, `pillar node run --upnp`), it asks
+    /// the local gateway to map this node's listen ports and confirms the
+    /// resulting external address to the swarm, so `identify` advertises a
+    /// publicly dialable address to peers — the same UPnP path WireGuard uses
+    /// on the gateway to become reachable.
+    pub upnp: Toggle<upnp::tokio::Behaviour>,
 }
 
 /// The behaviour run by a Pillar node acting as a relay (`libp2p::relay`
@@ -226,7 +235,7 @@ fn identify_config(keypair: &Keypair) -> identify::Config {
 pub fn build_event_swarm(
     keypair: Keypair,
 ) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
-    build_event_swarm_with_root(keypair, PrivateSwarmKey::disabled())
+    build_event_swarm_with_root(keypair, PrivateSwarmKey::disabled(), false)
 }
 
 /// Builds a [`Swarm`] running [`EventBehaviour`] whose TRANSPORT is bound to
@@ -247,10 +256,25 @@ pub fn build_event_swarm(
 ///   QUIC is not offered in this mode: QUIC's own TLS handshake is not
 ///   pnet-wrapped by this crate, so admitting it would open a side channel
 ///   that bypasses the root check.
+///
+/// `upnp_enabled` toggles a UPnP/NAT-PMP port-mapping behaviour (the
+/// [`EventBehaviour::upnp`] [`Toggle`]). Off (the default for a directly
+/// reachable node or a test) leaves it inert; on (a seed/public node behind a
+/// home gateway) it maps this node's listen ports on the gateway and confirms
+/// the external address to the swarm so `identify` advertises a dialable
+/// address — the mechanism that makes a NAT'd seed publicly reachable.
 pub fn build_event_swarm_with_root(
     keypair: Keypair,
     root: PrivateSwarmKey,
+    upnp_enabled: bool,
 ) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    let make_upnp = || -> Toggle<upnp::tokio::Behaviour> {
+        if upnp_enabled {
+            Toggle::from(Some(upnp::tokio::Behaviour::default()))
+        } else {
+            Toggle::from(None)
+        }
+    };
     let swarm = match root.0 {
         None => libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -269,6 +293,7 @@ pub fn build_event_swarm_with_root(
                     kademlia: new_kademlia(peer_id),
                     identify: identify::Behaviour::new(identify_config(key)),
                     op_sync: opsync::op_sync_behaviour(),
+                    upnp: make_upnp(),
                 }
             })?
             .build(),
@@ -285,6 +310,7 @@ pub fn build_event_swarm_with_root(
                         kademlia: new_kademlia(peer_id),
                         identify: identify::Behaviour::new(identify_config(key)),
                         op_sync: opsync::op_sync_behaviour(),
+                        upnp: make_upnp(),
                     }
                 })?
                 .build()
@@ -1375,6 +1401,28 @@ mod tests {
         assert!(matches!(classify_seed(bare), FederationSeed::Dial(_)));
     }
 
+    #[tokio::test]
+    async fn upnp_enabled_swarm_builds() {
+        // A UPnP-enabled event swarm constructs (the Toggle carries a real
+        // upnp behaviour, which spawns its gateway task on the Tokio runtime);
+        // the actual gateway mapping is a runtime/network concern surfaced as
+        // swarm events, not a build-time one.
+        let public = build_event_swarm_with_root(
+            Keypair::generate_ed25519(),
+            PrivateSwarmKey::disabled(),
+            true,
+        )
+        .expect("upnp-enabled public swarm builds");
+        drop(public);
+        let private = build_event_swarm_with_root(
+            Keypair::generate_ed25519(),
+            PrivateSwarmKey::from_root_secret("seed-upnp-test-root"),
+            true,
+        )
+        .expect("upnp-enabled private swarm builds");
+        drop(private);
+    }
+
     #[test]
     fn note_identified_peer_adds_addresses_to_kademlia() {
         // Build a real event swarm and confirm learning a peer from identify
@@ -1505,9 +1553,12 @@ mod tests {
     /// strictly additive.
     #[tokio::test]
     async fn public_root_default_path_unchanged() {
-        let mut a =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), PrivateSwarmKey::disabled())
-                .unwrap();
+        let mut a = build_event_swarm_with_root(
+            Keypair::generate_ed25519(),
+            PrivateSwarmKey::disabled(),
+            false,
+        )
+        .unwrap();
         let mut b = build_event_swarm(Keypair::generate_ed25519()).unwrap();
         let b_peer_id = *b.local_peer_id();
 
@@ -1561,8 +1612,10 @@ mod tests {
         let root_a = PrivateSwarmKey::from_root_secret("network-alpha");
         let root_b = PrivateSwarmKey::from_root_secret("network-beta");
 
-        let mut a = build_event_swarm_with_root(Keypair::generate_ed25519(), root_a).unwrap();
-        let mut b = build_event_swarm_with_root(Keypair::generate_ed25519(), root_b).unwrap();
+        let mut a =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_a, false).unwrap();
+        let mut b =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_b, false).unwrap();
         let b_peer_id = *b.local_peer_id();
 
         let b_addr = listen_and_get_addr(&mut b).await;
@@ -1607,7 +1660,7 @@ mod tests {
         let root = PrivateSwarmKey::from_root_secret("shared-private-root");
 
         let mut seed =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root.clone()).unwrap();
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root.clone(), false).unwrap();
         let seed_peer_id = *seed.local_peer_id();
         let seed_addr = listen_and_get_addr(&mut seed).await;
         let seed_multiaddr = seed_addr.with(Protocol::P2p(seed_peer_id));
@@ -1618,7 +1671,8 @@ mod tests {
             }
         });
 
-        let mut joiner = build_event_swarm_with_root(Keypair::generate_ed25519(), root).unwrap();
+        let mut joiner =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root, false).unwrap();
         let seeds = vec![parse_seed_multiaddr(seed_multiaddr).unwrap()];
         let added = seed_event_dht(&mut joiner, &seeds);
         assert_eq!(added, 1, "one seed configured");

@@ -93,6 +93,14 @@ const ENV_SEED_LEGACY: &str = "PILLAR_SEED_MULTIADDR";
 /// network is just distributing one `generate`d key file to each owned node
 /// (`--swarm-key`) and pointing them at each other with `--seed-node`.
 const ENV_SWARM_KEY: &str = "PILLAR_SWARM_KEY";
+/// `--upnp` / `PILLAR_UPNP`: enable UPnP/NAT-PMP port mapping on the local
+/// gateway. Off by default (a directly reachable node, or a test). Turn it on
+/// for a node behind a home NAT that must be publicly dialable — notably a
+/// public seed — so libp2p asks the gateway to forward this node's listen
+/// ports and advertises the resulting external address via `identify`. This is
+/// the same UPnP path WireGuard uses on the gateway to become reachable.
+/// `PILLAR_UPNP` is truthy for `1`/`true`/`yes`/`on` (case-insensitive).
+const ENV_UPNP: &str = "PILLAR_UPNP";
 /// `--web-bind` / `PILLAR_WEB_BIND`: the address the web UI listens on.
 /// Unset (the default) disables the web surface entirely — `node run` never
 /// opens a web listener unless explicitly configured.
@@ -186,6 +194,10 @@ pub struct NodeConfig {
     /// configured with the identical key. Pillar keeps no swarm state — the
     /// key lives only in this operator-owned file.
     pub swarm_key: Option<PathBuf>,
+    /// Whether to enable UPnP/NAT-PMP port mapping (`--upnp` / `PILLAR_UPNP`).
+    /// A NAT'd public seed sets this so the local gateway forwards its listen
+    /// ports and it becomes publicly dialable; off by default.
+    pub upnp: bool,
     /// The address the web UI listens on, if configured. `None` (the
     /// default) means `node run` serves no web surface at all. When set to
     /// a **non-loopback** address (e.g. `0.0.0.0`, so a k8s Service can
@@ -301,6 +313,7 @@ impl NodeConfig {
         let mut dial: Vec<Multiaddr> = Vec::new();
         let mut seed: Vec<Multiaddr> = Vec::new();
         let mut swarm_key: Option<PathBuf> = None;
+        let mut upnp = false;
         let mut web_bind: Option<IpAddr> = None;
         let mut web_port: Option<u16> = None;
         let mut health_bind: Option<IpAddr> = None;
@@ -348,6 +361,11 @@ impl NodeConfig {
                         .ok_or(ConfigError::MissingValue("--swarm-key"))?;
                     swarm_key = Some(PathBuf::from(v));
                     i += 2;
+                }
+                "--upnp" => {
+                    // Valueless boolean flag: presence enables UPnP.
+                    upnp = true;
+                    i += 1;
                 }
                 "--web-bind" => {
                     let v = args
@@ -435,6 +453,16 @@ impl NodeConfig {
             swarm_key = env(ENV_SWARM_KEY).map(PathBuf::from);
         }
 
+        // UPnP: the `--upnp` flag wins; else `PILLAR_UPNP` truthy.
+        if !upnp {
+            upnp = env(ENV_UPNP).is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        }
+
         // web_bind: explicit flag wins; else env; else disabled (no web
         // surface). `node run` never opens a web listener unless configured.
         if web_bind.is_none() {
@@ -470,6 +498,7 @@ impl NodeConfig {
             dial,
             seed,
             swarm_key,
+            upnp,
             web_bind,
             web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
             health_bind,
@@ -857,7 +886,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         "pillar peer transport bound to swarm (pnet-keyed pre-shared transport)"
     );
     let root = pillar_net::PrivateSwarmKey::from_root_secret(&root_secret);
-    let mut swarm = pillar_net::build_event_swarm_with_root(keypair, root)
+    let mut swarm = pillar_net::build_event_swarm_with_root(keypair, root, config.upnp)
         .map_err(|e| BootError::Transport(e.to_string()))?;
     let topic = pillar_net::event_log_topic();
     swarm
@@ -1337,6 +1366,25 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                             );
                         }
                     }
+                    // UPnP/NAT-PMP port mapping progress. The behaviour itself
+                    // confirms a mapped external address to the swarm (so
+                    // `identify` advertises it); these are informational so an
+                    // operator can see the seed became publicly reachable, or
+                    // why it did not (no IGD gateway on the network).
+                    SwarmEvent::Behaviour(pillar_net::EventBehaviourEvent::Upnp(ev)) => match ev {
+                        libp2p::upnp::Event::NewExternalAddr(addr) => {
+                            tracing::info!(%addr, "UPnP mapped external address (node now publicly dialable)");
+                        }
+                        libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
+                            tracing::warn!(%addr, "UPnP external address mapping expired");
+                        }
+                        libp2p::upnp::Event::GatewayNotFound => {
+                            tracing::warn!("UPnP enabled but no IGD gateway found on the network; node not auto-mapped");
+                        }
+                        libp2p::upnp::Event::NonRoutableGateway => {
+                            tracing::warn!("UPnP gateway found but its external address is not publicly routable; node not reachable via UPnP");
+                        }
+                    },
                     _ => {}
                 }
                 if let SwarmEvent::Behaviour(pillar_net::EventBehaviourEvent::Gossipsub(
@@ -1791,6 +1839,29 @@ mod tests {
     fn missing_swarm_key_value_errors() {
         let err = NodeConfig::from_args_env(&[s("--swarm-key")], no_env).unwrap_err();
         assert_eq!(err, ConfigError::MissingValue("--swarm-key"));
+    }
+
+    #[test]
+    fn upnp_is_off_by_default() {
+        let cfg = NodeConfig::from_args_env(&[], no_env).unwrap();
+        assert!(!cfg.upnp);
+    }
+
+    #[test]
+    fn upnp_flag_enables_it() {
+        let cfg = NodeConfig::from_args_env(&[s("--upnp")], no_env).unwrap();
+        assert!(cfg.upnp);
+    }
+
+    #[test]
+    fn upnp_env_truthy_values_enable_it() {
+        for v in ["1", "true", "TRUE", "yes", "On"] {
+            let cfg = NodeConfig::from_args_env(&[], |k| (k == ENV_UPNP).then(|| s(v))).unwrap();
+            assert!(cfg.upnp, "{v:?} should enable upnp");
+        }
+        // A non-truthy value leaves it off.
+        let off = NodeConfig::from_args_env(&[], |k| (k == ENV_UPNP).then(|| s("0"))).unwrap();
+        assert!(!off.upnp);
     }
 
     #[test]

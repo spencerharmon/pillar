@@ -180,9 +180,19 @@ Alongside the swarm key and seeds, every node also takes:
 | `--identity-key` | `PILLAR_IDENTITY_KEY` | `<data-dir>/identity.key` |
 | `--data-dir` | `PILLAR_DATA_DIR` | `./pillar-data` |
 | `--listen` (repeatable) | `PILLAR_LISTEN` (comma/space list) | `/ip4/0.0.0.0/tcp/0` |
+| `--upnp` (flag) | `PILLAR_UPNP` (truthy) | off |
 
 These are unrelated to the private/public network decision and are set the
 same way regardless of which swarm you configure.
+
+`--upnp` asks the local gateway (via UPnP/NAT-PMP) to forward this node's
+listen ports and advertises the resulting public address through `identify`,
+so a node behind a home NAT becomes publicly dialable — the same gateway path
+WireGuard uses. A **public seed** running behind a residential router sets
+`--upnp` and a FIXED listen port (e.g. `--listen /ip4/0.0.0.0/tcp/4001`) so
+its public address is stable enough to name in a `_dnsaddr` TXT record. If no
+UPnP-capable gateway is found the node logs it and keeps running (it is simply
+not auto-mapped); a directly reachable node does not need `--upnp`.
 
 ## Per-primitive worked examples
 
