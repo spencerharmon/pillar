@@ -381,6 +381,84 @@ pub struct WebAuthContext {
     /// hook. `None` in a bare unit-test context (the resource plane still
     /// records the signed event exactly as before; nothing is scheduled).
     scheduler_runtime: Option<SharedSchedulerRuntime>,
+    /// The durable streaming-DB sink every portal MUTATION is journaled into as
+    /// a signed, content-addressed op (real CIDv1 IPFS block, pinned) — the
+    /// SAME [`pillar_streamdb::IpfsPersistentStream`] the node's controller loop
+    /// appends gossiped ops to. `None` in unit tests (and any context built
+    /// without a durable node behind it), where mutations stay in-memory. When
+    /// present, [`WebAuthContext::record`] appends one [`PortalOp`] per mutation
+    /// so a restarted node rehydrates its cell/user/member/custody/identity
+    /// state from the persisted log via [`WebAuthContext::replay`] instead of
+    /// serving the bootstrap flow again.
+    journal: Option<SharedPortalJournal>,
+    /// Set only while [`WebAuthContext::replay`] is folding the persisted log
+    /// back into a fresh context on boot: suppresses [`WebAuthContext::record`]
+    /// so replaying an op never re-appends it to the durable log.
+    replaying: bool,
+}
+
+/// A thread-shared handle to the node's durable streaming DB — the portal's
+/// mutation journal. The controller loop and the web server both hold a clone;
+/// the web server locks it only briefly to append one op per portal act.
+pub type SharedPortalJournal = Arc<Mutex<pillar_streamdb::IpfsPersistentStream>>;
+
+/// The version tag every journaled [`PortalOp`] op payload is prefixed with, so
+/// [`WebAuthContext::replay`] folds ONLY portal ops and transparently skips any
+/// other op sharing the same streaming DB (e.g. a gossiped event-log message on
+/// a multi-node cell). A payload not starting with this tag is not a portal op.
+const PORTAL_OP_TAG: &[u8] = b"PORTALOPv1\n";
+
+/// One durable portal MUTATION, journaled into the streaming DB and replayed on
+/// boot to rebuild the node's cell/user/member/custody/identity state. Every
+/// variant carries exactly the material a deterministic replay needs — never a
+/// password (the first-user offer persists as its already-sealed ciphertext,
+/// `bootstrap_offer_sealed`, which login re-opens live with the user-supplied
+/// password; the plaintext password is never written to disk).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum PortalOp {
+    /// The atomic cell + first-user bootstrap. `bootstrap_offer_sealed` is the
+    /// node-sealed operational-key ciphertext (from
+    /// `NodeCustodyVerifier::provisioned_offer_parts`), restored verbatim so the
+    /// first user can log in after a restart.
+    BootstrapCellAndUser {
+        cell: String,
+        handle: String,
+        bootstrap_offer_sealed: Vec<u8>,
+    },
+    /// A cell created without a first user yet (the split create-cell step).
+    CreateCell { cell: String },
+    AddMember { handle: String, role: String },
+    SetMemberRole { handle: String, role: String },
+    CustodyMigrate { handle: String, holder: String, cid: String },
+    CustodyRotate { handle: String, cid: String },
+    CustodySeal { handle: String },
+    CustodyRevoke { handle: String },
+    IdentityEnroll { domain: String },
+    IdentityRotate { new_primary: String },
+    IdentityRecover,
+    StoreLayout { signer: String, content: String },
+}
+
+/// The first user's operational subkey id — deterministic from the handle, so a
+/// restart re-derives the IDENTICAL id the live bootstrap admitted into the WoT
+/// authority. The SINGLE source both the live provisioning
+/// ([`WebAuthContext::bootstrap_create_first_user`]) and the restart replay
+/// ([`WebAuthContext::restore_first_user`]) derive it from.
+fn bootstrap_subkey(handle: &str) -> NodeSubkey {
+    NodeSubkey::from(format!("op-subkey-{handle}").as_str())
+}
+
+/// The first user's offer CID — deterministic from the handle (see
+/// [`bootstrap_subkey`]).
+fn bootstrap_offer_cid(handle: &str) -> Cid {
+    Cid::from(format!("cid-{handle}").as_str())
+}
+
+/// The first user's operational-key material — deterministic from the handle
+/// (this bootstrap's scoped operational secret; NOT the user's password). Both
+/// the live seal and the restart-time verifier re-registration derive it here.
+fn bootstrap_secret(handle: &str) -> String {
+    format!("operational-key-material-{handle}")
 }
 
 /// A thread-shared handle to the node's live scheduler runtime: the running
@@ -569,6 +647,8 @@ impl WebAuthContext {
             live_obs: None,
             workload_reconciler: None,
             scheduler_runtime: None,
+            journal: None,
+            replaying: false,
         }
     }
 
@@ -595,6 +675,174 @@ impl WebAuthContext {
     pub fn with_scheduler_runtime(mut self, runtime: SharedSchedulerRuntime) -> Self {
         self.scheduler_runtime = Some(runtime);
         self
+    }
+
+    /// Wire the durable streaming-DB journal into this web plane: every portal
+    /// MUTATION is thereafter appended as a signed, content-addressed
+    /// [`PortalOp`] op to the SAME [`pillar_streamdb::IpfsPersistentStream`] the
+    /// node's controller loop rides, so the cell/user/member/custody/identity
+    /// state survives a restart. The running node calls this from
+    /// [`crate::run::run`] with an `Arc<Mutex<_>>` clone of its stream; unit
+    /// tests omit it and keep mutations in-memory.
+    #[must_use]
+    pub fn with_persistent_journal(mut self, journal: SharedPortalJournal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    /// Append one portal mutation to the durable streaming DB. A no-op while
+    /// replaying (so folding the log back never re-appends), and a no-op when
+    /// no journal is wired (unit tests). A serialize/append failure is logged
+    /// and does NOT roll back the already-applied in-memory mutation — the same
+    /// posture the controller loop takes for a failed gossip-op append; the
+    /// on-disk log simply lags by that op until the next successful append
+    /// (surfaced as an error, never silently swallowed as success).
+    fn record(&mut self, op: &PortalOp) {
+        if self.replaying {
+            return;
+        }
+        let Some(journal) = self.journal.clone() else {
+            return;
+        };
+        let mut payload = PORTAL_OP_TAG.to_vec();
+        match serde_json::to_vec(op) {
+            Ok(json) => payload.extend_from_slice(&json),
+            Err(e) => {
+                tracing::error!(error = %e, "portal journal: failed to serialize op; NOT persisted");
+                return;
+            }
+        }
+        let mut stream = match journal.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("portal journal: stream lock poisoned; op NOT persisted");
+                return;
+            }
+        };
+        if let Err(e) = stream.append(payload, pillar_core::SideEffect::Convergent) {
+            tracing::error!(error = %e, "portal journal: durable append failed; op NOT persisted");
+        }
+    }
+
+    /// Fold a persisted portal-op log back into this (freshly constructed)
+    /// context on boot — the inverse of [`Self::record`]. `ops` is the durable
+    /// op-payload set in apply order (`stream.stream().log().order()` bytes);
+    /// non-portal ops (no [`PORTAL_OP_TAG`]) and any that fail to decode are
+    /// skipped, so a shared multi-node streaming DB carrying gossiped event-log
+    /// messages replays cleanly. Every applied op re-runs the SAME deterministic
+    /// mutator the live act used, with recording suppressed. Call BEFORE serving.
+    pub fn replay(&mut self, ops: &[Vec<u8>]) {
+        self.replaying = true;
+        let mut applied = 0usize;
+        for raw in ops {
+            let Some(json) = raw.strip_prefix(PORTAL_OP_TAG) else {
+                continue;
+            };
+            let op: PortalOp = match serde_json::from_slice(json) {
+                Ok(op) => op,
+                Err(e) => {
+                    tracing::warn!(error = %e, "portal journal: skipping undecodable op during replay");
+                    continue;
+                }
+            };
+            self.apply_replayed(op);
+            applied += 1;
+        }
+        self.replaying = false;
+        if applied > 0 {
+            tracing::info!(applied, "portal journal: rehydrated portal state from streaming DB");
+        }
+    }
+
+    /// Apply one decoded [`PortalOp`] during [`Self::replay`], reconstructing
+    /// committed state WITHOUT re-authorizing (the act was already gated when it
+    /// was first journaled) and WITHOUT a network name-check (the cell name is
+    /// already owned). `self.replaying` is set, so the mutators' own
+    /// [`Self::record`] calls are suppressed.
+    fn apply_replayed(&mut self, op: PortalOp) {
+        match op {
+            PortalOp::CreateCell { cell } => {
+                self.restore_cell(NodeId::from(cell.as_str()));
+            }
+            PortalOp::BootstrapCellAndUser {
+                cell,
+                handle,
+                bootstrap_offer_sealed,
+            } => {
+                self.restore_cell(NodeId::from(cell.as_str()));
+                self.restore_first_user(&handle, bootstrap_offer_sealed);
+            }
+            PortalOp::AddMember { handle, role } => {
+                self.add_member(&handle, &role);
+            }
+            PortalOp::SetMemberRole { handle, role } => {
+                self.set_member_role(&handle, &role);
+            }
+            PortalOp::CustodyMigrate { handle, holder, cid } => {
+                self.custody_migrate(&handle, NodeId::from(holder.as_str()), Cid::from(cid.as_str()));
+            }
+            PortalOp::CustodyRotate { handle, cid } => {
+                self.custody_rotate(&handle, Cid::from(cid.as_str()));
+            }
+            PortalOp::CustodySeal { handle } => {
+                self.custody_seal_escrow(&handle);
+            }
+            PortalOp::CustodyRevoke { handle } => {
+                self.custody_revoke(&handle);
+            }
+            PortalOp::IdentityEnroll { domain } => {
+                let _ = self.identity_enroll(&domain);
+            }
+            PortalOp::IdentityRotate { new_primary } => {
+                let _ = self.identity_rotate(&new_primary);
+            }
+            PortalOp::IdentityRecover => {
+                let _ = self.identity_recover();
+            }
+            PortalOp::StoreLayout { signer, content } => {
+                self.layouts.append(format!("{signer}\n{content}").into_bytes());
+            }
+        }
+    }
+
+    /// Restore the cell on replay: the raw [`CellBootstrap::create_cell`] (NO
+    /// network name-check — the name is already owned) plus reopening the
+    /// join-request queue, idempotent if the cell is already present.
+    fn restore_cell(&mut self, cell: NodeId) {
+        if self.bootstrap.cell().is_some() {
+            return;
+        }
+        if self.bootstrap.create_cell(cell.clone()).is_ok() {
+            self.requests = Some(BootstrapRequestQueue::new(cell, std::iter::empty()));
+        }
+    }
+
+    /// Restore the first user on replay from its persisted already-sealed offer
+    /// ciphertext — the durable counterpart of
+    /// [`Self::bootstrap_create_first_user`] that needs NO password. Consumes
+    /// the one-shot capability, re-admits the (deterministic) operational subkey
+    /// into the WoT authority, and restores the node-sealed offer verbatim so
+    /// the user logs in exactly as before.
+    fn restore_first_user(&mut self, handle: &str, sealed_offer: Vec<u8>) {
+        if self.bootstrap.initial_user().is_some() {
+            return;
+        }
+        if self.bootstrap.create_first_user(handle).is_err() {
+            return;
+        }
+        let subkey = bootstrap_subkey(handle);
+        let level = self.authority.max_depth();
+        self.admit_subject(subkey.node_id(), level);
+        let cid = bootstrap_offer_cid(handle);
+        let secret = bootstrap_secret(handle);
+        self.verifier.restore_offer(
+            handle.to_owned(),
+            handle.to_owned(),
+            cid,
+            subkey,
+            &secret,
+            sealed_offer,
+        );
     }
 
     /// Tell the portal's Swarm panel which physical libp2p swarm this node is
@@ -839,7 +1087,12 @@ impl WebAuthContext {
     /// (its CID).
     pub fn store_layout(&mut self, signer: &str, content: &str) -> OpId {
         let payload = format!("{signer}\n{content}");
-        self.layouts.append(payload.into_bytes())
+        let id = self.layouts.append(payload.into_bytes());
+        self.record(&PortalOp::StoreLayout {
+            signer: signer.to_owned(),
+            content: content.to_owned(),
+        });
+        id
     }
 
     /// Resolve a previously stored layout by its CID, returning
@@ -1223,6 +1476,9 @@ impl WebAuthContext {
             .entry(domain.to_owned())
             .or_default()
             .push(format!("{domain}-cell-1"));
+        self.record(&PortalOp::IdentityEnroll {
+            domain: domain.to_owned(),
+        });
         Ok(subkey)
     }
 
@@ -1233,10 +1489,14 @@ impl WebAuthContext {
         new_primary: &str,
     ) -> Result<u64, pillar_identity::global_identity::IdentityLogError> {
         let signer = self.identity_log.current_primary().clone();
-        self.identity_log.rotate(IdentityRotation::signed_by(
+        let generation = self.identity_log.rotate(IdentityRotation::signed_by(
             IdentityKeyId::from(new_primary),
             signer.0,
-        ))
+        ))?;
+        self.record(&PortalOp::IdentityRotate {
+            new_primary: new_primary.to_owned(),
+        });
+        Ok(generation)
     }
 
     /// Recover: rotate to a fresh primary using the genesis-committed
@@ -1252,10 +1512,12 @@ impl WebAuthContext {
             .cloned()
             .unwrap_or_else(|| IdentityKeyId::from("no-recovery-configured"));
         let gen = self.identity_log.head_generation() + 1;
-        self.identity_log.rotate(IdentityRotation::signed_by(
+        let generation = self.identity_log.rotate(IdentityRotation::signed_by(
             IdentityKeyId::from(format!("recovered-primary-{gen}").as_str()),
             recovery.0,
-        ))
+        ))?;
+        self.record(&PortalOp::IdentityRecover);
+        Ok(generation)
     }
 
     /// The domain (naming-only) grouping view: each domain's cells. Read-only
@@ -1276,17 +1538,28 @@ impl WebAuthContext {
     /// checked the presented session is admitted).
     pub fn add_member(&mut self, handle: &str, role: &str) {
         self.members.insert(handle.to_owned(), role.to_owned());
+        self.record(&PortalOp::AddMember {
+            handle: handle.to_owned(),
+            role: role.to_owned(),
+        });
     }
 
     /// Change an existing member's role — a signed act. `false` if `handle`
     /// is not a known member (no-op).
     pub fn set_member_role(&mut self, handle: &str, role: &str) -> bool {
-        if let Some(r) = self.members.get_mut(handle) {
+        let existed = if let Some(r) = self.members.get_mut(handle) {
             *r = role.to_owned();
             true
         } else {
             false
+        };
+        if existed {
+            self.record(&PortalOp::SetMemberRole {
+                handle: handle.to_owned(),
+                role: role.to_owned(),
+            });
         }
+        existed
     }
 
     /// The portal's single real signed-action gate: authorize `actor` for
@@ -1582,6 +1855,8 @@ impl WebAuthContext {
     /// admitted); creates the record if `handle` has none yet.
     pub fn custody_migrate(&mut self, handle: &str, new_holder: NodeId, new_cid: Cid) {
         let generation = self.custody.get(handle).map_or(0, |r| r.generation);
+        let holder = new_holder.to_string();
+        let cid = new_cid.0.clone();
         self.custody.insert(
             handle.to_owned(),
             CustodyRecord {
@@ -1591,38 +1866,62 @@ impl WebAuthContext {
                 generation,
             },
         );
+        self.record(&PortalOp::CustodyMigrate {
+            handle: handle.to_owned(),
+            holder,
+            cid,
+        });
     }
 
     /// Custody rotation: reseal `handle`'s offer under fresh key material
     /// (a new content address) to its SAME current holder, bumping the
     /// generation counter. `false` if `handle` has no custody record yet.
     pub fn custody_rotate(&mut self, handle: &str, new_cid: Cid) -> bool {
-        if let Some(r) = self.custody.get_mut(handle) {
-            r.cid = new_cid;
+        let ok = if let Some(r) = self.custody.get_mut(handle) {
+            r.cid = new_cid.clone();
             r.generation += 1;
             r.sealed = true;
             true
         } else {
             false
+        };
+        if ok {
+            self.record(&PortalOp::CustodyRotate {
+                handle: handle.to_owned(),
+                cid: new_cid.0,
+            });
         }
+        ok
     }
 
     /// Seal/escrow: mark `handle`'s existing custody record sealed (escrowed)
     /// to its current holder. `false` if `handle` has no custody record.
     pub fn custody_seal_escrow(&mut self, handle: &str) -> bool {
-        if let Some(r) = self.custody.get_mut(handle) {
+        let ok = if let Some(r) = self.custody.get_mut(handle) {
             r.sealed = true;
             true
         } else {
             false
+        };
+        if ok {
+            self.record(&PortalOp::CustodySeal {
+                handle: handle.to_owned(),
+            });
         }
+        ok
     }
 
     /// Revoke: drop `handle`'s custody record entirely — fail-closed, the
     /// same handle resolves no offer from this node from this point on.
     /// `false` if `handle` had no custody record.
     pub fn custody_revoke(&mut self, handle: &str) -> bool {
-        self.custody.remove(handle).is_some()
+        let ok = self.custody.remove(handle).is_some();
+        if ok {
+            self.record(&PortalOp::CustodyRevoke {
+                handle: handle.to_owned(),
+            });
+        }
+        ok
     }
 
     /// Chain `subject` to the authority root at `level`, admitting it as
@@ -1955,16 +2254,32 @@ impl WebAuthContext {
         // (1) Apply the key-distribution label: chain the new user's
         // operational subkey into the WoT authority at the root's own
         // budget, so it is authoritative once admitted.
-        let subkey = NodeSubkey::from(format!("op-subkey-{handle}").as_str());
+        let subkey = bootstrap_subkey(&handle);
         let level = self.authority.max_depth();
         self.admit_subject(subkey.node_id(), level);
 
         // (2) Escrow the scoped operational key as a node-sealed L1 offer to
         // THIS bootstrap node's own node key — the per-node seal IS the
         // access control; no other node custodies this offer.
-        let cid = Cid::from(format!("cid-{handle}").as_str());
-        let secret = format!("operational-key-material-{handle}");
-        self.provision_offer(handle.clone(), handle, cid, subkey, password, &secret);
+        let cid = bootstrap_offer_cid(&handle);
+        let secret = bootstrap_secret(&handle);
+        self.provision_offer(handle.clone(), handle.clone(), cid, subkey, password, &secret);
+
+        // (3) Journal the bootstrap durably into the streaming DB so a restart
+        // rehydrates a login-capable node instead of serving the bootstrap
+        // flow again. We persist the ALREADY-SEALED offer ciphertext (never
+        // the password): login re-opens it live with the user-supplied
+        // password (see `NodeCustodyVerifier::admit`).
+        if let (Some(cell), Some((_cid, _h, sealed))) = (
+            self.bootstrap.cell().map(std::string::ToString::to_string),
+            self.verifier.provisioned_offer_parts(&handle),
+        ) {
+            self.record(&PortalOp::BootstrapCellAndUser {
+                cell,
+                handle,
+                bootstrap_offer_sealed: sealed,
+            });
+        }
 
         Ok(())
     }
@@ -2014,9 +2329,11 @@ impl WebAuthContext {
     pub fn create_cell(&mut self, cell: NodeId) -> Result<(), BootstrapError> {
         self.bootstrap
             .create_cell_checked(cell.clone(), self.name_registry.as_ref())?;
+        let cell_id = cell.to_string();
         // The cell now exists: open the bootstrap-request queue for it so fresh
         // nodes/users can request to join.
         self.requests = Some(BootstrapRequestQueue::new(cell, std::iter::empty()));
+        self.record(&PortalOp::CreateCell { cell: cell_id });
         Ok(())
     }
 
@@ -4978,6 +5295,136 @@ mod tests {
     // atomically apply the key-distribution label + escrow the new user's
     // node-sealed offer to this node, so the FIRST login succeeds
     // immediately, with no separate operator provisioning step.
+    /// An in-memory durable-stream journal for exercising the portal's
+    /// persistence path in a unit test (no disk): a genesis
+    /// [`IpfsPersistentStream`] whose op log the test reads back to simulate a
+    /// restart's rehydrate.
+    fn test_journal() -> SharedPortalJournal {
+        let seed = pillar_crypto::Seed::from_bytes(b"portal-journal-test-seed".to_vec());
+        let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(&seed)
+            .expect("ed25519 keygen from valid seed");
+        let stream = pillar_streamdb::IpfsPersistentStream::genesis(
+            public,
+            secret,
+            pillar_streamdb::Visibility::Cell,
+        );
+        Arc::new(Mutex::new(stream))
+    }
+
+    #[test]
+    fn bootstrap_is_journaled_and_a_restarted_node_rehydrates_login_not_bootstrap() {
+        // Node A: bootstrap through the real HTTP path with a durable journal
+        // wired in, exactly as `run.rs` wires it.
+        let journal = test_journal();
+        let mut node_a = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        )
+        .with_persistent_journal(Arc::clone(&journal));
+
+        assert_eq!(
+            post(&mut node_a, "/bootstrap/create-cell", "cell-genesis").status,
+            200
+        );
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/bootstrap/create-user",
+                &format!("spencer\n{PASSWORD}")
+            )
+            .status,
+            200
+        );
+        // A management act after bootstrap must also survive the restart.
+        node_a.add_member("charlie", "operator");
+
+        // Capture EXACTLY what landed durably in the streaming DB — the op
+        // payloads a restarted node reads back from its IPFS-pinned segments.
+        let persisted_ops: Vec<Vec<u8>> = {
+            let stream = journal.lock().expect("journal lock");
+            stream
+                .stream()
+                .log()
+                .order()
+                .iter()
+                .map(|op| op.payload().to_vec())
+                .collect()
+        };
+        assert!(
+            persisted_ops.len() >= 3,
+            "cell + first-user + add-member journaled, got {}",
+            persisted_ops.len()
+        );
+
+        // Node B: a FRESH node (empty in-memory state, as after a pod restart
+        // with the same PVC) that only replays the persisted ops.
+        let mut node_b = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        assert!(
+            node_b.bootstrap().initial_user().is_none(),
+            "a fresh node is unbootstrapped before replay"
+        );
+        node_b.replay(&persisted_ops);
+
+        // It now presents as BOOTSTRAPPED (serves login, not the create-cell
+        // flow) and the post-bootstrap member act is restored.
+        assert_eq!(node_b.bootstrap().initial_user(), Some("spencer"));
+        assert_eq!(
+            node_b.members().get("charlie").map(String::as_str),
+            Some("operator")
+        );
+
+        // And the FIRST USER can actually log in on the restarted node — with
+        // the correct password (restored from the sealed blob, never persisted
+        // in the clear) — while a wrong password is a plain unlock failure.
+        let id: u64 = get(&mut node_b, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let login = post(&mut node_b, "/login", &format!("spencer\n{PASSWORD}\n{id}"));
+        assert_eq!(
+            login.status, 200,
+            "restarted-node login must succeed, got: {}",
+            login.body
+        );
+        assert!(login.body.contains("spencer"), "got: {}", login.body);
+
+        let id2: u64 = get(&mut node_b, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let bad = post(&mut node_b, "/login", &format!("spencer\nwrong\n{id2}"));
+        assert_eq!(bad.status, 401);
+        assert!(bad.body.contains("unlock-failed"), "got: {}", bad.body);
+
+        // Replaying is idempotent under re-run (a node that reboots twice):
+        // re-applying the same ops does not double-create or corrupt state.
+        let mut node_c = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        node_c.replay(&persisted_ops);
+        node_c.replay(&persisted_ops);
+        assert_eq!(node_c.bootstrap().initial_user(), Some("spencer"));
+    }
+
     #[test]
     fn first_login_immediately_after_bootstrap_succeeds_with_no_extra_provisioning() {
         let mut ctx = WebAuthContext::new(

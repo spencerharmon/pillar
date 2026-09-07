@@ -802,24 +802,29 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             reason: format!("open durable embedded-IPFS content store: {e}"),
         }
     })?;
-    let mut stream = pillar_streamdb::IpfsPersistentStream::open_with_store(
-        store,
-        signer_public.signing,
-        signer_secret.signing,
-        // The node's own op stream is cell-visibility: its head travels the
-        // private swarm's pubsub, never the public DHT.
-        pillar_streamdb::Visibility::Cell,
-    )
-    .map_err(|e| BootError::StreamDb {
-        path: streamdb_root.clone(),
-        reason: e.to_string(),
-    })?;
-    tracing::info!(
-        streamdb_root = %streamdb_root.display(),
-        ops = stream.stream().log().len(),
-        durable = stream.store().is_durable(),
-        "pillar streaming DB opened (durable, embedded real-IPFS content-object node)"
-    );
+    let stream = std::sync::Arc::new(std::sync::Mutex::new(
+        pillar_streamdb::IpfsPersistentStream::open_with_store(
+            store,
+            signer_public.signing,
+            signer_secret.signing,
+            // The node's own op stream is cell-visibility: its head travels the
+            // private swarm's pubsub, never the public DHT.
+            pillar_streamdb::Visibility::Cell,
+        )
+        .map_err(|e| BootError::StreamDb {
+            path: streamdb_root.clone(),
+            reason: e.to_string(),
+        })?,
+    ));
+    {
+        let stream = stream.lock().expect("streaming DB lock");
+        tracing::info!(
+            streamdb_root = %streamdb_root.display(),
+            ops = stream.stream().log().len(),
+            durable = stream.store().is_durable(),
+            "pillar streaming DB opened (durable, embedded real-IPFS content-object node)"
+        );
+    }
 
     // Readiness: at this point the identity keypair is loaded and the durable
     // streaming DB has been opened and its materialized view rehydrated from
@@ -1145,7 +1150,30 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     swarm_key.kind(),
                     swarm_key.fingerprint(),
                     effective_seeds.iter().map(|a| a.to_string()).collect(),
-                );
+                )
+                // Wire the DURABLE streaming DB as the portal's mutation
+                // journal: every cell/user/member/custody/identity act is
+                // thereafter persisted as a signed op on the SAME stream the
+                // controller loop rides, so a restart rehydrates a
+                // login-capable node instead of re-serving bootstrap.
+                .with_persistent_journal(std::sync::Arc::clone(&stream));
+
+                // Rehydrate the portal state from the ops already persisted in
+                // the streaming DB (rebuilt from IPFS-pinned segments by
+                // `open_with_store`). MUST happen before serving so a
+                // bootstrapped node comes up serving LOGIN, not bootstrap.
+                let persisted_ops: Vec<Vec<u8>> = {
+                    let stream = stream.lock().expect("streaming DB lock");
+                    stream
+                        .stream()
+                        .log()
+                        .order()
+                        .iter()
+                        .map(|op| op.payload().to_vec())
+                        .collect()
+                };
+                ctx.replay(&persisted_ops);
+
                 std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
             }
             Err(e) => {
@@ -1230,7 +1258,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     // must hold it (otherwise it could not answer an
                     // anti-entropy sync for the op it originated, and a peer
                     // that missed the gossip could never catch up).
-                    if let Err(e) = stream.append(
+                    if let Err(e) = stream.lock().expect("streaming DB lock").append(
                         payload.clone().into_bytes(),
                         pillar_core::SideEffect::Convergent,
                     ) {
@@ -1255,7 +1283,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // streamdb op-log length and the real connected-peer count
                 // off this swarm feed the node's live counters; cpu/mem come
                 // straight from `/proc` inside the producer's source.
-                node_counters.record_streamdb_ops(stream.stream().log().len() as u64);
+                node_counters.record_streamdb_ops(stream.lock().expect("streaming DB lock").stream().log().len() as u64);
                 node_counters.set_p2p_peers(swarm.connected_peers().count() as u64);
                 if metrics_enabled {
                     // Drive the periodic producers (metrics + profiles +
@@ -1336,7 +1364,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // arrives (below). Skipped when we have no peer to ask.
                 let target_peer = swarm.connected_peers().next().copied();
                 if let Some(peer) = target_peer {
-                    let request = pillar_net::op_sync_request(stream.stream().log());
+                    let request = pillar_net::op_sync_request(stream.lock().expect("streaming DB lock").stream().log());
                     let have = request.have.len();
                     swarm.behaviour_mut().op_sync.send_request(&peer, request);
                     tracing::debug!(%peer, have, "pillar peer requested anti-entropy op sync");
@@ -1426,7 +1454,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     // Every gossiped event-log message is an append-only op the
                     // controller folds into the local stream view AND durably
                     // persists under the content-addressed data-dir store.
-                    if let Err(e) = stream.append(
+                    if let Err(e) = stream.lock().expect("streaming DB lock").append(
                         message.data,
                         pillar_core::SideEffect::Convergent,
                     ) {
@@ -1444,7 +1472,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                             request, channel, ..
                         } => {
                             let response =
-                                pillar_net::answer_op_sync(stream.stream().log(), &request);
+                                pillar_net::answer_op_sync(stream.lock().expect("streaming DB lock").stream().log(), &request);
                             let sent = response.ops.len();
                             if swarm
                                 .behaviour_mut()
@@ -1464,13 +1492,13 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         // partitioned/late node reconverges to one consistent
                         // state (no split-brain).
                         libp2p::request_response::Message::Response { response, .. } => {
-                            let admitted = pillar_net::apply_op_sync(&mut stream, response);
+                            let admitted = pillar_net::apply_op_sync(&mut *stream.lock().expect("streaming DB lock"), response);
                             if admitted > 0 {
-                                node_counters
-                                    .record_streamdb_ops(stream.stream().log().len() as u64);
+                                let ops = stream.lock().expect("streaming DB lock").stream().log().len();
+                                node_counters.record_streamdb_ops(ops as u64);
                                 tracing::info!(
                                     admitted,
-                                    ops = stream.stream().log().len(),
+                                    ops,
                                     "pillar peer applied anti-entropy op sync (reconverged)"
                                 );
                             }

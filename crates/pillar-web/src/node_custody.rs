@@ -235,6 +235,36 @@ impl SealedOffer {
     pub fn is_sealed_to(&self, node: &NodeId) -> bool {
         self.sealed_to.contains(node)
     }
+
+    /// The opaque node-sealed ciphertext bytes — the durable material a node
+    /// must persist to reconstruct this offer across a restart WITHOUT ever
+    /// storing the user's password (the password only ever unlocks the inner
+    /// layer at login time, live, from the user). The inverse of
+    /// [`SealedOffer::from_sealed_parts`].
+    #[must_use]
+    pub fn node_sealed_bytes(&self) -> &[u8] {
+        self.node_sealed.as_bytes()
+    }
+
+    /// Reconstruct a sealed offer from its persisted parts — the durable
+    /// counterpart of [`SealedOffer::seal`] used on restart to restore an
+    /// already-sealed offer from the streaming DB, never re-sealing it (so no
+    /// password is needed and none is ever persisted). `node_sealed` is the
+    /// exact ciphertext [`SealedOffer::node_sealed_bytes`] returned; `sealed_to`
+    /// is the same allow-list the ledger admits, so the node's own
+    /// [`NodeKey::unseal`] strips it identically to a freshly sealed offer.
+    #[must_use]
+    pub fn from_sealed_parts(
+        subkey: NodeSubkey,
+        node_sealed: impl Into<Vec<u8>>,
+        sealed_to: impl IntoIterator<Item = NodeId>,
+    ) -> Self {
+        SealedOffer {
+            subkey,
+            node_sealed: Ciphertext::from_bytes(node_sealed),
+            sealed_to: sealed_to.into_iter().collect(),
+        }
+    }
 }
 
 /// The cell DB view a node needs to resolve node-side custody logins: it maps
@@ -546,8 +576,36 @@ impl NodeCustodyVerifier {
         sealed_to: impl IntoIterator<Item = NodeId>,
     ) {
         let identifier = identifier.into();
+        let record = self.register_admit_record(&identifier, &cid, sealed_to);
+        let offer = SealedOffer::seal(
+            subkey.clone(),
+            password,
+            secret,
+            seal_with,
+            self.ledger.seal_of(&record),
+        );
+        self.registered.insert(
+            subkey.clone(),
+            RegisteredOperationalKey::register(subkey, password, secret),
+        );
+        self.cell_db
+            .put_offer(identifier, handle, cid, record, offer);
+    }
+
+    /// The REAL key-distribution ledger's offer/accept/admit sequence for one
+    /// `(identifier, cid)` record, registering its cell/user/artifact and
+    /// allow-listing every node in `sealed_to`. Shared by the live sealing
+    /// [`Self::admit_offer_via_ledger`] and the restart-time
+    /// [`Self::restore_offer`] so both drive the IDENTICAL admission — the
+    /// restore path is never a second, divergent modeled admission.
+    fn register_admit_record(
+        &mut self,
+        identifier: &str,
+        cid: &Cid,
+        sealed_to: impl IntoIterator<Item = NodeId>,
+    ) -> RecordKey {
         let cell = self.home_cell();
-        let user = KdUserId::from(identifier.as_str());
+        let user = KdUserId::from(identifier);
         let artifact_id = ArtifactId::from(cid.0.as_str());
         let record = RecordKey {
             user: user.clone(),
@@ -579,20 +637,57 @@ impl NodeCustodyVerifier {
         self.ledger
             .admit(&record)
             .expect("offered + accepted, non-cross-owner record always admits");
+        record
+    }
 
-        let offer = SealedOffer::seal(
+    /// Restore a previously-provisioned, ALREADY-SEALED offer on restart from
+    /// its persisted parts — the durable counterpart of [`Self::provision_offer`].
+    /// Re-runs the deterministic ledger offer/accept/admit sequence and
+    /// re-registers the (deterministic-from-`secret`) public operational-key
+    /// verifier, but installs the pre-sealed `node_sealed` ciphertext VERBATIM
+    /// instead of re-sealing — so NO password is required and none is ever read
+    /// from disk. The offer is sealed to THIS node (the only node the bootstrap
+    /// path ever sealed to), so [`Self::admit`] strips and unlocks it at login
+    /// exactly as it would a freshly provisioned offer.
+    pub fn restore_offer(
+        &mut self,
+        identifier: impl Into<String>,
+        handle: impl Into<String>,
+        cid: Cid,
+        subkey: NodeSubkey,
+        secret: &str,
+        node_sealed: Vec<u8>,
+    ) {
+        let identifier = identifier.into();
+        let this_node = self.node_key.node().clone();
+        let record = self.register_admit_record(&identifier, &cid, std::iter::once(this_node));
+        let offer = SealedOffer::from_sealed_parts(
             subkey.clone(),
-            password,
-            secret,
-            seal_with,
+            node_sealed,
             self.ledger.seal_of(&record),
         );
         self.registered.insert(
             subkey.clone(),
-            RegisteredOperationalKey::register(subkey, password, secret),
+            RegisteredOperationalKey::register(subkey, "", secret),
         );
         self.cell_db
             .put_offer(identifier, handle, cid, record, offer);
+    }
+
+    /// The persisted parts of the offer provisioned for `identifier`, if any:
+    /// its `(cid, handle, node-sealed ciphertext)` — the durable material the
+    /// portal journals so a restarted node can [`Self::restore_offer`] it
+    /// without the password.
+    #[must_use]
+    pub fn provisioned_offer_parts(&self, identifier: &str) -> Option<(Cid, String, Vec<u8>)> {
+        let cid = self.cell_db.resolve_cid(identifier)?.clone();
+        let handle = self
+            .cell_db
+            .handle_for(identifier)
+            .unwrap_or(identifier)
+            .to_owned();
+        let offer = self.cell_db.offer_for(&cid)?;
+        Some((cid, handle, offer.node_sealed_bytes().to_vec()))
     }
 
     /// Revoke a previously-provisioned offer through the REAL
@@ -797,6 +892,54 @@ mod tests {
             .expect("admitted");
         assert_eq!(session.subject, subkey.node_id());
         assert_eq!(session.handle, "Alice");
+    }
+
+    #[test]
+    fn a_restored_offer_admits_the_same_login_without_the_password_ever_persisting() {
+        // Provision live (with the password), then extract ONLY the durable
+        // parts a restart would journal: the cid, handle, and the ALREADY-
+        // SEALED node ciphertext — never the password.
+        let (live, subkey) = provisioned();
+        let (cid, handle, node_sealed) = live
+            .provisioned_offer_parts("alice@pillar")
+            .expect("the just-provisioned offer exposes its persisted parts");
+        assert_eq!(handle, "Alice");
+        assert!(
+            !node_sealed.is_empty(),
+            "the node-sealed ciphertext is the real durable material"
+        );
+
+        // Rebuild a FRESH verifier (as a restarted node would) and restore the
+        // offer from those parts alone — the password is NOT available here.
+        let mut restored = NodeCustodyVerifier::new(node_key(), ORIGIN);
+        restored.restore_offer(
+            "alice@pillar",
+            handle,
+            cid,
+            subkey.clone(),
+            SECRET,
+            node_sealed,
+        );
+
+        // The restored node resolves the offer and admits the SAME login with
+        // the correct password — proving the sealed blob (not the password)
+        // carried the credential across the "restart".
+        assert!(restored.has_offer_for("alice@pillar"));
+        let (auth, actor) = chained(&subkey);
+        let nonce = restored.issue_nonce(10);
+        let session = restored
+            .admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+            .expect("restored offer admits the correct password");
+        assert_eq!(session.subject, subkey.node_id());
+        assert_eq!(session.handle, "Alice");
+
+        // A wrong password still fails the argon2id/AEAD unlock on the restored
+        // blob — the inner password layer survived the restore intact.
+        let nonce2 = restored.issue_nonce(10);
+        assert_eq!(
+            restored.admit("alice@pillar", "wrong", nonce2.id(), 0, &auth, &actor),
+            Err(NodeCustodyError::UnlockFailed)
+        );
     }
 
     #[test]
