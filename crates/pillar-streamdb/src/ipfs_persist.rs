@@ -26,6 +26,8 @@
 //! segment chain.
 
 use pillar_core::{SideEffect, ViewPolicy};
+use std::path::PathBuf;
+
 use pillar_crypto::seal::{seal_to_recipients, unseal};
 use pillar_crypto::{
     CryptoError, SealedEnvelope, SealingPublicKey, SealingSecretKey, SigningPublicKey,
@@ -169,6 +171,104 @@ impl IpfsPersistentStream {
             seq: 0,
             head: None,
             ttl_secs: 3600,
+        }
+    }
+
+    /// Open a DURABLE IPFS-persisted stream whose content-object store is
+    /// rooted on local disk at `root` (the node's PVC-backed pin store),
+    /// authored by `owner`/`secret`.
+    ///
+    /// This is the constructor the node entrypoint uses. It is the real fix for
+    /// solo-node restart-survival: unlike [`Self::genesis`] (an in-memory
+    /// [`ContentStore`] that evaporates on restart) it reloads the pinned
+    /// segment/head state from disk. Two cases:
+    ///
+    /// - **Restart** — a head for `owner` already exists on disk: the
+    ///   materialized view is rebuilt by walking the locally-pinned signed-
+    ///   segment chain from that head (purely local disk, no peer needed), and
+    ///   the returned handle is WRITABLE (holds `secret`, so [`Self::append`]
+    ///   keeps advancing the same chain).
+    /// - **First boot** — no head yet: an empty stream at seq 0, writable.
+    ///
+    /// The signing secret is supplied by the caller (a node derives it
+    /// deterministically from its custody-held identity), so — unlike
+    /// [`Self::rehydrate`], which yields a read-only handle until
+    /// [`Self::unseal_signing_key`] — a durable reopen is immediately writable.
+    ///
+    /// # Errors
+    ///
+    /// [`IpfsPersistError::Store`] if the on-disk store cannot be opened;
+    /// [`IpfsPersistError::Corrupt`] if a locally-pinned segment in the chain
+    /// is malformed.
+    pub fn open(
+        root: impl Into<PathBuf>,
+        owner: SigningPublicKey,
+        secret: SigningSecretKey,
+        visibility: Visibility,
+    ) -> Result<Self, IpfsPersistError> {
+        Self::open_with_store(ContentStore::open(root)?, owner, secret, visibility)
+    }
+
+    /// Like [`Self::open`] but over an already-constructed durable
+    /// [`ContentStore`] — e.g. one backed by pillar's embedded IPFS node via
+    /// [`ContentStore::with_backend`] + [`crate::ipfs_backend::NativeIpfsBackend`].
+    /// This is the constructor the node entrypoint uses to run its stream on
+    /// the embedded IPFS node: on restart the view is rebuilt by
+    /// walking the pinned segment chain the backend already holds (local
+    /// blocks, no peer needed), and a missing block along the chain is
+    /// backfilled through the backend (bitswap, once the network layer lands).
+    ///
+    /// # Errors
+    ///
+    /// [`IpfsPersistError::Store`] if a chain segment cannot be resolved;
+    /// [`IpfsPersistError::Corrupt`] if a pinned segment is malformed.
+    pub fn open_with_store(
+        store: ContentStore,
+        owner: SigningPublicKey,
+        secret: SigningSecretKey,
+        visibility: Visibility,
+    ) -> Result<Self, IpfsPersistError> {
+        match store.resolve_head(&owner).cloned() {
+            Some(head) => {
+                // Rebuild the view from the locally-pinned chain (newest-first
+                // walk, then replay oldest-first), exactly like `rehydrate`
+                // but sourced from this durable store's own held set.
+                let mut stream = Stream::new();
+                let mut payloads_newest_first = Vec::new();
+                let mut cursor = Some(head.target().clone());
+                while let Some(cid) = cursor {
+                    let seg = store
+                        .get_local(&cid)
+                        .ok_or(IpfsPersistError::Store(StoreError::NotFound))?;
+                    let (prev, payload) =
+                        decode_segment(seg.bytes()).ok_or(IpfsPersistError::Corrupt)?;
+                    payloads_newest_first.push(payload);
+                    cursor = prev;
+                }
+                for payload in payloads_newest_first.into_iter().rev() {
+                    stream.log_mut().append(payload);
+                }
+                Ok(IpfsPersistentStream {
+                    stream,
+                    store,
+                    owner,
+                    secret: Some(secret),
+                    visibility: head.visibility(),
+                    seq: head.seq(),
+                    head: Some(head.target().clone()),
+                    ttl_secs: head.ttl_secs(),
+                })
+            }
+            None => Ok(IpfsPersistentStream {
+                stream: Stream::new(),
+                store,
+                owner,
+                secret: Some(secret),
+                visibility,
+                seq: 0,
+                head: None,
+                ttl_secs: 3600,
+            }),
         }
     }
 

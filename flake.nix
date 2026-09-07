@@ -23,7 +23,21 @@
   description = "pillar node — reproducible OCI image via nix flake";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Pinned to a specific nixpkgs revision shipping rustc 1.89.0 + LLVM 19.1.7,
+    # NOT the floating nixos-unstable ref. nixos-unstable had advanced to
+    # rustc 1.97.1 + LLVM 21.1.8, whose ScalarEvolution/LoopIdiomRecognize
+    # passes crash rustc with `SIGILL: illegal instruction` under
+    # `-C opt-level=3` on an AVX2-only host — an intermittent, run-to-run
+    # miscompile that broke `.#pillar-oci-image` (and every consumer that builds
+    # a local image-under-test, incl. the pillar-integration scenario harness).
+    # This pin picks the newest LLVM-19 nixpkgs whose rustc (1.89.0) still
+    # satisfies the workspace's minimum-rustc requirements (aes 0.9 / time 0.3 /
+    # ctap-hid-fido2 need >= 1.88/1.89); the older nixos-25.05 release (rustc
+    # 1.86.0) is too old. LLVM 19.1.7 compiles the whole workspace cleanly on
+    # AVX2, making the OCI image build deterministic again, and a fixed rev (not
+    # a floating channel) keeps the toolchain stable across rebuilds. See
+    # docs/pillar-oci-image-llvm21-sigill-fix-pillar-oci-image-llvm21-sigill-fix.md.
+    nixpkgs.url = "github:NixOS/nixpkgs/5bf69abfad9feaa47ebc5cec0c7dc1029db8fb92";
     flake-utils.url = "github:numtide/flake-utils";
   };
 

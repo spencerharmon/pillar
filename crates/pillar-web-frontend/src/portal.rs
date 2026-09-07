@@ -361,6 +361,75 @@ fn strip_marker(body: &str) -> String {
     }
 }
 
+/// The physical libp2p swarm this node runs on (`GET /portal/swarm`): the
+/// running swarm's kind + fingerprint plus its configured seed multiaddrs.
+/// Pillar keeps NO swarm state — a node is repointed only by rebooting with a
+/// new `--swarm-key`.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SwarmView {
+    /// The swarm kind tag (`public` / `private`).
+    pub kind: String,
+    /// The running swarm's key fingerprint.
+    pub fingerprint: String,
+    /// The configured seed multiaddrs.
+    pub seeds: Vec<String>,
+}
+
+/// Parse the `/portal/swarm` body: one `SWARM <kind> <fingerprint>` line plus
+/// zero or more `SEED <multiaddr>` lines.
+#[must_use]
+pub fn parse_swarm(text: &str) -> SwarmView {
+    let mut view = SwarmView::default();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("SWARM ") {
+            let mut it = rest.splitn(2, ' ');
+            view.kind = it.next().unwrap_or("").trim().to_owned();
+            view.fingerprint = it.next().unwrap_or("").trim().to_owned();
+        } else if let Some(seed) = line.strip_prefix("SEED ") {
+            let seed = seed.trim();
+            if !seed.is_empty() {
+                view.seeds.push(seed.to_owned());
+            }
+        }
+    }
+    if view.kind.is_empty() {
+        view.kind = "\u{2014}".to_owned();
+    }
+    if view.fingerprint.is_empty() {
+        view.fingerprint = "\u{2014}".to_owned();
+    }
+    view
+}
+
+/// A freshly minted private swarm key (`POST /portal/swarm/generate` ->
+/// `KEY <root-secret>` + `FINGERPRINT <fp>`).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct GeneratedKey {
+    /// The `--swarm-key` root secret to reboot a node onto this private swarm.
+    pub key: String,
+    /// The new key's fingerprint.
+    pub fingerprint: String,
+}
+
+/// Parse the `/portal/swarm/generate` success body, or an error reason.
+pub fn interpret_generate(ok: bool, body: &str) -> Result<GeneratedKey, String> {
+    if !ok {
+        return Err(strip_marker(body));
+    }
+    let mut g = GeneratedKey::default();
+    for line in body.lines() {
+        if let Some(k) = line.strip_prefix("KEY ") {
+            g.key = k.trim().to_owned();
+        } else if let Some(fp) = line.strip_prefix("FINGERPRINT ") {
+            g.fingerprint = fp.trim().to_owned();
+        }
+    }
+    if g.key.is_empty() {
+        return Err(strip_marker(body));
+    }
+    Ok(g)
+}
+
 // ===========================================================================
 // Yew components + fetch glue (behind the `yew` feature).
 // ===========================================================================
@@ -589,6 +658,94 @@ mod yew_impl {
                 <p>{ format!("Peers: {} \u{2014} {}", s.peer_count,
                     if s.peers.is_empty() { "none".to_owned() } else { s.peers.join(", ") }) }</p>
                 <p>{ "Lease holder: " }<CopyValue field="fingerprint" value={s.lease_holder.clone()} /></p>
+            </div>
+        }
+    }
+
+    /// The physical libp2p swarm this node runs on: a read-only view (kind +
+    /// fingerprint + seeds) plus one stateless act — mint a fresh private
+    /// swarm key to reboot a node onto with `--swarm-key`. Ports the Swarm
+    /// panel; wires `/portal/swarm` + `/portal/swarm/generate`.
+    #[function_component(SwarmTile)]
+    fn swarm_tile() -> Html {
+        let auth = use_auth();
+        let view = use_state(SwarmView::default);
+        let busy = use_state(|| false);
+        let minted = use_state(|| None::<Result<GeneratedKey, String>>);
+        {
+            let auth = auth.clone();
+            let view = view.clone();
+            use_effect_with(auth.token.clone(), move |_| {
+                if let Some(token) = auth.token.clone() {
+                    let (view, auth) = (view.clone(), auth.clone());
+                    spawn_local(async move {
+                        if let Ok(r) =
+                            http("GET", &get_url("/portal/swarm", &token, &[]), None).await
+                        {
+                            if r.ok() {
+                                view.set(parse_swarm(&r.body));
+                            } else {
+                                handle_401(&auth, r.status);
+                            }
+                        }
+                    });
+                }
+                || ()
+            });
+        }
+        let generate = {
+            let auth = auth.clone();
+            let busy = busy.clone();
+            let minted = minted.clone();
+            Callback::from(move |_: MouseEvent| {
+                if *busy {
+                    return;
+                }
+                let token = auth.token.clone().unwrap_or_default();
+                let (auth, busy, minted) = (auth.clone(), busy.clone(), minted.clone());
+                busy.set(true);
+                spawn_local(async move {
+                    match http("POST", "/portal/swarm/generate", Some(&token)).await {
+                        Ok(r) => {
+                            handle_401(&auth, r.status);
+                            minted.set(Some(interpret_generate(r.ok(), &r.body)));
+                        }
+                        Err(_) => minted
+                            .set(Some(Err("the node refused the request".to_owned()))),
+                    }
+                    busy.set(false);
+                });
+            })
+        };
+        let v = &*view;
+        html! {
+            <div class="tile" id="swarm-tile">
+                <h3>{ "Swarm" }</h3>
+                <p>{ format!("Running swarm: {}", v.kind) }</p>
+                <p>{ "Fingerprint: " }<CopyValue field="fingerprint" value={v.fingerprint.clone()} /></p>
+                <p>{ format!("Seeds: {}",
+                    if v.seeds.is_empty() { "none".to_owned() } else { v.seeds.join(", ") }) }</p>
+                <div class="explainer">
+                    <strong>{ "What happens next:" }</strong>
+                    { " generating mints a fresh private swarm key. Pillar keeps no \
+                       swarm state — reboot a node with `--swarm-key` to repoint it \
+                       onto the new private swarm." }
+                </div>
+                <PendingButton id="swarm-generate-btn"
+                    label="Generate private swarm key" busy={*busy}
+                    onclick={generate} />
+                {
+                    match &*minted {
+                        Some(Ok(g)) => html! {
+                            <div class="result" id="swarm-generated">
+                                <p>{ "New swarm key: " }<CopyValue field="swarm-key" value={g.key.clone()} /></p>
+                                <p>{ "Fingerprint: " }<CopyValue field="fingerprint" value={g.fingerprint.clone()} /></p>
+                            </div>
+                        },
+                        Some(Err(e)) => html! { <p class="error">{ format!("Failed: {e}") }</p> },
+                        None => Html::default(),
+                    }
+                }
             </div>
         }
     }
@@ -1785,6 +1942,7 @@ mod yew_impl {
                 <div class="who" id="portal-who">{ format!("Signed in as {handle}") }</div>
                 <div class="tile"><h3>{ "Node status" }</h3><p id="node-status">{ "Session admitted. Your node is reachable." }</p></div>
                 <NodeStatusTile />
+                <SwarmTile />
                 <InboxTile />
                 <IdentityTile />
                 <MembersTile />
@@ -1885,6 +2043,34 @@ mod tests {
             Some("bafyabc123".to_owned())
         );
         assert_eq!(extract_cid("APPROVED nothing"), None);
+    }
+
+    #[test]
+    fn swarm_parse_and_generate_round_trip() {
+        let v = parse_swarm("SWARM public 0011223344556677\nSEED /ip4/192.0.2.5/tcp/4001/p2p/abc\n");
+        assert_eq!(v.kind, "public");
+        assert_eq!(v.fingerprint, "0011223344556677");
+        assert_eq!(v.seeds, vec!["/ip4/192.0.2.5/tcp/4001/p2p/abc".to_owned()]);
+        // Missing fields fall back to the em-dash placeholder; no seeds is empty.
+        let empty = parse_swarm("");
+        assert_eq!(
+            (empty.kind.as_str(), empty.fingerprint.as_str()),
+            ("\u{2014}", "\u{2014}")
+        );
+        assert!(empty.seeds.is_empty());
+        // Generate parses KEY + FINGERPRINT; a body without a KEY is an error.
+        assert_eq!(
+            interpret_generate(true, "KEY deadbeef\nFINGERPRINT aabbccdd\n"),
+            Ok(GeneratedKey {
+                key: "deadbeef".to_owned(),
+                fingerprint: "aabbccdd".to_owned()
+            })
+        );
+        assert_eq!(
+            interpret_generate(false, "DENIED not-authenticated"),
+            Err("not-authenticated".to_owned())
+        );
+        assert!(interpret_generate(true, "FINGERPRINT aabbccdd").is_err());
     }
 
     #[test]

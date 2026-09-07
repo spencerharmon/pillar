@@ -28,8 +28,7 @@
 //! op under a CID that does not hash to its bytes.
 
 use libp2p::{request_response, StreamProtocol};
-use pillar_core::SideEffect;
-use pillar_streamdb::{content_address, OpId, OpLog, PersistentStream};
+use pillar_streamdb::{content_address, OpId, OpLog};
 use serde::{Deserialize, Serialize};
 
 /// libp2p protocol name for the streaming-DB op-set anti-entropy exchange.
@@ -85,18 +84,21 @@ pub fn answer_op_sync(log: &OpLog, request: &OpSyncRequest) -> OpSyncResponse {
 /// an op can never land under a CID that does not hash to it. Ops are appended
 /// as [`SideEffect::Convergent`] — the same effect `pillar node run` uses for
 /// gossiped ops (see `run.rs`).
-pub fn apply_op_sync(stream: &mut PersistentStream, response: OpSyncResponse) -> usize {
-    let before = stream.stream().log().len();
+pub fn apply_op_sync<S: pillar_streamdb::OpSyncTarget>(
+    stream: &mut S,
+    response: OpSyncResponse,
+) -> usize {
+    let before = stream.log().len();
     for payload in response.ops {
         let id = OpId(content_address(&payload));
-        if stream.stream().log().contains(&id) {
+        if stream.log().contains(&id) {
             continue;
         }
         // A relaxed/strict policy that refuses this op leaves the set unchanged
         // (a convergent op is admitted by the default Strict policy).
-        let _ = stream.append(payload, SideEffect::Convergent);
+        stream.append_convergent(payload);
     }
-    stream.stream().log().len() - before
+    stream.log().len() - before
 }
 
 /// The request/response behaviour half a node runs for streaming-DB op-set
@@ -118,6 +120,8 @@ pub fn op_sync_behaviour() -> request_response::cbor::Behaviour<OpSyncRequest, O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pillar_core::SideEffect;
+    use pillar_streamdb::PersistentStream;
 
     fn tmp_root(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();

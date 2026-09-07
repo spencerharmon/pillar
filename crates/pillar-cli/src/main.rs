@@ -79,7 +79,8 @@ fn usage() -> &'static str {
      \x20 pillar peer    ls|dial|ping|addrs                    (pillar_cli::cluster::PeerCli)\n\
      \x20 pillar lease   list|show|acquire|release|status      (pillar_cli::cluster::LeaseCli over pillar-coordination)\n\
      \x20 pillar request ls|approve|reject                     (pillar_cli::cluster::RequestCli; node-approve returns the sealed-cell-key CID)\n\
-     \x20 pillar stream  ls|tip|log|get|verify|snapshot|sync|sub|unsub|head  (pillar_cli::stream_cli::StreamCli over pillar-streamdb)\n"
+     \x20 pillar stream  ls|tip|log|get|verify|snapshot|sync|sub|unsub|head  (pillar_cli::stream_cli::StreamCli over pillar-streamdb)\n\
+     \x20 pillar swarm   generate|show                                    (pillar_cli::swarm_cli — which physical libp2p swarm this node joins; public by default, or `generate` your own key file)\n"
 }
 
 fn main() -> ExitCode {

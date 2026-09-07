@@ -20,6 +20,8 @@
 
 use pillar_manifest::SchemaRegistry;
 
+pub mod surface_parity;
+
 /// The kind of surface a [`SurfaceEntry`] describes — mirrors the
 /// `pillar-integration/v1` schema's `VALID_KINDS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

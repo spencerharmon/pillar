@@ -13,6 +13,10 @@
 #   crypto-realness   — the real crypto path runs end to end (the image's
 #                       `pillar onboard` drives real keygen/sign/trust and
 #                       fails closed on a forged/out-of-order step), not a stub.
+#   apply-authz       — the real trust/RBAC path (certify/trust/attest/revoke
+#                       over the real WoT-authority + RBAC-decider) DENIES an
+#                       unauthorized manifest `apply` with a real 403, and a
+#                       revoked grant flips a previously-allowed apply to denied.
 #   content-address   — (family stub) a content address resolves to its bytes.
 #   packet            — (family stub) packets observed on the wire.
 #   ciphertext        — (family stub) sealed payload decryptable only by a real
@@ -102,6 +106,32 @@ oracle_secrets_audit_rotation_mfa() {
             || fail "secrets-audit-rotation-mfa oracle: real image did not report '$step' ok:\n$out"
     done
     info "oracle-observed: secrets-audit-rotation-mfa real-image seal/read-secret, signed-audit+forged-rejected, key-rotation-revokes-old, stepup-mfa-required all ok (real sealed-secret-store/audit-log/rotation/MFA path)"
+    return 0
+}
+
+# oracle_versioning_rollout : assert the real image's `versioning-rollout` CLI
+# verb runs end to end and reports every safety step ok — a mixed-version cell
+# rolling through a REAL compat-window negotiation (an out-of-window member
+# cleanly refused, never mis-linked), a rolling migration that loses NO data
+# across the cutover (the post-migration content-addressed Merkle root equals
+# the pre-migration one), a readiness gate that holds a mid-rollout node OUT of
+# service (503 not-ready) until its real health probe passes, and a rollback
+# that restores the prior version's op set CLEANLY. The command fails closed
+# (non-zero, no `ok:` line for the violated step) the instant any one invariant
+# does not hold, so observing all four `ok:` lines from the REAL published image
+# is observing the real versioning/migration/readiness/rollback path end to
+# end — never a stubbed return code, never linking a pillar crate.
+oracle_versioning_rollout() {
+    local out
+    out=$(driver_cli_exec versioning-rollout) \
+        || fail "versioning-rollout oracle: real image reported a violated invariant:\n$out"
+    local step
+    for step in compat-window-negotiation migration-no-data-loss \
+                readiness-gating-holds-node-out rollback-restores-prior-version; do
+        printf '%s\n' "$out" | grep -q "^ok: ${step}$" \
+            || fail "versioning-rollout oracle: real image did not report '$step' ok:\n$out"
+    done
+    info "oracle-observed: versioning-rollout real-image compat-window-negotiation (out-of-window refused), migration-no-data-loss (Merkle root survives cutover), readiness-gating-holds-node-out (503 until ready), rollback-restores-prior-version all ok (real compat/migration/readiness/rollback path)"
     return 0
 }
 
@@ -445,5 +475,185 @@ oracle_resource_usage() {
     fi
 
     info "oracle-observed: resource-usage seed=$seed_name PLATEAUED over $nsamp samples / $cycles churn cycles — RSS early=${early_rss_mean}kB late=${late_rss_mean}kB (<=${rss_tol_pct}% drift), fd early=${early_fd_mean} late=${late_fd_mean} (<=${fd_tol} drift): no unbounded growth in the dedup table / event log / history — GREEN (real host /proc footprint, not a return code)"
+    return 0
+}
+
+# oracle_seed_no_reconstruction <response> <guess...> : the adversarial-security
+# family's public-seed-reconstruction oracle. `response` is a real
+# `APPROVED bafy-cellkey-<sha256-hex>` line observed from the host's own
+# approve response (a real content address over the REAL sealed envelope
+# bytes, which include fresh AEAD randomness — never a deterministic hash of
+# public metadata). Each `guess` is a plausible public "seed" an attacker who
+# saw only the request's public fields (cell id, subject, request id) might
+# try as the preimage. Asserts NONE of the sha256 digests of those guesses
+# equals the real CID's digest — an attacker limited to public information
+# cannot reconstruct/predict the real content address by guessing.
+oracle_seed_no_reconstruction() {
+    local response="$1"; shift
+    local real_hex
+    real_hex=$(printf '%s\n' "$response" | grep -Eo 'bafy-cellkey-[0-9a-f]{64}' | sed 's/^bafy-cellkey-//')
+    [ -n "$real_hex" ] \
+        || fail "seed-reconstruction oracle: response '$response' carries no real content-addressed CID to test against"
+    local guess ghash
+    for guess in "$@"; do
+        ghash=$(printf '%s' "$guess" | sha256sum | cut -d' ' -f1)
+        if [ "$ghash" = "$real_hex" ]; then
+            fail "seed-reconstruction oracle: public-seed guess '$guess' RECONSTRUCTED the real CID digest $real_hex — the content address is guessable from public metadata"
+        fi
+    done
+    info "oracle-observed: seed-no-reconstruction real CID digest=$real_hex survives $# naive public-seed guess(es) unmatched (not reconstructible from public metadata; real sealed-envelope randomness required)"
+    return 0
+}
+
+# oracle_udp_no_amplification <host:port> : the adversarial-security family's
+# anti-amplification oracle against the REAL pillar-UDP dataplane transport
+# (`pillar_net::pillar_udp_transport`, the libp2p `…/udp/<port>/p-pillar`
+# substrate a real `pillar node run` process binds with a real
+# `tokio::net::UdpSocket` — see `crates/pillar-net/src/pillar_udp_transport.rs`).
+# Drives it with raw UDP datagrams from FRESH, never-before-seen source ports
+# (an unvalidated/"spoofable" client identity, exactly the return-routability
+# gate's threat model) and measures the REAL bytes reflected back — never a
+# return code:
+#
+#   1. a bare/garbage datagram (no valid frame, or a bare SYN) from a new,
+#      unvalidated source elicits ZERO reply bytes — the real listener never
+#      speaks first to an unvalidated peer, so an attacker gets no
+#      reflection to amplify at all.
+#   2. a well-formed DATA frame elicits exactly one ACK reply that is
+#      SMALLER than (or equal to) the request — never larger.
+#
+# Across every probe the total reflected bytes must never exceed the total
+# sent bytes (amplification factor <= 1x): fails closed the instant a future
+# regression lets an unvalidated/spoofed source draw a bigger reply than it
+# sent.
+oracle_udp_no_amplification() {
+    local addr="$1" host port
+    host="${addr%:*}"
+    port="${addr##*:}"
+    local out
+    out=$(python3 - "$host" "$port" <<'PYEOF'
+import socket, sys, time
+
+host, port = sys.argv[1], int(sys.argv[2])
+addr = (host, port)
+
+def frame(tag, seq, payload):
+    return bytes([tag]) + seq.to_bytes(8, "big") + len(payload).to_bytes(4, "big") + payload
+
+def probe(payload):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))  # a FRESH, never-before-seen source port each probe
+    sock.settimeout(1.5)
+    sock.sendto(payload, addr)
+    total = 0
+    packets = 0
+    deadline = time.time() + 1.2
+    try:
+        while time.time() < deadline:
+            data, _ = sock.recvfrom(4096)
+            total += len(data)
+            packets += 1
+    except socket.timeout:
+        pass
+    sock.close()
+    return len(payload), total, packets
+
+probes = [
+    ("bare-syn", frame(3, 0, b"")),
+    ("garbage-1B", b"\x99"),
+    ("garbage-64B", b"\x01" * 64),
+    ("valid-data-frame", frame(1, 0, b"adversarial-probe")),
+]
+
+total_sent = 0
+total_recv = 0
+for label, payload in probes:
+    sent, recv, packets = probe(payload)
+    total_sent += sent
+    total_recv += recv
+    print(f"PROBE {label} sent={sent} recv={recv} packets={packets}")
+
+print(f"TOTAL sent={total_sent} recv={total_recv}")
+print(f"OK={1 if total_recv <= total_sent else 0}")
+PYEOF
+    ) || fail "udp-amplification oracle: python3 probe against $addr failed to run"
+    printf '%s\n' "$out" | while IFS= read -r line; do info "udp-amplification: $line"; done
+    printf '%s\n' "$out" | grep -q '^OK=1$' \
+        || fail "udp-amplification oracle: total reflected bytes exceeded total sent bytes against $addr — real amplification observed:\n$out"
+    local totals
+    totals=$(printf '%s\n' "$out" | grep '^TOTAL ')
+    info "oracle-observed: udp-no-amplification addr=$addr $totals (reflected bytes never exceed sent bytes; unvalidated sources get zero reply)"
+    return 0
+}
+
+# oracle_apply_authz : assert the REAL trust/RBAC pipeline (certify -> trust ->
+# attest -> revoke over the real WoT-authority + RBAC-decider) rejects an
+# UNAUTHORIZED manifest `apply` with a real fail-closed 403 denial, observed
+# through the real image's `apply-authz` CLI verb — never a mocked check. The
+# verb fails closed (non-zero, without the `denied:`/`ok:` lines) if the real
+# decider WRONGLY admits the unauthorized apply, so observing the two `denied:
+# ... verdict=403` lines plus every `ok:` step is observing the real
+# authorization path deny an unauthorized apply.
+#
+# RED (a real failure) if an unauthorized apply is silently admitted: the verb
+# exits non-zero and this oracle fails. GREEN when the unauthorized apply — and
+# a revoked grant's apply — are both denied by the real decider.
+oracle_apply_authz() {
+    local out
+    out=$(driver_cli_exec apply-authz) \
+        || fail "apply-authz oracle: real image reported an unauthorized apply was ADMITTED (fail-closed 403 violated):\n$out"
+
+    # Every real trust/RBAC step must have reported ok:.
+    local step
+    for step in certify trust attest authorized-apply-allowed \
+                unauthorized-apply-denied revoke revoked-apply-denied; do
+        printf '%s\n' "$out" | grep -q "^ok: ${step}$" \
+            || fail "apply-authz oracle: real image did not report '$step' ok:\n$out"
+    done
+
+    # The decisive real effect: the UNGRANTED stranger's apply was denied with
+    # a real 403 by the real decider, and a revoked grant flipped a previously
+    # allowed apply to denied. Both must be observed as concrete `denied:`
+    # lines — not a bare return code.
+    printf '%s\n' "$out" | grep -q '^denied: apply subject=stranger-primary .*verdict=403' \
+        || fail "apply-authz oracle: no observed 403 denial of the unauthorized (stranger) apply:\n$out"
+    printf '%s\n' "$out" | grep -q '^denied: apply subject=operator-primary .*verdict=403 (grant revoked)' \
+        || fail "apply-authz oracle: no observed 403 denial of the revoked-grant apply:\n$out"
+
+    info "oracle-observed: apply-authz real decider DENIED unauthorized apply (stranger) and revoked-grant apply with 403 (real trust/RBAC path, fail-closed)"
+    return 0
+}
+
+# oracle_manifests_apply : assert the real manifest/CRD apply surface
+# (`pillar_manifest::apply::ManifestStore` + `ControllerRegistry` — the SAME
+# engine a `pillar node run` cell backs `pillar apply|get|delete` with, via
+# `pillar_cli`'s `ResourcePlane`) round-trips apply→get→delete for EVERY
+# declarable kind, plus routes a third-party CRD hook through the identical
+# plugin-interface path as a built-in kind. Today no `pillar apply|get|delete`
+# CLI verb operates against an in-process store in the published image's
+# throwaway binary (`cli_surface::live_platform_guidance` prints guidance and
+# exits 2 — the live cell backs those verbs), exactly as the ipam surface has
+# no CLI verb; so, like `oracle_ipam_operator`, this drives the REAL,
+# freshly-compiled `pillar-manifest`/`pillar-e2e` acceptance surface under test
+# (`--features acceptance`, never a mock) as the realness oracle. A failing
+# assertion means a kind's apply/get/delete round-trip SILENTLY NO-OPPED (an
+# applied object was not retrievable, or a deleted object was not gone) or the
+# third-party CRD hook diverged from the built-in dispatch/prune path — a real
+# logic effect the ROI's realness oracle demands (RED if any kind no-ops,
+# GREEN when every applied object is retrievable and deletable).
+oracle_manifests_apply() {
+    local out repo_root
+    repo_root="$(cd "$HERE/../.." && pwd)"
+    out=$(cd "$repo_root" && cargo test -p pillar-e2e --test manifests_apply_roundtrip --features acceptance 2>&1) \
+        || fail "manifests-apply oracle: the real manifest apply/get/delete acceptance suite failed:\n$out"
+
+    printf '%s\n' "$out" | grep -q "test every_declarable_kind_applies_gets_and_deletes ... ok" \
+        || fail "manifests-apply oracle: per-kind apply→get→delete round-trip assertion did not report ok (a kind silently no-opped):\n$out"
+    printf '%s\n' "$out" | grep -q "test every_registry_kind_is_covered_by_the_roundtrip ... ok" \
+        || fail "manifests-apply oracle: registry-coverage assertion did not report ok (a served kind has no round-trip):\n$out"
+    printf '%s\n' "$out" | grep -q "test a_third_party_crd_and_a_builtin_travel_the_same_controller_path ... ok" \
+        || fail "manifests-apply oracle: third-party-CRD/built-in shared-controller-path assertion did not report ok:\n$out"
+
+    info "oracle-observed: manifests-apply every declarable kind apply→get→delete round-trips (no silent no-op) AND a third-party CRD hook travels the same dispatch/prune path as a built-in (real compiled manifest engine)"
     return 0
 }

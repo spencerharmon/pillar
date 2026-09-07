@@ -41,11 +41,67 @@
 //! substrate that already verifies content against its digest on receipt).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use pillar_crypto::sign::{sign, verify};
 use pillar_crypto::{ContentId, Signature, SigningPublicKey, SigningSecretKey};
 
 use crate::content_address;
+use crate::ipfs_backend::{IpfsBackend, NativeIpfsBackend};
+
+// ---------------------------------------------------------------------------
+// On-disk durability codec helpers.
+//
+// A durable `ContentStore` (see `ContentStore::open`) mirrors its held
+// segments, pin/provided sets, and per-owner heads to a local directory tree
+// (the node's PVC-backed pin store — exactly how a real IPFS node persists its
+// pinned blocks; content-addressing itself is unchanged, still the plugin's
+// multihash). These helpers are the length-prefixed wire codec for the two
+// content-object types the store persists.
+// ---------------------------------------------------------------------------
+
+fn wire_put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+fn wire_take_bytes(inp: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let len = u32::from_be_bytes(inp.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+    *pos += 4;
+    let b = inp.get(*pos..*pos + len)?.to_vec();
+    *pos += len;
+    Some(b)
+}
+
+fn vis_to_u8(v: Visibility) -> u8 {
+    match v {
+        Visibility::Public => 0,
+        Visibility::Cell => 1,
+        Visibility::Sealed => 2,
+    }
+}
+
+fn vis_from_u8(b: u8) -> Option<Visibility> {
+    match b {
+        0 => Some(Visibility::Public),
+        1 => Some(Visibility::Cell),
+        2 => Some(Visibility::Sealed),
+        _ => None,
+    }
+}
+
+pub(crate) fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push(char::from_digit((x >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((x & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+pub(crate) fn io_store_err(e: std::io::Error) -> StoreError {
+    StoreError::Io(e.kind())
+}
 
 /// A content identifier: the durable store's address for a content object,
 /// a pure, collision-resistant function of the object's bytes.
@@ -187,10 +243,18 @@ impl SignedSegment {
         self.visibility
     }
 
-    /// The content id of this segment — a pure function of its bytes.
+    /// The content id of this segment — a pure function of its full signed
+    /// wire form ([`Self::to_wire`]: bytes + signer + signature + visibility).
+    ///
+    /// Addressing the WHOLE signed object (not just the inner payload bytes) is
+    /// what lets a segment be stored as a single content-addressed IPFS block
+    /// whose CID a peer can fetch over bitswap and then verify end to end: the
+    /// authorship signature travels INSIDE the addressed block, so the fetched
+    /// bytes carry their own proof. Segment chain links (`prev`) and
+    /// [`HeadRecord`] targets are these same CIDs.
     #[must_use]
     pub fn cid(&self) -> Cid {
-        Cid::of(&self.bytes)
+        Cid::of(&self.to_wire())
     }
 
     /// Verify the authorship signature over this segment's bytes.
@@ -205,6 +269,40 @@ impl SignedSegment {
             &self.signature,
         )
         .map_err(|_| StoreError::BadSignature)
+    }
+
+    /// Serialize to the durable on-disk wire form (length-prefixed
+    /// `bytes|signer|signature|visibility`). The inverse of
+    /// [`SignedSegment::from_wire`]; used only by a durable [`ContentStore`]'s
+    /// local pin store — the `Cid` is NOT stored (it is recomputed from
+    /// `bytes` on load, so the store can never map a segment file to a `Cid`
+    /// its bytes do not hash to).
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        wire_put_bytes(&mut out, &self.bytes);
+        wire_put_bytes(&mut out, self.signer.as_bytes());
+        wire_put_bytes(&mut out, self.signature.as_bytes());
+        out.push(vis_to_u8(self.visibility));
+        out
+    }
+
+    /// Reconstruct from the durable on-disk wire form. Returns `None` on a
+    /// truncated/corrupt record; the caller still re-[`verify`](Self::verify)s
+    /// authorship before trusting it.
+    #[must_use]
+    pub fn from_wire(w: &[u8]) -> Option<Self> {
+        let mut pos = 0usize;
+        let bytes = wire_take_bytes(w, &mut pos)?;
+        let signer = SigningPublicKey::from_bytes(wire_take_bytes(w, &mut pos)?);
+        let signature = Signature::from_bytes(wire_take_bytes(w, &mut pos)?);
+        let visibility = vis_from_u8(*w.get(pos)?)?;
+        Some(SignedSegment {
+            bytes,
+            signer,
+            signature,
+            visibility,
+        })
     }
 }
 
@@ -315,6 +413,46 @@ impl HeadRecord {
         )
         .map_err(|_| StoreError::BadSignature)
     }
+
+    /// Serialize to the durable on-disk wire form
+    /// (`owner|seq|target|ttl|visibility|signature`). Inverse of
+    /// [`HeadRecord::from_wire`].
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        wire_put_bytes(&mut out, self.owner.as_bytes());
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        wire_put_bytes(&mut out, self.target.as_bytes());
+        out.extend_from_slice(&self.ttl_secs.to_be_bytes());
+        out.push(vis_to_u8(self.visibility));
+        wire_put_bytes(&mut out, self.signature.as_bytes());
+        out
+    }
+
+    /// Reconstruct from the durable on-disk wire form. Returns `None` on a
+    /// truncated/corrupt record; the caller still re-[`verify`](Self::verify)s
+    /// the owner signature before trusting it.
+    #[must_use]
+    pub fn from_wire(w: &[u8]) -> Option<Self> {
+        let mut pos = 0usize;
+        let owner = SigningPublicKey::from_bytes(wire_take_bytes(w, &mut pos)?);
+        let seq = u64::from_be_bytes(w.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let target = Cid(ContentId::from_bytes(wire_take_bytes(w, &mut pos)?));
+        let ttl_secs = u64::from_be_bytes(w.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let visibility = vis_from_u8(*w.get(pos)?)?;
+        pos += 1;
+        let signature = Signature::from_bytes(wire_take_bytes(w, &mut pos)?);
+        Some(HeadRecord {
+            owner,
+            seq,
+            target,
+            ttl_secs,
+            visibility,
+            signature,
+        })
+    }
 }
 
 /// A durable content-object store: the plugin-owned IPFS/libp2p surface the
@@ -325,12 +463,27 @@ impl HeadRecord {
 /// per owner key. Networked backfill is expressed against a [`SegmentSource`]
 /// abstraction so this type stays independent of the concrete libp2p wiring
 /// (`pillar_net::blob`) while still modelling the private-swarm fetch + verify.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ContentStore {
     held: HashMap<Cid, SignedSegment>,
     pinned: HashSet<Cid>,
     dht: HashSet<Cid>,
     heads: BTreeMap<Vec<u8>, HeadRecord>,
+    /// When `Some`, every mutation is delegated to a durable IPFS substrate
+    /// (pillar's own embedded [`pillar_ipfs::IpfsNode`] via
+    /// [`crate::ipfs_backend::NativeIpfsBackend`]) so the
+    /// held/pinned/provided/head state survives a process restart AND a missing
+    /// block can be backfilled over the private swarm (the network layer being
+    /// grown into the node). `None` = a
+    /// pure in-memory store (ephemeral peers / unit tests / [`ContentStore::new`]).
+    /// The in-memory maps above are a fast local index over the backend.
+    backend: Option<Box<dyn IpfsBackend>>,
+}
+
+impl Default for ContentStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A reachable source of segments over the private swarm — the abstraction the
@@ -357,10 +510,100 @@ where
 }
 
 impl ContentStore {
-    /// A new, empty store.
+    /// A new, empty PURE IN-MEMORY store (no durability, no network backfill):
+    /// an ephemeral peer or a unit-test fixture. The map IS the store.
     #[must_use]
     pub fn new() -> Self {
-        ContentStore::default()
+        ContentStore {
+            held: HashMap::new(),
+            pinned: HashSet::new(),
+            dht: HashSet::new(),
+            heads: BTreeMap::new(),
+            backend: None,
+        }
+    }
+
+    /// Open a DURABLE store backed by pillar's own embedded IPFS node
+    /// ([`pillar_ipfs::IpfsNode`]) rooted at `root` (the node's PVC). Convenience
+    /// for [`Self::with_backend`] with a [`crate::ipfs_backend::NativeIpfsBackend`].
+    /// A solo node rehydrates from its own pinned blocks; cross-node backfill is
+    /// the network layer being grown into the node.
+    ///
+    /// # Errors
+    /// [`StoreError::Io`] if the store directories cannot be created or read.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::with_backend(Box::new(NativeIpfsBackend::open(root.into())?))
+    }
+
+    /// Open a DURABLE store over an arbitrary [`IpfsBackend`] (pillar's embedded
+    /// IPFS node, or a test double), reloading the pinned
+    /// blocks, DHT-advertised set, and per-owner heads the backend already
+    /// holds. Every subsequent mutation is delegated to the backend, and a
+    /// missing block is backfilled through it.
+    ///
+    /// # Errors
+    /// Propagates any backend fault encountered while reloading.
+    pub fn with_backend(backend: Box<dyn IpfsBackend>) -> Result<Self, StoreError> {
+        let mut store = ContentStore {
+            held: HashMap::new(),
+            pinned: HashSet::new(),
+            dht: HashSet::new(),
+            heads: BTreeMap::new(),
+            backend: Some(backend),
+        };
+        store.reload_from_backend()?;
+        Ok(store)
+    }
+
+    /// Rebuild the in-memory index from the durable backend: every pinned
+    /// (durable) block is fetched and re-keyed by the `Cid` recomputed from its
+    /// bytes (a block whose bytes do not hash to its pin-listed CID, or whose
+    /// authorship signature does not verify, is skipped rather than trusted);
+    /// public-anchor provided markers and per-owner heads are reloaded and
+    /// re-verified. Pinned == the node's durable content (an unpinned block is
+    /// GC-eligible and not guaranteed to survive — real IPFS durability
+    /// semantics).
+    fn reload_from_backend(&mut self) -> Result<(), StoreError> {
+        let (pinned, provided, heads) = match &self.backend {
+            Some(b) => (b.pinned()?, b.provided()?, b.heads()?),
+            None => return Ok(()),
+        };
+        for cid in pinned {
+            let block = match &self.backend {
+                Some(b) => b.block_get(&cid)?,
+                None => None,
+            };
+            if let Some(w) = block {
+                if let Some(seg) = SignedSegment::from_wire(&w) {
+                    if seg.verify().is_ok() && seg.cid() == cid {
+                        self.held.insert(cid.clone(), seg);
+                        self.pinned.insert(cid);
+                    }
+                }
+            }
+        }
+        for cid in provided {
+            if self
+                .held
+                .get(&cid)
+                .is_some_and(|s| s.visibility().may_reach_dht())
+            {
+                self.dht.insert(cid);
+            }
+        }
+        for head in heads {
+            if head.verify().is_ok() {
+                self.heads.insert(head.owner().as_bytes().to_vec(), head);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this store mirrors its state to a durable backend (the embedded
+    /// IPFS node).
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| b.is_durable())
     }
 
     /// Store a signed segment, returning its [`Cid`].
@@ -377,6 +620,9 @@ impl ContentStore {
     pub fn put(&mut self, segment: SignedSegment) -> Result<Cid, StoreError> {
         segment.verify()?;
         let cid = segment.cid();
+        if let Some(b) = &self.backend {
+            b.block_put(&cid, &segment.to_wire())?;
+        }
         self.held.entry(cid.clone()).or_insert(segment);
         Ok(cid)
     }
@@ -405,12 +651,33 @@ impl ContentStore {
         if let Some(seg) = self.held.get(cid) {
             return Ok(seg.clone());
         }
+        // REAL backfill: the embedded IPFS node fetches the block from the local
+        // blockstore or, once the network layer lands, over bitswap from a
+        // private-swarm peer. The returned bytes are untrusted until proven to
+        // hash to `cid` AND to carry a valid authorship signature.
+        if let Some(b) = &self.backend {
+            if let Some(w) = b.block_get(cid)? {
+                let seg = SignedSegment::from_wire(&w).ok_or(StoreError::CidMismatch)?;
+                if seg.cid() != *cid {
+                    return Err(StoreError::CidMismatch);
+                }
+                seg.verify()?;
+                self.held.insert(cid.clone(), seg.clone());
+                return Ok(seg);
+            }
+        }
+        // Legacy in-process SegmentSource fallback (ephemeral peers / tests): a
+        // peer that returns wrong or forged content is rejected and nothing is
+        // stored. Once the node's bitswap network layer lands it IS the peer
+        // fetch, so `source` may be a no-op.
         let fetched = source.fetch(cid).ok_or(StoreError::NotFound)?;
-        // Untrusted until verified against the CID we asked for AND its author.
-        if !cid.verifies(fetched.bytes()) {
+        if fetched.cid() != *cid {
             return Err(StoreError::CidMismatch);
         }
         fetched.verify()?;
+        if let Some(b) = &self.backend {
+            b.block_put(cid, &fetched.to_wire())?;
+        }
         self.held.insert(cid.clone(), fetched.clone());
         Ok(fetched)
     }
@@ -439,6 +706,9 @@ impl ContentStore {
         if !self.held.contains_key(cid) {
             return Err(StoreError::NotFound);
         }
+        if let Some(b) = &self.backend {
+            b.pin(cid)?;
+        }
         self.pinned.insert(cid.clone());
         Ok(())
     }
@@ -465,6 +735,9 @@ impl ContentStore {
         let seg = self.held.get(cid).ok_or(StoreError::NotFound)?;
         if !seg.visibility().may_reach_dht() {
             return Err(StoreError::NotPublic);
+        }
+        if let Some(b) = &self.backend {
+            b.provide(cid)?;
         }
         self.dht.insert(cid.clone());
         Ok(())
@@ -510,6 +783,9 @@ impl ContentStore {
                 return Err(StoreError::StaleHead);
             }
         }
+        if let Some(b) = &self.backend {
+            b.put_head(&record)?;
+        }
         self.heads.insert(key, record);
         Ok(())
     }
@@ -535,6 +811,14 @@ pub enum StoreError {
     NotPublic,
     /// A head record did not strictly advance the owner's sequence number.
     StaleHead,
+    /// A durable-store local-disk I/O operation failed (create/read/write of
+    /// the PVC-backed pin store). Carries the [`std::io::ErrorKind`] so the
+    /// type stays `Copy` while still naming the fault.
+    Io(std::io::ErrorKind),
+    /// The IPFS node substrate failed, or returned a block whose CID disagreed
+    /// with ours. The detail is logged at the failing call site
+    /// (`tracing::warn!`) so the type stays `Copy`.
+    Ipfs,
 }
 
 impl std::fmt::Display for StoreError {
@@ -545,6 +829,8 @@ impl std::fmt::Display for StoreError {
             StoreError::BadSignature => "segment or head signature did not verify",
             StoreError::NotPublic => "only a public anchor may be provided to the swarm DHT",
             StoreError::StaleHead => "head sequence did not strictly advance",
+            StoreError::Io(kind) => return write!(f, "durable store local-disk I/O error: {kind}"),
+            StoreError::Ipfs => "IPFS node substrate error — see logs for detail",
         };
         f.write_str(msg)
     }
@@ -590,7 +876,15 @@ mod tests {
         );
         assert_eq!(cid.as_bytes()[0], 0x12, "multicodec sha2-256");
         assert_eq!(cid.as_bytes()[1], 0x20, "digest length 32");
-        assert!(cid.verifies(seg.bytes()), "CID must verify against bytes");
+        // The CID addresses the WHOLE signed object (to_wire: bytes + signer +
+        // signature + visibility), so the fetched block carries its own
+        // authorship proof. It is the content address of `to_wire()`, and
+        // equals the segment's own `cid()`.
+        assert!(
+            cid.verifies(&seg.to_wire()),
+            "CID must verify against the signed wire form"
+        );
+        assert_eq!(cid, seg.cid(), "put returns the segment's own content id");
 
         // Local round-trip: no peer needed, bytes are byte-identical.
         let never = |_: &Cid| None;

@@ -33,6 +33,8 @@ SCENARIOS="$HERE/scenarios"
 
 # shellcheck source=lib/common.sh
 . "$LIB/common.sh"
+# shellcheck source=lib/image.sh
+. "$LIB/image.sh"
 # shellcheck source=lib/fixtures.sh
 . "$LIB/fixtures.sh"
 # shellcheck source=lib/topology.sh

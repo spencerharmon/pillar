@@ -3021,6 +3021,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-blob-provider"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "libp2p",
+ "pillar-net",
+ "tokio",
+]
+
+[[package]]
 name = "pillar-bootstrap"
 version = "0.0.0"
 dependencies = [
@@ -3066,11 +3076,14 @@ dependencies = [
  "pillar-observability",
  "pillar-rbac",
  "pillar-streamdb",
+ "pillar-swarm",
  "pillar-topology",
  "pillar-trust-artifacts",
  "pillar-web",
  "pillar-web-api",
  "pillar-wot-authority",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",
@@ -3148,6 +3161,7 @@ dependencies = [
  "pillar-surface-inventory",
  "pillar-topology",
  "pillar-web",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -3180,6 +3194,19 @@ dependencies = [
  "pillar-core",
  "pillar-topology",
  "pillar-trust-artifacts",
+]
+
+[[package]]
+name = "pillar-ipfs"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "libp2p",
+ "pillar-crypto",
+ "serde",
+ "sha3",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3284,7 +3311,9 @@ version = "0.0.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
+ "pillar-ipfs",
  "sha2",
+ "tracing",
 ]
 
 [[package]]
@@ -3296,6 +3325,14 @@ dependencies = [
  "pillar-net",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pillar-swarm"
+version = "0.0.0"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha3",
 ]
 
 [[package]]

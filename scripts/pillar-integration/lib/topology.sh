@@ -27,10 +27,15 @@ topology_boot() {
     TOPO_PROBE_ADDRS=()
 
     info "topology: booting a real ${n}-node single-LAN topology on image $PILLAR_IMAGE"
-    # Pull the real published image up front so a boot failure is a clear image
-    # problem, not a per-node timeout. (Idempotent — a cached image is reused.)
-    "$CONTAINER_RUNTIME" pull "$PILLAR_IMAGE" >/dev/null 2>&1 \
-        || fail "could not pull the real published image $PILLAR_IMAGE (is container-image-ghcr-publish landed?)"
+    # Ensure the image is present. A locally-built image-under-test (see
+    # lib/image.sh) already exists in the runtime and must NOT be pulled; only
+    # pull when it is absent (a published ref). Pull the real published image
+    # up front so a boot failure is a clear image problem, not a per-node
+    # timeout. (Idempotent — a cached image is reused.)
+    if ! "$CONTAINER_RUNTIME" image exists "$PILLAR_IMAGE" 2>/dev/null; then
+        "$CONTAINER_RUNTIME" pull "$PILLAR_IMAGE" >/dev/null 2>&1 \
+            || fail "could not pull the real published image $PILLAR_IMAGE (is container-image-ghcr-publish landed?)"
+    fi
 
     local i name cid
     for i in $(seq 0 $((n - 1))); do

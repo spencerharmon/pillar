@@ -33,6 +33,10 @@ pub struct VerbSpec {
 /// what the inventory reports, by construction.
 pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
+        name: "surface-inventory",
+        handler: |_v, args| surface_inventory(args),
+    },
+    VerbSpec {
         name: "--web",
         handler: |_v, args| web(args),
     },
@@ -125,6 +129,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: cluster_stream,
     },
     VerbSpec {
+        name: "swarm",
+        handler: |_v, args| crate::swarm_cli::run(args),
+    },
+    VerbSpec {
         name: "render",
         handler: |_v, args| render(args),
     },
@@ -135,6 +143,14 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "secrets-audit-rotation-mfa",
         handler: |_v, _args| secrets_audit_rotation_mfa(),
+    },
+    VerbSpec {
+        name: "apply-authz",
+        handler: |_v, _args| apply_authz(),
+    },
+    VerbSpec {
+        name: "versioning-rollout",
+        handler: |_v, _args| versioning_rollout(),
     },
     VerbSpec {
         name: "obs",
@@ -240,6 +256,17 @@ fn completion(args: &[String]) -> ExitCode {
     }
 }
 
+/// `pillar surface-inventory`: emit the `pillar-integration/v1` machine-
+/// readable inventory of every external surface THIS binary serves (CLI
+/// verbs, HTTP routes, manifest kinds, wire ops), read from the live
+/// registries — the black-box source of truth the `pillar-integration`
+/// portal-cli-parity scenario drives its parity assertion against. Prints
+/// JSON to stdout; exits 0.
+fn surface_inventory(_args: &[String]) -> ExitCode {
+    println!("{}", crate::surface_inventory::emit_json());
+    ExitCode::SUCCESS
+}
+
 /// `pillar onboard`: drive the keygen -> node-key signing -> cross-user
 /// trust -> depth/policy-config sequence in one process, asserting every
 /// safety invariant `pillar_cli::onboard` checks.
@@ -264,6 +291,24 @@ fn secrets_audit_rotation_mfa() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+/// `pillar versioning-rollout`: the compat-negotiation/rolling-migration/
+/// readiness-gating/rollback rig (see [`crate::versioning_rollout`]).
+fn versioning_rollout() -> ExitCode {
+    match crate::versioning_rollout::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar apply-authz`: drive the real certify->trust->attest->revoke
+/// pipeline and the real RBAC decider, proving an unauthorized manifest
+/// `apply` is rejected with a real fail-closed 403 (never a mock).
+fn apply_authz() -> ExitCode {
+    crate::trust_rbac_authz::run()
 }
 
 /// `pillar bootstrap …`.
