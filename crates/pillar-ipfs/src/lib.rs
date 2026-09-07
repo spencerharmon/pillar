@@ -36,6 +36,7 @@ mod cid;
 mod error;
 mod head;
 mod node;
+#[cfg(feature = "network")]
 mod swarm;
 
 pub use blockstore::{
@@ -45,6 +46,7 @@ pub use cid::{content_id, from_cidv1_raw, to_cidv1_raw};
 pub use error::IpfsError;
 pub use head::{resolve_latest, HeadError, IpnsHead, Visibility};
 pub use node::IpfsNode;
+#[cfg(feature = "network")]
 pub use swarm::{
     answer_block_request, build_ipfs_swarm, BlockRequest, BlockResponse, IpfsSwarmBehaviour,
     IpfsSwarmBehaviourEvent, PrivateSwarmKey, BITSWAP_PROTOCOL_NAME, IPFS_KAD_PROTOCOL_NAME,

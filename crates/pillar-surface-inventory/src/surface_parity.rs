@@ -89,6 +89,10 @@ pub static PARITY_MAP: &[ParityRule] = &[
     ParityRule::Paired { verb: "trust", route_prefix: "/portal/trust-graph" },
     ParityRule::Paired { verb: "obs", route_prefix: "/portal/obs" },
     ParityRule::Paired { verb: "key", route_prefix: "/portal/custody" },
+    // `pillar swarm` (show/generate the node's swarm profile) pairs with the
+    // read-only `GET /portal/swarm` + stateless `POST /portal/swarm/generate`
+    // portal route family (one prefix pairs both routes).
+    ParityRule::Paired { verb: "swarm", route_prefix: "/portal/swarm" },
     // The kubectl-parity resource plane: the CLI `apply`/`get`/`describe` verb
     // family (and the create/delete/patch/label/scale/diff verbs that route
     // through the SAME resource dispatch) is the counterpart of the whole

@@ -7,16 +7,32 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Pillar's own embeddable IPFS node: real CIDv1 content addressing, a durable content-addressed blockstore, pin + provide sets. The IPFS/libp2p content-object primitive the streaming DB rides — no external daemon."
 
+[features]
+# The bitswap-style block exchange + Kademlia provider routing layer, over a
+# real libp2p swarm bound to a private-network pre-shared key
+# ([`PrivateSwarmKey`]) — the same pnet mechanism `pillar-net` uses for its own
+# private-swarm root, reimplemented locally here (rather than taken as a
+# `pillar-net` dependency) because `pillar-streamdb` depends on THIS crate and
+# `pillar-net` depends on `pillar-streamdb`, so a `pillar-ipfs` -> `pillar-net`
+# edge would be a cycle.
+#
+# Default-on: every consumer that needs the real swarm (the native `pillar`
+# binary via `pillar-streamdb`) gets it unchanged. It exists as an opt-out
+# feature ONLY so a consumer that needs solely the content-addressing /
+# blockstore core (no swarm) can drop it — concretely, the wasm32 portal
+# build (`pillar-frontend` -> `pillar-web-frontend` -> ... ->
+# `pillar-observability`/`pillar-quota-ledger` -> `pillar-streamdb` ->
+# `pillar-ipfs`) never opens a real OS socket, so `libp2p`'s `mio`/`tcp`/
+# `quic` stack does not even need to compile for `wasm32-unknown-unknown`
+# (which cannot support it). Nothing about the native embedded-IPFS
+# streamdb persistence changes: `pillar-streamdb` still depends on this
+# crate with its default (network-enabled) features.
+default = ["network"]
+network = ["dep:libp2p", "dep:tokio", "dep:futures"]
+
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
-# The network layer (bitswap-style block exchange + Kademlia provider
-# routing) runs over a libp2p swarm bound to a private-network pre-shared
-# key ([`PrivateSwarmKey`]) — the same pnet mechanism `pillar-net` uses for
-# its own private-swarm root, reimplemented locally here (rather than taken
-# as a `pillar-net` dependency) because `pillar-streamdb` depends on THIS
-# crate and `pillar-net` depends on `pillar-streamdb`, so a `pillar-ipfs` ->
-# `pillar-net` edge would be a cycle.
-libp2p = { version = "0.56", features = [
+libp2p = { version = "0.56", optional = true, features = [
     "kad",
     "identify",
     "noise",
@@ -30,8 +46,8 @@ libp2p = { version = "0.56", features = [
     "pnet",
 ] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-futures = "0.3"
+tokio = { version = "1", optional = true, features = ["full"] }
+futures = { version = "0.3", optional = true }
 sha3 = "0.10.9"
 tracing = "0.1"
 

@@ -7,10 +7,24 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Content-addressed op-log CRDT + materialized view + snapshot/compaction, with a durable content-addressed on-disk backend: the Rust refinement of specs/StreamingDB.tla."
 
+[features]
+# Default-on: the real embedded-IPFS bitswap/Kademlia swarm layer, via
+# `pillar-ipfs`'s own `network` feature. Every native consumer (the `pillar`
+# binary) keeps this on unchanged. It exists as an opt-out ONLY so a
+# wasm32 consumer that pulls in `pillar-streamdb` transitively (the portal
+# build's `pillar-observability`/`pillar-quota-ledger` path) never needs
+# `libp2p`'s real-socket `mio`/`tcp`/`quic` stack to compile for
+# `wasm32-unknown-unknown` (which cannot support raw OS sockets) — see
+# `pillar-frontend-wasm32-ipfs-compat`. `pillar-streamdb` itself never calls
+# into the swarm directly (only `pillar_ipfs::IpfsNode`'s blockstore/pin/
+# provide surface), so disabling it changes nothing here.
+default = ["network"]
+network = ["pillar-ipfs/network"]
+
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
-pillar-ipfs = { path = "../pillar-ipfs" }
+pillar-ipfs = { path = "../pillar-ipfs", default-features = false }
 sha2 = "0.10"
 tracing = "0.1"
 
