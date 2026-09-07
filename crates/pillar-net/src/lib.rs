@@ -176,6 +176,15 @@ pub struct EventBehaviour {
     /// a node whose best-effort gossipsub feed had a gap, multiplexed over the
     /// SAME connections as gossipsub/kademlia/identify.
     pub op_sync: request_response::cbor::Behaviour<opsync::OpSyncRequest, opsync::OpSyncResponse>,
+    /// Optional UPnP/NAT-PMP port mapping. A [`Toggle`]: disabled
+    /// (`Toggle::from(None)`) leaves it entirely inert, so an
+    /// [`EventBehaviour`] with UPnP off behaves exactly as before. Enabled (a
+    /// public/seed node behind a home NAT, `pillar node run --upnp`), it asks
+    /// the local gateway to map this node's listen ports and confirms the
+    /// resulting external address to the swarm, so `identify` advertises a
+    /// publicly dialable address to peers — the same UPnP path WireGuard uses
+    /// on the gateway to become reachable.
+    pub upnp: Toggle<upnp::tokio::Behaviour>,
 }
 
 /// The behaviour run by a Pillar node acting as a relay (`libp2p::relay`
@@ -226,7 +235,7 @@ fn identify_config(keypair: &Keypair) -> identify::Config {
 pub fn build_event_swarm(
     keypair: Keypair,
 ) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
-    build_event_swarm_with_root(keypair, PrivateSwarmKey::disabled())
+    build_event_swarm_with_root(keypair, PrivateSwarmKey::disabled(), false)
 }
 
 /// Builds a [`Swarm`] running [`EventBehaviour`] whose TRANSPORT is bound to
@@ -247,10 +256,25 @@ pub fn build_event_swarm(
 ///   QUIC is not offered in this mode: QUIC's own TLS handshake is not
 ///   pnet-wrapped by this crate, so admitting it would open a side channel
 ///   that bypasses the root check.
+///
+/// `upnp_enabled` toggles a UPnP/NAT-PMP port-mapping behaviour (the
+/// [`EventBehaviour::upnp`] [`Toggle`]). Off (the default for a directly
+/// reachable node or a test) leaves it inert; on (a seed/public node behind a
+/// home gateway) it maps this node's listen ports on the gateway and confirms
+/// the external address to the swarm so `identify` advertises a dialable
+/// address — the mechanism that makes a NAT'd seed publicly reachable.
 pub fn build_event_swarm_with_root(
     keypair: Keypair,
     root: PrivateSwarmKey,
+    upnp_enabled: bool,
 ) -> Result<Swarm<EventBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    let make_upnp = || -> Toggle<upnp::tokio::Behaviour> {
+        if upnp_enabled {
+            Toggle::from(Some(upnp::tokio::Behaviour::default()))
+        } else {
+            Toggle::from(None)
+        }
+    };
     let swarm = match root.0 {
         None => libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -261,6 +285,7 @@ pub fn build_event_swarm_with_root(
             )?
             .with_quic()
             .with_other_transport(pillar_udp_boxed_transport)?
+            .with_dns()?
             .with_behaviour(|key| {
                 let peer_id = key.public().to_peer_id();
                 EventBehaviour {
@@ -268,6 +293,7 @@ pub fn build_event_swarm_with_root(
                     kademlia: new_kademlia(peer_id),
                     identify: identify::Behaviour::new(identify_config(key)),
                     op_sync: opsync::op_sync_behaviour(),
+                    upnp: make_upnp(),
                 }
             })?
             .build(),
@@ -276,6 +302,7 @@ pub fn build_event_swarm_with_root(
             libp2p::SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
                 .with_other_transport(|kp| pnet_tcp_transport(kp, psk))?
+                .with_dns()?
                 .with_behaviour(|key| {
                     let peer_id = key.public().to_peer_id();
                     EventBehaviour {
@@ -283,6 +310,7 @@ pub fn build_event_swarm_with_root(
                         kademlia: new_kademlia(peer_id),
                         identify: identify::Behaviour::new(identify_config(key)),
                         op_sync: opsync::op_sync_behaviour(),
+                        upnp: make_upnp(),
                     }
                 })?
                 .build()
@@ -425,6 +453,90 @@ impl std::fmt::Display for SeedAddrMissingPeerId {
 }
 
 impl std::error::Error for SeedAddrMissingPeerId {}
+
+/// A classified federation seed: how a joining node should bootstrap from it.
+///
+/// A seed multiaddr comes in two shapes, and they enter the DHT differently:
+///
+/// - **[`FederationSeed::Direct`]** — the multiaddr terminates in a
+///   `/p2p/<peer-id>`, so the peer id is known up front. It is added straight
+///   to the Kademlia routing table (via [`seed_event_dht`]).
+/// - **[`FederationSeed::Dial`]** — the multiaddr has no `/p2p/<peer-id>`
+///   (typically a `/dnsaddr/<host>` bootstrap anchor, or a bare
+///   `/dns4|/dns6|/ip4 …/tcp/<port>`). Its peer id is not known until the node
+///   connects, so it is **dialed**; the `identify` exchange on the resulting
+///   connection then reveals the peer id + its listen addrs, which are folded
+///   into Kademlia by [`note_identified_peer`]. This is the IPFS-style
+///   `/dnsaddr` bootstrap: the peer id lives in the operator's
+///   `_dnsaddr.<host>` TXT record (resolved at runtime by the DNS transport),
+///   never in the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederationSeed {
+    /// A seed whose peer id is known from a trailing `/p2p/<id>`.
+    Direct(SeedPeer),
+    /// A peer-id-less bootstrap address to dial; identify learns the peer.
+    Dial(libp2p::Multiaddr),
+}
+
+/// Classifies a federation seed multiaddr into how the node bootstraps from it.
+///
+/// If the address terminates in `/p2p/<peer-id>` it is a
+/// [`FederationSeed::Direct`] (added to Kademlia immediately); otherwise it is
+/// a [`FederationSeed::Dial`] (dialed, with `identify` learning the peer). This
+/// never fails: a peer-id-less address is a valid bootstrap-dial anchor (e.g. a
+/// `/dnsaddr/seed.example.net`), not an error — unlike [`parse_seed_multiaddr`],
+/// which requires the peer id for the direct add-to-routing-table path.
+#[must_use]
+pub fn classify_seed(addr: libp2p::Multiaddr) -> FederationSeed {
+    match parse_seed_multiaddr(addr.clone()) {
+        Ok(seed) => FederationSeed::Direct(seed),
+        Err(_) => FederationSeed::Dial(addr),
+    }
+}
+
+/// Dials a [`FederationSeed::Dial`] bootstrap anchor so the DNS transport
+/// resolves it (a `/dnsaddr/<host>` expands via its `_dnsaddr.<host>` TXT
+/// record; a `/dns4|/dns6/<host>` resolves A/AAAA) and connects. The peer id is
+/// learned from the ensuing `identify` exchange (see [`note_identified_peer`]),
+/// so no peer id need be known in advance.
+///
+/// Returns the dial outcome; a failure (e.g. an anchor whose TXT record does
+/// not exist yet) is non-fatal at the call site — the node simply finds no
+/// seed and acts as its own first node until the anchor resolves.
+pub fn dial_bootstrap_seed(
+    swarm: &mut Swarm<EventBehaviour>,
+    addr: libp2p::Multiaddr,
+) -> Result<(), libp2p::swarm::DialError> {
+    swarm.dial(addr)
+}
+
+/// Folds a peer learned from an `identify` exchange into the Kademlia routing
+/// table: each of the peer's advertised listen addresses is added under its
+/// (now-known) peer id, and a single `bootstrap()` is kicked so the node walks
+/// outward from the freshly learned peer.
+///
+/// This is what turns a [`FederationSeed::Dial`] bootstrap dial into DHT
+/// membership: the dial establishes the connection, `identify` reveals the peer
+/// id + addrs, and this adds them so Kademlia can route through the peer.
+/// Returns the number of addresses added.
+pub fn note_identified_peer(
+    swarm: &mut Swarm<EventBehaviour>,
+    peer_id: &PeerId,
+    listen_addrs: impl IntoIterator<Item = libp2p::Multiaddr>,
+) -> usize {
+    let mut added = 0usize;
+    for addr in listen_addrs {
+        swarm.behaviour_mut().kademlia.add_address(peer_id, addr);
+        added += 1;
+    }
+    if added > 0 {
+        // Non-fatal: a bootstrap over a now-non-empty table walks outward. An
+        // error (e.g. a transient NoKnownPeers race) is ignored; discovery
+        // retries as peers appear.
+        let _ = swarm.behaviour_mut().kademlia.bootstrap();
+    }
+    added
+}
 
 /// Parses a federation seed multiaddr into its [`SeedPeer`] parts.
 ///
@@ -1264,6 +1376,79 @@ mod tests {
         assert!(parse_seed_multiaddr(no_p2p).is_err());
     }
 
+    #[test]
+    fn classify_seed_splits_direct_and_dial() {
+        // A `/p2p`-terminated seed classifies Direct with the peer id known.
+        let peer = PeerId::random();
+        let direct: Multiaddr = format!("/dns4/seed.example.net/tcp/4001/p2p/{peer}")
+            .parse()
+            .unwrap();
+        match classify_seed(direct) {
+            FederationSeed::Direct(s) => assert_eq!(s.peer_id, peer),
+            FederationSeed::Dial(a) => panic!("expected Direct, got Dial({a})"),
+        }
+
+        // A peer-id-less `/dnsaddr` bootstrap anchor classifies Dial verbatim
+        // (peer id learned later via identify).
+        let anchor: Multiaddr = "/dnsaddr/seed.pillar-rs.net".parse().unwrap();
+        match classify_seed(anchor.clone()) {
+            FederationSeed::Dial(a) => assert_eq!(a, anchor),
+            FederationSeed::Direct(_) => panic!("expected Dial for a peer-id-less dnsaddr"),
+        }
+
+        // A bare peer-id-less address is also a Dial anchor (dial + identify).
+        let bare: Multiaddr = "/ip4/192.0.2.9/tcp/4001".parse().unwrap();
+        assert!(matches!(classify_seed(bare), FederationSeed::Dial(_)));
+    }
+
+    #[tokio::test]
+    async fn upnp_enabled_swarm_builds() {
+        // A UPnP-enabled event swarm constructs (the Toggle carries a real
+        // upnp behaviour, which spawns its gateway task on the Tokio runtime);
+        // the actual gateway mapping is a runtime/network concern surfaced as
+        // swarm events, not a build-time one.
+        let public = build_event_swarm_with_root(
+            Keypair::generate_ed25519(),
+            PrivateSwarmKey::disabled(),
+            true,
+        )
+        .expect("upnp-enabled public swarm builds");
+        drop(public);
+        let private = build_event_swarm_with_root(
+            Keypair::generate_ed25519(),
+            PrivateSwarmKey::from_root_secret("seed-upnp-test-root"),
+            true,
+        )
+        .expect("upnp-enabled private swarm builds");
+        drop(private);
+    }
+
+    #[test]
+    fn note_identified_peer_adds_addresses_to_kademlia() {
+        // Build a real event swarm and confirm learning a peer from identify
+        // adds its addresses to the Kademlia routing table.
+        let kp = Keypair::generate_ed25519();
+        let mut swarm = build_event_swarm(kp).expect("event swarm builds");
+        let peer = PeerId::random();
+        let addrs = vec![
+            "/ip4/192.0.2.5/tcp/4001".parse::<Multiaddr>().unwrap(),
+            "/ip4/192.0.2.6/tcp/4001".parse::<Multiaddr>().unwrap(),
+        ];
+        let added = note_identified_peer(&mut swarm, &peer, addrs.clone());
+        assert_eq!(added, 2);
+        // The peer is now present in Kademlia's routing table.
+        let in_table = swarm
+            .behaviour_mut()
+            .kademlia
+            .kbucket(peer)
+            .map(|b| b.iter().any(|e| *e.node.key.preimage() == peer))
+            .unwrap_or(false);
+        assert!(
+            in_table,
+            "identified peer must be in the Kademlia routing table"
+        );
+    }
+
     /// The private-swarm key is OFF by default (the public root); a root
     /// secret derives a stable, deterministic key.
     #[test]
@@ -1368,9 +1553,12 @@ mod tests {
     /// strictly additive.
     #[tokio::test]
     async fn public_root_default_path_unchanged() {
-        let mut a =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), PrivateSwarmKey::disabled())
-                .unwrap();
+        let mut a = build_event_swarm_with_root(
+            Keypair::generate_ed25519(),
+            PrivateSwarmKey::disabled(),
+            false,
+        )
+        .unwrap();
         let mut b = build_event_swarm(Keypair::generate_ed25519()).unwrap();
         let b_peer_id = *b.local_peer_id();
 
@@ -1424,8 +1612,10 @@ mod tests {
         let root_a = PrivateSwarmKey::from_root_secret("network-alpha");
         let root_b = PrivateSwarmKey::from_root_secret("network-beta");
 
-        let mut a = build_event_swarm_with_root(Keypair::generate_ed25519(), root_a).unwrap();
-        let mut b = build_event_swarm_with_root(Keypair::generate_ed25519(), root_b).unwrap();
+        let mut a =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_a, false).unwrap();
+        let mut b =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root_b, false).unwrap();
         let b_peer_id = *b.local_peer_id();
 
         let b_addr = listen_and_get_addr(&mut b).await;
@@ -1470,7 +1660,7 @@ mod tests {
         let root = PrivateSwarmKey::from_root_secret("shared-private-root");
 
         let mut seed =
-            build_event_swarm_with_root(Keypair::generate_ed25519(), root.clone()).unwrap();
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root.clone(), false).unwrap();
         let seed_peer_id = *seed.local_peer_id();
         let seed_addr = listen_and_get_addr(&mut seed).await;
         let seed_multiaddr = seed_addr.with(Protocol::P2p(seed_peer_id));
@@ -1481,7 +1671,8 @@ mod tests {
             }
         });
 
-        let mut joiner = build_event_swarm_with_root(Keypair::generate_ed25519(), root).unwrap();
+        let mut joiner =
+            build_event_swarm_with_root(Keypair::generate_ed25519(), root, false).unwrap();
         let seeds = vec![parse_seed_multiaddr(seed_multiaddr).unwrap()];
         let added = seed_event_dht(&mut joiner, &seeds);
         assert_eq!(added, 1, "one seed configured");

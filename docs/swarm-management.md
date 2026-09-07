@@ -54,12 +54,17 @@ reads the key from `pillar-swarm` and hands it to each transport).
   libp2p/IPFS peers, but it is not a membership gate (anyone can read it). A
   fresh public node joins with **zero configuration** — with no `--swarm-key`
   and no `--seed-node` it bootstraps the public DHT from the baked-in
-  `PUBLIC_PILLAR_SEEDS` anchors (DNS seeds at pillar's own public
-  infrastructure, `pillar-rs.net`). Those anchors are public coordinates, not
-  secrets, and are the single source of truth for public bootstrap: adding or
-  rotating a public seed is one edit to that array, and `pillar_cli` asserts at
-  test time that every entry is a real federation seed (carries a
-  `/p2p/<peer-id>`), so a malformed anchor fails CI rather than production.
+  `PUBLIC_PILLAR_SEEDS` anchors. Each anchor is a libp2p `/dnsaddr/<host>`
+  bootstrap address at pillar's own public infrastructure
+  (`/dnsaddr/seed.pillar-rs.net`). The **peer id is not baked** — it lives in
+  the operator-managed `_dnsaddr.seed.pillar-rs.net` DNS **TXT record** (the
+  IPFS/libp2p bootstrap convention), which the DNS transport resolves at
+  runtime into the concrete `/p2p/<peer-id>` multiaddrs. A seed node can thus
+  be added/replaced/rotated by editing a TXT record — no pillar release. The
+  anchor list is the single source of truth; `pillar_cli` asserts at test time
+  that every entry parses and classifies as a federation seed (a `/dnsaddr`
+  dial anchor or a `/p2p`-terminated direct seed), so a malformed anchor fails
+  CI rather than production.
 - **Your own swarm** — a fresh 256-bit key minted from the OS CSPRNG
   (`pillar swarm generate`). Save it to a file, distribute it out-of-band to
   the nodes you want in your private network, and boot each with
@@ -104,6 +109,25 @@ suppress the fallback; a private swarm never falls back (it is
 transport-isolated from the public seeds), so with no `--seed-node` it acts as
 its own seed/first node. The resolution is a pure helper
 (`run::resolve_effective_seeds`) so it is unit-tested directly.
+
+### How a seed enters the DHT (direct vs. dnsaddr bootstrap)
+
+At boot each effective seed is classified (`pillar_net::classify_seed`):
+
+- A `/p2p/<peer-id>`-terminated seed is a **Direct** seed — its peer id is
+  known, so it is added straight to the Kademlia routing table and a bootstrap
+  is issued (`seed_event_dht`).
+- A peer-id-less `/dnsaddr/<host>` (or `/dns4|/dns6/<host>`) anchor is a
+  **Dial** seed — pillar **dials** it (the DNS transport, enabled by the
+  libp2p `dns` feature, resolves `_dnsaddr.<host>` TXT / A / AAAA records). On
+  the resulting connection the `identify` exchange reveals the peer's id and
+  listen addresses, which `pillar_net::note_identified_peer` folds into
+  Kademlia (then bootstraps). This is what lets the baked public anchor carry
+  **no** peer id — the peer id is learned at runtime from DNS + identify, never
+  baked into the binary.
+
+The identify→Kademlia wiring lives in the node's event loop, so ANY identified
+peer (not only baked seeds) teaches the routing table where it listens.
 
 ## CLI
 

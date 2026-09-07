@@ -79,41 +79,30 @@ pub const PUBLIC_PILLAR_ROOT: &str =
 /// The published, well-known **seed peers of the public pillar swarm**, baked
 /// into every binary so a fresh node joins the public network with ZERO
 /// configuration: `pillar node run` with no `--swarm-key` (⇒ public swarm) and
-/// no `--seed-node` falls back to these anchors to enter the public DHT.
+/// no `--seed-node` bootstraps the public DHT from these anchors.
 ///
-/// Each entry is a libp2p multiaddr terminating in `/p2p/<peer-id>` (a
-/// federation seed MUST name the peer it dials — Kademlia keys its routing
-/// table on that peer id, and a peer-id-less address can never populate the
-/// DHT). The canonical form is a DNS anchor at pillar's own public
-/// infrastructure so a node survives a seed's IP changing:
+/// Each entry is a libp2p **`/dnsaddr/<host>` bootstrap anchor** at pillar's own
+/// public infrastructure. The peer id is NOT baked here — it lives in the
+/// operator-managed `_dnsaddr.<host>` **DNS TXT record** (the IPFS/libp2p
+/// bootstrap convention, e.g. `/dnsaddr/bootstrap.libp2p.io`), which the DNS
+/// transport resolves at runtime into the concrete `/p2p/<peer-id>`
+/// multiaddrs. Keeping the peer id in DNS (not the binary) means a public seed
+/// node can be added, replaced, or rotated by editing a TXT record — no
+/// pillar release. The DNS host `pillar-rs.net` is the pillar project's OWN
+/// public infrastructure (not a deployment-private identifier), and a baked
+/// bootstrap anchor is the only way a zero-config public network is possible:
+/// the deliberate, scoped exception to "no infra identifiers in source".
 ///
-/// ```text
-/// /dns4/seed1.pillar-rs.net/tcp/4001/p2p/<peer-id>
-/// ```
+/// A node on a PRIVATE swarm never uses these (a private swarm is
+/// transport-isolated from the public seeds); it always supplies its own
+/// `--seed-node`(s).
 ///
-/// These are PUBLIC coordinates, not secrets — exactly like the well-known DNS
-/// seeds other P2P networks bake in — and they are the ONE exception to the
-/// "no infrastructure identifiers in source" rule: `pillar-rs.net` is the
-/// pillar project's *own public* infrastructure (not a deployment-private
-/// identifier), and a zero-config public network is only possible if the
-/// bootstrap anchor ships in the binary. A node on a PRIVATE swarm never uses
-/// these (a private swarm is transport-isolated from the public seeds); it
-/// always supplies its own `--seed-node`(s).
-///
-/// This list is the single source of truth: to add or rotate a public seed,
-/// edit THIS array. `pillar_cli` asserts at test time that every entry parses
-/// as a federation seed (carries a `/p2p/<peer-id>`), so a malformed entry
-/// fails CI rather than silently breaking zero-config bootstrap in production.
-///
-/// A `peer-id` here MUST be the real, stable peer id of a deployed public seed
-/// node (derived from that node's persistent ed25519 identity key) — never a
-/// placeholder. A wrong peer id makes every public node silently fail to
-/// bootstrap, so the list stays empty until the public seed nodes are deployed
-/// with fixed identities, at which point their real peer ids are baked here.
-pub const PUBLIC_PILLAR_SEEDS: &[&str] = &[
-    // /dns4/seed1.pillar-rs.net/tcp/4001/p2p/<peer-id>
-    // /dns4/seed2.pillar-rs.net/tcp/4001/p2p/<peer-id>
-];
+/// This list is the single source of truth: to add or rotate a public seed
+/// anchor, edit THIS array. `pillar_cli` asserts at test time that every entry
+/// parses as a multiaddr and classifies as a federation seed (a `/dnsaddr`
+/// dial anchor or a `/p2p`-terminated direct seed), so a malformed entry fails
+/// CI rather than silently breaking zero-config bootstrap in production.
+pub const PUBLIC_PILLAR_SEEDS: &[&str] = &["/dnsaddr/seed.pillar-rs.net"];
 
 /// The baked-in public-swarm seed multiaddr strings (see
 /// [`PUBLIC_PILLAR_SEEDS`]). Returned as raw strings because this crate holds

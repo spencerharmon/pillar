@@ -8,6 +8,7 @@
 \usepackage{tikz}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.16}
+\usetikzlibrary{arrows.meta,positioning,backgrounds,fit}
 \usepackage[hidelinks]{hyperref}
 \usepackage{caption}
 \captionsetup{font=small,labelfont=bf}
@@ -16,64 +17,103 @@
 \definecolor{pbad}{RGB}{200,40,40}
 \definecolor{pnode}{RGB}{38,70,120}
 \definecolor{pmid}{RGB}{210,140,20}
+\definecolor{ppur}{RGB}{120,60,150}
 \definecolor{pgray}{RGB}{110,110,110}
 \newcommand{\code}[1]{\texttt{\small #1}}
-\newcommand{\todo}[1]{{\color{pbad}\textbf{[TODO: #1]}}}
+\newcommand{\Wstar}{W^{\star}}
 
-\title{\vspace{-3.5em}\bfseries pillar-UDP Redundancy: Header Format and the
-Loss/Bandwidth Trade\\[0.3em]\large\normalfont(companion to ``Clustered Multipath
-Congestion Avoidance and Redundant Delivery'')}
+\title{\vspace{-3.5em}\bfseries pillar-UDP Redundancy: Header Format, the
+Loss/Bandwidth Trade, and Adaptive Congestion Safety\\[0.35em]
+\large\normalfont A companion to ``Clustered Multipath Congestion Avoidance and
+Redundant Delivery over Lossy Networks''}
 \author{\normalsize pillar engineering}
-\date{\normalsize DRAFT --- \today}
+\date{\normalsize \today}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
 \noindent
-\textbf{This is a working draft.} The primary pillar-UDP paper proves the
-\emph{qualitative} delivery guarantees (exactly-once, route-around liveness,
-bounded fan-out) and defers two quantitative matters to this companion: (i)~the
-on-the-wire encoding of the per-connection \emph{redundancy allowance} and the
-rest of the pillar-UDP message header, and (ii)~the analytic loss/bandwidth
-trade that determines how large the allowance should be for a target
-reliability. This draft fixes the analytic framework---which is closed-form and
-stated here in full---and lays out the header's logical field set; the exact
-byte encoding and the empirical validation of the independence assumption remain
-open (\S\ref{sec:open}).
+The primary pillar-UDP paper proves the protocol's \emph{qualitative} delivery
+guarantees---exactly-once processing, route-around liveness, and bounded
+fan-out---and defers the \emph{quantitative} design to this companion. We supply
+three things. First, the analytic loss/bandwidth trade that sets the
+per-connection \emph{redundancy allowance}: a closed form for the minimum copy
+count $\Wstar=\lceil\log_p\varepsilon\rceil$ in the small-message regime and a
+binomial residual for the erasure-coded bulk regime, with the overhead each
+implies. Second, a correlated-loss model---an exchangeable P\'olya/Beta-binomial
+mixture with a single correlation parameter $\rho$---that quantifies exactly how
+much shared loss erodes redundancy, showing that the whole benefit of pillar-UDP
+rides on driving $\rho$ toward zero by AS-diverse dispersion, and turning the
+``paths are independent'' claim from an assumption into a measurable quantity
+with a stated methodology. Third, the concrete header wire format and an adaptive
+control loop that sets the allowance from measured loss while remaining
+\emph{congestion-safe}: a delay-gradient discriminator prevents redundancy from
+being added in response to congestion (as opposed to link loss), and a
+marginal-gain rule plus an aggregate-egress bound cap fan-out so the adaptive
+allowance cannot itself induce collapse. Every numeric result here is exact
+arithmetic from the closed forms; the one empirical question---the real-world
+distribution of $\rho$---is framed as a measurement study, not filled with
+invented data.
 \end{abstract}
 
-\section{Scope}
-The companion's job is narrow: give operators a defensible rule for setting the
-redundancy allowance, and give implementers a stable header contract. Nothing
-here changes the protocol's proven guarantees; it parameterises them. Two
-regimes share one substrate and differ only in redundancy shape:
-\emph{small-message} delivery (a message rides in $W$ whole redundant copies)
-and \emph{bulk} delivery (a payload is split into $K$ data shards plus $M$
-erasure shards and reconstructed from any $K$ arrivals). Both are analysed
-below.
+\section{Introduction}
+pillar-UDP delivers a message by spraying a \emph{bounded} number of redundant,
+content-addressed datagrams across a topologically dispersed set of nodes and
+letting the receiver deduplicate by CID; loss is absorbed by redundancy and
+congestion is avoided by finding a good route rather than by throttling a
+window. The primary paper~\cite{primary} model-checks that this delivers exactly
+once and always routes around lossy links whenever the cell stays reachable by
+some dispersed path. What it deliberately leaves open is every \emph{number}: how
+many copies, how much bandwidth that costs, how to encode the choice on the wire,
+how to adapt it to a changing link, and how to keep the adaptation from becoming
+a self-inflicted congestion source. This paper closes those gaps.
 
-\section{The loss/bandwidth trade (small messages)}\label{sec:trade}
-Let a message be sent as $W$ redundant copies over paths whose losses are
-independent with per-path probability $p$ (the primary paper argues dispersion
-across AS-diverse nodes is what makes independence realistic; \S\ref{sec:open}
-records this as the assumption to validate empirically). The message is
-undelivered only if every copy drops:
-\[
-  P_{\text{fail}}(W,p) = p^{\,W}.
-\]
-The bandwidth cost is a fan-out of $W$: overhead is $(W-1)$ redundant copies per
-delivered message. Fixing a target residual $\varepsilon$ and solving
-$p^{W}\le\varepsilon$ gives the \emph{minimum allowance}
-\[
-  W^\star(p,\varepsilon)=\left\lceil \frac{\ln\varepsilon}{\ln p}\right\rceil
-    = \left\lceil \log_{p}\varepsilon \right\rceil ,
-\]
-a closed form the sender can evaluate per connection from its measured $p$ and
-the connection's declared $\varepsilon$. This is the value the redundancy
-allowance encodes; it scales \emph{down} toward $W=1$ as $p\to0$ (a clean path
-costs nothing) and \emph{up} as $p\to1$, which is exactly the adaptive posture
-the primary paper requires. Table~\ref{tab:wstar} tabulates $W^\star$.
+The engineering tension is a single trade. Redundancy buys reliability
+super-linearly ($p^{W}$ falls fast in $W$) but costs bandwidth linearly (fan-out
+$W$). Setting the redundancy allowance is therefore an optimisation with three
+inputs---the measured per-path loss $p$, the connection's target residual
+$\varepsilon$, and the correlation $\rho$ between the paths the copies take---and
+one hard constraint: the aggregate traffic a cell emits must never exceed what
+its egress can carry, or the ``cure'' becomes the disease. We treat each in turn.
+
+\section{System model}
+A \emph{message} is a small, signed, content-addressed unit identified by its
+CID. A \emph{connection} carries a stream of messages between a client and a cell
+or between two cells and declares a target residual loss $\varepsilon$ (the
+probability a message is ultimately undelivered that the application will
+tolerate). A \emph{path} is one dispersed source/route a copy takes; the sender
+controls how many paths it uses. We write $p$ for the per-path loss probability
+over the averaging window and treat per-path losses as a marginal-$p$ Bernoulli
+whose \emph{dependence} across paths is captured by a correlation parameter
+$\rho\in[0,1]$ (\S\ref{sec:corr}); $\rho=0$ is fully independent, $\rho=1$ is one
+shared fate. Two redundancy shapes share this substrate: \emph{copy redundancy}
+(a whole message sent $W$ times, for small messages) and \emph{erasure
+redundancy} ($K$ data $+$ $M$ parity shards, MDS target reconstructs from any
+$K$, for
+bulk). Both are bounded by the same per-connection allowance field
+(\S\ref{sec:header}).
+
+\section{The loss/bandwidth trade: small messages}\label{sec:trade}
+Under independent per-path loss, a message sent as $W$ copies is undelivered only
+if all $W$ drop:
+\begin{equation}
+  P_{\text{fail}}(W,p) = p^{\,W}. \label{eq:pw}
+\end{equation}
+The bandwidth cost is a fan-out of $W$ (overhead $W-1$ redundant copies per
+delivered message). Fixing the connection's target $\varepsilon$ and solving
+$p^{W}\le\varepsilon$ gives the minimum allowance in closed form:
+\begin{equation}
+  \Wstar(p,\varepsilon)=\left\lceil\frac{\ln\varepsilon}{\ln p}\right\rceil
+   =\left\lceil\log_{p}\varepsilon\right\rceil. \label{eq:wstar}
+\end{equation}
+This is the value the sender computes each averaging window and writes into the
+allowance field. It scales \emph{down} to $W=1$ as $p\to0$ (a clean path costs
+nothing beyond the message itself) and \emph{up} as $p\to1$, which is precisely
+the adaptive posture the primary paper requires and the opposite of a fixed
+redundancy multiplier. Table~\ref{tab:wstar} tabulates $\Wstar$; it is exact
+arithmetic from~\eqref{eq:wstar}. Even a $30\%$-loss path needs only
+$W{=}12$ copies for a one-in-a-million residual, and a $10\%$ path needs $6$.
 
 \begin{table}[t]
 \centering\small
@@ -89,79 +129,412 @@ $p$ & $\varepsilon{=}10^{-3}$ & $\varepsilon{=}10^{-6}$ & $\varepsilon{=}10^{-9}
 0.50 & 10 & 20 & 30 \\
 \bottomrule
 \end{tabular}
-\caption{Minimum redundancy allowance $W^\star=\lceil\log_p\varepsilon\rceil$ for
-target residual loss $\varepsilon$. The allowance is cheap on good paths and
-grows only as the path degrades.}
+\caption{Minimum copy allowance $\Wstar=\lceil\log_p\varepsilon\rceil$
+(Eq.~\ref{eq:wstar}). Cheap on good paths; grows only as the path degrades.}
 \label{tab:wstar}
 \end{table}
 
-\section{Erasure regime (bulk)}\label{sec:erasure}
-For bulk transfer the payload is split into $K$ data shards and $M$ parity
-shards ($N=K+M$ total, systematic code), reconstructable from any $K$ arrivals
-(the implementation's \code{encode}/\code{reconstruct} in \code{pillar\_udp.rs}).
-With independent per-shard loss $p$, reconstruction fails iff fewer than $K$ of
-$N$ shards arrive:
-\[
-  P_{\text{fail}}(K,M,p)=\sum_{i=0}^{K-1}\binom{N}{i}(1-p)^{i}p^{\,N-i}.
-\]
-The bandwidth overhead is $M/K$, tunable independently of $K$, so bulk pays a
-\emph{fractional} overhead where small messages pay a multiple. The parity rate
-$M/K$ is tied to the same redundancy-allowance header field, mapped through the
-$\varepsilon$/$p$ relation above rather than a raw copy count.
-\todo{plot $P_{\text{fail}}(K,M,p)$ surface and derive the $M/K$ that meets a
-given $\varepsilon$ at measured $p$; cross-check against Table~\ref{tab:wstar}.}
+\paragraph{Efficiency.}
+Delivered-message yield per unit bandwidth is $(1-p^{W})/W$: it is maximised at
+$W{=}1$ and decreases monotonically, so redundancy is never ``free
+throughput''---it is reliability purchased with bandwidth. The correct operating
+point is therefore not an efficiency optimum but the \emph{smallest} $W$ meeting
+$\varepsilon$, i.e.\ $\Wstar$; spending more wastes bandwidth and spending less
+misses the target. This is why the allowance is a hard per-connection budget and
+why the controller of \S\ref{sec:control} tracks $\Wstar$ rather than hunting a
+throughput maximum.
 
-\section{Header format (logical fields)}\label{sec:header}
-The header binds every datagram---initial spray copy or forward---to its logical
-message and states the connection's redundancy contract up front. The
-\emph{logical} field set below is fixed by the protocol's proven mechanics; the
-concrete byte layout is deferred (\S\ref{sec:open}).
+\paragraph{Latency.}
+Because the $W$ copies travel in parallel rather than as RTT-spaced
+retransmissions, delivery latency is the \emph{minimum} arrival time over the
+surviving copies, not a retransmit timeout after a loss. Redundancy thus improves
+tail latency on lossy paths at the same time as it improves delivery---the
+property single-path protocols cannot get, since their only recovery is to wait
+an RTT and resend.
+
+\section{Correlated loss and the independence assumption}\label{sec:corr}
+Equation~\eqref{eq:pw} assumes the $W$ paths fail independently. That assumption
+is the load-bearing one: if the copies share a bottleneck, redundancy buys far
+less. We make the dependence explicit with an exchangeable mixture. Let the
+common ``network weather'' over the copies be a latent loss level $q$ with mean
+$\mathbb{E}[q]=p$ drawn from a Beta$(a,b)$ distribution; conditioned on $q$ the
+$W$ copies drop independently. Then
+\begin{equation}
+  P_{\text{fail}}(W,p,\rho)=\mathbb{E}[q^{W}]
+   =\prod_{i=0}^{W-1}\frac{p\varphi+i}{\varphi+i},\qquad
+   \varphi=\frac{1-\rho}{\rho}, \label{eq:corr}
+\end{equation}
+where $\rho=1/(a{+}b{+}1)$ is the pairwise loss correlation and $\varphi=a{+}b$.
+This is a P\'olya/Beta-binomial urn and it interpolates exactly between the two
+extremes: as $\rho\to0$ ($\varphi\to\infty$), \eqref{eq:corr} $\to p^{W}$, the
+independent case; as $\rho\to1$ ($\varphi\to0$), it $\to p$---i.e.\ $W$ copies on
+one shared fate are worth a single copy. By Jensen's inequality
+$\mathbb{E}[q^{W}]\ge(\mathbb{E}q)^{W}=p^{W}$, so \emph{any} positive correlation
+strictly erodes redundancy, and the erosion compounds with $W$.
+
+Figure~\ref{fig:corr} plots \eqref{eq:corr} for $p{=}0.2$. The message is stark:
+at $\rho{=}0$ ten copies reach $10^{-7}$; at a modest $\rho{=}0.2$ the same ten
+copies stall near $10^{-2.7}$ and adding more barely helps; at $\rho{=}0.5$
+redundancy is nearly worthless. \emph{This is the analytic justification for
+dispersion.} pillar-ipam binds addresses to topology tiers and sites hold
+distinct prefixes, so ``spray from a dispersed set of IPs'' is exactly the
+operation that pushes the copies onto uncorrelated failure domains and drives
+$\rho\to0$. Dispersion is not a nicety; Eq.~\eqref{eq:corr} shows it is the
+difference between redundancy that works and redundancy that does not.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=5.2cm,
+  xlabel={copies $W$}, ylabel={$\log_{10}P_{\text{fail}}$ ($p{=}0.2$)},
+  xmin=1,xmax=12, ymin=-8, ymax=0,
+  xtick={2,4,6,8,10,12}, ytick={0,-2,-4,-6,-8},
+  legend pos=north east, legend style={font=\tiny,fill opacity=0.85,draw=none},
+  tick label style={font=\tiny}, label style={font=\tiny},
+  grid=both, grid style={gray!18},
+]
+\addplot[pnode,thick,mark=*,mark size=1pt] coordinates {
+ (1,-0.699)(2,-1.398)(3,-2.097)(4,-2.796)(5,-3.495)(6,-4.194)(7,-4.893)(8,-5.592)(9,-6.291)(10,-6.99)(11,-7.689)(12,-8.388)};
+\addlegendentry{$\rho=0$ (independent)}
+\addplot[pgood,thick,mark=square*,mark size=1pt,dashed] coordinates {
+ (1,-0.699)(2,-1.319)(3,-1.878)(4,-2.387)(5,-2.857)(6,-3.293)(7,-3.7)(8,-4.081)(9,-4.441)(10,-4.781)(11,-5.103)(12,-5.41)};
+\addlegendentry{$\rho=0.05$}
+\addplot[pmid,thick,mark=triangle*,mark size=1.3pt,dash dot] coordinates {
+ (1,-0.699)(2,-1.143)(3,-1.474)(4,-1.739)(5,-1.961)(6,-2.152)(7,-2.319)(8,-2.468)(9,-2.603)(10,-2.726)(11,-2.839)(12,-2.943)};
+\addlegendentry{$\rho=0.2$}
+\addplot[pbad,thick,mark=diamond*,mark size=1.4pt,densely dotted] coordinates {
+ (1,-0.699)(2,-0.9208)(3,-1.056)(4,-1.152)(5,-1.228)(6,-1.29)(7,-1.343)(8,-1.389)(9,-1.429)(10,-1.465)(11,-1.498)(12,-1.528)};
+\addlegendentry{$\rho=0.5$}
+\end{axis}
+\end{tikzpicture}
+\caption{Residual loss vs.\ copy count under correlated loss
+(Eq.~\ref{eq:corr}, $p{=}0.2$). Independence ($\rho{=}0$) is a straight log
+decline; correlation flattens the curve, and past modest $\rho$ extra copies stop
+helping. Redundancy's value is entirely a function of how uncorrelated the
+dispersed paths are.}
+\label{fig:corr}
+\end{figure}
+
+\paragraph{Making $\rho$ measurable (methodology, not results).}
+Equation~\eqref{eq:corr} reduces the open empirical question to a single
+estimand: the pairwise loss correlation $\rho$ between dispersed pillar paths,
+and its dependence on how much topology diversity separates them. We do
+\emph{not} report a value here---measuring it requires a live multi-site
+deployment we treat as future work---but we fix the method so the number, once
+gathered, plugs straight into the model. (i)~From concurrent per-path
+delivery logs across pairs of pillar-ipam prefixes at increasing topology
+distance (same rack, same site, same region, cross-region), estimate the
+empirical joint drop rate and invert \eqref{eq:corr} for $\rho$ at each distance.
+(ii)~Fit the burst structure with a two-state Gilbert--Elliott
+channel~\cite{gilbert,elliott} per path and measure cross-path state
+correlation, which yields $\rho$ directly. (iii)~Feed the measured
+$\rho(\text{distance})$ back into $\Wstar$ by replacing $p$ in \eqref{eq:wstar}
+with the correlation-inflated effective loss from \eqref{eq:corr}. Until those
+measurements exist, the controller (\S\ref{sec:control}) uses a conservative
+$\rho$ prior and the safety envelope (\S\ref{sec:safety}) does not depend on the
+value.
+
+\section{Bulk transfer: erasure coding}\label{sec:erasure}
+For payloads larger than a datagram, copy redundancy is wasteful: sending a
+megabyte $W$ times to survive loss pays an integer multiple. Bulk instead uses a
+\emph{systematic erasure code}: $K$ data shards plus $M$ parity shards, $N=K+M$
+total. The design target is a \emph{maximum-distance-separable} (MDS) code---any
+$K$ of the $N$ shards reconstruct the payload---as provided by
+Reed--Solomon~\cite{reedsolomon} or a fountain code such as
+RaptorQ~\cite{raptorq}. Under independent per-shard loss $p$, an MDS code fails
+to reconstruct iff fewer than $K$ shards arrive:
+\begin{equation}
+  P_{\text{fail}}(K,M,p)=\sum_{i=0}^{K-1}\binom{N}{i}(1-p)^{i}p^{\,N-i}.
+  \label{eq:erasure}
+\end{equation}
+The overhead is $M/K$, a \emph{fractional} rate tunable independently of $K$,
+where copy redundancy pays a whole multiple. Figure~\ref{fig:erasure} plots
+\eqref{eq:erasure}: at $20\%$ loss, $K{=}8,M{=}8$ (overhead $1.0$) reaches
+$10^{-2.8}$, and increasing the block to $K{=}16,M{=}8$ (overhead $0.5$) does
+about as well because a larger block averages the loss. The minimum parity
+$M^\star(K,p,\varepsilon)$ meeting a target follows by the same solve as
+$\Wstar$; Table~\ref{tab:mstar} reports it for $K{=}8,\varepsilon{=}10^{-6}$. The
+mapping is the design rule: the single allowance field encodes a parity
+\emph{rate} (\S\ref{sec:header}) and the sender derives $M=\lceil\text{rate}\cdot
+K\rceil$ from it and the block size $K$.
+
+\paragraph{Implementation status.}
+The shipping \code{encode}/\code{reconstruct} in \code{pillar\_udp.rs} realises a
+simpler first step, \emph{not} yet the MDS target: $M$ \emph{identical}
+XOR-parity shards (each the XOR of all $K$ data shards), which recover
+\emph{exactly one} lost data shard---the extra parity copies only guard the
+parity itself against loss, so the test suite asserts ``one parity cannot recover
+two holes.'' Its exact residual is therefore
+\begin{equation}
+  P^{\text{xor}}_{\text{fail}}(K,M,p)=1-(1-p)^{K}-Kp(1-p)^{K-1}\big(1-p^{M}\big),
+  \label{eq:xor}
+\end{equation}
+which for $K{=}8$ sits near $0.19$ at $p{=}0.1$ \emph{independent of $M\ge2$},
+against the MDS target's $4.3\times10^{-3}$ at $M{=}4$: a single-erasure code
+cannot survive two concurrent data-shard losses however much parity it carries.
+Generalising the coding kernel to a true MDS code (Reed--Solomon / RaptorQ) is
+the specified bulk-regime work, and Eq.~\eqref{eq:erasure} is the residual that
+upgrade unlocks; every shard already carries a per-payload CID and a
+protocol-version stamp, so only the kernel changes.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=5.2cm,
+  xlabel={per-shard loss $p$}, ylabel={$\log_{10}P_{\text{fail}}$},
+  xmin=0,xmax=0.7, ymin=-12, ymax=0,
+  xtick={0,0.1,0.2,0.3,0.4,0.5,0.6,0.7}, ytick={0,-3,-6,-9,-12},
+  legend pos=north east, legend style={font=\tiny,fill opacity=0.85,draw=none},
+  tick label style={font=\tiny}, label style={font=\tiny},
+  grid=both, grid style={gray!18},
+]
+\addplot[pbad,thick,mark=square*,mark size=1pt,densely dotted] coordinates {
+ (0.02,-3.064)(0.05,-1.939)(0.1,-1.154)(0.15,-0.7452)(0.2,-0.4919)(0.3,-0.2096)(0.4,-0.0795)(0.5,-0.0244)(0.6,-0.0054)(0.7,-0.0007)};
+\addlegendentry{$K{=}8,M{=}2$ (ovh 0.25)}
+\addplot[pmid,thick,mark=triangle*,mark size=1.2pt,dash dot] coordinates {
+ (0.02,-5.647)(0.05,-3.735)(0.1,-2.364)(0.15,-1.621)(0.2,-1.139)(0.3,-0.5585)(0.4,-0.2504)(0.5,-0.0936)(0.6,-0.0256)(0.7,-0.0041)};
+\addlegendentry{$K{=}8,M{=}4$ (ovh 0.50)}
+\addplot[pnode,thick,mark=*,mark size=1pt] coordinates {
+ (0.02,-11.29)(0.05,-7.791)(0.1,-5.227)(0.15,-3.795)(0.2,-2.831)(0.3,-1.591)(0.4,-0.8469)(0.5,-0.396)(0.6,-0.145)(0.7,-0.0336)};
+\addlegendentry{$K{=}8,M{=}8$ (ovh 1.00)}
+\addplot[ppur,thick,mark=o,mark size=1.2pt,dashed] coordinates {
+ (0.02,-9.292)(0.05,-5.892)(0.1,-3.493)(0.15,-2.231)(0.2,-1.442)(0.3,-0.5607)(0.4,-0.1726)(0.5,-0.0342)(0.6,-0.0033)(0.7,-0.0001)};
+\addlegendentry{$K{=}16,M{=}8$ (ovh 0.50)}
+\end{axis}
+\end{tikzpicture}
+\caption{MDS (any-$K$-of-$N$) erasure residual loss (Eq.~\ref{eq:erasure}); the
+bulk-regime design target. Parity rate $M/K$ sets the
+overhead; a larger block ($K{=}16,M{=}8$) beats a smaller one at the same rate by
+averaging loss over more shards. Lower is better; log scale.}
+\label{fig:erasure}
+\end{figure}
 
 \begin{table}[t]
 \centering\small
-\begin{tabular}{@{}p{0.27\columnwidth}p{0.63\columnwidth}@{}}
+\begin{tabular}{@{}lrrrrrr@{}}
 \toprule
-field & meaning \\
+$p$ & 0.05 & 0.10 & 0.20 & 0.30 & 0.40 & 0.50 \\
 \midrule
-CID & content address of the message bytes; the dedup and integrity key
-(identical to the streamdb/blob content address). \\
-redundancy allowance & the connection's $W^\star$ (small) or parity rate $M/K$
-(bulk), per \S\ref{sec:trade}--\ref{sec:erasure}; caps system-wide fan-out. \\
-hop TTL & remaining forward budget; decremented per hop, forwarding stops at 0
-(with CID dedup, guarantees loop-free termination). \\
-side-effect class & idempotent/\emph{Convergent} vs \emph{Exclusive}; routes an
-exclusive message's processing to the coordination-core lease holder. \\
-shard descriptor & for bulk: $K$, $M$, and the shard index/offset for
-reconstruction. \\
-return-routability token & anti-amplification: proof the source address is
-reachable before the cell commits redundant replies. \\
+$M^\star$ & 7 & 9 & 15 & 21 & 28 & 38 \\
+overhead $M^\star/K$ & 0.88 & 1.12 & 1.88 & 2.62 & 3.50 & 4.75 \\
 \bottomrule
 \end{tabular}
-\caption{pillar-UDP header logical fields. Each corresponds to an invariant
-already modelled in \code{specs/PillarUDP.tla} / \code{PillarUdpClient.tla} /
-\code{PillarUdpMesh.tla}; this paper's remaining work is their wire encoding.}
+\caption{Minimum parity $M^\star$ for an MDS code, $K{=}8$, $\varepsilon{=}10^{-6}$
+(Eq.~\ref{eq:erasure}). Beyond $\sim\!30\%$ loss even erasure overhead grows
+past $1\times$; a larger $K$ (Fig.~\ref{fig:erasure}) is the cheaper lever there.}
+\label{tab:mstar}
+\end{table}
+
+\section{Adaptive allowance control}\label{sec:control}
+The allowance is not static: the sender measures loss and re-derives it. Let
+$\hat p_t$ be an exponentially weighted estimate of per-path loss updated per
+acknowledgement/CID-arrival observation $\ell_t\in\{0,1\}$:
+\begin{equation}
+  \hat p_t=(1-\alpha)\hat p_{t-1}+\alpha\,\ell_t,\qquad 0<\alpha\ll1,
+\end{equation}
+and set $W_t=\mathrm{clamp}\big(\Wstar(\hat p_t,\varepsilon),\,1,\,W_{\max}\big)$
+(or the parity analogue for bulk). Three properties make this stable where a
+window-based controller is not:
+\begin{enumerate}\itemsep2pt
+  \item \textbf{Monotone, memoryless map.} $\Wstar(\cdot,\varepsilon)$ is a fixed
+  monotone step function of $\hat p_t$; the only state is the EWMA, a contraction
+  of bounded inputs, so $W_t$ cannot diverge or oscillate absent boundary
+  chatter.
+  \item \textbf{Hysteresis at the steps.} $\Wstar$ jumps at discrete $\hat p$
+  thresholds; we only change $W$ when $\hat p_t$ crosses a threshold by a margin
+  $\delta$, eliminating flapping when $\hat p$ sits on a boundary.
+  \item \textbf{No positive feedback.} The control target is \emph{loss}, and---
+  crucially---redundancy is added only for \emph{link} loss, not congestion
+  (\S\ref{sec:safety}). On dispersed independent paths, raising $W$ does not raise
+  the $\hat p$ that drove it, so the loop has no self-reinforcing term. This is
+  the structural difference from TCP/QUIC, whose control variable (the window)
+  directly drives the congestion signal it reacts to.
+\end{enumerate}
+$W_{\max}$ is the connection's declared allowance ceiling; the controller may
+request up to it but never beyond, so a misbehaving loss estimate can never
+unbound fan-out.
+
+\section{Congestion safety}\label{sec:safety}
+Redundancy is dangerous in exactly one regime: when the loss it is reacting to is
+\emph{congestion} rather than link degradation. Adding copies to a congested
+bottleneck worsens the congestion---the classic collapse. pillar-UDP stays safe
+by three composable mechanisms.
+
+\paragraph{1. Discriminate link loss from congestion.}
+Congestion raises queueing delay \emph{and} loss together; link loss raises loss
+with roughly flat one-way delay. The sender tracks a one-way delay gradient (the
+signal LEDBAT~\cite{ledbat} and delay-based controllers use) and attributes to
+the link-loss component only the loss that is \emph{not} accompanied by a rising
+delay gradient. Redundancy scales with the link-loss component; when the delay
+gradient indicates congestion, the controller \emph{reduces} offered rate (and
+$W$) exactly like a well-behaved flow, rather than adding copies.
+
+\paragraph{2. Marginal-gain stop.}
+Even absent an explicit $\varepsilon$, the marginal delivery gain of the $W$-th
+copy is $\partial_W(1-p^{W})=p^{W}\ln(1/p)$, which falls geometrically: for
+$p{=}0.3$ it is $0.36,0.11,0.033,0.0098,\dots$ for $W{=}1,2,3,4$. The controller
+stops increasing $W$ once the marginal delivered-probability per extra copy falls
+below a threshold $\tau$, giving a natural cap that no target can push past on a
+good path.
+
+\paragraph{3. Aggregate egress bound.}
+Redundancy is admitted against capacity. For a node with egress capacity $C$
+carrying flows $f$ at rates $\lambda_f$ with mean message size $S_f$ and
+allowance $W_f$, the local admission invariant is
+\begin{equation}
+  \sum_f \lambda_f\,W_f\,S_f \;\le\; C. \label{eq:admit}
+\end{equation}
+Each node enforces \eqref{eq:admit} on its own egress; because redundant copies
+are \emph{dispersed} across nodes and paths, any single bottleneck link carries
+only a fraction of a flow's fan-out, so the bound binds on aggregate egress, not
+on any one path. Together these ensure the adaptive allowance can raise
+reliability without ever becoming a congestion source: it responds to the loss it
+can fix (the link) and stands down on the loss it would worsen (congestion).
+
+\section{Header wire format}\label{sec:header}
+Every datagram---spray copy, forward, reply, or acknowledgement---carries the
+header below, which binds it to its logical message and states the connection's
+redundancy contract up front. Fields are fixed-width and big-endian; optional
+fields are gated by flag bits so the common small-message header stays compact.
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}llp{0.42\columnwidth}@{}}
+\toprule
+field & bytes & meaning \\
+\midrule
+flags & 1 & version (3b), type (2b: spray/forward/reply/ack), effect-class
+(1b: convergent/exclusive), has-shard (1b), has-RR-token (1b) \\
+CID & 34 & content-address multihash \code{<code><len><digest>} (SHA2-256
+today, $0x12\,0x20{+}32$B; algorithm-agile); dedup + integrity key \\
+allowance & 1 & mode bit + 7-bit value: copy count $W\in[1,127]$, or parity rate
+$M/K$ in $1/32$ units \\
+hop TTL & 1 & remaining forward budget; forwarding stops at 0 \\
+shard desc.\ & 8$^\dagger$ & $K$(1), $M$(1), shard index(2), payload length(4) \\
+RR token & 16$^\dagger$ & return-routability cookie (keyed MAC of client
+address); anti-amplification \\
+\bottomrule
+\end{tabular}
+\caption{pillar-UDP \emph{specified} header. $^\dagger$present only when the
+corresponding flag is set. Base header (small message, no token) is $37$ bytes;
+with shard descriptor $45$; with RR token $+16$. (The live transport today stamps
+each shard's on-wire bytes with the 2-byte protocol version followed by the
+payload and verifies the CID per shard; the full header above is the specified
+encoding of the modelled datagram fields.)}
 \label{tab:header}
 \end{table}
 
-\section{Open items}\label{sec:open}
-This draft is complete on the analytic framework and the logical header
-contract; the following remain before it is publishable:
-\begin{itemize}\itemsep2pt
-  \item \todo{Byte-level wire encoding of Table~\ref{tab:header}: field widths,
-  varint vs fixed, alignment, and the Noise/session-key framing boundary.}
-  \item \todo{Empirical validation of the independence assumption
-  (\S\ref{sec:trade}): measure correlated loss across AS-diverse pillar-ipam
-  prefixes and quantify how much it inflates the effective $p$ used in
-  $W^\star$.}
-  \item \todo{Bulk $M/K$ selection curve (\S\ref{sec:erasure}) and its mapping
-  onto the single redundancy-allowance field shared with the small-message
-  regime.}
-  \item \todo{Congestion-safety envelope: bound the aggregate fan-out a cell
-  emits so the adaptive allowance cannot itself induce congestion collapse under
-  correlated loss.}
-\end{itemize}
-No quantitative claim in this draft rests on unmeasured data: Tables~\ref{tab:wstar}
-is exact arithmetic from the closed forms, and every empirical question is listed
-above rather than filled with a placeholder value.
+\paragraph{Framing and MTU.}
+The header and payload ride as the application framing inside the pillar-UDP
+transport's Noise-encrypted, yamux-muxed stream (``Route~A'', the libp2p
+Noise$+$yamux upgrade the transport reuses). Datagrams are sized to the
+conservative IPv6 minimum path MTU: a small-message datagram keeps
+header~$+$~payload~$\le 1200$~bytes, and each bulk shard is sized so
+header~$+$~shard~$\le 1200$, so neither fragments. The header is therefore a fixed
+$37$--$61$-byte prefix; for a $1$~KB message its overhead is $3.5\%$, dwarfed by
+the $\times W$ payload cost, so the redundancy allowance, not the header,
+dominates on-wire bytes---as intended.
+
+\paragraph{Worked examples.}
+A small idempotent spray copy with $W{=}4$, $\text{TTL}{=}6$, no shard, no token:
+\begin{center}\code{20 12 20 <32-byte SHA-256 digest> 04 06 <payload>}\end{center}
+(\code{0x20}$=$ version~1, type spray, convergent; the CID is the $34$-byte
+multihash led by \code{12 20}). A bulk shard from a $K{=}8, M{=}4$ block, index~3,
+of a $1{,}048{,}576$-byte payload:
+\begin{center}\code{22 12 20 <digest> 90 06 08 04 0003 00100000 <shard>}\end{center}
+(\code{0x22} sets has-shard; \code{0x90} is parity mode at rate $16/32{=}0.5$;
+the descriptor carries $K{=}8,M{=}4,\text{idx}{=}3,\text{len}{=}0\text{x}100000$).
+
+\section{Relation to the verified models}
+Every header field corresponds to an invariant already machine-checked in the
+primary paper's TLA\textsuperscript{+} specifications, so the wire format is an
+encoding of proven mechanics, not new untested behaviour: the CID is the dedup
+key behind \code{ExactlyOnce}; the allowance bounds fan-out behind
+\code{SprayWidthBounded}/\code{BoundedTotalDatagrams}; the hop TTL is the
+forwarding-termination budget behind \code{NoForwardingLoops}; the effect-class
+bit is the idempotent/exclusive split routing exclusive processing to the
+coordination-core lease holder; and the RR token is the return-routability proof
+behind \code{AntiAmplificationBound}~\cite{primary}. This paper adds the
+\emph{quantities}---$\Wstar$, $M^\star$, the $\rho$ model, the control loop, and
+the safety envelope---that the qualitative proofs deliberately abstract away.
+
+\section{Related work}
+The loss-cliff that motivates the protocol is documented by Head~\cite{grayson};
+the idea of surviving loss with redundant, source-dispersed copies rather than
+retransmission descends from real-time game networking~\cite{tribes}. Bursty loss
+is classically modelled by the Gilbert--Elliott two-state
+channel~\cite{gilbert,elliott}, which we use to motivate the correlation
+estimand. Erasure coding for reliable transport spans Reed--Solomon
+codes~\cite{reedsolomon}, fountain codes such as RaptorQ~\cite{raptorq}, and
+on-the-fly coding such as Tetrys~\cite{tetrys}; pillar-UDP's bulk regime is a
+systematic block code whose MDS target is selected by \eqref{eq:erasure}.
+QUIC~\cite{quic} and its
+loss/congestion control~\cite{quicrecovery} exemplify the single-path,
+window-throttled posture we contrast against; LEDBAT~\cite{ledbat} supplies the
+delay-gradient discriminator we borrow for congestion safety; and
+MPTCP~\cite{mptcp} shares the multipath aim but retains per-subflow window
+control rather than redundancy. The correctness scaffolding is
+TLA\textsuperscript{+}~\cite{tlaplus}.
+
+\section{Limitations and future work}
+The analysis is exact but rests on two modelling choices whose empirical
+calibration is future work: the marginal-$p$ Bernoulli-with-correlation loss
+model (\S\ref{sec:corr}), whose single parameter $\rho$ must be measured across
+real dispersed pillar paths by the methodology given rather than assumed; and the
+independence \emph{within} a block for erasure (\S\ref{sec:erasure}), which the
+same correlation study should validate for shards as it does for copies. The
+delay-gradient discriminator (\S\ref{sec:safety}) inherits the known difficulty
+of delay-based congestion signals under reordering and needs the same live
+validation. None of these affects the proven safety and liveness guarantees,
+which hold for any loss pattern; they affect only how tightly the allowance can
+be tuned. We report no measured numbers here precisely because we have not run
+that study; the framework is built so its results drop in without changing any
+equation.
+
+\section{Conclusion}
+Setting pillar-UDP's redundancy is a bounded optimisation: choose the smallest
+allowance---copy count $\Wstar$ or parity $M^\star$---that meets the connection's
+residual target at the measured loss, adapt it as loss changes, and never let the
+aggregate exceed egress. The reliability it buys is real and super-linear, but
+only to the extent the dispersed paths are uncorrelated: Eq.~\eqref{eq:corr}
+makes that dependence exact and turns ``spray from diverse IPs'' from folklore
+into the quantitative lever it is. With the wire format fixed and the control
+loop kept congestion-safe by construction, the allowance becomes a single,
+well-understood knob spanning a clean link (where $W{=}1$ costs nothing) to a
+hostile one (where redundancy delivers what window backoff cannot).
+
+\begin{thebibliography}{99}
+\small
+\bibitem{primary} pillar engineering, \emph{pillar-UDP: Clustered Multipath
+Congestion Avoidance and Redundant Delivery over Lossy Networks}, 2026
+(companion paper).
+\bibitem{grayson} G.~Head, \emph{Reliable Delivery Over Horrible Networks}, 2026.
+\url{https://blog.graysonhead.net/posts/reliable-delivery/}
+\bibitem{tribes} M.~Frohnmayer and T.~Gift, \emph{The TRIBES Engine Networking
+Model}, 2000.
+\bibitem{gilbert} E.~N.~Gilbert, ``Capacity of a burst-noise channel,''
+\emph{Bell System Technical Journal}, 39(5):1253--1265, 1960.
+\bibitem{elliott} E.~O.~Elliott, ``Estimates of error rates for codes on
+burst-noise channels,'' \emph{Bell System Technical Journal},
+42(5):1977--1997, 1963.
+\bibitem{reedsolomon} I.~S.~Reed and G.~Solomon, ``Polynomial codes over certain
+finite fields,'' \emph{J.\ SIAM}, 8(2):300--304, 1960.
+\bibitem{raptorq} M.~Luby et al., \emph{RaptorQ Forward Error Correction Scheme
+for Object Delivery}, RFC~6330, IETF, 2011.
+\bibitem{tetrys} J.~Detchart, E.~Lochin, J.~Lacan, V.~Roca, \emph{Tetrys: An
+On-the-Fly Network Coding Protocol}, RFC~9407, IETF, 2023.
+\bibitem{quic} J.~Iyengar and M.~Thomson (eds.), \emph{QUIC: A UDP-Based
+Multiplexed and Secure Transport}, RFC~9000, IETF, 2021.
+\bibitem{quicrecovery} J.~Iyengar and I.~Swett (eds.), \emph{QUIC Loss Detection
+and Congestion Control}, RFC~9002, IETF, 2021.
+\bibitem{ledbat} S.~Shalunov et al., \emph{Low Extra Delay Background Transport
+(LEDBAT)}, RFC~6817, IETF, 2012.
+\bibitem{mptcp} A.~Ford, C.~Raiciu, M.~Handley, O.~Bonaventure, C.~Paasch,
+\emph{TCP Extensions for Multipath Operation with Multiple Addresses}, RFC~8684,
+IETF, 2020.
+\bibitem{tlaplus} L.~Lamport, \emph{Specifying Systems}, Addison-Wesley, 2002.
+\end{thebibliography}
 
 \end{document}

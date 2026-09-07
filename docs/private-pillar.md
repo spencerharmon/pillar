@@ -2,11 +2,15 @@
 
 Pillar ships with a **public default swarm**: a well-known, published swarm
 key baked into every binary (`pillar_swarm::PUBLIC_PILLAR_ROOT`) plus
-well-known public seed nodes baked in as `pillar_swarm::PUBLIC_PILLAR_SEEDS`
-(DNS anchors at pillar's own public infrastructure, `pillar-rs.net`). A fresh
-node with no `--swarm-key` and no `--seed-node` joins the public swarm with
-zero configuration — it derives the public pnet key and bootstraps the public
-Kademlia DHT straight from those baked anchors. Membership is open, and
+well-known public seed **anchors** baked in as `pillar_swarm::PUBLIC_PILLAR_SEEDS`
+(libp2p `/dnsaddr/seed.pillar-rs.net` bootstrap addresses at pillar's own
+public infrastructure). A fresh node with no `--swarm-key` and no `--seed-node`
+joins the public swarm with zero configuration — it derives the public pnet key
+and bootstraps the public Kademlia DHT from those anchors. The anchors carry
+**no peer id**; the peer id lives in the operator-managed
+`_dnsaddr.seed.pillar-rs.net` DNS TXT record (the IPFS/libp2p bootstrap
+convention), which pillar's DNS transport resolves at runtime — so seed nodes
+rotate by editing a TXT record, never a pillar release. Membership is open, and
 authority within that federation is gated by the PGP Web of Trust (WoT), not
 by network membership. The public key provides **namespace isolation, not
 secrecy**: it keeps pillar's public swarm from co-mingling with unrelated
@@ -176,9 +180,19 @@ Alongside the swarm key and seeds, every node also takes:
 | `--identity-key` | `PILLAR_IDENTITY_KEY` | `<data-dir>/identity.key` |
 | `--data-dir` | `PILLAR_DATA_DIR` | `./pillar-data` |
 | `--listen` (repeatable) | `PILLAR_LISTEN` (comma/space list) | `/ip4/0.0.0.0/tcp/0` |
+| `--upnp` (flag) | `PILLAR_UPNP` (truthy) | off |
 
 These are unrelated to the private/public network decision and are set the
 same way regardless of which swarm you configure.
+
+`--upnp` asks the local gateway (via UPnP/NAT-PMP) to forward this node's
+listen ports and advertises the resulting public address through `identify`,
+so a node behind a home NAT becomes publicly dialable — the same gateway path
+WireGuard uses. A **public seed** running behind a residential router sets
+`--upnp` and a FIXED listen port (e.g. `--listen /ip4/0.0.0.0/tcp/4001`) so
+its public address is stable enough to name in a `_dnsaddr` TXT record. If no
+UPnP-capable gateway is found the node logs it and keeps running (it is simply
+not auto-mapped); a directly reachable node does not need `--upnp`.
 
 ## Per-primitive worked examples
 
