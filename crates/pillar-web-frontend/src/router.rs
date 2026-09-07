@@ -45,6 +45,16 @@ pub enum Route {
     /// Workload / resource inventory + lifecycle.
     #[cfg_attr(feature = "yew", at("/resources"))]
     Resources,
+    /// The per-resource detail page (Overview/Manifest/Logs/Exec/Events tabs
+    /// over `crate::resources_console::ResourceDetailPage`) — a real,
+    /// deep-linkable route distinct from the inventory grid's drawer.
+    #[cfg_attr(feature = "yew", at("/resources/:kind/:id"))]
+    ResourceDetail {
+        /// The resource kind path segment.
+        kind: String,
+        /// The resource name path segment.
+        id: String,
+    },
     /// The five-signal observability console.
     #[cfg_attr(feature = "yew", at("/observability"))]
     Observability,
@@ -88,6 +98,7 @@ impl Route {
             self,
             Route::Overview
                 | Route::Resources
+                | Route::ResourceDetail { .. }
                 | Route::Observability
                 | Route::Topology
                 | Route::Identity
@@ -118,6 +129,9 @@ impl Route {
             Route::Swarm => Section::Swarm,
             Route::Inbox => Section::Inbox,
             Route::Home | Route::Login | Route::NotFound => return None,
+            // The detail page is not a `Section` — it renders its own page
+            // directly (see `guarded` below), not the `ConsoleView` frame.
+            Route::ResourceDetail { .. } => return None,
         })
     }
 }
@@ -161,6 +175,14 @@ fn guarded(props: &GuardedProps) -> Html {
     match effective {
         Route::Login => html! { <LoginPanel /> },
         Route::NotFound => html! { <p>{ "not found" }</p> },
+        // The resource detail page is a real registered route, mounted
+        // directly (not via `ConsoleView`'s `Section` dispatch) so
+        // `crate::resources_console::ResourceDetailPage` is reachable at
+        // `/resources/:kind/:id` from a plain deep link, not only the
+        // inventory drawer.
+        Route::ResourceDetail { kind, id } => {
+            html! { <crate::resources_console::ResourceDetailPage kind={kind} id={id} /> }
+        }
         // `Home` (and any route that resolved to `Login` above) — the public
         // landing / entry surface.
         _ => html! { <PortalEntry /> },
@@ -199,6 +221,58 @@ pub fn shell() -> Html {
 mod tests {
     use super::*;
     use crate::auth::{reduce, AuthAction};
+
+    #[test]
+    fn resource_detail_route_requires_auth_and_is_not_a_console_section() {
+        let route = Route::ResourceDetail {
+            kind: "Workload".to_owned(),
+            id: "web".to_owned(),
+        };
+        assert!(route.requires_auth());
+        // It renders its own page directly (see `guarded`), not a `Section`.
+        assert_eq!(route.section(), None);
+        let session = AuthSession::default();
+        assert_eq!(guard(route, &session), Route::Login);
+    }
+
+    #[test]
+    fn authenticated_resource_detail_route_preserves_its_kind_and_id() {
+        let session = reduce(
+            &AuthSession::default(),
+            AuthAction::LoginSuccess {
+                user: "alice".to_string(),
+                token: "tok-123".to_string(),
+            },
+        );
+        let route = Route::ResourceDetail {
+            kind: "Workload".to_owned(),
+            id: "web".to_owned(),
+        };
+        assert_eq!(guard(route.clone(), &session), route);
+    }
+
+    /// Mount-audit (anti-facade DoD): the ROI's `/resources/:kind/:id` detail
+    /// route must be a REAL registered route dispatching to a real component —
+    /// not a `Section` shim only reachable from the drawer. This file's
+    /// `guarded` match arm mounts `crate::resources_console::ResourceDetailPage`
+    /// directly off `Route::ResourceDetail`; assert that reference on this
+    /// module's own source so a future edit can never silently drop the mount.
+    #[test]
+    fn router_mounts_the_resource_detail_page_off_a_real_route() {
+        let src = include_str!("router.rs");
+        assert!(
+            src.contains(r#"at("/resources/:kind/:id")"#),
+            "router.rs no longer registers the /resources/:kind/:id route"
+        );
+        assert!(
+            src.contains("crate::resources_console::ResourceDetailPage"),
+            "router.rs no longer references ResourceDetailPage"
+        );
+        assert!(
+            src.contains("<crate::resources_console::ResourceDetailPage"),
+            "router.rs no longer mounts ResourceDetailPage from a route"
+        );
+    }
 
     #[test]
     fn unauthenticated_navigation_to_protected_route_redirects_to_login() {
