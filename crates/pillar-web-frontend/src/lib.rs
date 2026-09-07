@@ -25,10 +25,10 @@ pub mod panels;
 pub mod portal;
 pub mod portal_entry;
 pub mod primitives;
-pub mod resources_console;
-pub mod router;
+pub mod resources_console;pub mod router;
 pub mod styles;
 pub mod theme;
+pub mod topology_console;
 pub mod webauthn;
 
 #[cfg(feature = "yew")]

@@ -446,7 +446,7 @@ pub(crate) use yew_impl::{http, input_value};
 #[cfg(feature = "yew")]
 pub(crate) use yew_impl::{
     IdentityTile, InboxTile, MembersTile, NodeStatusTile, ObservabilityTile, SessionsTile,
-    SwarmTile, TopologyTile, TrustTile,
+    SwarmTile,
 };
 
 #[cfg(feature = "yew")]

@@ -527,6 +527,14 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .res-change h4 {{ margin: 0.9rem 0 0.4rem; }}
         .res-verdict {{ display: flex; align-items: center; gap: 0.75rem; margin: 0.75rem 0; }}
 
+        /* ---- node-link graph (trust) ---- */
+        .ds-graph {{ width: 100%; height: auto; max-height: 60vh; display: block; }}
+        .ds-graph__edge {{ stroke: {border}; stroke-width: 1.2; }}
+        .ds-graph__arrow {{ fill: {muted}; }}
+        .ds-graph__node {{ fill: {accent}; stroke: {surface_base}; stroke-width: 2; }}
+        .ds-graph__nlabel {{ fill: {text}; font-size: 11px; text-anchor: middle; }}
+        .ds-graph__elabel {{ fill: {muted}; font-size: 9px; text-anchor: middle; }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{

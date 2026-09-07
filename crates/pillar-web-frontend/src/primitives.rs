@@ -280,6 +280,31 @@ pub fn status_tone(status: &str) -> Tone {
 }
 
 // ---------------------------------------------------------------------------
+// Graph layout (pure)
+// ---------------------------------------------------------------------------
+
+/// Lay out `n` nodes evenly on a circle centered at `(cx, cy)` with radius `r`,
+/// starting at the top (12 o'clock) and going clockwise. A single node sits at
+/// the center; zero nodes yields an empty layout. Used by the node-link graph
+/// (trust graph) so the geometry is host-testable without a browser.
+#[must_use]
+pub fn circle_layout(n: usize, cx: f64, cy: f64, r: f64) -> Vec<(f64, f64)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![(cx, cy)];
+    }
+    (0..n)
+        .map(|i| {
+            let theta =
+                -std::f64::consts::FRAC_PI_2 + (i as f64) * std::f64::consts::TAU / (n as f64);
+            (cx + r * theta.cos(), cy + r * theta.sin())
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Line diff (pure)
 // ---------------------------------------------------------------------------
 
@@ -349,8 +374,8 @@ pub use yew_impl::*;
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::{
-        area_path, bar_rects, chart_coords, diff_lines, polyline_points, status_tone, table_order,
-        ChartBox, DiffKind, Tone,
+        area_path, bar_rects, chart_coords, circle_layout, diff_lines, polyline_points,
+        status_tone, table_order, ChartBox, DiffKind, Tone,
     };
     use yew::prelude::*;
 
@@ -740,6 +765,72 @@ mod yew_impl {
             </li>
         }
     }
+
+    /// One edge of a [`Graph`]: endpoint node indices plus a label.
+    #[derive(Clone, PartialEq)]
+    pub struct GraphEdge {
+        /// Index into the `nodes` vec of the source.
+        pub from: usize,
+        /// Index into the `nodes` vec of the target.
+        pub to: usize,
+        /// The edge label (e.g. the trust relation).
+        pub label: String,
+    }
+
+    /// Props for [`Graph`].
+    #[derive(Properties, PartialEq)]
+    pub struct GraphProps {
+        /// Node labels; positions are derived by [`circle_layout`].
+        pub nodes: Vec<String>,
+        /// Directed, labeled edges between nodes.
+        pub edges: Vec<GraphEdge>,
+    }
+
+    /// A dependency-free node-link graph on a circular layout: edges as lines
+    /// (with an arrowhead marker), nodes as labeled dots. The layout math is the
+    /// host-tested [`circle_layout`].
+    #[function_component(Graph)]
+    pub fn graph(props: &GraphProps) -> Html {
+        let (w, h) = (520.0_f64, 360.0_f64);
+        if props.nodes.is_empty() {
+            return html! { <p class="ds-empty">{ "No edges to graph." }</p> };
+        }
+        let pos = circle_layout(props.nodes.len(), w / 2.0, h / 2.0, h / 2.0 - 48.0);
+        let vb = format!("0 0 {w} {h}");
+        html! {
+            <svg class="ds-graph" viewBox={vb} role="img">
+                <defs>
+                    <marker id="ds-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z" class="ds-graph__arrow" />
+                    </marker>
+                </defs>
+                { for props.edges.iter().filter_map(|e| {
+                    let (a, b) = (pos.get(e.from)?, pos.get(e.to)?);
+                    let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+                    Some(html! {
+                        <>
+                            <line class="ds-graph__edge" x1={a.0.to_string()} y1={a.1.to_string()}
+                                  x2={b.0.to_string()} y2={b.1.to_string()} marker-end="url(#ds-arrow)" />
+                            <text class="ds-graph__elabel" x={mx.to_string()} y={my.to_string()}>
+                                { &e.label }
+                            </text>
+                        </>
+                    })
+                }) }
+                { for props.nodes.iter().enumerate().map(|(i, label)| {
+                    let (x, y) = pos[i];
+                    html! {
+                        <>
+                            <circle class="ds-graph__node" cx={x.to_string()} cy={y.to_string()} r="7" />
+                            <text class="ds-graph__nlabel" x={x.to_string()}
+                                  y={(y - 12.0).to_string()}>{ label }</text>
+                        </>
+                    }
+                }) }
+            </svg>
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +956,22 @@ mod tests {
         assert!(d.iter().all(|(k, _)| *k == DiffKind::Same));
     }
 
+    #[test]
+    fn circle_layout_places_nodes_on_the_ring() {
+        assert!(circle_layout(0, 0.0, 0.0, 10.0).is_empty());
+        // one node sits at the center.
+        assert_eq!(circle_layout(1, 5.0, 6.0, 10.0), vec![(5.0, 6.0)]);
+        // first of many starts at 12 o'clock: same x as center, y = cy - r.
+        let p = circle_layout(4, 0.0, 0.0, 10.0);
+        assert_eq!(p.len(), 4);
+        assert!((p[0].0 - 0.0).abs() < 1e-9);
+        assert!((p[0].1 - -10.0).abs() < 1e-9);
+        // every node is at radius r from the center.
+        for (x, y) in p {
+            assert!(((x * x + y * y).sqrt() - 10.0).abs() < 1e-9);
+        }
+    }
+
     /// Mount-audit guard (anti-facade DoD): the global stylesheet must carry the
     /// primitives' CSS classes, so a primitive rendered in a mounted view is
     /// actually styled rather than silently orphaned.
@@ -881,6 +988,7 @@ mod tests {
             ".ds-code",
             ".ds-diff",
             ".ds-tree",
+            ".ds-graph",
         ] {
             assert!(css.contains(class), "global sheet missing {class}");
         }

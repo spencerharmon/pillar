@@ -177,10 +177,10 @@ mod yew_impl {
     use crate::obs_console::ObservabilityConsole;
     use crate::portal::{
         IdentityTile, InboxTile, MembersTile, NodeStatusTile, SessionsTile, SwarmTile,
-        TopologyTile, TrustTile,
     };
     use crate::resources_console::ResourcesConsole;
     use crate::router::Route;
+    use crate::topology_console::{TopologyConsole, TrustGraphConsole};
     use yew::prelude::*;
     use yew_router::prelude::*;
 
@@ -285,11 +285,11 @@ mod yew_impl {
             },
             Section::Resources => html! { <ResourcesConsole /> },
             Section::Observability => html! { <ObservabilityConsole /> },
-            Section::Topology => html! { <TopologyTile /> },
+            Section::Topology => html! { <TopologyConsole /> },
             Section::Identity => html! { <IdentityTile /> },
             Section::Members => html! { <MembersTile /> },
             Section::Sessions => html! { <SessionsTile /> },
-            Section::Trust => html! { <TrustTile /> },
+            Section::Trust => html! { <TrustGraphConsole /> },
             Section::Swarm => html! { <SwarmTile /> },
             Section::Inbox => html! { <InboxTile /> },
         }
