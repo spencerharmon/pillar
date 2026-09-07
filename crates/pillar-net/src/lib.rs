@@ -36,6 +36,12 @@ use libp2p::{
 
 pub mod pillar_udp;
 
+pub mod pillar_udp_posture;
+pub use pillar_udp_posture::{
+    classify_reply_tier, select_preferred_transport, ClientConnectionSet, IngestNode,
+    PeerAvailability, ReplyPathTier, TransportChoiceReason, TransportSelection,
+};
+
 pub mod wire_surface;
 pub use wire_surface::{registered_wire_ops, WireOp, WireOpRegistry};
 
