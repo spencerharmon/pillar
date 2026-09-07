@@ -397,6 +397,144 @@ impl AntiAmplificationGate {
     }
 }
 
+/// A measured per-path link signal, as reported by the reliability mesh.
+///
+/// This is the raw quantitative input the dynamic-redundancy controller
+/// consumes — the same measured signal `select_transport` classifies into a
+/// coarse [`LinkQuality`], but kept numeric here so redundancy can scale
+/// *continuously* with conditions rather than snap between discrete modes. A
+/// clean cheap path reports a near-zero `loss` and low `latency`; a hostile one
+/// reports a high `loss` and/or `latency`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PathSignal {
+    /// Measured packet-loss fraction on this path, in `[0.0, 1.0]`.
+    pub loss: f64,
+    /// Measured one-way latency on this path, in milliseconds.
+    pub latency_ms: f64,
+}
+
+impl PathSignal {
+    /// A pristine path: zero measured loss, zero latency. The controller
+    /// collapses redundancy toward a single copy for such a path.
+    pub const PRISTINE: PathSignal = PathSignal {
+        loss: 0.0,
+        latency_ms: 0.0,
+    };
+
+    /// A measured path signal, clamping `loss` into `[0.0, 1.0]` and a negative
+    /// `latency_ms` up to `0.0` so a bogus report can never drive a negative or
+    /// out-of-range redundancy pressure.
+    #[must_use]
+    pub fn new(loss: f64, latency_ms: f64) -> Self {
+        PathSignal {
+            loss: loss.clamp(0.0, 1.0),
+            latency_ms: latency_ms.max(0.0),
+        }
+    }
+
+    /// The normalized `[0.0, 1.0]` redundancy PRESSURE this signal warrants:
+    /// `0.0` on a pristine path (one copy is enough), rising toward `1.0` as
+    /// measured loss and latency climb. Loss dominates (it directly defeats a
+    /// single copy); latency contributes a smaller term (a high-RTT path
+    /// benefits from spraying rather than serializing retransmit rounds).
+    ///
+    /// `latency_ref_ms` is the latency at which the latency term saturates
+    /// (a per-connection tuning constant); a `<= 0` reference disables the
+    /// latency term entirely.
+    #[must_use]
+    pub fn pressure(&self, latency_ref_ms: f64) -> f64 {
+        let loss_term = self.loss; // already in [0,1]
+        let lat_term = if latency_ref_ms > 0.0 {
+            (self.latency_ms / latency_ref_ms).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Loss is the primary driver (weight 1.0); latency is a secondary
+        // nudge (weight 0.5). The combined pressure is clamped to [0,1] so it
+        // can never push redundancy past the allowance ceiling.
+        (loss_term + 0.5 * lat_term).clamp(0.0, 1.0)
+    }
+}
+
+/// A per-connection redundancy controller: redundancy is the DEFAULT delivery
+/// posture on EVERY link, dynamically bounded to what measured conditions
+/// warrant, never a fallback engaged only on a known-bad link.
+///
+/// Unlike a single-connection congestion window (TCP/QUIC) that reads loss as
+/// congestion and THROTTLES one path, this controller treats the whole cell as
+/// the congestion-handling resource: the measured loss/latency signal
+/// REALLOCATES redundancy (more copies, spread across dispersed paths) rather
+/// than shrinking a window. A clean cheap path collapses toward a SINGLE copy
+/// (`floor`, default 1) so a healthy link pays little; a hostile path scales
+/// UP toward — but NEVER past — the config `ceiling`, so a bad link is still
+/// covered while the per-connection [`BoundedTotalDatagrams`] allowance
+/// (`specs/PillarUDP.tla`) is preserved by construction.
+///
+/// The `ceiling` IS the declared per-connection redundancy allowance; the
+/// controller guarantees `floor <= copies(signal) <= ceiling` for every
+/// possible signal, so no dynamic scaling can ever exceed the allowance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RedundancyController {
+    /// The minimum copy count on a pristine path (the default single-copy
+    /// posture). Always `>= 1` — a message is always sent at least once.
+    floor: u32,
+    /// The config-bounded per-connection redundancy allowance: the maximum
+    /// copies any spray round may use, NEVER exceeded (BoundedTotalDatagrams).
+    ceiling: u32,
+    /// Latency (ms) at which the latency pressure term saturates.
+    latency_ref_ms: f64,
+}
+
+impl RedundancyController {
+    /// A controller with the given single-copy `floor` (raised to at least 1)
+    /// and config redundancy-allowance `ceiling` (raised to at least the
+    /// floor). `latency_ref_ms` sets where the latency pressure term saturates
+    /// (`<= 0` disables the latency term, making redundancy loss-driven only).
+    #[must_use]
+    pub fn new(floor: u32, ceiling: u32, latency_ref_ms: f64) -> Self {
+        let floor = floor.max(1);
+        let ceiling = ceiling.max(floor);
+        RedundancyController {
+            floor,
+            ceiling,
+            latency_ref_ms,
+        }
+    }
+
+    /// The config-bounded per-connection redundancy allowance (the ceiling).
+    #[must_use]
+    pub fn allowance(&self) -> u32 {
+        self.ceiling
+    }
+
+    /// The single-copy floor (the default posture on a pristine path).
+    #[must_use]
+    pub fn floor(&self) -> u32 {
+        self.floor
+    }
+
+    /// The redundancy copy count this measured path signal warrants.
+    ///
+    /// Interpolates linearly from `floor` (at zero pressure — a pristine path)
+    /// to `ceiling` (at full pressure — a maximally hostile path) using the
+    /// normalized pressure from [`PathSignal::pressure`]. The result is ALWAYS
+    /// in `[floor, ceiling]`:
+    /// - a clean cheap path yields `floor` (a single copy by default), so a
+    ///   healthy link pays almost nothing;
+    /// - rising loss/latency scales copies up toward the allowance;
+    /// - the count can NEVER exceed `ceiling`, preserving the per-connection
+    ///   BoundedTotalDatagrams allowance regardless of how bad the signal is.
+    #[must_use]
+    pub fn copies(&self, signal: PathSignal) -> u32 {
+        let p = signal.pressure(self.latency_ref_ms);
+        let span = f64::from(self.ceiling - self.floor);
+        // Round to nearest so a mid-pressure path gets a representative count;
+        // clamp defensively even though pressure ∈ [0,1] guarantees the range.
+        let extra = (p * span).round() as u32;
+        (self.floor + extra).clamp(self.floor, self.ceiling)
+    }
+}
+
 /// One erasure-coded shard of a bulk message.
 ///
 /// The message is split into `k` data shards; `m` parity shards are the XOR of
