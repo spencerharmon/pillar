@@ -345,6 +345,82 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
             }}
         }}
 
+        /* ---- Observability console: tabs, stat cards, panels ---- */
+        .obs-tabs {{
+            display: flex;
+            gap: 0.25rem;
+            flex-wrap: wrap;
+            border-bottom: 1px solid {border};
+            margin: 0.5rem 0 1rem;
+        }}
+        .obs-tab {{
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: {muted};
+            padding: 0.45rem 0.7rem;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: {transition};
+        }}
+        .obs-tab:hover {{ color: {text}; }}
+        .obs-tab.is-active {{ color: {text}; border-bottom-color: {accent}; }}
+        .obs-statgrid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 0.75rem;
+        }}
+        .obs-stat {{
+            background-color: {surface_raised};
+            border: 1px solid {border};
+            border-radius: {radius};
+            padding: 0.9rem 1rem;
+            box-shadow: {shadow_resting};
+        }}
+        .obs-stat__value {{ font-size: 1.6rem; font-weight: 700; color: {text}; letter-spacing: -0.02em; }}
+        .obs-stat__label {{ font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: {muted}; margin-top: 0.2rem; }}
+        .obs-subpanel {{ display: flex; flex-direction: column; gap: 0.6rem; }}
+        .obs-subpanel input, .obs-subpanel select, .obs-spec {{
+            background-color: {surface_base};
+            border: 1px solid {border};
+            border-radius: {radius};
+            color: {text};
+            padding: 0.45rem 0.6rem;
+            font-size: 0.9rem;
+        }}
+        .obs-spec {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; }}
+        .obs-run {{ align-self: flex-start; }}
+        .obs-panel {{
+            margin-top: 0.75rem;
+            padding: 0.85rem;
+            background-color: {surface_base};
+            border: 1px solid {border};
+            border-radius: {radius};
+        }}
+        .obs-panel h4 {{ margin: 0 0 0.5rem; font-size: 0.95rem; color: {text}; }}
+        .obs-table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+        .obs-table th, .obs-table td {{
+            text-align: left;
+            padding: 0.35rem 0.5rem;
+            border-bottom: 1px solid {border};
+            vertical-align: top;
+        }}
+        .obs-table th {{ color: {muted}; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; }}
+        .obs-payload {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-word; }}
+        .obs-results {{ list-style: none; margin: 0.5rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.2rem; }}
+        .obs-results li {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.82rem;
+            padding: 0.3rem 0.45rem;
+            border-radius: 6px;
+            background-color: {surface_raised};
+            border: 1px solid {border};
+            word-break: break-word;
+        }}
+        .obs-empty {{ color: {muted}; font-size: 0.85rem; }}
+        .obs-msg {{ font-size: 0.85rem; color: {muted}; }}
+        .obs-msg.is-error {{ color: #f87171; }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{

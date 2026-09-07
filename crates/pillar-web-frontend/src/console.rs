@@ -174,8 +174,9 @@ pub use yew_impl::ConsoleView;
 mod yew_impl {
     use super::{NavGroup, Section};
     use crate::auth::{use_auth, AuthAction};
+    use crate::obs_console::ObservabilityConsole;
     use crate::portal::{
-        IdentityTile, InboxTile, MembersTile, NodeStatusTile, ObservabilityTile, ResourceTile,
+        IdentityTile, InboxTile, MembersTile, NodeStatusTile, ResourceTile,
         SessionsTile, SwarmTile, TopologyTile, TrustTile,
     };
     use crate::router::Route;
@@ -282,7 +283,7 @@ mod yew_impl {
                 </>
             },
             Section::Resources => html! { <ResourceTile /> },
-            Section::Observability => html! { <ObservabilityTile /> },
+            Section::Observability => html! { <ObservabilityConsole /> },
             Section::Topology => html! { <TopologyTile /> },
             Section::Identity => html! { <IdentityTile /> },
             Section::Members => html! { <MembersTile /> },

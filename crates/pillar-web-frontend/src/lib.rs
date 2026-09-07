@@ -20,6 +20,7 @@ pub mod console;
 pub mod dashboard;
 pub mod drilldown;
 pub mod explore;
+pub mod obs_console;
 pub mod panels;
 pub mod portal;
 pub mod portal_entry;
