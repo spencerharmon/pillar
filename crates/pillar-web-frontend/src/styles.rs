@@ -252,6 +252,99 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         }}
         [data-role="run-query"] {{ align-self: flex-start; }}
 
+        /* ---- Console shell: sidebar + topbar frame ---- */
+        .console {{
+            display: grid;
+            grid-template-columns: 240px 1fr;
+            min-height: 100vh;
+            align-items: stretch;
+        }}
+        .console-sidebar {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            padding: 1rem 0.75rem;
+            background-color: {surface_raised};
+            border-right: 1px solid {border};
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
+        }}
+        .console-brand {{
+            font-weight: 700;
+            font-size: 1.1rem;
+            letter-spacing: -0.02em;
+            color: {text};
+            padding: 0.25rem 0.6rem 0.75rem;
+        }}
+        .console-navgroup {{ display: flex; flex-direction: column; gap: 0.1rem; margin-top: 0.5rem; }}
+        .console-navgroup__label {{
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: {muted};
+            padding: 0.35rem 0.6rem 0.2rem;
+        }}
+        .console-navlink {{
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            padding: 0.45rem 0.6rem;
+            border-radius: {radius};
+            color: {text};
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: {transition};
+        }}
+        .console-navlink:hover {{ background-color: {surface_overlay}; text-decoration: none; }}
+        .console-navlink.is-active {{
+            background-color: {accent};
+            color: #fff;
+            box-shadow: 0 0 0 1px {glow};
+        }}
+        .console-navlink__glyph {{
+            width: 1.2rem;
+            text-align: center;
+            opacity: 0.9;
+            font-size: 0.95rem;
+        }}
+        .console-main {{ display: flex; flex-direction: column; min-width: 0; }}
+        .console-topbar {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.85rem 1.5rem;
+            background-color: {surface_base};
+            border-bottom: 1px solid {border};
+            position: sticky;
+            top: 0;
+            z-index: 5;
+        }}
+        .console-crumb {{ font-weight: 650; font-size: 1.05rem; color: {text}; }}
+        .console-topbar__right {{ display: flex; align-items: center; gap: 1rem; }}
+        .console-who {{ color: {muted}; font-size: 0.85rem; }}
+        .console-content {{
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+            max-width: 1200px;
+            width: 100%;
+        }}
+        @media (max-width: 780px) {{
+            .console {{ grid-template-columns: 1fr; }}
+            .console-sidebar {{
+                position: static;
+                height: auto;
+                flex-direction: row;
+                flex-wrap: wrap;
+                border-right: none;
+                border-bottom: 1px solid {border};
+            }}
+        }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{

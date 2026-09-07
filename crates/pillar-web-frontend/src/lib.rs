@@ -16,6 +16,7 @@
 //! classes, so the visual language is defined exactly once.
 
 pub mod auth;
+pub mod console;
 pub mod dashboard;
 pub mod drilldown;
 pub mod explore;
@@ -31,6 +32,7 @@ pub mod webauthn;
 pub mod components;
 
 pub use auth::{AuthAction, AuthSession};
+pub use console::{NavGroup, Section};
 pub use dashboard::{render_panel_persisted, CellId, Dashboard, Panel, PeerId};
 pub use explore::{
     build_log_query, build_metadata_query, build_metric_query, build_profile_query,
@@ -46,6 +48,8 @@ pub use webauthn::{authenticate, register, CeremonyError, CredentialCeremony, Rp
 
 #[cfg(feature = "yew")]
 pub use auth::{use_auth, AuthContext, AuthProvider};
+#[cfg(feature = "yew")]
+pub use console::ConsoleView;
 #[cfg(feature = "yew")]
 pub use explore::{
     ExploreBuilder, ExploreBuilderProps, ExploreLogsBuilder, ExploreMetadataBuilder,
