@@ -120,5 +120,13 @@ gloo-net = { version = "0.4", optional = true }
 # base64url encode/decode for the RP's wire challenge/credential fields.
 base64 = { version = "0.22", optional = true }
 
+[dev-dependencies]
+# NATIVE-only (never wasm32): pins the command palette's manifest-kind
+# commands (`crate::command_palette::resource_commands`) against the SAME
+# canonical, registry-driven emitter `pillar-integration`'s conformance rig
+# and `GET /surface-inventory` serve — so the palette action list can never
+# silently drift into a hand-maintained duplicate of the real surface.
+pillar-surface-inventory = { path = "../pillar-surface-inventory" }
+
 [lints]
 workspace = true

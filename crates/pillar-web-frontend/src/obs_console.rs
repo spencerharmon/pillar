@@ -149,7 +149,10 @@ mod yew_impl {
         recording_request_body, DashPanel, KindCount,
     };
     use crate::auth::use_auth;
-    use crate::components::data_table::{Column, DataTable};
+    use crate::components::{
+        data_table::{Column, DataTable},
+        use_toast_error,
+    };
     use crate::drilldown::DrilldownPanel;
     use crate::drilldown_live::{build_drilldowns, parse_correlate_response};
     use crate::portal::{get_url, http, input_value, ObservabilityTile};
@@ -199,18 +202,21 @@ mod yew_impl {
         let auth = use_auth();
         let tab = use_state(|| Tab::Overview);
         let counts = use_state(Vec::<KindCount>::new);
+        let toast_error = use_toast_error();
 
         // Load the live per-kind counts on mount / token change.
         {
-            let (auth, counts) = (auth.clone(), counts.clone());
+            let (auth, counts, toast_error) = (auth.clone(), counts.clone(), toast_error.clone());
             use_effect_with(auth.token.clone(), move |token| {
                 if let Some(token) = token.clone() {
-                    let counts = counts.clone();
+                    let (counts, toast_error) = (counts.clone(), toast_error.clone());
                     let url = get_url("/portal/obs/live/kinds", &token, &[]);
                     spawn_local(async move {
-                        if let Ok(r) = http("GET", &url, None).await {
-                            if r.ok() {
-                                counts.set(parse_kind_counts(&r.body));
+                        match http("GET", &url, None).await {
+                            Ok(r) if r.ok() => counts.set(parse_kind_counts(&r.body)),
+                            Ok(_) => {}
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't load live signal counts: {e:?}"))
                             }
                         }
                     });
@@ -285,20 +291,26 @@ mod yew_impl {
         let query = use_state(|| "correlate: metric".to_owned());
         let drills = use_state(Vec::new);
         let msg = use_state(|| None::<String>);
+        let toast_error = use_toast_error();
 
         let on_query = {
             let query = query.clone();
             Callback::from(move |e: InputEvent| query.set(input_value(&e)))
         };
         let run = {
-            let (auth, query, drills, msg) =
-                (auth.clone(), query.clone(), drills.clone(), msg.clone());
+            let (auth, query, drills, msg, toast_error) = (
+                auth.clone(),
+                query.clone(),
+                drills.clone(),
+                msg.clone(),
+                toast_error.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
                 let Some(token) = auth.token.clone() else {
                     return;
                 };
                 let body = format!("{token}\n{}", *query);
-                let (drills, msg) = (drills.clone(), msg.clone());
+                let (drills, msg, toast_error) = (drills.clone(), msg.clone(), toast_error.clone());
                 spawn_local(async move {
                     match http("POST", "/portal/obs/live/query", Some(&body)).await {
                         Ok(r) if r.ok() => {
@@ -313,7 +325,10 @@ mod yew_impl {
                             drills.set(built);
                         }
                         Ok(r) => msg.set(Some(r.body.trim().to_owned())),
-                        Err(_) => msg.set(Some("request failed".to_owned())),
+                        Err(e) => {
+                            msg.set(Some("request failed".to_owned()));
+                            toast_error.emit(format!("Drilldown query failed: {e:?}"));
+                        }
                     }
                 });
             })
@@ -347,18 +362,20 @@ mod yew_impl {
         let panels = use_state(Vec::<DashPanel>::new);
         let msg = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
+        let toast_error = use_toast_error();
 
         let on_spec = {
             let spec = spec.clone();
             Callback::from(move |e: InputEvent| spec.set(input_value(&e)))
         };
         let materialize = {
-            let (auth, spec, panels, msg, busy) = (
+            let (auth, spec, panels, msg, busy, toast_error) = (
                 auth.clone(),
                 spec.clone(),
                 panels.clone(),
                 msg.clone(),
                 busy.clone(),
+                toast_error.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 if *busy {
@@ -368,7 +385,12 @@ mod yew_impl {
                     return;
                 };
                 let body = dashboard_request_body(&token, &spec);
-                let (panels, msg, busy) = (panels.clone(), msg.clone(), busy.clone());
+                let (panels, msg, busy, toast_error) = (
+                    panels.clone(),
+                    msg.clone(),
+                    busy.clone(),
+                    toast_error.clone(),
+                );
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/obs/live/dashboard", Some(&body)).await {
@@ -377,7 +399,10 @@ mod yew_impl {
                             msg.set(None);
                         }
                         Ok(r) => msg.set(Some((r.body.trim().to_owned(), false))),
-                        Err(_) => msg.set(Some(("request failed".to_owned(), false))),
+                        Err(e) => {
+                            msg.set(Some(("request failed".to_owned(), false)));
+                            toast_error.emit(format!("Dashboard materialize failed: {e:?}"));
+                        }
                     }
                     busy.set(false);
                 });
@@ -448,12 +473,13 @@ mod yew_impl {
         let result = use_state(Vec::<String>::new);
         let msg = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
+        let toast_error = use_toast_error();
 
         let field = |st: UseStateHandle<String>| {
             Callback::from(move |e: InputEvent| st.set(input_value(&e)))
         };
         let run = {
-            let (auth, id, kind, psl, emit, result, msg, busy) = (
+            let (auth, id, kind, psl, emit, result, msg, busy, toast_error) = (
                 auth.clone(),
                 id.clone(),
                 kind.clone(),
@@ -462,6 +488,7 @@ mod yew_impl {
                 result.clone(),
                 msg.clone(),
                 busy.clone(),
+                toast_error.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 if *busy {
@@ -471,7 +498,12 @@ mod yew_impl {
                     return;
                 };
                 let body = recording_request_body(&token, &id, &kind, &psl, &emit);
-                let (result, msg, busy) = (result.clone(), msg.clone(), busy.clone());
+                let (result, msg, busy, toast_error) = (
+                    result.clone(),
+                    msg.clone(),
+                    busy.clone(),
+                    toast_error.clone(),
+                );
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/obs/live/recording", Some(&body)).await {
@@ -480,7 +512,10 @@ mod yew_impl {
                             msg.set(None);
                         }
                         Ok(r) => msg.set(Some((r.body.trim().to_owned(), false))),
-                        Err(_) => msg.set(Some(("request failed".to_owned(), false))),
+                        Err(e) => {
+                            msg.set(Some(("request failed".to_owned(), false)));
+                            toast_error.emit(format!("Recording rule failed: {e:?}"));
+                        }
                     }
                     busy.set(false);
                 });
@@ -527,12 +562,13 @@ mod yew_impl {
         let result = use_state(Vec::<String>::new);
         let msg = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
+        let toast_error = use_toast_error();
 
         let field = |st: UseStateHandle<String>| {
             Callback::from(move |e: InputEvent| st.set(input_value(&e)))
         };
         let run = {
-            let (auth, id, psl, op, threshold, result, msg, busy) = (
+            let (auth, id, psl, op, threshold, result, msg, busy, toast_error) = (
                 auth.clone(),
                 id.clone(),
                 psl.clone(),
@@ -541,6 +577,7 @@ mod yew_impl {
                 result.clone(),
                 msg.clone(),
                 busy.clone(),
+                toast_error.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 if *busy {
@@ -550,7 +587,12 @@ mod yew_impl {
                     return;
                 };
                 let body = alert_request_body(&token, &id, &psl, &op, &threshold);
-                let (result, msg, busy) = (result.clone(), msg.clone(), busy.clone());
+                let (result, msg, busy, toast_error) = (
+                    result.clone(),
+                    msg.clone(),
+                    busy.clone(),
+                    toast_error.clone(),
+                );
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/obs/live/alert", Some(&body)).await {
@@ -566,7 +608,10 @@ mod yew_impl {
                             msg.set(None);
                         }
                         Ok(r) => msg.set(Some((r.body.trim().to_owned(), false))),
-                        Err(_) => msg.set(Some(("request failed".to_owned(), false))),
+                        Err(e) => {
+                            msg.set(Some(("request failed".to_owned(), false)));
+                            toast_error.emit(format!("Alert evaluation failed: {e:?}"));
+                        }
                     }
                     busy.set(false);
                 });

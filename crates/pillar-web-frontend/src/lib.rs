@@ -28,7 +28,8 @@ pub mod panels;
 pub mod portal;
 pub mod portal_entry;
 pub mod primitives;
-pub mod resources_console;pub mod router;
+pub mod resources_console;
+pub mod router;
 pub mod styles;
 pub mod theme;
 pub mod topology_console;
@@ -57,12 +58,12 @@ pub use auth::{use_auth, AuthContext, AuthProvider};
 #[cfg(feature = "yew")]
 pub use console::ConsoleView;
 #[cfg(feature = "yew")]
+pub use drilldown::DrilldownPanel;
+#[cfg(feature = "yew")]
 pub use explore::{
     ExploreBuilder, ExploreBuilderProps, ExploreLogsBuilder, ExploreMetadataBuilder,
     ExploreProfilesBuilder, ExploreTracesBuilder,
 };
-#[cfg(feature = "yew")]
-pub use drilldown::DrilldownPanel;
 #[cfg(feature = "yew")]
 pub use portal::Portal;
 #[cfg(feature = "yew")]
@@ -294,14 +295,26 @@ mod tests {
         }
         // Raised tiles + auth cards use the layered surface, accent, and the
         // multi-layer shadows — the Linear aesthetic tokens.
-        assert!(g.contains(t.surface_raised), "global missing raised surface");
+        assert!(
+            g.contains(t.surface_raised),
+            "global missing raised surface"
+        );
         assert!(g.contains(t.accent), "global missing accent");
         assert!(g.contains(t.accent_glow), "global missing accent glow");
-        assert!(g.contains(t.shadow_resting), "global missing resting shadow");
-        assert!(g.contains(t.shadow_elevated), "global missing elevated shadow");
+        assert!(
+            g.contains(t.shadow_resting),
+            "global missing resting shadow"
+        );
+        assert!(
+            g.contains(t.shadow_elevated),
+            "global missing elevated shadow"
+        );
         // Full motion emits a transition with the token duration.
         assert!(g.contains("transition"), "global missing transition");
-        assert!(g.contains(t.motion_duration), "global missing motion duration");
+        assert!(
+            g.contains(t.motion_duration),
+            "global missing motion duration"
+        );
     }
 
     #[test]
@@ -322,5 +335,54 @@ mod tests {
             !reduced.contains("transition: all"),
             "reduced-motion global still emits an active transition"
         );
+    }
+}
+
+/// Console fetch-path error-handling hygiene (Phase 5 anti-facade DoD): every
+/// `spawn_local` block in a console source file that performs an HTTP round
+/// trip must ALSO report a transport failure through the shared toast queue
+/// (`crate::components::use_toast_error`), never a silent `Err(_) => {}` /
+/// `if let Ok(..) = .. { .. }` no-op. This is a NATIVE, source-level host
+/// test (no wasm/DOM needed): it enumerates every fetch call site by
+/// `include_str!`-ing each console source file at compile time and asserting
+/// it contains at least as many `toast_error`/`toast::use_toast_error`
+/// references as `spawn_local(` fetch blocks, and that NO file regresses to
+/// the banned `Err(_) => {}` no-op shape.
+#[cfg(test)]
+mod fetch_path_error_handling {
+    /// Every console source file with at least one `fetch`/`http()` round
+    /// trip inside a `spawn_local` block, added or touched by
+    /// `console-overview-polish`.
+    const FETCHING_FILES: &[(&str, &str)] = &[
+        ("overview.rs", include_str!("overview.rs")),
+        ("panels.rs", include_str!("panels.rs")),
+        ("resources_console.rs", include_str!("resources_console.rs")),
+        ("topology_console.rs", include_str!("topology_console.rs")),
+        ("obs_console.rs", include_str!("obs_console.rs")),
+        ("explore.rs", include_str!("explore.rs")),
+        ("portal.rs", include_str!("portal.rs")),
+    ];
+
+    #[test]
+    fn every_fetching_file_has_at_least_one_toast_error_report() {
+        for (name, src) in FETCHING_FILES {
+            let fetch_sites = src.matches("spawn_local(").count();
+            let toast_reports = src.matches("toast_error").count();
+            assert!(
+                fetch_sites == 0 || toast_reports > 0,
+                "{name} has {fetch_sites} spawn_local fetch site(s) but never \
+                 reports a failure via toast_error — a silent no-op fetch path"
+            );
+        }
+    }
+
+    #[test]
+    fn no_fetching_file_regresses_to_a_silent_error_arm() {
+        for (name, src) in FETCHING_FILES {
+            assert!(
+                !src.contains("Err(_) => {}"),
+                "{name} regressed to a silent `Err(_) => {{}}` fetch failure no-op"
+            );
+        }
     }
 }

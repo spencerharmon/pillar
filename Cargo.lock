@@ -3402,6 +3402,7 @@ dependencies = [
  "js-sys",
  "pillar-manifest",
  "pillar-observability",
+ "pillar-surface-inventory",
  "pillar-web-api",
  "stylist",
  "wasm-bindgen",

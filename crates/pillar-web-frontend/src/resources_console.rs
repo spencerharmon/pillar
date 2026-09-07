@@ -262,6 +262,7 @@ mod yew_impl {
         parse_resource_rows, ReplicaRow, ResourceAction, ResourceRow,
     };
     use crate::auth::use_auth;
+    use crate::components::use_toast_error;
     use crate::portal::{get_url, http, input_value};
     use crate::primitives::{Badge, DataTable, DiffView, Drawer, Tabs, Tone};
     use wasm_bindgen_futures::spawn_local;
@@ -278,17 +279,24 @@ mod yew_impl {
         let replicas = use_state(Vec::<ReplicaRow>::new);
         let selected = use_state(|| None::<ResourceRow>);
         let load_msg = use_state(|| None::<(String, bool)>);
+        let toast_error = use_toast_error();
 
         // ---- inventory load ----
         let load = {
-            let (auth, kind, rows, load_msg) =
-                (auth.clone(), kind.clone(), rows.clone(), load_msg.clone());
+            let (auth, kind, rows, load_msg, toast_error) = (
+                auth.clone(),
+                kind.clone(),
+                rows.clone(),
+                load_msg.clone(),
+                toast_error.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
                 let Some(token) = auth.token.clone() else {
                     return;
                 };
                 let url = get_url("/portal/resource/get", &token, &[("kind", &kind)]);
-                let (rows, load_msg) = (rows.clone(), load_msg.clone());
+                let (rows, load_msg, toast_error) =
+                    (rows.clone(), load_msg.clone(), toast_error.clone());
                 spawn_local(async move {
                     match http("GET", &url, None).await {
                         Ok(r) if r.ok() => {
@@ -296,7 +304,10 @@ mod yew_impl {
                             load_msg.set(None);
                         }
                         Ok(r) => load_msg.set(Some((r.body.trim().to_owned(), false))),
-                        Err(_) => load_msg.set(Some(("request failed".to_owned(), false))),
+                        Err(e) => {
+                            load_msg.set(Some(("request failed".to_owned(), false)));
+                            toast_error.emit(format!("Couldn't load resources: {e:?}"));
+                        }
                     }
                 });
             })
@@ -304,14 +315,15 @@ mod yew_impl {
 
         // ---- live replica oracle (unauthenticated endpoint) ----
         let load_replicas = {
-            let replicas = replicas.clone();
+            let (replicas, toast_error) = (replicas.clone(), toast_error.clone());
             Callback::from(move |_: MouseEvent| {
-                let replicas = replicas.clone();
+                let (replicas, toast_error) = (replicas.clone(), toast_error.clone());
                 spawn_local(async move {
-                    if let Ok(r) = http("GET", "/portal/resource/replicas", None).await {
-                        if r.ok() {
-                            replicas.set(parse_replicas(&r.body));
-                        }
+                    match http("GET", "/portal/resource/replicas", None).await {
+                        Ok(r) if r.ok() => replicas.set(parse_replicas(&r.body)),
+                        Ok(r) => toast_error
+                            .emit(format!("Couldn't load live replicas: {}", r.body.trim())),
+                        Err(e) => toast_error.emit(format!("Couldn't load live replicas: {e:?}")),
                     }
                 });
             })
@@ -434,10 +446,17 @@ mod yew_impl {
         let tab = use_state(|| 0usize);
         let output = use_state(String::new);
         let cmd = use_state(|| "sh".to_owned());
+        let toast_error = use_toast_error();
 
         // A read tab (describe/logs/exec) fetches its endpoint into `output`.
         let fetch = {
-            let (auth, row, output, cmd) = (auth.clone(), row.clone(), output.clone(), cmd.clone());
+            let (auth, row, output, cmd, toast_error) = (
+                auth.clone(),
+                row.clone(),
+                output.clone(),
+                cmd.clone(),
+                toast_error.clone(),
+            );
             Callback::from(move |which: &'static str| {
                 let Some(token) = auth.token.clone() else {
                     return;
@@ -455,11 +474,14 @@ mod yew_impl {
                         &[("name", &row.name), ("cmd", &cmd)],
                     ),
                 };
-                let output = output.clone();
+                let (output, toast_error) = (output.clone(), toast_error.clone());
                 spawn_local(async move {
                     match http("GET", &url, None).await {
                         Ok(r) => output.set(r.body),
-                        Err(_) => output.set("request failed".to_owned()),
+                        Err(e) => {
+                            output.set("request failed".to_owned());
+                            toast_error.emit(format!("{which} failed: {e:?}"));
+                        }
                     }
                 });
             })
@@ -545,6 +567,7 @@ mod yew_impl {
         let arg = use_state(String::new);
         let predicted = use_state(|| None::<bool>);
         let result = use_state(|| None::<Result<String, String>>);
+        let toast_error = use_toast_error();
 
         let on_arg = {
             let arg = arg.clone();
@@ -571,17 +594,24 @@ mod yew_impl {
 
         // Preview: fetch the authorization dry-run (PREDICTED ALLOW/DENY).
         let preview = {
-            let (auth, predicted, result) = (auth.clone(), predicted.clone(), result.clone());
+            let (auth, predicted, result, toast_error) = (
+                auth.clone(),
+                predicted.clone(),
+                result.clone(),
+                toast_error.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
                 let Some(token) = auth.token.clone() else {
                     return;
                 };
                 let url = get_url("/portal/resource/dry-run", &token, &[]);
-                let (predicted, result) = (predicted.clone(), result.clone());
+                let (predicted, result, toast_error) =
+                    (predicted.clone(), result.clone(), toast_error.clone());
                 result.set(None);
                 spawn_local(async move {
-                    if let Ok(r) = http("GET", &url, None).await {
-                        predicted.set(parse_predicted(&r.body));
+                    match http("GET", &url, None).await {
+                        Ok(r) => predicted.set(parse_predicted(&r.body)),
+                        Err(e) => toast_error.emit(format!("Dry-run preview failed: {e:?}")),
                     }
                 });
             })
@@ -589,23 +619,28 @@ mod yew_impl {
 
         // Confirm: POST the signed act, interpret EVENT/DENIED.
         let confirm = {
-            let (auth, row, action, arg, result) = (
+            let (auth, row, action, arg, result, toast_error) = (
                 auth.clone(),
                 row.clone(),
                 action.clone(),
                 arg.clone(),
                 result.clone(),
+                toast_error.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 let Some(token) = auth.token.clone() else {
                     return;
                 };
                 let body = act_request_body(&token, &row.name, &arg);
-                let (path, result) = ((*action).path(), result.clone());
+                let (path, result, toast_error) =
+                    ((*action).path(), result.clone(), toast_error.clone());
                 spawn_local(async move {
                     match http("POST", path, Some(&body)).await {
                         Ok(r) => result.set(Some(parse_act_result(&r.body))),
-                        Err(_) => result.set(Some(Err("request failed".to_owned()))),
+                        Err(e) => {
+                            result.set(Some(Err("request failed".to_owned())));
+                            toast_error.emit(format!("Action failed: {e:?}"));
+                        }
                     }
                 });
             })

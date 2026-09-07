@@ -723,8 +723,7 @@ mod yew_impl {
                             handle_401(&auth, r.status);
                             minted.set(Some(interpret_generate(r.ok(), &r.body)));
                         }
-                        Err(_) => minted
-                            .set(Some(Err("the node refused the request".to_owned()))),
+                        Err(_) => minted.set(Some(Err("the node refused the request".to_owned()))),
                     }
                     busy.set(false);
                 });
@@ -1431,14 +1430,16 @@ mod yew_impl {
         let arg = use_state(String::new);
         let msg = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
+        let toast_error = crate::components::use_toast_error();
 
         let get = {
-            let (auth, rows, kind, selector, msg) = (
+            let (auth, rows, kind, selector, msg, toast_error) = (
                 auth.clone(),
                 rows.clone(),
                 kind.clone(),
                 selector.clone(),
                 msg.clone(),
+                toast_error.clone(),
             );
             Callback::from(move |_: ()| {
                 let Some(token) = auth.token.clone() else {
@@ -1449,7 +1450,8 @@ mod yew_impl {
                     &token,
                     &[("kind", (*kind).trim()), ("selector", (*selector).trim())],
                 );
-                let (auth, rows, msg) = (auth.clone(), rows.clone(), msg.clone());
+                let (auth, rows, msg, toast_error) =
+                    (auth.clone(), rows.clone(), msg.clone(), toast_error.clone());
                 spawn_local(async move {
                     match http("GET", &url, None).await {
                         Ok(r) if r.ok() => rows.set(nonempty_lines(&r.body)),
@@ -1458,7 +1460,7 @@ mod yew_impl {
                                 msg.set(Some((strip_marker(&r.body), false)));
                             }
                         }
-                        Err(_) => {}
+                        Err(e) => toast_error.emit(format!("Couldn't load resources: {e:?}")),
                     }
                 });
             })
@@ -2094,7 +2096,8 @@ mod tests {
 
     #[test]
     fn swarm_parse_and_generate_round_trip() {
-        let v = parse_swarm("SWARM public 0011223344556677\nSEED /ip4/192.0.2.5/tcp/4001/p2p/abc\n");
+        let v =
+            parse_swarm("SWARM public 0011223344556677\nSEED /ip4/192.0.2.5/tcp/4001/p2p/abc\n");
         assert_eq!(v.kind, "public");
         assert_eq!(v.fingerprint, "0011223344556677");
         assert_eq!(v.seeds, vec!["/ip4/192.0.2.5/tcp/4001/p2p/abc".to_owned()]);

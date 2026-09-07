@@ -22,6 +22,8 @@ use yew::prelude::*;
 
 #[cfg(feature = "yew")]
 use crate::auth::{use_auth, AuthAction};
+#[cfg(feature = "yew")]
+use crate::components::use_toast_error;
 
 /// One action a panel can perform: an HTTP method + endpoint path + the
 /// button label the user sees.
@@ -282,18 +284,21 @@ pub fn panel(props: &PanelProps) -> Html {
     let auth = use_auth();
     let spec = props.spec;
     let rows: UseStateHandle<Vec<String>> = use_state(Vec::new);
+    let toast_error = use_toast_error();
 
     {
         let rows = rows.clone();
         let auth = auth.clone();
+        let toast_error = toast_error.clone();
         use_effect_with((spec.list_path, auth.token.clone()), move |_| {
             let rows = rows.clone();
             let auth = auth.clone();
+            let toast_error = toast_error.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match fetch_text(spec.list_path, auth.token.as_deref(), None).await {
                     Ok(FetchOutcome::Ok(text)) => rows.set(parse_lines(&text, spec.line_prefix)),
                     Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
-                    Err(_) => {}
+                    Err(e) => toast_error.emit(format!("Couldn't load {}: {e:?}", spec.title)),
                 }
             });
             || ()
@@ -303,21 +308,31 @@ pub fn panel(props: &PanelProps) -> Html {
     let make_action_handler = |action: PanelAction, refresh: bool| {
         let rows = rows.clone();
         let auth = auth.clone();
+        let toast_error = toast_error.clone();
         Callback::from(move |_| {
             let rows = rows.clone();
             let auth = auth.clone();
+            let toast_error = toast_error.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match fetch_text(action.path, auth.token.as_deref(), Some("")).await {
                     Ok(FetchOutcome::Ok(_)) if refresh => {
-                        if let Ok(FetchOutcome::Ok(text)) =
-                            fetch_text(spec.list_path, auth.token.as_deref(), None).await
-                        {
-                            rows.set(parse_lines(&text, spec.line_prefix));
+                        match fetch_text(spec.list_path, auth.token.as_deref(), None).await {
+                            Ok(FetchOutcome::Ok(text)) => {
+                                rows.set(parse_lines(&text, spec.line_prefix));
+                            }
+                            Ok(FetchOutcome::Unauthorized) => {
+                                auth.dispatch(AuthAction::Unauthorized);
+                            }
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't refresh {}: {e:?}", spec.title))
+                            }
                         }
                     }
                     Ok(FetchOutcome::Ok(_)) => {}
                     Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
-                    Err(_) => {}
+                    Err(e) => {
+                        toast_error.emit(format!("{} failed: {e:?}", action.label));
+                    }
                 }
             });
         })

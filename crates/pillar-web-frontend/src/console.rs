@@ -177,6 +177,7 @@ mod yew_impl {
     use super::{NavGroup, Section};
     use crate::auth::{use_auth, AuthAction};
     use crate::command_palette::CommandPalette;
+    use crate::components::{ToastQueueProvider, ToastStack};
     use crate::obs_console::ObservabilityConsole;
     use crate::overview::OverviewConsole;
     use crate::portal::{IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile};
@@ -209,32 +210,35 @@ mod yew_impl {
         };
 
         html! {
-            <div class="console">
-                <nav class="console-sidebar" aria-label="Sections">
-                    <div class="console-brand">{ "pillar" }</div>
-                    { for NavGroup::all().into_iter().map(|group| render_group(group, active)) }
-                </nav>
-                <div class="console-main">
-                    <header class="console-topbar">
-                        <div class="console-crumb">{ active.label() }</div>
-                        <div class="console-topbar__right">
-                            <span class="console-who" id="portal-who">
-                                { format!("Signed in as {handle}") }
-                            </span>
-                            <button
-                                type="button"
-                                id="signout"
-                                class="signout"
-                                onclick={signout}
-                            >{ "Sign out" }</button>
-                        </div>
-                    </header>
-                    <main class="console-content" id="portal">
-                        { render_section(active) }
-                    </main>
+            <ToastQueueProvider>
+                <div class="console">
+                    <nav class="console-sidebar" aria-label="Sections">
+                        <div class="console-brand">{ "pillar" }</div>
+                        { for NavGroup::all().into_iter().map(|group| render_group(group, active)) }
+                    </nav>
+                    <div class="console-main">
+                        <header class="console-topbar">
+                            <div class="console-crumb">{ active.label() }</div>
+                            <div class="console-topbar__right">
+                                <span class="console-who" id="portal-who">
+                                    { format!("Signed in as {handle}") }
+                                </span>
+                                <button
+                                    type="button"
+                                    id="signout"
+                                    class="signout"
+                                    onclick={signout}
+                                >{ "Sign out" }</button>
+                            </div>
+                        </header>
+                        <main class="console-content" id="portal">
+                            { render_section(active) }
+                        </main>
+                    </div>
+                    <CommandPalette />
+                    <ToastStack />
                 </div>
-                <CommandPalette />
-            </div>
+            </ToastQueueProvider>
         }
     }
 

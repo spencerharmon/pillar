@@ -293,6 +293,7 @@ mod yew_impl {
         parse_trust_edges, trust_node_index, TopoTreeNode, TopologyTree,
     };
     use crate::auth::use_auth;
+    use crate::components::use_toast_error;
     use crate::portal::{get_url, http, input_value};
     use crate::primitives::{Badge, DataTable, Graph, GraphEdge, Tabs, Tone, Tree, TreeNode};
     use wasm_bindgen_futures::spawn_local;
@@ -317,24 +318,35 @@ mod yew_impl {
         let spread_nodes = use_state(String::new);
         let spread_tier = use_state(|| "rack".to_owned());
         let spread = use_state(super::SpreadOverlay::default);
+        let toast_error = use_toast_error();
 
         // Load the placement tree + mismatches on mount / token change.
         {
-            let (auth, tree, mismatches) = (auth.clone(), tree.clone(), mismatches.clone());
+            let (auth, tree, mismatches, toast_error) = (
+                auth.clone(),
+                tree.clone(),
+                mismatches.clone(),
+                toast_error.clone(),
+            );
             use_effect_with(auth.token.clone(), move |token| {
                 if let Some(token) = token.clone() {
-                    let (tree, mismatches) = (tree.clone(), mismatches.clone());
+                    let (tree, mismatches, toast_error) =
+                        (tree.clone(), mismatches.clone(), toast_error.clone());
                     let tree_url = get_url("/portal/topology/tree", &token, &[]);
                     let mm_url = get_url("/portal/topology/mismatches", &token, &[]);
                     spawn_local(async move {
-                        if let Ok(r) = http("GET", &tree_url, None).await {
-                            if r.ok() {
-                                tree.set(parse_topology_tree(&r.body));
+                        match http("GET", &tree_url, None).await {
+                            Ok(r) if r.ok() => tree.set(parse_topology_tree(&r.body)),
+                            Ok(_) => {}
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't load the placement tree: {e:?}"))
                             }
                         }
-                        if let Ok(r) = http("GET", &mm_url, None).await {
-                            if r.ok() {
-                                mismatches.set(parse_mismatches(&r.body));
+                        match http("GET", &mm_url, None).await {
+                            Ok(r) if r.ok() => mismatches.set(parse_mismatches(&r.body)),
+                            Ok(_) => {}
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't load mismatches: {e:?}"));
                             }
                         }
                     });
@@ -352,11 +364,12 @@ mod yew_impl {
             Callback::from(move |e: InputEvent| spread_tier.set(input_value(&e)))
         };
         let check_spread = {
-            let (auth, spread_nodes, spread_tier, spread) = (
+            let (auth, spread_nodes, spread_tier, spread, toast_error) = (
                 auth.clone(),
                 spread_nodes.clone(),
                 spread_tier.clone(),
                 spread.clone(),
+                toast_error.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 let Some(token) = auth.token.clone() else {
@@ -367,12 +380,14 @@ mod yew_impl {
                     &token,
                     &[("tier", &spread_tier), ("nodes", &spread_nodes)],
                 );
-                let spread = spread.clone();
+                let (spread, toast_error) = (spread.clone(), toast_error.clone());
                 spawn_local(async move {
-                    if let Ok(r) = http("GET", &url, None).await {
-                        if r.ok() {
-                            spread.set(parse_spread(&r.body));
+                    match http("GET", &url, None).await {
+                        Ok(r) if r.ok() => spread.set(parse_spread(&r.body)),
+                        Ok(r) => {
+                            toast_error.emit(format!("Spread check failed: {}", r.body.trim()))
                         }
+                        Err(e) => toast_error.emit(format!("Spread check failed: {e:?}")),
                     }
                 });
             })
@@ -494,17 +509,20 @@ mod yew_impl {
     pub fn trust_graph_console() -> Html {
         let auth = use_auth();
         let edges = use_state(Vec::new);
+        let toast_error = use_toast_error();
 
         {
-            let (auth, edges) = (auth.clone(), edges.clone());
+            let (auth, edges, toast_error) = (auth.clone(), edges.clone(), toast_error.clone());
             use_effect_with(auth.token.clone(), move |token| {
                 if let Some(token) = token.clone() {
-                    let edges = edges.clone();
+                    let (edges, toast_error) = (edges.clone(), toast_error.clone());
                     let url = get_url("/portal/trust-graph", &token, &[]);
                     spawn_local(async move {
-                        if let Ok(r) = http("GET", &url, None).await {
-                            if r.ok() {
-                                edges.set(parse_trust_edges(&r.body));
+                        match http("GET", &url, None).await {
+                            Ok(r) if r.ok() => edges.set(parse_trust_edges(&r.body)),
+                            Ok(_) => {}
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't load the trust graph: {e:?}"));
                             }
                         }
                     });

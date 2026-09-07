@@ -47,6 +47,7 @@ pub use yew_impl::OverviewConsole;
 mod yew_impl {
     use super::{summarize, OverviewKpis};
     use crate::auth::use_auth;
+    use crate::components::use_toast_error;
     use crate::obs_console::parse_kind_counts;
     use crate::portal::{get_url, http, NodeStatusTile};
     use crate::primitives::{Chart, ChartKind, StatCard};
@@ -61,36 +62,67 @@ mod yew_impl {
     pub fn overview_console() -> Html {
         let auth = use_auth();
         let kpis = use_state(OverviewKpis::default);
+        let loading = use_state(|| true);
+        let toast_error = use_toast_error();
 
         {
-            let (auth, kpis) = (auth.clone(), kpis.clone());
+            let (auth, kpis, loading, toast_error) = (
+                auth.clone(),
+                kpis.clone(),
+                loading.clone(),
+                toast_error.clone(),
+            );
             use_effect_with(auth.token.clone(), move |token| {
                 if let Some(token) = token.clone() {
                     let kpis = kpis.clone();
+                    let loading = loading.clone();
+                    let toast_error = toast_error.clone();
                     let kinds_url = get_url("/portal/obs/live/kinds", &token, &[]);
                     let tree_url = get_url("/portal/topology/tree", &token, &[]);
                     let trust_url = get_url("/portal/trust-graph", &token, &[]);
                     spawn_local(async move {
-                        // Signal kinds (may be 503 if no live substrate).
+                        // Signal kinds (may be 503 if no live substrate — that
+                        // is a legitimate empty state, never toasted; only a
+                        // transport failure is).
                         let counts = match http("GET", &kinds_url, None).await {
                             Ok(r) if r.ok() => parse_kind_counts(&r.body),
-                            _ => Vec::new(),
+                            Ok(_) => Vec::new(),
+                            Err(e) => {
+                                toast_error
+                                    .emit(format!("Couldn't load live signal counts: {e:?}"));
+                                Vec::new()
+                            }
                         };
                         // Live replicas (unauthenticated oracle).
                         let replicas = match http("GET", "/portal/resource/replicas", None).await {
                             Ok(r) if r.ok() => parse_replicas(&r.body).len(),
-                            _ => 0,
+                            Ok(_) => 0,
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't load live replicas: {e:?}"));
+                                0
+                            }
                         };
                         let nodes = match http("GET", &tree_url, None).await {
                             Ok(r) if r.ok() => parse_topology_tree(&r.body).nodes.len(),
-                            _ => 0,
+                            Ok(_) => 0,
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't load topology nodes: {e:?}"));
+                                0
+                            }
                         };
                         let edges = match http("GET", &trust_url, None).await {
                             Ok(r) if r.ok() => parse_trust_edges(&r.body).len(),
-                            _ => 0,
+                            Ok(_) => 0,
+                            Err(e) => {
+                                toast_error.emit(format!("Couldn't load trust edges: {e:?}"));
+                                0
+                            }
                         };
                         kpis.set(summarize(&counts, replicas, nodes, edges));
+                        loading.set(false);
                     });
+                } else {
+                    loading.set(false);
                 }
                 || ()
             });
@@ -100,17 +132,28 @@ mod yew_impl {
 
         html! {
             <>
-                <div class="ov-kpis">
-                    <StatCard label="Live signals" value={kpis.signal_total.to_string()} spark={bars.clone()} />
-                    <StatCard label="Live replicas" value={kpis.live_replicas.to_string()} />
-                    <StatCard label="Topology nodes" value={kpis.topo_nodes.to_string()} />
-                    <StatCard label="Trust edges" value={kpis.trust_edges.to_string()} />
-                </div>
-                if !bars.is_empty() {
-                    <div class="obs-panel">
-                        <h4>{ "Live signal distribution" }</h4>
-                        <Chart values={bars} kind={ChartKind::Bar} width={480.0} height={120.0} />
+                if *loading {
+                    <div class="ov-kpis ov-kpis--loading" aria-busy="true">
+                        <div class="skeleton skeleton--stat" />
+                        <div class="skeleton skeleton--stat" />
+                        <div class="skeleton skeleton--stat" />
+                        <div class="skeleton skeleton--stat" />
                     </div>
+                } else {
+                    <div class="ov-kpis">
+                        <StatCard label="Live signals" value={kpis.signal_total.to_string()} spark={bars.clone()} />
+                        <StatCard label="Live replicas" value={kpis.live_replicas.to_string()} />
+                        <StatCard label="Topology nodes" value={kpis.topo_nodes.to_string()} />
+                        <StatCard label="Trust edges" value={kpis.trust_edges.to_string()} />
+                    </div>
+                    if !bars.is_empty() {
+                        <div class="obs-panel">
+                            <h4>{ "Live signal distribution" }</h4>
+                            <Chart values={bars} kind={ChartKind::Bar} width={480.0} height={120.0} />
+                        </div>
+                    } else {
+                        <p class="ov-empty">{ "No live signals reported yet." }</p>
+                    }
                 }
                 <NodeStatusTile />
             </>
