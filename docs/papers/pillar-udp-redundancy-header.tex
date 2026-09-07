@@ -89,7 +89,8 @@ whose \emph{dependence} across paths is captured by a correlation parameter
 $\rho\in[0,1]$ (\S\ref{sec:corr}); $\rho=0$ is fully independent, $\rho=1$ is one
 shared fate. Two redundancy shapes share this substrate: \emph{copy redundancy}
 (a whole message sent $W$ times, for small messages) and \emph{erasure
-redundancy} ($K$ data $+$ $M$ parity shards, reconstructable from any $K$, for
+redundancy} ($K$ data $+$ $M$ parity shards, MDS target reconstructs from any
+$K$, for
 bulk). Both are bounded by the same per-connection allowance field
 (\S\ref{sec:header}).
 
@@ -237,10 +238,12 @@ value.
 \section{Bulk transfer: erasure coding}\label{sec:erasure}
 For payloads larger than a datagram, copy redundancy is wasteful: sending a
 megabyte $W$ times to survive loss pays an integer multiple. Bulk instead uses a
-systematic erasure code---$K$ data shards plus $M$ parity shards, $N=K+M$
-total, any $K$ of which reconstruct the payload (the implementation's
-\code{encode}/\code{reconstruct} in \code{pillar\_udp.rs}). Under independent
-per-shard loss $p$, reconstruction fails iff fewer than $K$ shards arrive:
+\emph{systematic erasure code}: $K$ data shards plus $M$ parity shards, $N=K+M$
+total. The design target is a \emph{maximum-distance-separable} (MDS) code---any
+$K$ of the $N$ shards reconstruct the payload---as provided by
+Reed--Solomon~\cite{reedsolomon} or a fountain code such as
+RaptorQ~\cite{raptorq}. Under independent per-shard loss $p$, an MDS code fails
+to reconstruct iff fewer than $K$ shards arrive:
 \begin{equation}
   P_{\text{fail}}(K,M,p)=\sum_{i=0}^{K-1}\binom{N}{i}(1-p)^{i}p^{\,N-i}.
   \label{eq:erasure}
@@ -255,6 +258,25 @@ $\Wstar$; Table~\ref{tab:mstar} reports it for $K{=}8,\varepsilon{=}10^{-6}$. Th
 mapping is the design rule: the single allowance field encodes a parity
 \emph{rate} (\S\ref{sec:header}) and the sender derives $M=\lceil\text{rate}\cdot
 K\rceil$ from it and the block size $K$.
+
+\paragraph{Implementation status.}
+The shipping \code{encode}/\code{reconstruct} in \code{pillar\_udp.rs} realises a
+simpler first step, \emph{not} yet the MDS target: $M$ \emph{identical}
+XOR-parity shards (each the XOR of all $K$ data shards), which recover
+\emph{exactly one} lost data shard---the extra parity copies only guard the
+parity itself against loss, so the test suite asserts ``one parity cannot recover
+two holes.'' Its exact residual is therefore
+\begin{equation}
+  P^{\text{xor}}_{\text{fail}}(K,M,p)=1-(1-p)^{K}-Kp(1-p)^{K-1}\big(1-p^{M}\big),
+  \label{eq:xor}
+\end{equation}
+which for $K{=}8$ sits near $0.19$ at $p{=}0.1$ \emph{independent of $M\ge2$},
+against the MDS target's $4.3\times10^{-3}$ at $M{=}4$: a single-erasure code
+cannot survive two concurrent data-shard losses however much parity it carries.
+Generalising the coding kernel to a true MDS code (Reed--Solomon / RaptorQ) is
+the specified bulk-regime work, and Eq.~\eqref{eq:erasure} is the residual that
+upgrade unlocks; every shard already carries a per-payload CID and a
+protocol-version stamp, so only the kernel changes.
 
 \begin{figure}[t]
 \centering
@@ -282,7 +304,8 @@ K\rceil$ from it and the block size $K$.
 \addlegendentry{$K{=}16,M{=}8$ (ovh 0.50)}
 \end{axis}
 \end{tikzpicture}
-\caption{Erasure residual loss (Eq.~\ref{eq:erasure}). Parity rate $M/K$ sets the
+\caption{MDS (any-$K$-of-$N$) erasure residual loss (Eq.~\ref{eq:erasure}); the
+bulk-regime design target. Parity rate $M/K$ sets the
 overhead; a larger block ($K{=}16,M{=}8$) beats a smaller one at the same rate by
 averaging loss over more shards. Lower is better; log scale.}
 \label{fig:erasure}
@@ -298,7 +321,7 @@ $M^\star$ & 7 & 9 & 15 & 21 & 28 & 38 \\
 overhead $M^\star/K$ & 0.88 & 1.12 & 1.88 & 2.62 & 3.50 & 4.75 \\
 \bottomrule
 \end{tabular}
-\caption{Minimum parity $M^\star$ for $K{=}8$, $\varepsilon{=}10^{-6}$
+\caption{Minimum parity $M^\star$ for an MDS code, $K{=}8$, $\varepsilon{=}10^{-6}$
 (Eq.~\ref{eq:erasure}). Beyond $\sim\!30\%$ loss even erasure overhead grows
 past $1\times$; a larger $K$ (Fig.~\ref{fig:erasure}) is the cheaper lever there.}
 \label{tab:mstar}
@@ -384,7 +407,8 @@ field & bytes & meaning \\
 \midrule
 flags & 1 & version (3b), type (2b: spray/forward/reply/ack), effect-class
 (1b: convergent/exclusive), has-shard (1b), has-RR-token (1b) \\
-CID & 32 & BLAKE3-256 content address; dedup + integrity key \\
+CID & 34 & content-address multihash \code{<code><len><digest>} (SHA2-256
+today, $0x12\,0x20{+}32$B; algorithm-agile); dedup + integrity key \\
 allowance & 1 & mode bit + 7-bit value: copy count $W\in[1,127]$, or parity rate
 $M/K$ in $1/32$ units \\
 hop TTL & 1 & remaining forward budget; forwarding stops at 0 \\
@@ -393,28 +417,33 @@ RR token & 16$^\dagger$ & return-routability cookie (keyed MAC of client
 address); anti-amplification \\
 \bottomrule
 \end{tabular}
-\caption{pillar-UDP header. $^\dagger$present only when the corresponding flag is
-set. Base header (small message, no token) is $35$ bytes; with shard descriptor
-$43$; with RR token $+16$.}
+\caption{pillar-UDP \emph{specified} header. $^\dagger$present only when the
+corresponding flag is set. Base header (small message, no token) is $37$ bytes;
+with shard descriptor $45$; with RR token $+16$. (The live transport today stamps
+each shard's on-wire bytes with the 2-byte protocol version followed by the
+payload and verifies the CID per shard; the full header above is the specified
+encoding of the modelled datagram fields.)}
 \label{tab:header}
 \end{table}
 
 \paragraph{Framing and MTU.}
-On Route~A the header and payload ride as the application framing inside the
-Noise-encrypted, yamux-muxed stream; on Route~B they are the native transport
-frame. Datagrams are sized to the conservative IPv6 minimum path MTU: a
-small-message datagram keeps header~$+$~payload~$\le 1200$~bytes, and each bulk
-shard is sized so header~$+$~shard~$\le 1200$, so neither fragments. The header is
-therefore a fixed $35$--$59$-byte prefix; for a $1$~KB message its overhead is
-$3.4\%$, dwarfed by the $\times W$ payload cost, so the redundancy allowance, not
-the header, dominates on-wire bytes---as intended.
+The header and payload ride as the application framing inside the pillar-UDP
+transport's Noise-encrypted, yamux-muxed stream (``Route~A'', the libp2p
+Noise$+$yamux upgrade the transport reuses). Datagrams are sized to the
+conservative IPv6 minimum path MTU: a small-message datagram keeps
+header~$+$~payload~$\le 1200$~bytes, and each bulk shard is sized so
+header~$+$~shard~$\le 1200$, so neither fragments. The header is therefore a fixed
+$37$--$61$-byte prefix; for a $1$~KB message its overhead is $3.5\%$, dwarfed by
+the $\times W$ payload cost, so the redundancy allowance, not the header,
+dominates on-wire bytes---as intended.
 
 \paragraph{Worked examples.}
 A small idempotent spray copy with $W{=}4$, $\text{TTL}{=}6$, no shard, no token:
-\begin{center}\code{20 <32-byte CID> 04 06 <payload>}\end{center}
-(\code{0x20}$=$ version~1, type spray, convergent). A bulk shard from a $K{=}8,
-M{=}4$ block, index~3, of a $1{,}048{,}576$-byte payload:
-\begin{center}\code{22 <CID> 90 06 08 04 0003 00100000 <shard>}\end{center}
+\begin{center}\code{20 12 20 <32-byte SHA-256 digest> 04 06 <payload>}\end{center}
+(\code{0x20}$=$ version~1, type spray, convergent; the CID is the $34$-byte
+multihash led by \code{12 20}). A bulk shard from a $K{=}8, M{=}4$ block, index~3,
+of a $1{,}048{,}576$-byte payload:
+\begin{center}\code{22 12 20 <digest> 90 06 08 04 0003 00100000 <shard>}\end{center}
 (\code{0x22} sets has-shard; \code{0x90} is parity mode at rate $16/32{=}0.5$;
 the descriptor carries $K{=}8,M{=}4,\text{idx}{=}3,\text{len}{=}0\text{x}100000$).
 
@@ -440,7 +469,8 @@ channel~\cite{gilbert,elliott}, which we use to motivate the correlation
 estimand. Erasure coding for reliable transport spans Reed--Solomon
 codes~\cite{reedsolomon}, fountain codes such as RaptorQ~\cite{raptorq}, and
 on-the-fly coding such as Tetrys~\cite{tetrys}; pillar-UDP's bulk regime is a
-systematic block code selected by \eqref{eq:erasure}. QUIC~\cite{quic} and its
+systematic block code whose MDS target is selected by \eqref{eq:erasure}.
+QUIC~\cite{quic} and its
 loss/congestion control~\cite{quicrecovery} exemplify the single-path,
 window-throttled posture we contrast against; LEDBAT~\cite{ledbat} supplies the
 delay-gradient discriminator we borrow for congestion safety; and
