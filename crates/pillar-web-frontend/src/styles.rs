@@ -421,6 +421,102 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .obs-msg {{ font-size: 0.85rem; color: {muted}; }}
         .obs-msg.is-error {{ color: #f87171; }}
 
+        /* ---- design-system primitives (charts, tables, badges, tree, diff) ---- */
+        .ds-chart {{ width: 100%; height: auto; display: block; overflow: visible; }}
+        .ds-chart__line {{ stroke: {accent}; stroke-width: 1.5; vector-effect: non-scaling-stroke; }}
+        .ds-chart__area {{ fill: {glow}; opacity: 0.5; }}
+        .ds-chart__bar {{ fill: {accent}; opacity: 0.85; }}
+
+        .ds-stat {{
+            padding: 0.75rem 0.9rem;
+            background-color: {surface_raised};
+            border: 1px solid {border};
+            border-radius: {radius};
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }}
+        .ds-stat__head {{ display: flex; align-items: center; gap: 0.4rem; justify-content: space-between; }}
+        .ds-stat__label {{ color: {muted}; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+        .ds-stat__value {{ color: {text}; font-size: 1.6rem; font-weight: 650; letter-spacing: -0.02em; }}
+
+        .ds-dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }}
+        .ds-badge {{
+            display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
+            font-size: 0.72rem; font-weight: 600; border: 1px solid transparent;
+            white-space: nowrap;
+        }}
+        .ds-dot--neutral, .ds-badge--neutral {{ background-color: rgba(148,163,184,0.18); color: #cbd5e1; border-color: rgba(148,163,184,0.35); }}
+        .ds-dot--neutral {{ background-color: #94a3b8; }}
+        .ds-dot--info, .ds-badge--info {{ background-color: rgba(94,106,210,0.18); color: #a5b4fc; border-color: rgba(94,106,210,0.4); }}
+        .ds-dot--info {{ background-color: {accent}; }}
+        .ds-dot--success, .ds-badge--success {{ background-color: rgba(34,197,94,0.16); color: #86efac; border-color: rgba(34,197,94,0.4); }}
+        .ds-dot--success {{ background-color: #22c55e; }}
+        .ds-dot--warn, .ds-badge--warn {{ background-color: rgba(234,179,8,0.16); color: #fde047; border-color: rgba(234,179,8,0.4); }}
+        .ds-dot--warn {{ background-color: #eab308; }}
+        .ds-dot--danger, .ds-badge--danger {{ background-color: rgba(248,113,113,0.16); color: #fca5a5; border-color: rgba(248,113,113,0.4); }}
+        .ds-dot--danger {{ background-color: #f87171; }}
+
+        .ds-tabs {{ display: flex; gap: 0.25rem; border-bottom: 1px solid {border}; margin-bottom: 0.9rem; flex-wrap: wrap; }}
+        .ds-tab {{
+            background: none; border: none; border-bottom: 2px solid transparent;
+            color: {muted}; padding: 0.5rem 0.85rem; cursor: pointer; font-size: 0.85rem;
+            font-weight: 550; transition: {transition};
+        }}
+        .ds-tab:hover {{ color: {text}; }}
+        .ds-tab.is-active {{ color: {text}; border-bottom-color: {accent}; }}
+
+        .ds-table-wrap {{ display: flex; flex-direction: column; gap: 0.5rem; }}
+        .ds-table__filter {{
+            align-self: flex-start; min-width: 12rem; padding: 0.4rem 0.6rem;
+            background-color: {surface_base}; color: {text};
+            border: 1px solid {border}; border-radius: 8px; font-size: 0.82rem;
+        }}
+        .ds-table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+        .ds-table th, .ds-table td {{ text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid {border}; vertical-align: top; }}
+        .ds-table th {{ color: {muted}; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; cursor: pointer; user-select: none; white-space: nowrap; }}
+        .ds-table th:hover {{ color: {text}; }}
+        .ds-table tbody tr:hover {{ background-color: {surface_raised}; }}
+        .ds-empty {{ color: {muted}; font-size: 0.85rem; }}
+
+        .ds-drawer {{ position: fixed; inset: 0; z-index: 40; }}
+        .ds-drawer__scrim {{ position: absolute; inset: 0; background: rgba(0,0,0,0.5); }}
+        .ds-drawer__panel {{
+            position: absolute; top: 0; right: 0; height: 100%; width: min(560px, 92vw);
+            background-color: {surface_base}; border-left: 1px solid {border};
+            box-shadow: {shadow_elevated}; display: flex; flex-direction: column;
+            animation: ds-slide-in 250ms {motion_easing};
+        }}
+        @keyframes ds-slide-in {{ from {{ transform: translateX(24px); opacity: 0; }} to {{ transform: none; opacity: 1; }} }}
+        .ds-drawer__head {{ display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.1rem; border-bottom: 1px solid {border}; }}
+        .ds-drawer__head h3 {{ margin: 0; font-size: 1rem; }}
+        .ds-drawer__x {{ background: none; border: none; color: {muted}; font-size: 1rem; cursor: pointer; }}
+        .ds-drawer__x:hover {{ color: {text}; }}
+        .ds-drawer__body {{ padding: 1.1rem; overflow: auto; }}
+
+        .ds-code {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.8rem; background-color: {surface_base}; border: 1px solid {border};
+            border-radius: {radius}; padding: 0.75rem; overflow: auto; max-height: 60vh;
+            white-space: pre; color: {text};
+        }}
+        .ds-diff {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.8rem; background-color: {surface_base}; border: 1px solid {border};
+            border-radius: {radius}; padding: 0.5rem 0; overflow: auto; max-height: 60vh; margin: 0;
+        }}
+        .ds-diff__line {{ padding: 0 0.75rem; white-space: pre; }}
+        .ds-diff__sign {{ display: inline-block; width: 1ch; margin-right: 0.5rem; opacity: 0.7; }}
+        .ds-diff__line.is-add {{ background-color: rgba(34,197,94,0.12); color: #bbf7d0; }}
+        .ds-diff__line.is-del {{ background-color: rgba(248,113,113,0.12); color: #fecaca; }}
+        .ds-diff__line.is-same {{ color: {muted}; }}
+
+        .ds-tree, .ds-tree ul {{ list-style: none; margin: 0; padding-left: 1.1rem; }}
+        .ds-tree {{ padding-left: 0; font-size: 0.85rem; }}
+        .ds-tree__leaf, .ds-tree summary {{ display: flex; align-items: center; gap: 0.4rem; padding: 0.15rem 0; }}
+        .ds-tree summary {{ cursor: pointer; }}
+        .ds-tree summary::-webkit-details-marker {{ color: {muted}; }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{
@@ -441,6 +537,7 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         glow = theme.accent_glow,
         shadow_resting = theme.shadow_resting,
         shadow_elevated = theme.shadow_elevated,
+        motion_easing = theme.motion_easing,
         transition = transition,
     )
 }

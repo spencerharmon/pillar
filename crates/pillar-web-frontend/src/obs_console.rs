@@ -150,6 +150,7 @@ mod yew_impl {
     };
     use crate::auth::use_auth;
     use crate::portal::{get_url, http, input_value, ObservabilityTile};
+    use crate::primitives::{Chart, ChartKind, DataTable, StatCard, Tabs};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
 
@@ -212,23 +213,16 @@ mod yew_impl {
             });
         }
 
-        let tabs = {
+        let tabs_ui = {
             let tab = tab.clone();
-            Tab::ALL
-                .into_iter()
-                .map(|t| {
-                    let is_active = *tab == t;
-                    let mut class = Classes::from("obs-tab");
-                    if is_active {
-                        class.push("is-active");
-                    }
-                    let onclick = {
-                        let tab = tab.clone();
-                        Callback::from(move |_: MouseEvent| tab.set(t))
-                    };
-                    html! { <button type="button" class={class} {onclick}>{ t.label() }</button> }
-                })
-                .collect::<Html>()
+            let labels: Vec<String> = Tab::ALL.iter().map(|t| t.label().to_owned()).collect();
+            let selected = Tab::ALL.iter().position(|t| *t == *tab).unwrap_or(0);
+            let onselect = Callback::from(move |i: usize| {
+                if let Some(t) = Tab::ALL.get(i) {
+                    tab.set(*t);
+                }
+            });
+            html! { <Tabs tabs={labels} {selected} {onselect} /> }
         };
 
         let body = match *tab {
@@ -244,27 +238,32 @@ mod yew_impl {
                 <h3>{ "Observability" }</h3>
                 <p>{ "Live metrics, logs, traces, profiles, and metadata over this \
                       node's observability substrate." }</p>
-                <div class="obs-tabs" role="tablist">{ tabs }</div>
+                <div class="obs-tabpanel-head">{ tabs_ui }</div>
                 <div class="obs-tabpanel">{ body }</div>
             </div>
         }
     }
 
-    /// The Overview tab: a stat card per signal kind with its live count.
+    /// The Overview tab: a live-count stat card per signal kind plus a bar chart
+    /// of the distribution, built on the shared design-system primitives.
     fn render_overview(counts: &[KindCount]) -> Html {
         if counts.is_empty() {
-            return html! { <p class="obs-empty">{ "No live signals yet, or no live \
+            return html! { <p class="ds-empty">{ "No live signals yet, or no live \
             substrate attached to this node." }</p> };
         }
+        let bars: Vec<f64> = counts.iter().map(|c| c.count as f64).collect();
         html! {
-            <div class="obs-statgrid">
-                { for counts.iter().map(|c| html! {
-                    <div class="obs-stat">
-                        <div class="obs-stat__value">{ c.count }</div>
-                        <div class="obs-stat__label">{ c.kind.clone() }</div>
-                    </div>
-                }) }
-            </div>
+            <>
+                <div class="obs-statgrid">
+                    { for counts.iter().map(|c| html! {
+                        <StatCard label={c.kind.clone()} value={c.count.to_string()} />
+                    }) }
+                </div>
+                <div class="obs-panel">
+                    <h4>{ "Signal distribution" }</h4>
+                    <Chart values={bars} kind={ChartKind::Bar} width={480.0} height={120.0} />
+                </div>
+            </>
         }
     }
 
@@ -335,24 +334,19 @@ mod yew_impl {
 
     /// Render one materialized dashboard panel as a titled signal table.
     fn render_panel(panel: &DashPanel) -> Html {
+        let columns = vec!["signal".to_owned(), "kind".to_owned(), "payload".to_owned()];
+        let rows: Vec<Vec<String>> = panel
+            .signals
+            .iter()
+            .map(|s| vec![s.id.clone(), s.kind.clone(), s.payload.clone()])
+            .collect();
         html! {
             <section class="obs-panel" data-panel={panel.name.clone()}>
                 <h4>{ format!("{} ({})", panel.name, panel.count) }</h4>
                 if panel.signals.is_empty() {
-                    <p class="obs-empty">{ "No signals matched." }</p>
+                    <p class="ds-empty">{ "No signals matched." }</p>
                 } else {
-                    <table class="obs-table">
-                        <thead><tr><th>{ "signal" }</th><th>{ "kind" }</th><th>{ "payload" }</th></tr></thead>
-                        <tbody>
-                            { for panel.signals.iter().map(|s| html! {
-                                <tr>
-                                    <td>{ s.id.clone() }</td>
-                                    <td>{ s.kind.clone() }</td>
-                                    <td class="obs-payload">{ s.payload.clone() }</td>
-                                </tr>
-                            }) }
-                        </tbody>
-                    </table>
+                    <DataTable {columns} {rows} />
                 }
             </section>
         }
