@@ -241,4 +241,57 @@ mod tests {
         assert!(full.contains(t.surface_raised));
         assert!(reduced.contains(t.surface_raised));
     }
+
+    #[test]
+    fn global_stylesheet_themes_every_portal_surface() {
+        let t = Theme::dark();
+        let g = styles::global(&t, Motion::Full);
+        // The base page carries the near-black surface + primary text tokens.
+        assert!(g.contains(t.surface_base), "global missing base surface");
+        assert!(g.contains(t.text_primary), "global missing primary text");
+        // The dashboard grid + every panel tile and the auth surfaces are
+        // styled by class (these are the bare classes the panels emit).
+        for sel in [
+            ".portal",
+            ".tile",
+            ".pillar-login",
+            ".pillar-bootstrap",
+            ".member-row",
+            ".resource-row",
+            ".obs-row",
+            ".signout",
+        ] {
+            assert!(g.contains(sel), "global stylesheet does not style {sel}");
+        }
+        // Raised tiles + auth cards use the layered surface, accent, and the
+        // multi-layer shadows — the Linear aesthetic tokens.
+        assert!(g.contains(t.surface_raised), "global missing raised surface");
+        assert!(g.contains(t.accent), "global missing accent");
+        assert!(g.contains(t.accent_glow), "global missing accent glow");
+        assert!(g.contains(t.shadow_resting), "global missing resting shadow");
+        assert!(g.contains(t.shadow_elevated), "global missing elevated shadow");
+        // Full motion emits a transition with the token duration.
+        assert!(g.contains("transition"), "global missing transition");
+        assert!(g.contains(t.motion_duration), "global missing motion duration");
+    }
+
+    #[test]
+    fn global_stylesheet_carries_reduced_motion_fallback() {
+        let t = Theme::dark();
+        // Even built with full motion, the global sheet ships the live
+        // prefers-reduced-motion guard that disables transitions/animations.
+        let full = styles::global(&t, Motion::Full);
+        assert!(
+            full.contains("prefers-reduced-motion"),
+            "global missing prefers-reduced-motion media guard"
+        );
+        // Built under reduced motion, the interactive transition on the tile /
+        // controls is suppressed (only the media-query guard's `transition:
+        // none` remains — never an active `transition: all …` declaration).
+        let reduced = styles::global(&t, Motion::Reduced);
+        assert!(
+            !reduced.contains("transition: all"),
+            "reduced-motion global still emits an active transition"
+        );
+    }
 }
