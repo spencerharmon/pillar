@@ -1,0 +1,4 @@
+[build]
+# Cap parallel codegen/compile jobs to keep peak memory and CPU bounded on
+# constrained build hosts. Cargo otherwise defaults to the logical CPU count.
+jobs = 4
