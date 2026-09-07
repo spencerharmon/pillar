@@ -44,7 +44,72 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        # crates.io's API front-end (fastly/varnish) 403s the bare
+        # `curl/<ver>` User-Agent that this pinned nixpkgs' `importCargoLock`
+        # per-crate fetcher sends against its DEFAULT download URL
+        # `https://crates.io/api/v1/crates/.../download`, which broke every
+        # crate vendor (`crate-either-1.18.0.tar.gz` et al.) and thus
+        # `.#pillar-oci-image` and every local image-under-test build.
+        # `static.crates.io` (the actual CDN blob store) serves the same
+        # `.crate` tarballs unconditionally, and later nixpkgs made it the
+        # default. We can't fix this via `importCargoLock`'s `extraRegistries`
+        # (that maps ALTERNATE registries and emits a second
+        # `[source."https://github.com/rust-lang/crates.io-index"]` block cargo
+        # rejects as a duplicate of the built-in `crates-io`). Instead patch
+        # the nixpkgs SOURCE so `import-cargo-lock.nix`'s built-in registries
+        # map points the crates.io-index download URL at the CDN — exactly the
+        # change upstream nixpkgs later made. This keeps the LLVM-19 toolchain
+        # pin (see pillar-oci-image-llvm21-sigill-fix): only the crate DOWNLOAD
+        # host changes, never the compiler.
+        basePkgs = import nixpkgs { inherit system; };
+        patchedNixpkgs = basePkgs.applyPatches {
+          name = "nixpkgs-crate-fetch-static-cdn";
+          src = nixpkgs;
+          postPatch = ''
+            substituteInPlace pkgs/build-support/rust/import-cargo-lock.nix \
+              --replace-fail \
+                '"https://github.com/rust-lang/crates.io-index" = "https://crates.io/api/v1/crates";' \
+                '"https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";'
+            # fetchCrate's per-crate download URL default (used by the
+            # wasm-bindgen-cli override below).
+            substituteInPlace pkgs/build-support/rust/fetchcrate.nix \
+              --replace-fail \
+                'registryDl ? "https://crates.io/api/v1/crates",' \
+                'registryDl ? "https://static.crates.io/crates",'
+            # fetchCargoVendor's Python fetcher (used by rustPlatform for the
+            # wasm-bindgen-cli vendor dir) hits the same 403'ing host.
+            substituteInPlace pkgs/build-support/rust/fetch-cargo-vendor-util.py \
+              --replace-fail \
+                'return f"https://crates.io/api/v1/crates/{pkg["name"]}/{pkg["version"]}/download"' \
+                'return f"https://static.crates.io/crates/{pkg["name"]}/{pkg["version"]}/download"'
+          '';
+        };
+        pkgs = import patchedNixpkgs { inherit system; };
+
+        # The frontend crate pins `wasm-bindgen = "=0.2.121"` (its Cargo.lock),
+        # but the LLVM-19 nixpkgs pin above only ships `wasm-bindgen-cli`
+        # 0.2.100 — and trunk aborts unless the CLI version EXACTLY equals the
+        # crate's wasm-bindgen. (This skew was previously masked: crate
+        # vendoring 403'd before trunk ever ran, so the mismatch only surfaced
+        # once the crate-fetch fix above let the frontend build reach
+        # wasm-bindgen.) Build the matching 0.2.121 CLI from crates.io with the
+        # SAME reproducible `buildWasmBindgenCli` builder nixpkgs uses, so the
+        # toolchain pin is untouched and only this one tool tracks the lock.
+        wasm-bindgen-cli-0_2_121 = pkgs.buildWasmBindgenCli rec {
+          src = pkgs.fetchCrate {
+            pname = "wasm-bindgen-cli";
+            version = "0.2.121";
+            # `fetchCrate`'s default `registryDl` is the same 403'ing
+            # `crates.io/api/v1/crates` host; point it at the CDN too.
+            registryDl = "https://static.crates.io/crates";
+            hash = "sha256-ZOMgFNOcGkO66Jz/Z83eoIu+DIzo3Z/vq6Z5g6BDY/w=";
+          };
+          cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+            inherit src;
+            inherit (src) pname version;
+            hash = "sha256-DPdCDPTAPBrbqLUqnCwQu1dePs9lGg85JCJOCIr9qjU=";
+          };
+        };
 
         # ---------------------------------------------------------------------
         # Stage 1 of the two-stage build: compile the Yew + WebAssembly portal
@@ -87,10 +152,19 @@
           # MUST equal the crate's `wasm-bindgen` (0.2.127, pinned in the
           # frontend Cargo.lock) or wasm-bindgen refuses the module.
           nativeBuildInputs = [
-            pkgs.trunk
-            pkgs.wasm-bindgen-cli
-            pkgs.binaryen
-            pkgs.lld
+            # trunk/binaryen/lld come from the UNPATCHED basePkgs so they stay
+            # binary-cache hits — the `applyPatches` nixpkgs below changes every
+            # derivation hash, which would otherwise force `trunk` (and the whole
+            # rust toolchain) to COMPILE from source locally, where rustc 1.89.0
+            # intermittently SIGSEGVs under `-C opt-level=3` on this host (the
+            # same host-toolchain fragility the pillar-oci-image-llvm21-sigill-fix
+            # note describes). Only the crate-vendoring FODs (which merely
+            # DOWNLOAD, never compile) need the CDN patch, so build tools stay on
+            # the cached, unpatched nixpkgs.
+            basePkgs.trunk
+            wasm-bindgen-cli-0_2_121
+            basePkgs.binaryen
+            basePkgs.lld
           ];
 
           # nixpkgs rustc ships the wasm32-unknown-unknown std; add the target
