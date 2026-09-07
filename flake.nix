@@ -81,6 +81,14 @@
           overlays = [ cratesIoStaticCdnOverlay ];
         };
 
+        # Single source of truth for the release version: the workspace's
+        # `[workspace.package].version` in Cargo.toml (also the tag build-image
+        # stamps on the OCI image and what the binary reports as
+        # CARGO_PKG_VERSION). Read it here so the nix derivation names never
+        # drift from the crate version on a bump.
+        cargoVersion =
+          (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
         # trunk's offline wasm-bindgen step must run the EXACT `wasm-bindgen-cli`
         # version matching the frontend crate's `wasm-bindgen` library
         # (=0.2.121, lockstep with web-sys/js-sys 0.3.98). The pinned nixpkgs
@@ -112,7 +120,7 @@
         # include_bytes! (see crates/pillar-cli/src/web_serve.rs).
         pillar-frontend = pkgs.rustPlatform.buildRustPackage {
           pname = "pillar-frontend";
-          version = "0.0.0";
+          version = cargoVersion;
           # The frontend crate builds to `wasm32-unknown-unknown` from its OWN
           # Cargo.lock (own dep closure), but it PATH-depends on sibling crates
           # (`pillar-web-frontend`, and through it `pillar-web-api`,
@@ -186,7 +194,7 @@
         # from the vendored Cargo.lock. No network at build time.
         pillar = pkgs.rustPlatform.buildRustPackage {
           pname = "pillar";
-          version = "0.0.0";
+          version = cargoVersion;
           src = self;
 
           cargoLock = {
