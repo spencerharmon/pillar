@@ -63,6 +63,8 @@ pub use drawer::{Drawer, DrawerProps};
 #[cfg(feature = "yew")]
 pub use form::{FormField, FormFieldProps};
 #[cfg(feature = "yew")]
+pub use form::{FieldSet, FieldSetProps};
+#[cfg(feature = "yew")]
 pub use stat_card::{StatCard, StatCardProps};
 #[cfg(feature = "yew")]
 pub use tabs::{TabItem, Tabs, TabsProps};
