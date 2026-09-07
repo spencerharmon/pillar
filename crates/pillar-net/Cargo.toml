@@ -7,6 +7,22 @@ repository.workspace = true
 rust-version.workspace = true
 description = "libp2p transport substrate for Pillar: gossipsub event log, Kademlia discovery, relay/dcutr NAT traversal."
 
+[features]
+# Opt-in acceptance gate for the public-seed UPnP external-address reachability
+# vertical (definition-of-done for `public-seed-upnp-external-addr`). The test
+# it enables (`tests/public_seed_upnp_external_addr.rs`) exercises the REAL
+# swarm behaviour: a `--upnp`-enabled event swarm actually carries an active
+# UPnP/NAT-PMP mapping behaviour, and a discovered external multiaddr enters the
+# swarm's advertised external-address set (the exact set libp2p `identify`
+# broadcasts to peers), while a UPnP-off swarm leaves the behaviour inert. It is
+# off by default so the ordinary `cargo test` unit run does not require it.
+#
+# The same feature also gates `tests/pillar_udp_preferred_transport.rs`, which
+# stands up real libp2p swarms over real sockets to prove the corrected
+# transport posture (pillar-UDP preferred; QUIC/TCP fallback) end to end. Both
+# acceptance-tier tests share this single off-by-default gate.
+acceptance = []
+
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
 libp2p = { version = "0.56", features = [
