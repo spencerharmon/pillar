@@ -1,0 +1,167 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.16}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+
+\definecolor{pgood}{RGB}{31,119,80}
+\definecolor{pbad}{RGB}{200,40,40}
+\definecolor{pnode}{RGB}{38,70,120}
+\definecolor{pmid}{RGB}{210,140,20}
+\definecolor{pgray}{RGB}{110,110,110}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\todo}[1]{{\color{pbad}\textbf{[TODO: #1]}}}
+
+\title{\vspace{-3.5em}\bfseries pillar-UDP Redundancy: Header Format and the
+Loss/Bandwidth Trade\\[0.3em]\large\normalfont(companion to ``Clustered Multipath
+Congestion Avoidance and Redundant Delivery'')}
+\author{\normalsize pillar engineering}
+\date{\normalsize DRAFT --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+\textbf{This is a working draft.} The primary pillar-UDP paper proves the
+\emph{qualitative} delivery guarantees (exactly-once, route-around liveness,
+bounded fan-out) and defers two quantitative matters to this companion: (i)~the
+on-the-wire encoding of the per-connection \emph{redundancy allowance} and the
+rest of the pillar-UDP message header, and (ii)~the analytic loss/bandwidth
+trade that determines how large the allowance should be for a target
+reliability. This draft fixes the analytic framework---which is closed-form and
+stated here in full---and lays out the header's logical field set; the exact
+byte encoding and the empirical validation of the independence assumption remain
+open (\S\ref{sec:open}).
+\end{abstract}
+
+\section{Scope}
+The companion's job is narrow: give operators a defensible rule for setting the
+redundancy allowance, and give implementers a stable header contract. Nothing
+here changes the protocol's proven guarantees; it parameterises them. Two
+regimes share one substrate and differ only in redundancy shape:
+\emph{small-message} delivery (a message rides in $W$ whole redundant copies)
+and \emph{bulk} delivery (a payload is split into $K$ data shards plus $M$
+erasure shards and reconstructed from any $K$ arrivals). Both are analysed
+below.
+
+\section{The loss/bandwidth trade (small messages)}\label{sec:trade}
+Let a message be sent as $W$ redundant copies over paths whose losses are
+independent with per-path probability $p$ (the primary paper argues dispersion
+across AS-diverse nodes is what makes independence realistic; \S\ref{sec:open}
+records this as the assumption to validate empirically). The message is
+undelivered only if every copy drops:
+\[
+  P_{\text{fail}}(W,p) = p^{\,W}.
+\]
+The bandwidth cost is a fan-out of $W$: overhead is $(W-1)$ redundant copies per
+delivered message. Fixing a target residual $\varepsilon$ and solving
+$p^{W}\le\varepsilon$ gives the \emph{minimum allowance}
+\[
+  W^\star(p,\varepsilon)=\left\lceil \frac{\ln\varepsilon}{\ln p}\right\rceil
+    = \left\lceil \log_{p}\varepsilon \right\rceil ,
+\]
+a closed form the sender can evaluate per connection from its measured $p$ and
+the connection's declared $\varepsilon$. This is the value the redundancy
+allowance encodes; it scales \emph{down} toward $W=1$ as $p\to0$ (a clean path
+costs nothing) and \emph{up} as $p\to1$, which is exactly the adaptive posture
+the primary paper requires. Table~\ref{tab:wstar} tabulates $W^\star$.
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+$p$ & $\varepsilon{=}10^{-3}$ & $\varepsilon{=}10^{-6}$ & $\varepsilon{=}10^{-9}$\\
+\midrule
+0.01 & 2 & 3 & 5 \\
+0.05 & 3 & 5 & 7 \\
+0.10 & 3 & 6 & 9 \\
+0.20 & 5 & 9 & 13 \\
+0.30 & 6 & 12 & 18 \\
+0.50 & 10 & 20 & 30 \\
+\bottomrule
+\end{tabular}
+\caption{Minimum redundancy allowance $W^\star=\lceil\log_p\varepsilon\rceil$ for
+target residual loss $\varepsilon$. The allowance is cheap on good paths and
+grows only as the path degrades.}
+\label{tab:wstar}
+\end{table}
+
+\section{Erasure regime (bulk)}\label{sec:erasure}
+For bulk transfer the payload is split into $K$ data shards and $M$ parity
+shards ($N=K+M$ total, systematic code), reconstructable from any $K$ arrivals
+(the implementation's \code{encode}/\code{reconstruct} in \code{pillar\_udp.rs}).
+With independent per-shard loss $p$, reconstruction fails iff fewer than $K$ of
+$N$ shards arrive:
+\[
+  P_{\text{fail}}(K,M,p)=\sum_{i=0}^{K-1}\binom{N}{i}(1-p)^{i}p^{\,N-i}.
+\]
+The bandwidth overhead is $M/K$, tunable independently of $K$, so bulk pays a
+\emph{fractional} overhead where small messages pay a multiple. The parity rate
+$M/K$ is tied to the same redundancy-allowance header field, mapped through the
+$\varepsilon$/$p$ relation above rather than a raw copy count.
+\todo{plot $P_{\text{fail}}(K,M,p)$ surface and derive the $M/K$ that meets a
+given $\varepsilon$ at measured $p$; cross-check against Table~\ref{tab:wstar}.}
+
+\section{Header format (logical fields)}\label{sec:header}
+The header binds every datagram---initial spray copy or forward---to its logical
+message and states the connection's redundancy contract up front. The
+\emph{logical} field set below is fixed by the protocol's proven mechanics; the
+concrete byte layout is deferred (\S\ref{sec:open}).
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}p{0.27\columnwidth}p{0.63\columnwidth}@{}}
+\toprule
+field & meaning \\
+\midrule
+CID & content address of the message bytes; the dedup and integrity key
+(identical to the streamdb/blob content address). \\
+redundancy allowance & the connection's $W^\star$ (small) or parity rate $M/K$
+(bulk), per \S\ref{sec:trade}--\ref{sec:erasure}; caps system-wide fan-out. \\
+hop TTL & remaining forward budget; decremented per hop, forwarding stops at 0
+(with CID dedup, guarantees loop-free termination). \\
+side-effect class & idempotent/\emph{Convergent} vs \emph{Exclusive}; routes an
+exclusive message's processing to the coordination-core lease holder. \\
+shard descriptor & for bulk: $K$, $M$, and the shard index/offset for
+reconstruction. \\
+return-routability token & anti-amplification: proof the source address is
+reachable before the cell commits redundant replies. \\
+\bottomrule
+\end{tabular}
+\caption{pillar-UDP header logical fields. Each corresponds to an invariant
+already modelled in \code{specs/PillarUDP.tla} / \code{PillarUdpClient.tla} /
+\code{PillarUdpMesh.tla}; this paper's remaining work is their wire encoding.}
+\label{tab:header}
+\end{table}
+
+\section{Open items}\label{sec:open}
+This draft is complete on the analytic framework and the logical header
+contract; the following remain before it is publishable:
+\begin{itemize}\itemsep2pt
+  \item \todo{Byte-level wire encoding of Table~\ref{tab:header}: field widths,
+  varint vs fixed, alignment, and the Noise/session-key framing boundary.}
+  \item \todo{Empirical validation of the independence assumption
+  (\S\ref{sec:trade}): measure correlated loss across AS-diverse pillar-ipam
+  prefixes and quantify how much it inflates the effective $p$ used in
+  $W^\star$.}
+  \item \todo{Bulk $M/K$ selection curve (\S\ref{sec:erasure}) and its mapping
+  onto the single redundancy-allowance field shared with the small-message
+  regime.}
+  \item \todo{Congestion-safety envelope: bound the aggregate fan-out a cell
+  emits so the adaptive allowance cannot itself induce congestion collapse under
+  correlated loss.}
+\end{itemize}
+No quantitative claim in this draft rests on unmeasured data: Tables~\ref{tab:wstar}
+is exact arithmetic from the closed forms, and every empirical question is listed
+above rather than filled with a placeholder value.
+
+\end{document}
