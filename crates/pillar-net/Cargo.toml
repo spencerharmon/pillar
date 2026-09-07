@@ -76,6 +76,17 @@ pillar-topology = { path = "../pillar-topology" }
 # artifacts gating Route attachment. (pillar-manifest is now a runtime dep of
 # this crate for the UDP dataplane, above.)
 pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+# Dev-only: the network-root pnet acceptance test (`tests/network_root_pnet.rs`,
+# gated by the `acceptance` feature) asserts the PUBLIC default derives its pnet
+# key from the published `pillar_swarm::PUBLIC_PILLAR_ROOT` (never a keyless
+# `disabled()` transport) and that ONE root feeds BOTH the event-log pnet key
+# (this crate) AND the IPFS pnet key (`pillar-ipfs`) via each crate's
+# domain-separated `PrivateSwarmKey::from_root_secret`. Both are DEV-only: the
+# runtime substrate never depends on either (pillar-swarm carries the shared key
+# model; the pillar-ipfs edge is a dev-dependency cycle, which cargo permits —
+# it never becomes a build/runtime dependency of pillar-net).
+pillar-swarm = { path = "../pillar-swarm" }
+pillar-ipfs = { path = "../pillar-ipfs" }
 
 [lints]
 workspace = true
