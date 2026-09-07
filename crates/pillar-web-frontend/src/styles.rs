@@ -517,6 +517,16 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .ds-tree summary {{ cursor: pointer; }}
         .ds-tree summary::-webkit-details-marker {{ color: {muted}; }}
 
+        /* ---- resources console ---- */
+        .res-toolbar {{ display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.6rem; }}
+        .res-toolbar select {{
+            padding: 0.4rem 0.6rem; background-color: {surface_base}; color: {text};
+            border: 1px solid {border}; border-radius: 8px; font-size: 0.82rem;
+        }}
+        .res-openrow {{ display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; }}
+        .res-change h4 {{ margin: 0.9rem 0 0.4rem; }}
+        .res-verdict {{ display: flex; align-items: center; gap: 0.75rem; margin: 0.75rem 0; }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{

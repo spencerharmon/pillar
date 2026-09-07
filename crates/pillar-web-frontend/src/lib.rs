@@ -25,6 +25,7 @@ pub mod panels;
 pub mod portal;
 pub mod portal_entry;
 pub mod primitives;
+pub mod resources_console;
 pub mod router;
 pub mod styles;
 pub mod theme;

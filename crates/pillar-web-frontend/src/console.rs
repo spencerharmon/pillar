@@ -176,9 +176,10 @@ mod yew_impl {
     use crate::auth::{use_auth, AuthAction};
     use crate::obs_console::ObservabilityConsole;
     use crate::portal::{
-        IdentityTile, InboxTile, MembersTile, NodeStatusTile, ResourceTile, SessionsTile,
-        SwarmTile, TopologyTile, TrustTile,
+        IdentityTile, InboxTile, MembersTile, NodeStatusTile, SessionsTile, SwarmTile,
+        TopologyTile, TrustTile,
     };
+    use crate::resources_console::ResourcesConsole;
     use crate::router::Route;
     use yew::prelude::*;
     use yew_router::prelude::*;
@@ -282,7 +283,7 @@ mod yew_impl {
                     </div>
                 </>
             },
-            Section::Resources => html! { <ResourceTile /> },
+            Section::Resources => html! { <ResourcesConsole /> },
             Section::Observability => html! { <ObservabilityConsole /> },
             Section::Topology => html! { <TopologyTile /> },
             Section::Identity => html! { <IdentityTile /> },
