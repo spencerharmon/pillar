@@ -37,8 +37,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::core::multiaddr::{Multiaddr, Protocol};
 use libp2p::identity::Keypair;
-use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::kad;
+use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use tokio::time::timeout;
 
 use pillar_net::{
@@ -254,7 +254,10 @@ async fn same_swarm_key_file_plus_seed_node_converges() {
     })
     .await;
 
-    let query_id = joiner.behaviour_mut().kademlia.get_closest_peers(seed_peer_id);
+    let query_id = joiner
+        .behaviour_mut()
+        .kademlia
+        .get_closest_peers(seed_peer_id);
     let found = drive_until(&mut joiner, Duration::from_secs(15), |event| match event {
         SwarmEvent::Behaviour(EventBehaviourEvent::Kademlia(
             kad::Event::OutboundQueryProgressed {
@@ -347,10 +350,8 @@ mod tempdir_shim {
     impl TempDir {
         pub fn new(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "pillar-net-{tag}-{}-{n}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("pillar-net-{tag}-{}-{n}", std::process::id()));
             std::fs::create_dir_all(&path).expect("create tempdir");
             TempDir { path }
         }
