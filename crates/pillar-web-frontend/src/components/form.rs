@@ -74,8 +74,19 @@ pub fn validate_all(fields: &[(String, String, Vec<FieldRule>)]) -> Vec<(String,
         .collect()
 }
 
+/// Whether a set of `(field-name, value, rules)` triples is entirely valid
+/// (i.e. [`validate_all`] found no failures). This is the field-set's aggregate
+/// definition of "can submit", host-tested independently of the Yew glue.
+#[must_use]
+pub fn all_valid(fields: &[(String, String, Vec<FieldRule>)]) -> bool {
+    validate_all(fields).is_empty()
+}
+
 #[cfg(feature = "yew")]
 pub use yew_impl::{FormField, FormFieldProps};
+
+#[cfg(feature = "yew")]
+pub use yew_impl::{FieldSet, FieldSetProps};
 
 #[cfg(feature = "yew")]
 mod yew_impl {
@@ -129,6 +140,60 @@ mod yew_impl {
                     <p class="pillar-formfield__error" role="alert">{ msg }</p>
                 }
             </div>
+        }
+    }
+
+    /// Props for [`FieldSet`] — a reusable `<form>` field-set wrapper.
+    #[derive(Properties, PartialEq)]
+    pub struct FieldSetProps {
+        /// An optional group legend/heading.
+        #[prop_or_default]
+        pub legend: AttrValue,
+        /// The label on the submit control.
+        #[prop_or(AttrValue::from("Submit"))]
+        pub submit_label: AttrValue,
+        /// Whether the field-set is currently submittable (typically wired from
+        /// the pure [`super::all_valid`] over the parent's live field values).
+        #[prop_or(true)]
+        pub can_submit: bool,
+        /// Invoked when the enabled submit control is activated.
+        #[prop_or_default]
+        pub onsubmit: Callback<()>,
+        /// The [`FormField`] children of this set.
+        #[prop_or_default]
+        pub children: Children,
+    }
+
+    /// A `<form>` field-set that groups a set of [`FormField`]s under an optional
+    /// legend and gates a submit control on `can_submit`. The submit gate is
+    /// derived by the caller from the host-tested [`super::all_valid`] /
+    /// [`super::validate_all`], so the whole-form validity is proven without a
+    /// browser; this component only renders the grouping and the (dis)abled
+    /// submit button.
+    #[function_component(FieldSet)]
+    pub fn field_set(props: &FieldSetProps) -> Html {
+        let onsubmit = {
+            let cb = props.onsubmit.clone();
+            let can = props.can_submit;
+            Callback::from(move |e: SubmitEvent| {
+                e.prevent_default();
+                if can {
+                    cb.emit(());
+                }
+            })
+        };
+        html! {
+            <form class="pillar-fieldset" onsubmit={onsubmit}>
+                if !props.legend.is_empty() {
+                    <legend class="pillar-fieldset__legend">{ props.legend.clone() }</legend>
+                }
+                { for props.children.iter() }
+                <button
+                    type="submit"
+                    class="pillar-fieldset__submit"
+                    disabled={!props.can_submit}
+                >{ props.submit_label.clone() }</button>
+            </form>
         }
     }
 }
@@ -188,5 +253,23 @@ mod tests {
         assert!(errs.iter().any(|(f, _)| f == "name"));
         assert!(errs.iter().any(|(f, _)| f == "bio"));
         assert!(!errs.iter().any(|(f, _)| f == "age"));
+    }
+
+    #[test]
+    fn all_valid_gates_the_field_set_on_every_field() {
+        // A field-set with one failing field is not valid.
+        let bad = vec![
+            ("name".into(), "".into(), vec![FieldRule::Required]),
+            ("age".into(), "42".into(), vec![FieldRule::Integer]),
+        ];
+        assert!(!all_valid(&bad));
+        // Fix the failing field and the whole set is valid.
+        let good = vec![
+            ("name".into(), "ada".into(), vec![FieldRule::Required]),
+            ("age".into(), "42".into(), vec![FieldRule::Integer]),
+        ];
+        assert!(all_valid(&good));
+        // An empty field-set is vacuously valid.
+        assert!(all_valid(&[]));
     }
 }
