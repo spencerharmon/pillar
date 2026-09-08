@@ -66,6 +66,11 @@ use pillar_core::NodeId;
 use pillar_wot_authority::WotAuthority;
 
 pub mod sealed_secret_store;
+pub mod key_export;
+pub use key_export::{
+    authorize_key_export, cell_key_export_capability, key_export_step_up_policy,
+    CELL_KEY_EXPORT_CAPABILITY, KEY_EXPORT_STEP_UP_MAX_AGE_SECS,
+};
 pub use sealed_secret_store::{SecretId, SecretRequestError, SecretStore};
 
 /// One specific, named action the decider may allow or deny.

@@ -220,10 +220,12 @@ pub fn interpret_login(ok: bool, body: &str, submitted: &str) -> Result<String, 
     }
 }
 
-/// The atomic `POST /bootstrap/create` body (`<cell>\n<handle>\n<factor>`).
+/// The atomic `POST /bootstrap/create` body
+/// (`<cell>\n<handle>\n<factor>\n<second_factor>`). `second_factor` is the
+/// first user's 2FA method (`password`|`passkey`|`tpm`|`pkcs11`).
 #[must_use]
-pub fn bootstrap_wire(cell: &str, handle: &str, factor: &str) -> String {
-    body_lines(&[cell, handle, factor])
+pub fn bootstrap_wire(cell: &str, handle: &str, factor: &str, second_factor: &str) -> String {
+    body_lines(&[cell, handle, factor, second_factor])
 }
 
 /// A bootstrap succeeded iff a 2xx body contains `BOOTSTRAPPED`.
@@ -2190,7 +2192,7 @@ mod tests {
 
     #[test]
     fn bootstrap_wire_and_interpret() {
-        assert_eq!(bootstrap_wire("cell", "h", "f"), "cell\nh\nf");
+        assert_eq!(bootstrap_wire("cell", "h", "f", "passkey"), "cell\nh\nf\npasskey");
         assert!(interpret_bootstrap(true, "BOOTSTRAPPED cell").is_ok());
         assert_eq!(
             interpret_bootstrap(false, "DENIED CellNameInUse"),

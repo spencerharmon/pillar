@@ -227,6 +227,20 @@ pub struct WebAuthContext {
     sessions: HashMap<String, NodeCustodySession>,
     /// The `pillar_web` login-session view (for the shared non-loopback gate).
     login_sessions: HashMap<String, LoginSession>,
+    /// Subjects granted the cell-level key-export role (the `cell:key-export`
+    /// capability). Populated at first-user creation (the cell admin holds it)
+    /// and by a future admin grant path; an export is authorized ONLY for a
+    /// subject in this set, through the shared `pillar_rbac::authorize_key_export`
+    /// gate. Independent of every other capability.
+    key_export_role: std::collections::HashSet<NodeId>,
+    /// Per-token step-up freshness stamp (the session clock tick at which the
+    /// token last authenticated). The key-export gate consumes it as the fresh
+    /// WebAuthn step-up proof; a token with no fresh stamp cannot export a secret.
+    step_up_at: HashMap<String, u64>,
+    /// The first user's required second factor (`password`|`passkey`|`tpm`|
+    /// `pkcs11`), recorded at bootstrap so first-login enrollment requires/offers
+    /// the matching WebAuthn/HSM/TPM registration.
+    first_user_second_factor: HashMap<String, String>,
     next_session: u64,
     /// The node/user bootstrap-request queue for the cell this node serves.
     /// `None` until the cell is created (a request joins an EXISTING cell).
@@ -638,6 +652,9 @@ impl WebAuthContext {
             name_registry: Box::new(InMemoryCellNameRegistry::new()),
             sessions: HashMap::new(),
             login_sessions: HashMap::new(),
+            key_export_role: std::collections::HashSet::new(),
+            step_up_at: HashMap::new(),
+            first_user_second_factor: HashMap::new(),
             next_session: 0,
             requests: None,
             identity: NodeIdentitySnapshot {
@@ -1734,6 +1751,50 @@ impl WebAuthContext {
         &self.trust
     }
 
+    /// Record the first user's chosen second factor (2FA) so first-login
+    /// enrollment requires/offers the matching WebAuthn/HSM/TPM registration.
+    pub fn note_first_user_second_factor(&mut self, handle: &str, method: &str) {
+        self.first_user_second_factor
+            .insert(handle.to_owned(), method.to_owned());
+    }
+
+    /// The second factor recorded for `handle` at bootstrap (`"password"` when
+    /// none / unknown).
+    #[must_use]
+    pub fn first_user_second_factor(&self, handle: &str) -> &str {
+        self.first_user_second_factor
+            .get(handle)
+            .map_or("password", String::as_str)
+    }
+
+    /// The shared key-export authorization for `subject` on this `token`: builds
+    /// the `pillar_rbac` decider with the mandatory key-export step-up policy and
+    /// an explicit `cell:key-export` grant iff `subject` holds the export role,
+    /// then routes through `pillar_rbac::authorize_key_export` with the token's
+    /// fresh step-up stamp. The ONE decision both the portal endpoint and (via
+    /// the endpoint) the CLI `pillar key export --secret` consult.
+    #[must_use]
+    pub fn authorize_key_export_decision(&self, subject: &NodeId, token: &str) -> Decision {
+        let policies: [PolicyEvent; 0] = [];
+        let grants: Vec<pillar_rbac::ExplicitGrant> = if self.key_export_role.contains(subject) {
+            vec![pillar_rbac::ExplicitGrant {
+                subject: subject.clone(),
+                capability: pillar_rbac::cell_key_export_capability(),
+                effect: pillar_rbac::GrantEffect::Allow,
+            }]
+        } else {
+            Vec::new()
+        };
+        let step_up = pillar_rbac::key_export_step_up_policy();
+        let decider =
+            RbacDecider::new(&self.authority, &policies, &grants).with_step_up_policy(&step_up);
+        let proof = self
+            .step_up_at
+            .get(token)
+            .map(|t| pillar_rbac::StepUpAssertion::new(*t, token.as_bytes().to_vec()));
+        pillar_rbac::authorize_key_export(&decider, subject.clone(), self.session_clock, proof)
+    }
+
     /// Register (or update) a node's LIVE health status + capacity — the
     /// topology explorer tree's per-node leaf data (ROI "Web portal / UI
     /// rework": topology UI). A real node folds this from telemetry; the
@@ -2304,6 +2365,11 @@ impl WebAuthContext {
         let subkey = bootstrap_subkey(&handle);
         let level = self.authority.max_depth();
         self.admit_subject(subkey.node_id(), level);
+        // The first user is the cell admin: grant the independent key-export
+        // role to its identity so it can export the cell/user keys for a
+        // gpg audit (still step-up gated at export time).
+        self.key_export_role.insert(subkey.node_id());
+        self.key_export_role.insert(NodeId::from(handle.as_str()));
 
         // (2) Escrow the scoped operational key as a node-sealed L1 offer to
         // THIS bootstrap node's own node key — the per-node seal IS the
@@ -2450,6 +2516,10 @@ impl WebAuthContext {
         // session-management panel's substrate (list/revoke/revoke-all).
         let issued_at = self.session_clock;
         self.session_clock += 1;
+        // Stamp this token's step-up freshness: the login is itself an
+        // authentication ceremony, so a just-logged-in token carries a fresh
+        // step-up proof the key-export gate consumes.
+        self.step_up_at.insert(token.clone(), issued_at);
         self.session_registry.mint(
             session.subject.to_string(),
             token.clone(),
@@ -2945,6 +3015,7 @@ fn dispatch_bootstrap_create(
         cell_id,
         handle,
         password,
+        second_factor,
     } = BootstrapCreateRequest::from_body(&request.body);
     if cell_id.is_empty() || handle.is_empty() || password.is_empty() {
         return text_response(
@@ -2954,7 +3025,18 @@ fn dispatch_bootstrap_create(
         );
     }
     match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
-        Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
+        Ok(()) => {
+            // Record the first user's required second factor so the enrollment
+            // (WebAuthn/HSM/TPM registration) is required/offered at first
+            // login; "password" means no hardware second factor.
+            ctx.note_first_user_second_factor(&handle, &second_factor);
+            let hint = if second_factor == "password" {
+                String::new()
+            } else {
+                format!(" REGISTER-2FA {second_factor}")
+            };
+            text_response(200, "OK", format!("BOOTSTRAPPED {handle}{hint}"))
+        }
         Err(BootstrapError::CellNameInUse) => text_response(
             409,
             "Conflict",
@@ -3155,6 +3237,11 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "GET",
         path: PathMatch::Exact("/portal/trust-graph"),
         handler: |ctx, _peer, request| dispatch_trust_graph_view(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/key-export"),
+        handler: |ctx, _peer, request| dispatch_key_export(ctx, request),
     },
     RouteSpec {
         method: "GET",
@@ -4178,20 +4265,80 @@ fn dispatch_attestation_build(ctx: &mut WebAuthContext, request: &HttpRequest) -
     }
 }
 
-/// The trust-graph visualization: `GET /portal/trust-graph?token=...`. A
-/// PURE view — signs and mutates nothing.
+/// The gpg-auditable key export: `GET /portal/key-export?token=<s>&principal=<id>
+/// [&secret=true]`. A PUBLIC export (default) renders any WoT principal's
+/// OpenPGP public key (public keys are public) with its inbound trust
+/// signatures. A SECRET export (`secret=true`) is refused unless the caller is
+/// exporting THEIR OWN identity AND holds the `cell:key-export` role AND carries
+/// a fresh step-up — the shared [`pillar_rbac::authorize_key_export`] gate, the
+/// SAME one the CLI routes through. Fail-closed on every missing factor.
+fn dispatch_key_export(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    const EXPORT_KEY_CREATED_SECS: u32 = 1_700_000_000;
+    let token = query_value(&request.path, "token").unwrap_or("");
+    let Some(session) = ctx.login_session_for(token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let subject = session.subject.clone();
+    let principal = query_value(&request.path, "principal")
+        .filter(|p| !p.is_empty())
+        .map(NodeId::from)
+        .unwrap_or_else(|| subject.clone());
+    let want_secret = query_value(&request.path, "secret") == Some("true");
+    let uid = format!("{} (pillar identity key)", principal.0);
+
+    let decision = if !want_secret {
+        pillar_rbac::Decision::Allow
+    } else {
+        if principal != subject {
+            return text_response(
+                403,
+                "Forbidden",
+                "DENIED can only export your own secret key".to_owned(),
+            );
+        }
+        ctx.authorize_key_export_decision(&subject, token)
+    };
+
+    match crate::wot_cli::export_named_principal(
+        decision,
+        ctx.trust_store(),
+        &principal,
+        &uid,
+        EXPORT_KEY_CREATED_SECS,
+        want_secret,
+    ) {
+        Ok(armored) => text_response(200, "OK", armored),
+        Err(crate::wot_cli::ExportError::NotAuthorized) => text_response(
+            403,
+            "Forbidden",
+            "DENIED key export requires the cell:key-export role and a fresh step-up".to_owned(),
+        ),
+        Err(e) => text_response(400, "Bad Request", format!("DENIED {e}")),
+    }
+}
+
+/// The trust-graph visualization: `GET /portal/trust-graph?token=...&view=...`.
+/// A PURE view — signs and mutates nothing. `view` selects the rendering:
+/// `graph` (default; per-node signing-key fingerprints + per-edge signatures,
+/// the node-link body the portal draws), `trust` (live trust edges), `signatures`
+/// (the issuer signing public key behind each edge's signature), or
+/// `attestations` (each edge's full signed predicate). All four render through
+/// the shared [`crate::wot_cli`] library the CLI `pillar wot` verbs also use, so
+/// the portal and CLI can never diverge.
 fn dispatch_trust_graph_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let token = query_value(&request.path, "token").unwrap_or("");
     if ctx.login_session_for(token).is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     }
-    let mut body = String::new();
-    for e in ctx.trust_graph_edges() {
-        body.push_str(&format!(
-            "EDGE {} -> {} LABEL {}\n",
-            e.from.0, e.to.0, e.label
-        ));
-    }
+    let store = ctx.trust_store();
+    let body = match query_value(&request.path, "view").unwrap_or("graph") {
+        "trust" => crate::wot_cli::list_trust(store),
+        "signatures" => crate::wot_cli::list_signatures(store),
+        "attestations" => crate::wot_cli::list_attestations(store),
+        // Default/`graph`: the node-link body carrying every node's public-key
+        // fingerprint and every edge's signature cid (WoT transparency).
+        _ => crate::wot_cli::graph_text(store),
+    };
     text_response(200, "OK", body)
 }
 
@@ -7196,6 +7343,82 @@ mod tests {
             "got: {}",
             view.body
         );
+    }
+
+    // gpg-auditable key export: public keys are exportable by any authenticated
+    // viewer; a SECRET export is gated on owning your key + the cell:key-export
+    // role + a fresh step-up (the shared pillar_rbac gate).
+    #[test]
+    fn key_export_endpoint_enforces_public_vs_secret_gate() {
+        // A bootstrapped first user holds the export role by default.
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        ctx.create_cell(NodeId::from("cell-x")).expect("cell");
+        ctx.bootstrap_create_first_user("founder@pillar", PASSWORD)
+            .expect("first user");
+        let nonce = get(&mut ctx, "/nonce");
+        let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
+        let login = post(
+            &mut ctx,
+            "/login",
+            &format!("founder@pillar\n{PASSWORD}\n{nonce_id}"),
+        );
+        assert_eq!(login.status, 200, "login: {}", login.body);
+        let token = login.session_token.expect("token");
+
+        // Unauthenticated is refused.
+        assert_eq!(
+            get(&mut ctx, "/portal/key-export?token=nope&principal=founder@pillar").status,
+            401
+        );
+
+        // Public export: allowed, real armored OpenPGP public key (own key,
+        // principal defaults to the session subject).
+        let pubx = get(&mut ctx, &format!("/portal/key-export?token={token}"));
+        assert_eq!(pubx.status, 200, "got: {}", pubx.body);
+        assert!(
+            pubx.body.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+            "got: {}",
+            pubx.body
+        );
+
+        // Secret export of OWN key: allowed (role + fresh login step-up).
+        let secx = get(&mut ctx, &format!("/portal/key-export?token={token}&secret=true"));
+        assert_eq!(secx.status, 200, "got: {}", secx.body);
+        assert!(
+            secx.body.contains("-----BEGIN PGP PRIVATE KEY BLOCK-----"),
+            "got: {}",
+            secx.body
+        );
+
+        // Secret export of SOMEONE ELSE's key: refused.
+        let other = get(
+            &mut ctx,
+            &format!("/portal/key-export?token={token}&principal=someone-else&secret=true"),
+        );
+        assert_eq!(other.status, 403, "got: {}", other.body);
+    }
+
+    // A logged-in user WITHOUT the export role cannot export a secret key.
+    #[test]
+    fn key_export_secret_refused_without_the_role() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let secx = get(
+            &mut ctx,
+            &format!("/portal/key-export?token={token}&principal=alice@pillar&secret=true"),
+        );
+        // alice's session subject may differ from the identifier; either way a
+        // no-role subject is refused a secret export (403).
+        assert_eq!(secx.status, 403, "got: {}", secx.body);
+        // But a public key is still exportable.
+        let pubx = get(&mut ctx, &format!("/portal/key-export?token={token}"));
+        assert_eq!(pubx.status, 200, "got: {}", pubx.body);
     }
 
     // Key & offer UI: custody migration/rotation/seal-escrow/revoke each

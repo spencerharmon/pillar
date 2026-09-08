@@ -233,7 +233,10 @@ impl BootstrapStatus {
 }
 
 /// `POST /bootstrap/create` request — the ONE atomic bootstrap (cell + first
-/// user together). Wire framing: `"<cell_id>\n<handle>\n<password>"`.
+/// user together). Wire framing:
+/// `"<cell_id>\n<handle>\n<password>\n<second_factor>"`. The trailing
+/// `second_factor` line is OPTIONAL (older clients omit it); when absent it
+/// defaults to `"password"` (no hardware second factor).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapCreateRequest {
     /// The new cell's id.
@@ -242,10 +245,14 @@ pub struct BootstrapCreateRequest {
     pub handle: String,
     /// The first user's unlock factor.
     pub password: String,
+    /// The first user's required second factor for 2FA registration:
+    /// `"password"` (none), `"passkey"` (WebAuthn/FIDO2), `"tpm"` (TPM 2.0), or
+    /// `"pkcs11"` (PKCS#11 HSM / smart card).
+    pub second_factor: String,
 }
 
 impl BootstrapCreateRequest {
-    /// Parse the `"<cell_id>\n<handle>\n<password>"` body.
+    /// Parse the `"<cell_id>\n<handle>\n<password>[\n<second_factor>]"` body.
     #[must_use]
     pub fn from_body(body: &str) -> Self {
         let mut lines = body.lines();
@@ -253,13 +260,24 @@ impl BootstrapCreateRequest {
             cell_id: lines.next().unwrap_or("").trim().to_owned(),
             handle: lines.next().unwrap_or("").trim().to_owned(),
             password: lines.next().unwrap_or("").trim().to_owned(),
+            second_factor: {
+                let sf = lines.next().unwrap_or("").trim();
+                if sf.is_empty() {
+                    "password".to_owned()
+                } else {
+                    sf.to_owned()
+                }
+            },
         }
     }
 
-    /// Render back to the exact wire body.
+    /// Render back to the exact wire body (always four lines).
     #[must_use]
     pub fn to_wire(&self) -> String {
-        format!("{}\n{}\n{}", self.cell_id, self.handle, self.password)
+        format!(
+            "{}\n{}\n{}\n{}",
+            self.cell_id, self.handle, self.password, self.second_factor
+        )
     }
 }
 
@@ -591,8 +609,9 @@ mod tests {
     fn bootstrap_create_request_json_round_trips() {
         round_trip(&BootstrapCreateRequest {
             cell_id: "cell-1".to_owned(),
-            handle: "spencer".to_owned(),
+            handle: "founder".to_owned(),
             password: "s3cret".to_owned(),
+            second_factor: "passkey".to_owned(),
         });
     }
 
@@ -600,11 +619,17 @@ mod tests {
     fn bootstrap_create_request_wire_round_trips() {
         let req = BootstrapCreateRequest {
             cell_id: "cell-1".to_owned(),
-            handle: "spencer".to_owned(),
+            handle: "founder".to_owned(),
             password: "s3cret".to_owned(),
+            second_factor: "tpm".to_owned(),
         };
         let wire = req.to_wire();
         assert_eq!(BootstrapCreateRequest::from_body(&wire), req);
+        // A legacy 3-line body defaults the second factor to "password".
+        assert_eq!(
+            BootstrapCreateRequest::from_body("cell-1\nfounder\ns3cret").second_factor,
+            "password"
+        );
     }
 
     #[test]

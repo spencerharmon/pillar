@@ -51,6 +51,7 @@ pub mod versioning_rollout;
 pub mod web_serve;
 pub mod webauthn_cli;
 pub mod workload_reconcile;
+pub mod wot_cli;
 
 use std::collections::BTreeMap;
 use std::fmt;
