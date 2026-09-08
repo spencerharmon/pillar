@@ -40,7 +40,7 @@ image_repo_root() {
 # working tree's flake and load it into the container runtime, printing the
 # loaded image reference. Fails loudly (non-zero) if nix or the load fails.
 image_build_local() {
-    local root tag streamer gcroot
+    local root tag streamer gcroot buildlog build_rc attempt
     root="$(image_repo_root)"
     tag="pillar-it-under-test:local"
 
@@ -58,13 +58,37 @@ image_build_local() {
     # "expected an executable streamer" for a path that no longer existed).
     # `--out-link` to a private tmp path keeps the whole closure alive until
     # we explicitly remove the link below.
+    #
+    # Write nix's output to a real file rather than piping through `tail -1`:
+    # a pipeline's exit status is its LAST stage's (`tail`'s, which never
+    # fails), so `nix build ... | tail -1` silently swallowed a genuine build
+    # failure and let a stale/garbage line be mistaken for the out-path. Capture
+    # the real `nix build` exit code directly instead.
+    buildlog="$(mktemp "${TMPDIR:-/tmp}/pillar-it-oci-image-build.XXXXXX.log")"
     gcroot="$(mktemp -u "${TMPDIR:-/tmp}/pillar-it-oci-image.XXXXXX")"
-    streamer="$(nix --extra-experimental-features "nix-command flakes" \
-        build --out-link "$gcroot" --print-out-paths "$root#pillar-oci-image" 2>&1 | tail -1)" \
-        || { rm -f "$gcroot"; fail "image_build_local: nix build .#pillar-oci-image failed:\n$streamer"; }
+    nix --extra-experimental-features "nix-command flakes" \
+        build --out-link "$gcroot" --print-out-paths "$root#pillar-oci-image" >"$buildlog" 2>&1
+    build_rc=$?
+    streamer="$(tail -1 "$buildlog")"
+    if [ "$build_rc" -ne 0 ]; then
+        rm -f "$gcroot" "$buildlog"
+        fail "image_build_local: nix build .#pillar-oci-image failed (exit $build_rc):\n$streamer"
+    fi
+    rm -f "$buildlog"
+
+    # Even with a registered GC root, the sandboxed harness's own mount
+    # namespace can observe a just-created nix-store path with a short lag
+    # (a stale directory-entry cache over the /nix/store bind-mount predating
+    # the daemon's write) — NOT a real GC race, since the root already
+    # protects the object from collection. Settle for a few seconds rather
+    # than failing on the very first stat.
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        [ -x "$streamer" ] && break
+        sleep 1
+    done
     if [ ! -x "$streamer" ]; then
         rm -f "$gcroot"
-        fail "image_build_local: expected an executable streamer at '$streamer'"
+        fail "image_build_local: expected an executable streamer at '$streamer' (still absent after settling)"
     fi
 
     info "image: loading the built image-under-test into $CONTAINER_RUNTIME as $tag"
