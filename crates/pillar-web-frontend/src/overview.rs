@@ -47,6 +47,7 @@ pub use yew_impl::OverviewConsole;
 mod yew_impl {
     use super::{summarize, OverviewKpis};
     use crate::auth::use_auth;
+    use crate::components::use_toaster;
     use crate::obs_console::parse_kind_counts;
     use crate::portal::{get_url, http, NodeStatusTile};
     use crate::primitives::{Chart, ChartKind, StatCard};
@@ -61,33 +62,57 @@ mod yew_impl {
     pub fn overview_console() -> Html {
         let auth = use_auth();
         let kpis = use_state(OverviewKpis::default);
+        let toaster = use_toaster();
 
         {
-            let (auth, kpis) = (auth.clone(), kpis.clone());
+            let (auth, kpis, toaster) = (auth.clone(), kpis.clone(), toaster.clone());
             use_effect_with(auth.token.clone(), move |token| {
                 if let Some(token) = token.clone() {
-                    let kpis = kpis.clone();
+                    let (kpis, toaster) = (kpis.clone(), toaster.clone());
                     let kinds_url = get_url("/portal/obs/live/kinds", &token, &[]);
                     let tree_url = get_url("/portal/topology/tree", &token, &[]);
                     let trust_url = get_url("/portal/trust-graph", &token, &[]);
                     spawn_local(async move {
-                        // Signal kinds (may be 503 if no live substrate).
+                        // Signal kinds — deliberately best-effort: a 503 with no
+                        // live substrate is normal, not an error to surface.
                         let counts = match http("GET", &kinds_url, None).await {
                             Ok(r) if r.ok() => parse_kind_counts(&r.body),
                             _ => Vec::new(),
                         };
-                        // Live replicas (unauthenticated oracle).
+                        // Live replicas (reportable): a failure is surfaced, not
+                        // silently collapsed to zero.
                         let replicas = match http("GET", "/portal/resource/replicas", None).await {
                             Ok(r) if r.ok() => parse_replicas(&r.body).len(),
-                            _ => 0,
+                            Ok(_) => {
+                                toaster.error("Overview: could not load live replicas.");
+                                0
+                            }
+                            Err(_) => {
+                                toaster.error("Overview: the live-replicas request failed.");
+                                0
+                            }
                         };
                         let nodes = match http("GET", &tree_url, None).await {
                             Ok(r) if r.ok() => parse_topology_tree(&r.body).nodes.len(),
-                            _ => 0,
+                            Ok(_) => {
+                                toaster.error("Overview: could not load the topology tree.");
+                                0
+                            }
+                            Err(_) => {
+                                toaster.error("Overview: the topology-tree request failed.");
+                                0
+                            }
                         };
                         let edges = match http("GET", &trust_url, None).await {
                             Ok(r) if r.ok() => parse_trust_edges(&r.body).len(),
-                            _ => 0,
+                            Ok(_) => {
+                                toaster.error("Overview: could not load the trust graph.");
+                                0
+                            }
+                            Err(_) => {
+                                toaster.error("Overview: the trust-graph request failed.");
+                                0
+                            }
                         };
                         kpis.set(summarize(&counts, replicas, nodes, edges));
                     });
@@ -148,5 +173,28 @@ mod tests {
         let k = summarize(&[], 0, 0, 0);
         assert_eq!(k, OverviewKpis::default());
         assert_eq!(k.signal_total, 0);
+    }
+
+    /// Source audit (anti-facade DoD): every REPORTABLE Overview fetch (live
+    /// replicas, topology tree, trust graph — the signal-kinds fetch is
+    /// deliberately best-effort) surfaces BOTH failure arms (a non-OK status
+    /// and a transport error) through `toaster.error(...)` instead of silently
+    /// collapsing to a zero. Three reportable fetches × two arms ⇒ ≥6 error
+    /// branches; a future edit cannot drop one back to a `_ => 0` no-op without
+    /// tripping this.
+    #[test]
+    fn every_reportable_overview_fetch_has_a_toast_error_branch() {
+        let src = include_str!("overview.rs");
+        let n = src.matches("toaster.error(").count();
+        assert!(
+            n >= 6,
+            "the three reportable Overview fetches must each surface both failure arms via toaster.error(...), found {n}"
+        );
+        // And the best-effort signal-kinds fetch is still a silent fallback (it
+        // must NOT be forced through a toast — a 503 with no substrate is normal).
+        assert!(
+            src.contains("Ok(r) if r.ok() => parse_kind_counts(&r.body),"),
+            "the signal-kinds fetch should remain best-effort"
+        );
     }
 }

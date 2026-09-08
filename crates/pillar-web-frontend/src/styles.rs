@@ -578,6 +578,31 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .cmdk__hint {{ color: {muted}; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }}
         .cmdk__empty {{ color: {muted}; padding: 0.75rem; font-size: 0.85rem; }}
 
+        /* ---- toast stack (transient notifications, corner overlay) ---- */
+        .pillar-toaststack {{
+            position: fixed; right: 1rem; bottom: 1rem; z-index: 70;
+            display: flex; flex-direction: column; gap: 0.5rem;
+            max-width: 24rem;
+        }}
+        .pillar-toast {{
+            display: flex; align-items: flex-start; gap: 0.5rem;
+            padding: 0.6rem 0.75rem; border-radius: {radius};
+            background: {surface_overlay}; color: {text};
+            border: 1px solid {border};
+            box-shadow: {shadow_elevated};
+            font-size: 0.85rem;
+        }}
+        .pillar-toast.is-info {{ border-left: 3px solid {accent}; }}
+        .pillar-toast.is-success {{ border-left: 3px solid {accent}; }}
+        .pillar-toast.is-warning {{ border-left: 3px solid {accent_hover}; }}
+        .pillar-toast.is-error {{ border-left: 3px solid #e5484d; }}
+        .pillar-toast__text {{ flex: 1; }}
+        .pillar-toast__dismiss {{
+            background: none; border: none; color: {muted};
+            cursor: pointer; font-size: 1rem; line-height: 1; padding: 0;
+        }}
+        .pillar-toast__dismiss:hover {{ color: {text}; }}
+
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{
             *, *::before, *::after {{

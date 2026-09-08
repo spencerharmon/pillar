@@ -290,6 +290,7 @@ mod tests {
             ".resource-row",
             ".obs-row",
             ".signout",
+            ".pillar-toaststack",
         ] {
             assert!(g.contains(sel), "global stylesheet does not style {sel}");
         }
