@@ -152,6 +152,7 @@ pub fn export_cold_root_secret(
         signing_pub,
         signing_sec: Some(signing_sec),
         sealing_pub,
+        sealing_sec: None,
         certifications: Vec::new(),
     };
     key.export_secret_armored()
@@ -235,6 +236,7 @@ mod tests {
             signing_pub: expected_pub,
             signing_sec: None,
             sealing_pub: SealingPublicKey::default(),
+            sealing_sec: None,
             certifications: Vec::new(),
         };
         assert!(!reference.fingerprint_hex().is_empty());
