@@ -290,10 +290,10 @@ pub use yew_impl::{TopologyConsole, TrustGraphConsole};
 mod yew_impl {
     use super::{
         build_placement_tree, parse_mismatches, parse_spread, parse_topology_tree,
-        parse_trust_edges, trust_node_index, TopoTreeNode, TopologyTree,
+        parse_trust_edges, trust_node_index, Mismatch, TopoTreeNode, TopologyTree,
     };
     use crate::auth::use_auth;
-    use crate::portal::{get_url, http, input_value};
+    use crate::portal::{body_lines, get_url, http, input_value};
     use crate::primitives::{Badge, DataTable, Graph, GraphEdge, Tabs, Tone, Tree, TreeNode};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
@@ -378,6 +378,34 @@ mod yew_impl {
             })
         };
 
+        // Reconcile a declared-vs-attested mismatch straight from the row:
+        // emit a signed `topology:label` attest event for the observed
+        // (attested) value via `POST /portal/topology/label/attest`, then
+        // reload the mismatch list. `issuer`/`authority`/`scope` are left to
+        // the server's session-derived defaults (capacity `self`, empty
+        // authority + scope), so the tile fetches the endpoint directly.
+        let attest_observed = {
+            let (auth, mismatches) = (auth.clone(), mismatches.clone());
+            Callback::from(move |m: Mismatch| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let body = body_lines(&[
+                    &token, "", "self", "", &m.node, &m.tier, &m.attested, "",
+                ]);
+                let mismatches = mismatches.clone();
+                let mm_url = get_url("/portal/topology/mismatches", &token, &[]);
+                spawn_local(async move {
+                    let _ = http("POST", "/portal/topology/label/attest", Some(&body)).await;
+                    if let Ok(r) = http("GET", &mm_url, None).await {
+                        if r.ok() {
+                            mismatches.set(parse_mismatches(&r.body));
+                        }
+                    }
+                });
+            })
+        };
+
         let tabs = vec![
             "Placement".to_owned(),
             "Rollups".to_owned(),
@@ -430,16 +458,22 @@ mod yew_impl {
                     html! {
                         <table class="ds-table">
                             <thead><tr><th>{ "node" }</th><th>{ "tier" }</th>
-                                <th>{ "declared" }</th><th>{ "attested" }</th></tr></thead>
+                                <th>{ "declared" }</th><th>{ "attested" }</th><th>{ "action" }</th></tr></thead>
                             <tbody>
-                                { for mismatches.iter().map(|m| html! {
+                                { for mismatches.iter().map(|m| {
+                                    let attest = {
+                                        let (attest_observed, m) = (attest_observed.clone(), m.clone());
+                                        Callback::from(move |_: MouseEvent| attest_observed.emit(m.clone()))
+                                    };
+                                    html! {
                                     <tr>
                                         <td>{ &m.node }</td>
                                         <td>{ &m.tier }</td>
                                         <td>{ &m.declared }</td>
                                         <td><Badge label={m.attested.clone()} tone={Tone::Warn} /></td>
+                                        <td><button class="ds-tab" onclick={attest}>{ "Attest observed" }</button></td>
                                     </tr>
-                                }) }
+                                } }) }
                             </tbody>
                         </table>
                     }
