@@ -109,6 +109,60 @@ pub fn format_psl_response(body: &str) -> Vec<String> {
     rows
 }
 
+/// Compose the notice shown when a PSL query returns NO matching signals, from
+/// the live store's per-kind counts (`KIND <k> COUNT <n>` lines, the
+/// `/portal/obs/live/kinds` body) and its real label keys (one per line, the
+/// `/portal/obs/live/label-keys` body).
+///
+/// It answers the operator's real question — "is there no data, or did my query
+/// just not match?" — honestly: a genuinely EMPTY store says so; a NON-empty
+/// store reports what it holds and names the label keys that actually exist, so
+/// an operator who filtered on a label that isn't present (e.g. `where: cell =
+/// …` when signals are labeled `node`) sees why nothing matched and what to use
+/// instead. Never fabricates a count or a key.
+#[must_use]
+pub fn empty_result_hint(kinds_body: &str, label_keys_body: &str) -> String {
+    let counts: Vec<(String, u64)> = kinds_body
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            match (it.next(), it.next(), it.next(), it.next()) {
+                (Some("KIND"), Some(k), Some("COUNT"), Some(n)) => {
+                    n.parse::<u64>().ok().map(|c| (k.to_owned(), c))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let total: u64 = counts.iter().map(|(_, c)| c).sum();
+    if total == 0 {
+        return "Query ran; the live store is empty — no signals have been recorded on this \
+                node yet."
+            .to_owned();
+    }
+    let held = counts
+        .iter()
+        .filter(|(_, c)| *c > 0)
+        .map(|(k, c)| format!("{k} {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let keys: Vec<&str> = label_keys_body
+        .lines()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .collect();
+    let keys_note = if keys.is_empty() {
+        "no label keys are present".to_owned()
+    } else {
+        format!("available label keys: {}", keys.join(", "))
+    };
+    format!(
+        "Query ran; no signals matched. The live store holds: {held}. Your where:/select: \
+         predicates may reference a label that isn't present — {keys_note}. Try the query \
+         without the where: clause, or filter on one of those keys."
+    )
+}
+
 /// The `POST /login` body for the two human fields bound to a `/nonce` id.
 #[must_use]
 pub fn login_wire(identifier: &str, password: &str, nonce_id: u64) -> String {
@@ -1760,14 +1814,35 @@ mod yew_impl {
                         Ok(r) if r.ok() => {
                             let rows = format_psl_response(&r.body);
                             if rows.is_empty() {
-                                psl_msg.set(Some((
-                                    "Query ran; no matching signals in the live store.".to_owned(),
-                                    true,
-                                )));
+                                psl_rows.set(Vec::new());
+                                // Distinguish an EMPTY store from a filter that
+                                // simply matched nothing, and name the real label
+                                // keys, by consulting the live store directly.
+                                let kinds = http(
+                                    "GET",
+                                    &get_url("/portal/obs/live/kinds", &token, &[]),
+                                    None,
+                                )
+                                .await
+                                .ok()
+                                .filter(HttpResult::ok)
+                                .map(|r| r.body)
+                                .unwrap_or_default();
+                                let keys = http(
+                                    "GET",
+                                    &get_url("/portal/obs/live/label-keys", &token, &[]),
+                                    None,
+                                )
+                                .await
+                                .ok()
+                                .filter(HttpResult::ok)
+                                .map(|r| r.body)
+                                .unwrap_or_default();
+                                psl_msg.set(Some((empty_result_hint(&kinds, &keys), true)));
                             } else {
                                 psl_msg.set(None);
+                                psl_rows.set(rows);
                             }
-                            psl_rows.set(rows);
                         }
                         // Surface the backend's real error (e.g. `PSL-PARSE …`,
                         // `NO-LIVE-SUBSTRATE`) instead of a silent empty result.
@@ -1921,6 +1996,32 @@ mod tests {
     fn query_encode_escapes_reserved_and_keeps_unreserved() {
         assert_eq!(query_encode("a b/c=d&e"), "a%20b%2Fc%3Dd%26e");
         assert_eq!(query_encode("tok-1_2.3~x"), "tok-1_2.3~x");
+    }
+
+    #[test]
+    fn empty_result_hint_reports_an_empty_store() {
+        let kinds = "KIND metric COUNT 0\nKIND log COUNT 0\nKIND trace COUNT 0\n\
+                     KIND profile COUNT 0\nKIND metadata COUNT 0\n";
+        let hint = empty_result_hint(kinds, "");
+        assert!(hint.contains("live store is empty"), "got: {hint}");
+    }
+
+    #[test]
+    fn empty_result_hint_reports_held_counts_and_real_label_keys() {
+        // The exact situation the operator hit: the store HAS signals (labeled
+        // `node`), but their `where: cell = …` matched nothing. The hint must
+        // say what's held and name the real key (`node`), never claim empty.
+        let kinds = "KIND metric COUNT 128\nKIND log COUNT 64\nKIND trace COUNT 8\n\
+                     KIND profile COUNT 0\nKIND metadata COUNT 4\n";
+        let hint = empty_result_hint(kinds, "node\n");
+        assert!(!hint.contains("empty"), "must not claim empty: {hint}");
+        assert!(hint.contains("metric 128"), "got: {hint}");
+        assert!(hint.contains("log 64"), "got: {hint}");
+        assert!(
+            !hint.contains("profile"),
+            "zero-count kinds omitted: {hint}"
+        );
+        assert!(hint.contains("available label keys: node"), "got: {hint}");
     }
 
     #[test]
