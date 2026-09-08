@@ -38,6 +38,23 @@ pub fn signing_keypair_from_seed(seed: &Seed) -> Result<(SigningPublicKey, Signi
     ))
 }
 
+/// Recover the ed25519 verifying (public) key that matches a raw 32-byte
+/// signing secret scalar seed. Used when a signing secret is recovered from
+/// at-rest custody (rather than derived from a name seed) and its matching
+/// public key must be reconstructed to render/verify an OpenPGP key. Fails
+/// closed with [`CryptoError::InvalidKey`] on a non-32-byte secret.
+pub fn public_key_from_signing_secret(secret: &SigningSecretKey) -> Result<SigningPublicKey> {
+    use ed25519_dalek::SigningKey;
+    let sk_bytes: [u8; 32] = secret
+        .as_bytes()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let signing = SigningKey::from_bytes(&sk_bytes);
+    Ok(SigningPublicKey::from_bytes(
+        signing.verifying_key().to_bytes().to_vec(),
+    ))
+}
+
 /// Sign `message` with `secret`.
 pub fn sign(secret: &SigningSecretKey, message: &[u8]) -> Result<Signature> {
     use ed25519_dalek::{Signer, SigningKey};

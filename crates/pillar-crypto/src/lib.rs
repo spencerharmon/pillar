@@ -45,6 +45,7 @@ mod types;
 
 pub mod aead;
 pub mod cell;
+pub mod coldroot;
 pub mod compat;
 pub mod content;
 pub mod custody;

@@ -377,6 +377,20 @@ fn key_verb(args: &[String]) -> ExitCode {
             }
         };
     }
+    // `pillar key export-cold-root …`: CLI-ONLY, fully offline cold-root secret
+    // export from a custody backup (never a portal/browser action).
+    if args.first().map(String::as_str) == Some("export-cold-root") {
+        return match crate::wot_cli::run_cold_root_export(&args[1..]) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     identity_trust("key", args)
 }
 

@@ -441,3 +441,178 @@ pub fn run_key_export(args: &[String]) -> Result<String, String> {
     }
     Ok(reply.body)
 }
+
+// ---------------------------------------------------------------------------
+// Cold-root export-on-custody (CLI-ONLY — never `/portal/*`).
+//
+// Per the operator-directed design, exporting the cell cold-root SECRET is
+// intentionally NOT a browser action: the cold root lives in ONE user-controlled
+// custody (offline encrypted backup / hardware), never on an online node. This
+// runner is a purely LOCAL, offline operation: it reads a cold-root custody
+// backup file from disk, unlocks it with an operator passphrase, and renders the
+// gpg-auditable OpenPGP private key via `pillar_crypto::coldroot`. It makes NO
+// HTTP call to any node and touches no portal endpoint — that is the whole point.
+// ---------------------------------------------------------------------------
+
+/// The on-disk cold-root custody backup format. Small, self-describing JSON with
+/// hex-encoded byte fields so an operator can inspect and archive it offline. It
+/// carries everything needed to unlock the cold root EXCEPT the passphrase, which
+/// the operator supplies at export time (via `--passphrase` / env).
+#[derive(serde::Deserialize)]
+struct ColdRootBackup {
+    /// OpenPGP user id to stamp on the exported key,
+    /// e.g. `"cell:genesis (pillar cold root) <cold-root@pillar>"`.
+    uid: String,
+    /// Cold-root key creation time (unix seconds); stable across exports.
+    created_secs: u32,
+    /// Cold-root sealing (recipient) PUBLIC key, hex — exported as a public ECDH
+    /// subkey (its secret is deliberately never rendered).
+    sealing_pub_hex: String,
+    /// KDF salt, hex.
+    salt_hex: String,
+    /// AEAD-wrapped Ed25519 signing secret, hex.
+    wrapped_hex: String,
+    /// KDF memory cost (KiB). Optional; defaults to the crate default.
+    #[serde(default)]
+    kdf_mem_kib: Option<u32>,
+    /// KDF iterations. Optional; defaults to the crate default.
+    #[serde(default)]
+    kdf_iterations: Option<u32>,
+    /// KDF parallelism. Optional; defaults to the crate default.
+    #[serde(default)]
+    kdf_parallelism: Option<u32>,
+}
+
+/// Decode a hex string into bytes, erroring with the field name on bad input.
+fn from_hex(field: &str, s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err(format!("{field}: hex has an odd length"));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| format!("{field}: invalid hex byte at offset {i}"))
+        })
+        .collect()
+}
+
+/// `pillar key export-cold-root --backup <file> [--passphrase <pass>]`
+/// (or `PILLAR_COLDROOT_PASSPHRASE`): unlock the cell cold-root secret from its
+/// offline custody backup and print the gpg-auditable OpenPGP PRIVATE key.
+///
+/// This is CLI-ONLY and fully offline: no node, no portal, no network. The
+/// passphrase never persists. A wrong passphrase fails closed (the AEAD tag),
+/// never yielding a bogus key.
+pub fn run_cold_root_export(args: &[String]) -> Result<String, String> {
+    let backup_path = flag(args, "--backup")
+        .ok_or("pillar key export-cold-root requires --backup <custody-backup.json>")?;
+    let passphrase = flag(args, "--passphrase")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("PILLAR_COLDROOT_PASSPHRASE").ok())
+        .ok_or("missing --passphrase <pass> (or PILLAR_COLDROOT_PASSPHRASE)")?;
+
+    let raw = std::fs::read_to_string(backup_path)
+        .map_err(|e| format!("cannot read cold-root backup {backup_path}: {e}"))?;
+    let backup: ColdRootBackup =
+        serde_json::from_str(&raw).map_err(|e| format!("malformed cold-root backup: {e}"))?;
+
+    let mut params = pillar_crypto::KdfParams::default();
+    if let Some(m) = backup.kdf_mem_kib {
+        params.mem_kib = m;
+    }
+    if let Some(i) = backup.kdf_iterations {
+        params.iterations = i;
+    }
+    if let Some(p) = backup.kdf_parallelism {
+        params.parallelism = p;
+    }
+
+    let custody = pillar_crypto::coldroot::ColdRootCustody::PassphraseBackup {
+        params,
+        salt: pillar_crypto::Salt::from_bytes(from_hex("salt_hex", &backup.salt_hex)?),
+        wrapped: pillar_crypto::Ciphertext::from_bytes(from_hex(
+            "wrapped_hex",
+            &backup.wrapped_hex,
+        )?),
+        passphrase: passphrase.into_bytes(),
+    };
+    let sealing_pub =
+        SealingPublicKey::from_bytes(from_hex("sealing_pub_hex", &backup.sealing_pub_hex)?);
+
+    pillar_crypto::coldroot::export_cold_root_secret(
+        &custody,
+        &backup.uid,
+        backup.created_secs,
+        sealing_pub,
+    )
+    .map_err(|e| format!("cold-root export failed: {e}"))
+}
+
+#[cfg(test)]
+mod coldroot_cli_tests {
+    use super::*;
+    use pillar_crypto::coldroot::ColdRootCustody;
+    use pillar_crypto::principal::principal_from_seed;
+    use pillar_crypto::{KdfParams, Salt, Seed};
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn cold_root_export_round_trips_through_a_backup_file() {
+        let (pubk, seck) =
+            principal_from_seed(&Seed::from_bytes(b"cell:genesis cold root".to_vec())).unwrap();
+        let salt = Salt::from_bytes(b"cli-cold-root-salt".to_vec());
+        let params = KdfParams::default();
+        let backup = ColdRootCustody::seal_passphrase_backup(
+            &seck.signing,
+            b"operator passphrase",
+            salt.clone(),
+            params.clone(),
+        )
+        .unwrap();
+        let wrapped_hex = match &backup {
+            ColdRootCustody::PassphraseBackup { wrapped, .. } => hex_of(wrapped.as_bytes()),
+            _ => unreachable!(),
+        };
+
+        let dir = std::env::temp_dir().join(format!("pillar-coldroot-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.json");
+        let json = format!(
+            r#"{{"uid":"cell:genesis (pillar cold root) <cold-root@pillar>","created_secs":1724800000,"sealing_pub_hex":"{}","salt_hex":"{}","wrapped_hex":"{}"}}"#,
+            hex_of(pubk.sealing.as_bytes()),
+            hex_of(salt.as_bytes()),
+            wrapped_hex,
+        );
+        std::fs::write(&path, json).unwrap();
+
+        let args = vec![
+            "--backup".to_owned(),
+            path.to_str().unwrap().to_owned(),
+            "--passphrase".to_owned(),
+            "operator passphrase".to_owned(),
+        ];
+        let out = run_cold_root_export(&args).expect("cold-root export");
+        assert!(out.starts_with("-----BEGIN PGP PRIVATE KEY BLOCK-----"));
+
+        // A wrong passphrase fails closed, never emitting a key.
+        let bad = vec![
+            "--backup".to_owned(),
+            path.to_str().unwrap().to_owned(),
+            "--passphrase".to_owned(),
+            "WRONG".to_owned(),
+        ];
+        assert!(run_cold_root_export(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_passphrase_is_refused() {
+        std::env::remove_var("PILLAR_COLDROOT_PASSPHRASE");
+        let args = vec!["--backup".to_owned(), "/nonexistent.json".to_owned()];
+        assert!(run_cold_root_export(&args).is_err());
+    }
+}
