@@ -54,6 +54,10 @@ pub struct LiveRecord {
     pub tick: u64,
     /// The signal's real label set (`node`, `metric`, `cell`, …).
     pub labels: LabelSet,
+    /// The real wall-clock timestamp (unix millis) the signal was written,
+    /// resolved from the node's tick->wall-clock anchors; `None` if no anchor
+    /// covers its tick (e.g. a store driven without a wall-clock node).
+    pub unix_millis: Option<u64>,
 }
 
 /// The live observability substrate a running node shares with its portal.
@@ -80,6 +84,13 @@ pub struct LiveObservabilitySubstrate {
     recording: RecordingEngine,
     alerts: AlertEngine,
     notifier: RecordingNotifier,
+
+    /// Anchors mapping a logical write `tick` -> real wall-clock unix millis,
+    /// captured at the node boundary each time it drives the substrate. The
+    /// store stays deterministic (tick-only); this side table lets a read path
+    /// resolve a real human timestamp for a record without a clock inside the
+    /// pure store.
+    tick_wallclock: std::collections::BTreeMap<u64, u64>,
 }
 
 impl LiveObservabilitySubstrate {
@@ -130,6 +141,7 @@ impl LiveObservabilitySubstrate {
             recording,
             alerts,
             notifier: RecordingNotifier::default(),
+            tick_wallclock: std::collections::BTreeMap::new(),
         }
     }
 
@@ -145,6 +157,34 @@ impl LiveObservabilitySubstrate {
     #[must_use]
     pub fn counters(&self) -> &NodeCounters {
         &self.counters
+    }
+
+    /// Record the real wall-clock (`unix_millis`) that corresponds to logical
+    /// `tick`, called by the running node each time it advances the substrate.
+    /// Read paths resolve a record's human timestamp from the nearest anchor at
+    /// or before its write tick. Keeps the pure store clock-free/deterministic.
+    pub fn anchor_wallclock(&mut self, tick: u64, unix_millis: u64) {
+        self.tick_wallclock.insert(tick, unix_millis);
+    }
+
+    /// The real wall-clock (unix millis) for a signal written at `tick`: the
+    /// nearest anchor at or before `tick`, or `None` if no anchor is known.
+    #[must_use]
+    fn wallclock_for(&self, tick: u64) -> Option<u64> {
+        self.tick_wallclock
+            .range(..=tick)
+            .next_back()
+            .map(|(_, millis)| *millis)
+    }
+
+    /// Push the operator's real cell name into the metadata source once the
+    /// cell has actually been created/named (post-bootstrap). Metadata samples
+    /// after this carry the real `cell` label; earlier ones carried none (no
+    /// synthetic placeholder). Also refreshes the member-count gauge.
+    pub fn set_cell_name(&mut self, cell: impl Into<String>) {
+        self.node_metadata.source_mut().set_cell(cell);
+        let members = self.node_metadata.source_mut().member_count() as u64;
+        self.counters.set_cell_member_count(members);
     }
 
     // ----------------------------- Ingest paths -----------------------------
@@ -173,9 +213,10 @@ impl LiveObservabilitySubstrate {
         &mut self,
         level: LogLevel,
         message: impl Into<String>,
+        component: impl Into<String>,
         tick: u64,
     ) -> Option<SignalId> {
-        let event = LogEvent::new(level, message);
+        let event = LogEvent::new(level, message).with_component(component);
         self.logs
             .record(&mut self.store, &mut self.index, &event, tick)
     }
@@ -187,9 +228,10 @@ impl LiveObservabilitySubstrate {
         trace_id: impl Into<String>,
         span_id: impl Into<String>,
         operation: impl Into<String>,
+        component: impl Into<String>,
         tick: u64,
     ) -> Option<SignalId> {
-        let event = SpanEvent::root(trace_id, span_id, operation);
+        let event = SpanEvent::root(trace_id, span_id, operation).with_component(component);
         self.traces
             .record(&mut self.store, &mut self.index, &event, tick)
     }
@@ -207,6 +249,7 @@ impl LiveObservabilitySubstrate {
                 payload: String::from_utf8_lossy(s.payload()).into_owned(),
                 tick: self.store.write_tick_of(&s.id()).unwrap_or(0),
                 labels: s.labels().clone(),
+                unix_millis: self.wallclock_for(self.store.write_tick_of(&s.id()).unwrap_or(0)),
             })
             .collect()
     }
@@ -264,6 +307,8 @@ impl LiveObservabilitySubstrate {
                         payload: String::from_utf8_lossy(s.payload()).into_owned(),
                         tick: self.store.write_tick_of(&s.id()).unwrap_or(0),
                         labels: s.labels().clone(),
+                        unix_millis: self
+                            .wallclock_for(self.store.write_tick_of(&s.id()).unwrap_or(0)),
                     })
             })
             .collect()

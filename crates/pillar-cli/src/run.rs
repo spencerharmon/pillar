@@ -804,12 +804,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 reason: format!("derive streamdb segment-signing key: {e}"),
             }
         })?;
-    let store = pillar_streamdb::ContentStore::open(&streamdb_root).map_err(|e| {
-        BootError::StreamDb {
+    let store =
+        pillar_streamdb::ContentStore::open(&streamdb_root).map_err(|e| BootError::StreamDb {
             path: streamdb_root.clone(),
             reason: format!("open durable embedded-IPFS content store: {e}"),
-        }
-    })?;
+        })?;
     let stream = std::sync::Arc::new(std::sync::Mutex::new(
         pillar_streamdb::IpfsPersistentStream::open_with_store(
             store,
@@ -893,7 +892,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         None => pillar_swarm::SwarmKey::public(),
     };
     let root_secret = swarm_key.root_secret().to_owned();
-    let swarm_label = format!("{} (fp {})", swarm_key.kind().tag(), swarm_key.fingerprint());
+    let swarm_label = format!(
+        "{} (fp {})",
+        swarm_key.kind().tag(),
+        swarm_key.fingerprint()
+    );
     tracing::info!(
         swarm = %swarm_label,
         "pillar peer transport bound to swarm (pnet-keyed pre-shared transport)"
@@ -1001,13 +1004,19 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let mut node_labels = pillar_observability::LabelSet::new();
     node_labels.insert("node".to_string(), peer_id.to_string());
     let node_counters = pillar_observability::NodeCounters::new();
+    // This node's cell name is unknown at boot (the operator creates/names the
+    // cell later over HTTP) — pass `None`, never a synthetic `cell-<peer>`
+    // placeholder. `web_serve`'s create-cell handler pushes the real name in
+    // via `LiveObservabilitySubstrate::set_cell_name` once it exists.
     let metadata_source = pillar_observability::NodeMetadataSource::new(
         peer_id.to_string(),
-        format!("cell-{peer_id}"),
+        None,
         std::iter::once(peer_id.to_string()),
         env!("CARGO_PKG_VERSION"),
         option_env!("TARGET").map(str::to_owned),
     );
+    // The node's own membership at boot is just itself.
+    node_counters.set_cell_member_count(1);
     let live_obs = std::sync::Arc::new(std::sync::Mutex::new(
         pillar_observability::LiveObservabilitySubstrate::new(
             node_labels,
@@ -1300,16 +1309,26 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     // recorded so the trace kind is genuinely ingested from the
                     // node's own operation.
                     let mut sub = live_obs.lock().expect("live observability lock");
+                    // Anchor this tick to real wall-clock so read paths can
+                    // resolve a human timestamp per signal (the store itself
+                    // stays clock-free/deterministic).
+                    let now_millis = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    sub.anchor_wallclock(self_metrics_tick, now_millis);
                     let written = sub.sample_periodic(self_metrics_tick);
                     sub.record_span(
                         format!("self-instrument-{self_metrics_tick}"),
                         format!("span-{self_metrics_tick}"),
                         "self_metrics_sample",
+                        "observability",
                         self_metrics_tick,
                     );
                     sub.record_log(
                         pillar_observability::LogLevel::Info,
                         format!("self metrics sampled written={written}"),
+                        "observability",
                         self_metrics_tick,
                     );
                     tracing::debug!(count = written, tick = self_metrics_tick, "pillar peer ingested self metrics");
@@ -1450,12 +1469,14 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         sub.record_log(
                             pillar_observability::LogLevel::Info,
                             format!("gossip event handled bytes={}", message.data.len()),
+                            "federation",
                             self_metrics_tick,
                         );
                         sub.record_span(
                             format!("gossip-{self_metrics_tick}"),
                             format!("handle-{self_metrics_tick}"),
                             "handle_gossip_event",
+                            "federation",
                             self_metrics_tick,
                         );
                     }
@@ -1906,10 +1927,9 @@ mod tests {
 
     #[test]
     fn swarm_key_env_fills_when_flag_absent() {
-        let cfg = NodeConfig::from_args_env(&[], |k| {
-            (k == ENV_SWARM_KEY).then(|| s("/data/edge.key"))
-        })
-        .unwrap();
+        let cfg =
+            NodeConfig::from_args_env(&[], |k| (k == ENV_SWARM_KEY).then(|| s("/data/edge.key")))
+                .unwrap();
         assert_eq!(cfg.swarm_key, Some(PathBuf::from("/data/edge.key")));
     }
 
@@ -2020,7 +2040,8 @@ mod tests {
 
     #[test]
     fn seed_node_flag_is_accepted_as_the_canonical_seed_flag() {
-        let addr = "/ip4/192.0.2.7/tcp/4001/p2p/12D3KooWA6WsQFA6jBrmM6xrDZQyMbvXwqDXK5W9E9y7hqCkQ7wZ";
+        let addr =
+            "/ip4/192.0.2.7/tcp/4001/p2p/12D3KooWA6WsQFA6jBrmM6xrDZQyMbvXwqDXK5W9E9y7hqCkQ7wZ";
         let cfg = NodeConfig::from_args_env(&[s("--seed-node"), s(addr)], no_env).unwrap();
         assert_eq!(cfg.seed.len(), 1);
         // The legacy `--seed` spelling still parses to the same field.
@@ -2030,7 +2051,8 @@ mod tests {
 
     #[test]
     fn seed_node_env_and_legacy_env_both_fill() {
-        let addr = "/ip4/192.0.2.9/tcp/4001/p2p/12D3KooWA6WsQFA6jBrmM6xrDZQyMbvXwqDXK5W9E9y7hqCkQ7wZ";
+        let addr =
+            "/ip4/192.0.2.9/tcp/4001/p2p/12D3KooWA6WsQFA6jBrmM6xrDZQyMbvXwqDXK5W9E9y7hqCkQ7wZ";
         let cfg = NodeConfig::from_args_env(&[], |k| (k == ENV_SEED).then(|| s(addr))).unwrap();
         assert_eq!(cfg.seed.len(), 1);
         let cfg2 =

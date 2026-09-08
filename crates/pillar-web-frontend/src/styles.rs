@@ -635,6 +635,61 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
                 animation: none !important;
             }}
         }}
+
+        /* ---- Logs & signals console (Tier 1-3 logging surface) ---- */
+        .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+        .msg-ok {{ color: #35c07a; }}
+        .msg-err {{ color: #e5646e; }}
+        #logs-console .logs-builder, #logs-console .logs-ranges,
+        #logs-console .logs-chips, #logs-console .logs-actions,
+        #logs-console .logs-levelsum {{
+            display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+            margin: 0.35rem 0;
+        }}
+        #logs-console label {{ font-size: 0.78rem; opacity: 0.8; margin-right: 0.15rem; }}
+        #logs-console button.active {{ outline: 2px solid {glow}; font-weight: 600; }}
+        .chip {{
+            display: inline-flex; align-items: center; gap: 0.3rem;
+            padding: 0.1rem 0.5rem; border-radius: 999px;
+            border: 1px solid {border}; background: {surface_raised};
+            font-size: 0.76rem; line-height: 1.6; white-space: nowrap;
+        }}
+        .chip-click {{ cursor: pointer; }}
+        .chip-click:hover {{ border-color: {glow}; }}
+        .chip-x {{
+            border: none; background: none; cursor: pointer;
+            color: inherit; font-size: 0.9rem; line-height: 1; padding: 0;
+        }}
+        .chip.lvl-error {{ border-color: #e5646e; color: #e5646e; }}
+        .chip.lvl-warn {{ border-color: #e0a640; color: #e0a640; }}
+        .chip.lvl-info {{ border-color: #4a90d9; }}
+        .chip.lvl-debug {{ opacity: 0.7; }}
+        .logs-hist {{ margin: 0.5rem 0; }}
+        .logs-layout {{ display: grid; grid-template-columns: 1fr 220px; gap: 0.8rem; }}
+        .logs-results {{ display: flex; flex-direction: column; gap: 0.3rem; max-height: 60vh; overflow-y: auto; }}
+        .logs-row {{
+            border: 1px solid {border}; border-left-width: 3px;
+            border-radius: 6px; padding: 0.35rem 0.5rem; background: {surface_raised};
+        }}
+        .logs-row.lvl-error {{ border-left-color: #e5646e; }}
+        .logs-row.lvl-warn {{ border-left-color: #e0a640; }}
+        .logs-row.lvl-info {{ border-left-color: #4a90d9; }}
+        .logs-row.lvl-debug {{ border-left-color: {border}; }}
+        .logs-row-head {{ display: flex; gap: 0.6rem; align-items: baseline; cursor: pointer; }}
+        .logs-ts {{ font-family: ui-monospace, monospace; font-size: 0.74rem; opacity: 0.75; flex: 0 0 auto; }}
+        .logs-kind {{ font-size: 0.7rem; text-transform: uppercase; opacity: 0.6; flex: 0 0 auto; }}
+        .logs-payload {{ font-size: 0.82rem; word-break: break-word; }}
+        .logs-chips-inline {{ display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; }}
+        .logs-fields {{ margin-top: 0.35rem; padding-top: 0.35rem; border-top: 1px dashed {border}; }}
+        .logs-field {{ display: flex; gap: 0.5rem; font-size: 0.78rem; }}
+        .logs-field-k {{ opacity: 0.6; min-width: 6rem; }}
+        .logs-explorer {{ border-left: 1px solid {border}; padding-left: 0.7rem; }}
+        .logs-keylist, .logs-vallist {{ display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.3rem 0 0.6rem; }}
+        .logs-groups {{ margin-top: 0.6rem; }}
+        @media (max-width: 640px) {{
+            .logs-layout {{ grid-template-columns: 1fr; }}
+            .logs-explorer {{ border-left: none; padding-left: 0; }}
+        }}
         "#,
         surface_base = theme.surface_base,
         surface_raised = theme.surface_raised,

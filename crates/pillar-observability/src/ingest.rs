@@ -45,17 +45,20 @@ pub enum MetricKind {
     RequestCount,
     /// Bytes ingested onto the observability substrate (monotonic counter).
     IngestBytes,
+    /// Number of members this node currently sees in its cell (gauge).
+    CellMemberCount,
 }
 
 impl MetricKind {
     /// Every named metric a running node instruments itself with.
-    pub const ALL: [MetricKind; 6] = [
+    pub const ALL: [MetricKind; 7] = [
         MetricKind::Cpu,
         MetricKind::Mem,
         MetricKind::StreamdbOps,
         MetricKind::P2pPeers,
         MetricKind::RequestCount,
         MetricKind::IngestBytes,
+        MetricKind::CellMemberCount,
     ];
 
     /// The stable series name — the string carried in the signal payload and
@@ -69,6 +72,7 @@ impl MetricKind {
             MetricKind::P2pPeers => "node_p2p_peers",
             MetricKind::RequestCount => "node_request_count",
             MetricKind::IngestBytes => "node_ingest_bytes",
+            MetricKind::CellMemberCount => "node_cell_member_count",
         }
     }
 }
@@ -102,6 +106,7 @@ pub struct NodeCounters {
     p2p_peers: Arc<AtomicU64>,
     request_count: Arc<AtomicU64>,
     ingest_bytes: Arc<AtomicU64>,
+    cell_member_count: Arc<AtomicU64>,
 }
 
 impl NodeCounters {
@@ -131,12 +136,18 @@ impl NodeCounters {
         self.ingest_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Set the current live cell member count (a gauge, not a counter).
+    pub fn set_cell_member_count(&self, members: u64) {
+        self.cell_member_count.store(members, Ordering::Relaxed);
+    }
+
     fn get(&self, metric: MetricKind) -> Option<u64> {
         match metric {
             MetricKind::StreamdbOps => Some(self.streamdb_ops.load(Ordering::Relaxed)),
             MetricKind::P2pPeers => Some(self.p2p_peers.load(Ordering::Relaxed)),
             MetricKind::RequestCount => Some(self.request_count.load(Ordering::Relaxed)),
             MetricKind::IngestBytes => Some(self.ingest_bytes.load(Ordering::Relaxed)),
+            MetricKind::CellMemberCount => Some(self.cell_member_count.load(Ordering::Relaxed)),
             // cpu/mem come from the OS, not these counters.
             MetricKind::Cpu | MetricKind::Mem => None,
         }

@@ -59,6 +59,9 @@ pub struct SpanEvent {
     pub parent_span_id: Option<String>,
     /// The operation this span covers (e.g. `handle_request`, `apply_op`).
     pub operation: String,
+    /// The subsystem/component that emitted this span. `None` renders as the
+    /// default `core` component, stamped as the `component` label.
+    pub component: Option<String>,
 }
 
 impl SpanEvent {
@@ -74,6 +77,7 @@ impl SpanEvent {
             span_id: span_id.into(),
             parent_span_id: None,
             operation: operation.into(),
+            component: None,
         }
     }
 
@@ -90,7 +94,22 @@ impl SpanEvent {
             span_id: span_id.into(),
             parent_span_id: Some(parent_span_id.into()),
             operation: operation.into(),
+            component: None,
         }
+    }
+
+    /// Tag this span with the emitting subsystem/component, stamped as the
+    /// `component` label so a query can filter `where: component = <name>`.
+    #[must_use]
+    pub fn with_component(mut self, component: impl Into<String>) -> Self {
+        self.component = Some(component.into());
+        self
+    }
+
+    /// The component name this span carries, defaulting to `core`.
+    #[must_use]
+    pub fn component(&self) -> &str {
+        self.component.as_deref().unwrap_or("core")
     }
 
     /// The correlation id this span shares with every other signal of the same
@@ -167,6 +186,7 @@ impl TraceProducer {
     fn span_labels(&self, event: &SpanEvent) -> LabelSet {
         let mut labels = self.node_labels.clone();
         labels.insert("trace".to_string(), event.trace_id.clone());
+        labels.insert("component".to_string(), event.component().to_string());
         labels
     }
 
@@ -359,8 +379,14 @@ mod tests {
         let by_node = index.by_label(&node);
         assert!(by_node.contains(&root));
         assert!(by_node.contains(&child));
-        assert!(by_node.contains(&metric_id), "span shares the node label with the metric");
-        assert!(by_node.contains(&log_id), "span shares the node label with the log");
+        assert!(
+            by_node.contains(&metric_id),
+            "span shares the node label with the metric"
+        );
+        assert!(
+            by_node.contains(&log_id),
+            "span shares the node label with the log"
+        );
 
         // Correlation-id pivot: the trace id gathers the spans AND the metric
         // AND the log, and genuinely crosses those kinds.
@@ -385,12 +411,7 @@ mod tests {
         let mut index = CorrelationIndex::new();
 
         producer.set_enabled(true);
-        let a = producer.record(
-            &mut store,
-            &mut index,
-            &SpanEvent::root("t", "s0", "op"),
-            0,
-        );
+        let a = producer.record(&mut store, &mut index, &SpanEvent::root("t", "s0", "op"), 0);
         assert!(a.is_some(), "enabled producer writes a span");
         let held_after_enabled = store.held_len();
         assert_eq!(held_after_enabled, 1);
@@ -459,7 +480,10 @@ mod tests {
             })
             .expect("child span present");
         let text = String::from_utf8_lossy(leaf.payload());
-        assert!(text.contains("parent=root"), "child records its parent edge");
+        assert!(
+            text.contains("parent=root"),
+            "child records its parent edge"
+        );
 
         let root = store
             .held_signals()

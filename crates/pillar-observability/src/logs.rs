@@ -76,6 +76,10 @@ pub struct LogEvent {
     /// An optional request/trace correlation id shared with a concurrent
     /// metric/span of the same causal thread.
     pub correlation: Option<String>,
+    /// The subsystem/component that emitted this log (e.g. `federation`,
+    /// `web`, `controller`). `None` renders as the default `core` component so
+    /// the `component` label is always present and filterable.
+    pub component: Option<String>,
 }
 
 impl LogEvent {
@@ -87,6 +91,7 @@ impl LogEvent {
             level,
             message: message.into(),
             correlation: None,
+            component: None,
         }
     }
 
@@ -103,7 +108,22 @@ impl LogEvent {
             level,
             message: message.into(),
             correlation: Some(correlation.into()),
+            component: None,
         }
+    }
+
+    /// Tag this occurrence with the emitting subsystem/component, stamped as
+    /// the `component` label so a query can filter `where: component = <name>`.
+    #[must_use]
+    pub fn with_component(mut self, component: impl Into<String>) -> Self {
+        self.component = Some(component.into());
+        self
+    }
+
+    /// The component name this log carries, defaulting to `core`.
+    #[must_use]
+    pub fn component(&self) -> &str {
+        self.component.as_deref().unwrap_or("core")
     }
 }
 
@@ -194,14 +214,21 @@ impl LogProducer {
         if event.level < self.min_level {
             return None;
         }
-        let labels = self.log_labels();
+        // Signal labels = the node's shared labels + the promoted `level` and
+        // `component` dimensions, so severity and subsystem are indexed
+        // filters (`where: level = warn`, `where: component = federation`),
+        // not payload substrings.
+        let mut labels = self.log_labels();
+        labels.insert("level".to_string(), event.level.as_str().to_string());
+        labels.insert("component".to_string(), event.component().to_string());
         let payload = format!(
             "level={} msg={} @{}",
             event.level.as_str(),
             event.message,
             tick
         );
-        let id = store.write_labeled(SignalKind::Log, payload.into_bytes(), labels.clone(), tick)?;
+        let id =
+            store.write_labeled(SignalKind::Log, payload.into_bytes(), labels.clone(), tick)?;
         let spine = SignalRef {
             kind: SignalKind::Log,
             correlation: event.correlation.clone().map(CorrelationId),
@@ -237,7 +264,11 @@ mod tests {
     fn booted_node_captures_real_log_entries_at_default_info_level() {
         assert!(default_on(SignalKind::Log), "logs must default ON");
         let producer = LogProducer::new(node_labels("n-1"));
-        assert_eq!(producer.min_level(), LogLevel::Info, "default level is info");
+        assert_eq!(
+            producer.min_level(),
+            LogLevel::Info,
+            "default level is info"
+        );
         assert!(!producer.is_overridden(), "no override yet on a fresh node");
 
         let mut store = TimeseriesStore::new(64, 10_000);
@@ -308,7 +339,10 @@ mod tests {
         let node = Label::new("node", "n-7");
         let by_node = index.by_label(&node);
         assert!(by_node.contains(&log_id));
-        assert!(by_node.contains(&metric_id), "log shares node label with metric");
+        assert!(
+            by_node.contains(&metric_id),
+            "log shares node label with metric"
+        );
 
         // Correlation-id pivot: the request id gathers both.
         let cid = CorrelationId(trace.to_string());

@@ -1293,10 +1293,11 @@ impl WebAuthContext {
                 .collect::<Vec<_>>()
                 .join(";");
             body.push_str(&format!(
-                "SIGNAL {} KIND {} TICK {} LABELS {} PAYLOAD {}\n",
+                "SIGNAL {} KIND {} TICK {} TS {} LABELS {} PAYLOAD {}\n",
                 r.id.0,
                 signal_kind_tag(r.kind),
                 r.tick,
+                r.unix_millis.map(|m| m.to_string()).unwrap_or_default(),
                 labels,
                 r.payload
             ));
@@ -2386,8 +2387,23 @@ impl WebAuthContext {
         // The cell now exists: open the bootstrap-request queue for it so fresh
         // nodes/users can request to join.
         self.requests = Some(BootstrapRequestQueue::new(cell, std::iter::empty()));
-        self.record(&PortalOp::CreateCell { cell: cell_id });
+        self.record(&PortalOp::CreateCell {
+            cell: cell_id.clone(),
+        });
+        self.announce_cell_name(&cell_id);
         Ok(())
+    }
+
+    /// Push the operator's real cell name into the live observability substrate
+    /// (P2: the metadata `cell` label is unknown at node boot — it becomes real
+    /// only once the cell is created here). No-op when the node exposes no live
+    /// substrate. Best-effort: a poisoned lock never fails cell creation.
+    fn announce_cell_name(&self, cell_id: &str) {
+        if let Some(live) = &self.live_obs {
+            if let Ok(mut sub) = live.lock() {
+                sub.set_cell_name(cell_id.to_string());
+            }
+        }
     }
 
     /// The ONE atomic bootstrap step the web portal drives: create the cell AND

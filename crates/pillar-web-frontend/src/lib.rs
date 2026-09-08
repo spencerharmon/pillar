@@ -23,6 +23,7 @@ pub mod dashboard;
 pub mod drilldown;
 pub mod drilldown_live;
 pub mod explore;
+pub mod logs_console;
 pub mod obs_console;
 pub mod overview;
 pub mod panels;

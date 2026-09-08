@@ -152,6 +152,7 @@ mod yew_impl {
     use crate::components::data_table::{Column, DataTable};
     use crate::drilldown::DrilldownPanel;
     use crate::drilldown_live::{build_drilldowns, parse_correlate_response};
+    use crate::logs_console::LogsConsole;
     use crate::portal::{get_url, http, input_value, ObservabilityTile};
     use crate::primitives::{Chart, ChartKind, StatCard, Tabs};
     use wasm_bindgen_futures::spawn_local;
@@ -233,7 +234,7 @@ mod yew_impl {
 
         let body = match *tab {
             Tab::Overview => render_overview(&counts),
-            Tab::Explore => html! { <ObservabilityTile /> },
+            Tab::Explore => html! { <><LogsConsole /><ObservabilityTile /></> },
             Tab::Drilldown => html! { <DrilldownTab /> },
             Tab::Dashboards => html! { <DashboardsTab /> },
             Tab::Rules => html! { <RulesTab /> },

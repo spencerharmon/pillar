@@ -48,6 +48,13 @@ pub trait MetadataSource {
     /// cell membership snapshot, version/build info — or `None` if no genuine
     /// snapshot can be taken right now (never a placeholder set).
     fn snapshot(&self) -> Option<LabelSet>;
+
+    /// Extra real fields that belong in the sample's PAYLOAD but NOT as indexed
+    /// labels — high-cardinality/churny values (e.g. the full member list)
+    /// that would explode series cardinality if indexed. Default: none.
+    fn payload_fields(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// The real metadata source for a running node: its own peer id, the live cell
@@ -58,8 +65,10 @@ pub trait MetadataSource {
 pub struct NodeMetadataSource {
     /// This node's stable peer identity.
     peer_id: String,
-    /// The cell this node is a member of.
-    cell: String,
+    /// The cell this node is a member of — `None` until the operator has
+    /// actually created/named the cell (no synthetic `cell-<peer>`
+    /// placeholder). Once known, stamped as the real `cell` label.
+    cell: Option<String>,
     /// The current membership snapshot the node sees (sorted peer ids).
     members: Vec<String>,
     /// The node's real compiled-in version (crate semver).
@@ -69,13 +78,13 @@ pub struct NodeMetadataSource {
 }
 
 impl NodeMetadataSource {
-    /// A source describing a running node: its `peer_id`, its `cell`, the live
-    /// `members` snapshot, and the real compiled-in `version` / optional
-    /// `build` info.
+    /// A source describing a running node: its `peer_id`, its `cell` (or `None`
+    /// until the cell is created), the live `members` snapshot, and the real
+    /// compiled-in `version` / optional `build` info.
     #[must_use]
     pub fn new(
         peer_id: impl Into<String>,
-        cell: impl Into<String>,
+        cell: Option<String>,
         members: impl IntoIterator<Item = String>,
         version: impl Into<String>,
         build: Option<String>,
@@ -85,7 +94,7 @@ impl NodeMetadataSource {
         members.dedup();
         NodeMetadataSource {
             peer_id: peer_id.into(),
-            cell: cell.into(),
+            cell: cell.map(Into::into),
             members,
             version: version.into(),
             build,
@@ -99,6 +108,20 @@ impl NodeMetadataSource {
         m.sort();
         m.dedup();
         self.members = m;
+    }
+
+    /// Set the node's real cell name once the operator has created/named it
+    /// (the post-bootstrap fixup: signals emitted after this carry the real
+    /// `cell` label instead of no cell at all).
+    pub fn set_cell(&mut self, cell: impl Into<String>) {
+        self.cell = Some(cell.into());
+    }
+
+    /// The number of members this node currently sees (for the
+    /// `node_cell_member_count` gauge).
+    #[must_use]
+    pub fn member_count(&self) -> usize {
+        self.members.len()
     }
 
     /// This node's peer id.
@@ -115,18 +138,25 @@ impl MetadataSource for NodeMetadataSource {
 
     fn snapshot(&self) -> Option<LabelSet> {
         let mut labels = LabelSet::new();
-        // Peer identity.
-        labels.insert("peer".to_string(), self.peer_id.clone());
-        // Cell membership snapshot.
-        labels.insert("cell".to_string(), self.cell.clone());
-        labels.insert("members".to_string(), self.members.join(","));
-        labels.insert("member_count".to_string(), self.members.len().to_string());
-        // Version/build info.
+        // Cell membership — the REAL cell name, only once known (never a
+        // synthetic placeholder). Peer identity is carried by the universal
+        // `node` base label + the `entity` label, so no redundant `peer`.
+        if let Some(cell) = &self.cell {
+            labels.insert("cell".to_string(), cell.clone());
+        }
+        // Version/build info — low-cardinality resource labels.
         labels.insert("version".to_string(), self.version.clone());
         if let Some(build) = &self.build {
             labels.insert("build".to_string(), build.clone());
         }
         Some(labels)
+    }
+
+    fn payload_fields(&self) -> Vec<(String, String)> {
+        // The full member list is high-cardinality/churny — keep it queryable in
+        // the payload but out of the indexed label set. The member COUNT is a
+        // gauge metric (`node_cell_member_count`), not a metadata field.
+        vec![("members".to_string(), self.members.join(","))]
     }
 }
 
@@ -191,6 +221,13 @@ impl<S: MetadataSource> MetadataProducer<S> {
     pub fn with_base_labels(mut self, base_labels: LabelSet) -> Self {
         self.base_labels = base_labels;
         self
+    }
+
+    /// Mutable access to the underlying source — the seam a running node uses to
+    /// push a real fact it only learns post-boot (e.g. the operator's chosen
+    /// cell name, a membership change) into subsequent snapshots.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
     }
 
     /// Whether this producer is currently live (writing samples).
@@ -281,6 +318,11 @@ impl<S: MetadataSource> MetadataProducer<S> {
         labels.insert("entity".to_string(), entity.0.clone());
 
         let mut kv: Vec<String> = snapshot.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        // High-cardinality payload-only fields (e.g. the member list) ride the
+        // payload but are NOT indexed labels.
+        for (k, v) in self.source.payload_fields() {
+            kv.push(format!("{k}={v}"));
+        }
         kv.sort();
         let payload = format!("entity={} {} @{}", entity.0, kv.join(" "), tick);
 
@@ -303,7 +345,7 @@ mod tests {
     fn node_source() -> NodeMetadataSource {
         NodeMetadataSource::new(
             "peer-1",
-            "cell-a",
+            Some("cell-a".to_string()),
             ["peer-1".to_string(), "peer-2".to_string()],
             "0.3.1",
             Some("x86_64-unknown-linux-gnu/release".to_string()),
@@ -354,20 +396,33 @@ mod tests {
             "periodic metadata samples ingested onto substrate"
         );
 
-        // Each sample carries the real snapshot: peer identity, cell
-        // membership snapshot, version/build info.
+        // Each sample carries the real snapshot as INDEXED labels: the cell
+        // name + version/build. Peer identity is the `entity` label + the
+        // universal `node` base label (no redundant `peer`); the member list
+        // is a payload field, not an indexed label.
         for s in store
             .held_signals()
             .filter(|s| s.kind() == SignalKind::MetadataSample)
         {
-            assert_eq!(s.labels().get("peer").map(String::as_str), Some("peer-1"));
+            assert_eq!(s.labels().get("entity").map(String::as_str), Some("peer-1"));
             assert_eq!(s.labels().get("cell").map(String::as_str), Some("cell-a"));
-            assert_eq!(
-                s.labels().get("members").map(String::as_str),
-                Some("peer-1,peer-2")
-            );
             assert_eq!(s.labels().get("version").map(String::as_str), Some("0.3.1"));
             assert!(s.labels().get("build").is_some(), "build info carried");
+            // Demoted: no longer indexed labels.
+            assert!(s.labels().get("peer").is_none(), "peer is not a label");
+            assert!(
+                s.labels().get("members").is_none(),
+                "members is a payload field, not a label"
+            );
+            assert!(
+                s.labels().get("member_count").is_none(),
+                "member_count is a gauge metric, not a label"
+            );
+            // The member list still rides the payload for full-text/regex use.
+            assert!(
+                String::from_utf8_lossy(s.payload()).contains("members=peer-1,peer-2"),
+                "member list carried in the payload"
+            );
         }
 
         // The label-set-over-time view reflects the node's current labels.
@@ -513,20 +568,19 @@ mod tests {
             "unchanged periodic samples record no spurious transition"
         );
 
-        // A real membership change: rebuild the producer with an updated
-        // source snapshot and sample again -> a genuine transition.
-        src.set_members([
-            "peer-1".to_string(),
-            "peer-2".to_string(),
-            "peer-3".to_string(),
-        ]);
+        // A real INDEXED-LABEL change: the operator names the cell. (A
+        // membership change is now a payload field, deliberately NOT an indexed
+        // label, so it records no label transition — that churn is exactly what
+        // we demoted out of the index.) Rebuild with the updated source and
+        // sample again -> a genuine transition on the `cell` label.
+        src.set_cell("cell-b");
         producer = MetadataProducer::new(src);
         producer.set_period(1);
         producer.sample(&mut store, &mut meta, 3);
         assert_eq!(
             meta.transitions(&ent).len(),
             2,
-            "a real membership change records a transition"
+            "a real cell-name change records a transition"
         );
     }
 }
