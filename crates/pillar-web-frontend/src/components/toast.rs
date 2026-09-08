@@ -66,11 +66,11 @@ pub fn dismiss(queue: &[Toast], id: u64) -> Vec<Toast> {
 }
 
 #[cfg(feature = "yew")]
-pub use yew_impl::{ToastStack, ToastStackProps};
+pub use yew_impl::{use_toaster, ToastProvider, ToastStack, ToastStackProps, Toaster};
 
 #[cfg(feature = "yew")]
 mod yew_impl {
-    use super::Toast;
+    use super::{dismiss, push, Level, Toast};
     use yew::prelude::*;
 
     /// Props for [`ToastStack`].
@@ -106,6 +106,83 @@ mod yew_impl {
                     }
                 }) }
             </div>
+        }
+    }
+
+    /// A cloneable handle to the app-wide toast queue, obtained via
+    /// [`use_toaster`]. Calling one of its methods enqueues a toast that the
+    /// single [`ToastProvider`]-mounted [`ToastStack`] renders — this is the
+    /// ONE way a console fetch path surfaces an error to the user (replacing a
+    /// silent no-op), so every reportable fetch's failure arm calls
+    /// [`Toaster::error`].
+    #[derive(Clone, PartialEq)]
+    pub struct Toaster {
+        queue: UseStateHandle<Vec<Toast>>,
+        next: UseStateHandle<u64>,
+    }
+
+    impl Toaster {
+        /// The most-recent-`max` cap applied on every push.
+        const MAX: usize = 5;
+
+        fn emit(&self, level: Level, text: &str) {
+            let id = *self.next;
+            self.next.set(id + 1);
+            self.queue.set(push(&self.queue, id, level, text, Self::MAX));
+        }
+
+        /// Surface an error toast (the failure arm of a console fetch).
+        pub fn error(&self, text: &str) {
+            self.emit(Level::Error, text);
+        }
+
+        /// Surface an informational/success/warning toast.
+        pub fn info(&self, text: &str) {
+            self.emit(Level::Info, text);
+        }
+
+        /// Surface a success toast.
+        pub fn success(&self, text: &str) {
+            self.emit(Level::Success, text);
+        }
+    }
+
+    /// Read the app-wide [`Toaster`] handle from context. Panics only if used
+    /// outside a [`ToastProvider`], which the router `Shell` always mounts.
+    #[hook]
+    #[must_use]
+    pub fn use_toaster() -> Toaster {
+        use_context::<Toaster>().expect("use_toaster requires a ToastProvider ancestor")
+    }
+
+    /// Props for [`ToastProvider`].
+    #[derive(Properties, PartialEq)]
+    pub struct ToastProviderProps {
+        /// The app subtree that can enqueue toasts via [`use_toaster`].
+        #[prop_or_default]
+        pub children: Html,
+    }
+
+    /// Mount once at the app root: owns the live toast queue, exposes a
+    /// [`Toaster`] handle to every descendant via context, and renders the
+    /// corner [`ToastStack`] so an enqueued toast is visible app-wide.
+    #[function_component(ToastProvider)]
+    pub fn toast_provider(props: &ToastProviderProps) -> Html {
+        let queue = use_state(Vec::<Toast>::new);
+        let next = use_state(|| 1_u64);
+        let toaster = Toaster {
+            queue: queue.clone(),
+            next,
+        };
+        let on_dismiss = {
+            let queue = queue.clone();
+            Callback::from(move |id: u64| queue.set(dismiss(&queue, id)))
+        };
+        html! {
+            <ContextProvider<Toaster> context={toaster}>
+                { props.children.clone() }
+                <ToastStack toasts={(*queue).clone()} on_dismiss={on_dismiss} />
+            </ContextProvider<Toaster>>
         }
     }
 }

@@ -69,6 +69,6 @@ pub use stat_card::{StatCard, StatCardProps};
 #[cfg(feature = "yew")]
 pub use tabs::{TabItem, Tabs, TabsProps};
 #[cfg(feature = "yew")]
-pub use toast::{ToastStack, ToastStackProps};
+pub use toast::{use_toaster, ToastProvider, ToastStack, ToastStackProps, Toaster};
 #[cfg(feature = "yew")]
 pub use tree::{Tree, TreeProps};

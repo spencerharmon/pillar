@@ -15,6 +15,8 @@ use crate::auth::{use_auth, AuthProvider};
 #[cfg(feature = "yew")]
 use crate::components::LoginPanel;
 #[cfg(feature = "yew")]
+use crate::components::ToastProvider;
+#[cfg(feature = "yew")]
 #[cfg(feature = "yew")]
 use crate::portal_entry::PortalEntry;
 #[cfg(feature = "yew")]
@@ -214,9 +216,11 @@ pub fn shell() -> Html {
             <ContextProvider<Motion> context={motion}>
                 <Global css={crate::styles::global(&theme, motion)} />
                 <AuthProvider>
-                    <BrowserRouter>
-                        <Switch<Route> render={switch} />
-                    </BrowserRouter>
+                    <ToastProvider>
+                        <BrowserRouter>
+                            <Switch<Route> render={switch} />
+                        </BrowserRouter>
+                    </ToastProvider>
                 </AuthProvider>
             </ContextProvider<Motion>>
         </ContextProvider<Theme>>
