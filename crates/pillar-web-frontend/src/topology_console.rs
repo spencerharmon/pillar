@@ -221,7 +221,8 @@ pub fn parse_spread(body: &str) -> SpreadOverlay {
 // Trust graph (pure)
 // ---------------------------------------------------------------------------
 
-/// A trust-graph edge: `from` trusts `to` under `label`.
+/// A trust-graph edge: `from` trusts `to` under `label`, backed by the
+/// signature `sig` (the attest content id) a viewer can cross-reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustEdge {
     /// The trusting node.
@@ -230,9 +231,43 @@ pub struct TrustEdge {
     pub to: String,
     /// The relation label.
     pub label: String,
+    /// The signature (attest content id) authorizing this edge; empty if the
+    /// body carried no `SIG` field (legacy view).
+    pub sig: String,
 }
 
-/// Parse the `trust-graph` body: `EDGE <from> -> <to> LABEL <label>` lines.
+/// One node in the trust graph and its signing-key fingerprint, parsed from a
+/// `NODE <id> KEY <fingerprint>` line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustNode {
+    /// The identity name.
+    pub id: String,
+    /// The node's OpenPGP signing-key fingerprint (uppercase hex).
+    pub key: String,
+}
+
+/// Parse the `trust-graph` body's `NODE <id> KEY <fpr>` lines into the per-node
+/// public-key fingerprints the graph displays.
+#[must_use]
+pub fn parse_trust_nodes(body: &str) -> Vec<TrustNode> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.trim().strip_prefix("NODE ") else {
+            continue;
+        };
+        let Some((id, key)) = rest.split_once(" KEY ") else {
+            continue;
+        };
+        out.push(TrustNode {
+            id: id.to_owned(),
+            key: key.to_owned(),
+        });
+    }
+    out
+}
+
+/// Parse the `trust-graph` body: `EDGE <from> -> <to> LABEL <label>[ SIG <cid>]`
+/// lines. The optional trailing `SIG <cid>` carries the edge's signature.
 #[must_use]
 pub fn parse_trust_edges(body: &str) -> Vec<TrustEdge> {
     let mut out = Vec::new();
@@ -243,13 +278,18 @@ pub fn parse_trust_edges(body: &str) -> Vec<TrustEdge> {
         let Some((from, rest)) = rest.split_once(" -> ") else {
             continue;
         };
-        let Some((to, label)) = rest.split_once(" LABEL ") else {
+        let Some((to, label_and_sig)) = rest.split_once(" LABEL ") else {
             continue;
+        };
+        let (label, sig) = match label_and_sig.split_once(" SIG ") {
+            Some((l, s)) => (l.to_owned(), s.to_owned()),
+            None => (label_and_sig.to_owned(), String::new()),
         };
         out.push(TrustEdge {
             from: from.to_owned(),
             to: to.to_owned(),
-            label: label.to_owned(),
+            label,
+            sig,
         });
     }
     out
@@ -290,7 +330,8 @@ pub use yew_impl::{TopologyConsole, TrustGraphConsole};
 mod yew_impl {
     use super::{
         build_placement_tree, parse_mismatches, parse_spread, parse_topology_tree,
-        parse_trust_edges, trust_node_index, TopoTreeNode, TopologyTree,
+        parse_trust_edges, parse_trust_nodes, trust_node_index, TopoTreeNode, TopologyTree,
+        TrustNode,
     };
     use crate::auth::use_auth;
     use crate::portal::{body_lines, get_url, http, input_value};
@@ -633,17 +674,19 @@ mod yew_impl {
     pub fn trust_graph_console() -> Html {
         let auth = use_auth();
         let edges = use_state(Vec::new);
+        let keys = use_state(Vec::new);
 
         {
-            let (auth, edges) = (auth.clone(), edges.clone());
+            let (auth, edges, keys) = (auth.clone(), edges.clone(), keys.clone());
             use_effect_with(auth.token.clone(), move |token| {
                 if let Some(token) = token.clone() {
-                    let edges = edges.clone();
+                    let (edges, keys) = (edges.clone(), keys.clone());
                     let url = get_url("/portal/trust-graph", &token, &[]);
                     spawn_local(async move {
                         if let Ok(r) = http("GET", &url, None).await {
                             if r.ok() {
                                 edges.set(parse_trust_edges(&r.body));
+                                keys.set(parse_trust_nodes(&r.body));
                             }
                         }
                     });
@@ -657,18 +700,80 @@ mod yew_impl {
             .into_iter()
             .map(|(from, to, label)| GraphEdge { from, to, label })
             .collect();
+        let token = auth.token.clone().unwrap_or_default();
+
+        // Whether the current viewer may see a private-export control: the node
+        // authorizes the actual export, but only offer the affordance when the
+        // viewer is a key-export role holder is decided server-side; here we
+        // always offer it and let the endpoint fail closed (403) if unheld.
+        let key_rows: Html = keys
+            .iter()
+            .map(|n: &TrustNode| {
+                let pub_url = get_url(
+                    "/portal/key-export",
+                    &token,
+                    &[("principal", &n.id), ("secret", "false")],
+                );
+                let sec_url = get_url(
+                    "/portal/key-export",
+                    &token,
+                    &[("principal", &n.id), ("secret", "true")],
+                );
+                html! {
+                    <tr>
+                        <td>{ n.id.clone() }</td>
+                        <td class="mono">{ n.key.clone() }</td>
+                        <td>
+                            <a class="ds-link" href={pub_url} target="_blank" rel="noopener">
+                                { "Export public" }
+                            </a>
+                            { " · " }
+                            <a class="ds-link" href={sec_url} target="_blank" rel="noopener">
+                                { "Export private" }
+                            </a>
+                        </td>
+                    </tr>
+                }
+            })
+            .collect();
+
+        let sig_rows: Html = edges
+            .iter()
+            .filter(|e| !e.sig.is_empty())
+            .map(|e| {
+                html! {
+                    <tr>
+                        <td>{ format!("{} → {}", e.from, e.to) }</td>
+                        <td>{ e.label.clone() }</td>
+                        <td class="mono">{ e.sig.clone() }</td>
+                    </tr>
+                }
+            })
+            .collect();
 
         html! {
             <div class="tile" id="trust-graph-console">
                 <h3>{ "Trust Graph" }</h3>
-                <p>{ "The web of trust: who has admitted whom, and under which \
-                      relation." }</p>
+                <p>{ "The web of trust: who has admitted whom, under which \
+                      relation, with every public key and signature visible. \
+                      Admins holding the key-export role can export a key for a \
+                      gpg audit." }</p>
                 if nodes.is_empty() {
                     <p class="ds-empty">{ "No trust edges yet." }</p>
                 } else {
                     <>
                         <Graph nodes={nodes} edges={graph_edges} />
                         <p class="ds-empty">{ format!("{} nodes in the web of trust.", (*edges).len()) }</p>
+                        <h4>{ "Public keys & export" }</h4>
+                        <table id="trust-graph-keys" class="ds-table">
+                            <thead><tr><th>{ "Identity" }</th><th>{ "Signing key (OpenPGP fpr)" }</th><th>{ "Export" }</th></tr></thead>
+                            <tbody>{ key_rows }</tbody>
+                        </table>
+                        <h4>{ "Signatures" }</h4>
+                        <table id="trust-graph-signatures" class="ds-table">
+                            <thead><tr><th>{ "Edge" }</th><th>{ "Relation" }</th><th>{ "Signature (cid)" }</th></tr></thead>
+                            <tbody>{ sig_rows }</tbody>
+                        </table>
                     </>
                 }
             </div>
@@ -764,8 +869,9 @@ mod tests {
 
     #[test]
     fn trust_edges_parse_and_index() {
-        let edges =
-            parse_trust_edges("EDGE root -> alice LABEL admin\nEDGE alice -> bob LABEL member\n");
+        let edges = parse_trust_edges(
+            "EDGE root -> alice LABEL admin SIG cid-1\nEDGE alice -> bob LABEL member\n",
+        );
         assert_eq!(edges.len(), 2);
         assert_eq!(
             edges[0],
@@ -773,14 +879,27 @@ mod tests {
                 from: "root".into(),
                 to: "alice".into(),
                 label: "admin".into(),
+                sig: "cid-1".into(),
             }
         );
+        // An edge with no SIG field parses with an empty signature.
+        assert_eq!(edges[1].sig, "");
         let (nodes, indexed) = trust_node_index(&edges);
         // unique nodes in first-seen order.
         assert_eq!(nodes, vec!["root", "alice", "bob"]);
         // edges reference node indices.
         assert_eq!(indexed[0], (0, 1, "admin".into()));
         assert_eq!(indexed[1], (1, 2, "member".into()));
+    }
+
+    #[test]
+    fn trust_nodes_parse_public_key_fingerprints() {
+        let nodes = parse_trust_nodes(
+            "NODE cell:genesis KEY ABC123\nEDGE cell:genesis -> alice LABEL x SIG c\nNODE alice KEY DEF456\n",
+        );
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0], TrustNode { id: "cell:genesis".into(), key: "ABC123".into() });
+        assert_eq!(nodes[1].key, "DEF456");
     }
 
     #[test]
