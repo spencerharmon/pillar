@@ -139,6 +139,7 @@ mod yew_impl {
         let cell = use_state(String::new);
         let handle = use_state(String::new);
         let factor = use_state(String::new);
+        let second_factor = use_state(|| "password".to_owned());
         let name_hint = use_state(|| NameHint::Idle);
         let message = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
@@ -177,12 +178,21 @@ mod yew_impl {
             let factor = factor.clone();
             Callback::from(move |e: InputEvent| factor.set(input_value(&e)))
         };
+        let on_second_factor = {
+            let second_factor = second_factor.clone();
+            Callback::from(move |e: Event| {
+                if let Some(sel) = e.target_dyn_into::<web_sys::HtmlSelectElement>() {
+                    second_factor.set(sel.value());
+                }
+            })
+        };
 
         let on_submit = {
-            let (cell, handle, factor, message, busy) = (
+            let (cell, handle, factor, second_factor, message, busy) = (
                 cell.clone(),
                 handle.clone(),
                 factor.clone(),
+                second_factor.clone(),
                 message.clone(),
                 busy.clone(),
             );
@@ -192,8 +202,12 @@ mod yew_impl {
                 if *busy {
                     return;
                 }
-                let (cell_v, handle_v, factor_v) =
-                    ((*cell).clone(), (*handle).clone(), (*factor).clone());
+                let (cell_v, handle_v, factor_v, second_factor_v) = (
+                    (*cell).clone(),
+                    (*handle).clone(),
+                    (*factor).clone(),
+                    (*second_factor).clone(),
+                );
                 let (message, busy, on_bootstrapped) =
                     (message.clone(), busy.clone(), on_bootstrapped.clone());
                 if cell_v.trim().is_empty() || handle_v.trim().is_empty() || factor_v.is_empty() {
@@ -209,7 +223,7 @@ mod yew_impl {
                     true,
                 )));
                 spawn_local(async move {
-                    let body = bootstrap_wire(cell_v.trim(), handle_v.trim(), &factor_v);
+                    let body = bootstrap_wire(cell_v.trim(), handle_v.trim(), &factor_v, &second_factor_v);
                     match http("POST", "/bootstrap/create", Some(&body)).await {
                         Ok(r) => match interpret_bootstrap(r.ok(), &r.body) {
                             Ok(()) => {
@@ -243,7 +257,7 @@ mod yew_impl {
             <form id="bootstrap-form" class="pillar-bootstrap" onsubmit={on_submit}>
                 <div class="step" id="bootstrap-step">{ "Set up this node \u{2014} create your cell and first user" }</div>
                 <label for="cell-id">{ "Cell name" }</label>
-                <input id="cell-id" type="text" value={(*cell).clone()} placeholder="e.g. spencer-cell" oninput={on_cell} />
+                <input id="cell-id" type="text" value={(*cell).clone()} placeholder="your cell name" oninput={on_cell} />
                 <div id="cell-name-hint" class={hint_cls}>{ hint_text }</div>
                 <label for="custody">{ "Cell key custody" }</label>
                 <select id="custody">
@@ -253,9 +267,16 @@ mod yew_impl {
                     <option value="keyring">{ "OS keyring" }</option>
                 </select>
                 <label for="first-handle">{ "First user handle" }</label>
-                <input id="first-handle" type="text" value={(*handle).clone()} placeholder="e.g. spencer" oninput={on_handle} />
+                <input id="first-handle" type="text" value={(*handle).clone()} placeholder="choose a handle" oninput={on_handle} />
                 <label for="first-factor">{ "Unlock factor" }</label>
                 <input id="first-factor" type="password" value={(*factor).clone()} placeholder="Password or passkey token" oninput={on_factor} />
+                <label for="first-2fa">{ "First user second factor (2FA)" }</label>
+                <select id="first-2fa" onchange={on_second_factor}>
+                    <option value="password" selected={*second_factor == "password"}>{ "None (password only)" }</option>
+                    <option value="passkey" selected={*second_factor == "passkey"}>{ "Passkey / WebAuthn (FIDO2)" }</option>
+                    <option value="tpm" selected={*second_factor == "tpm"}>{ "TPM 2.0" }</option>
+                    <option value="pkcs11" selected={*second_factor == "pkcs11"}>{ "PKCS#11 HSM / smart card" }</option>
+                </select>
                 <button id="bootstrap-submit" type="submit" disabled={*busy}>{ "Create cell & first user" }</button>
                 <div class="explainer" id="bootstrap-explainer">
                     <strong>{ "What happens next:" }</strong>

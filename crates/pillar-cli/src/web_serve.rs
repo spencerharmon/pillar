@@ -237,6 +237,10 @@ pub struct WebAuthContext {
     /// token last authenticated). The key-export gate consumes it as the fresh
     /// WebAuthn step-up proof; a token with no fresh stamp cannot export a secret.
     step_up_at: HashMap<String, u64>,
+    /// The first user's required second factor (`password`|`passkey`|`tpm`|
+    /// `pkcs11`), recorded at bootstrap so first-login enrollment requires/offers
+    /// the matching WebAuthn/HSM/TPM registration.
+    first_user_second_factor: HashMap<String, String>,
     next_session: u64,
     /// The node/user bootstrap-request queue for the cell this node serves.
     /// `None` until the cell is created (a request joins an EXISTING cell).
@@ -650,6 +654,7 @@ impl WebAuthContext {
             login_sessions: HashMap::new(),
             key_export_role: std::collections::HashSet::new(),
             step_up_at: HashMap::new(),
+            first_user_second_factor: HashMap::new(),
             next_session: 0,
             requests: None,
             identity: NodeIdentitySnapshot {
@@ -1743,6 +1748,22 @@ impl WebAuthContext {
     #[must_use]
     pub fn trust_store(&self) -> &TrustStore {
         &self.trust
+    }
+
+    /// Record the first user's chosen second factor (2FA) so first-login
+    /// enrollment requires/offers the matching WebAuthn/HSM/TPM registration.
+    pub fn note_first_user_second_factor(&mut self, handle: &str, method: &str) {
+        self.first_user_second_factor
+            .insert(handle.to_owned(), method.to_owned());
+    }
+
+    /// The second factor recorded for `handle` at bootstrap (`"password"` when
+    /// none / unknown).
+    #[must_use]
+    pub fn first_user_second_factor(&self, handle: &str) -> &str {
+        self.first_user_second_factor
+            .get(handle)
+            .map_or("password", String::as_str)
     }
 
     /// The shared key-export authorization for `subject` on this `token`: builds
@@ -2978,6 +2999,7 @@ fn dispatch_bootstrap_create(
         cell_id,
         handle,
         password,
+        second_factor,
     } = BootstrapCreateRequest::from_body(&request.body);
     if cell_id.is_empty() || handle.is_empty() || password.is_empty() {
         return text_response(
@@ -2987,7 +3009,18 @@ fn dispatch_bootstrap_create(
         );
     }
     match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
-        Ok(()) => text_response(200, "OK", format!("BOOTSTRAPPED {handle}")),
+        Ok(()) => {
+            // Record the first user's required second factor so the enrollment
+            // (WebAuthn/HSM/TPM registration) is required/offered at first
+            // login; "password" means no hardware second factor.
+            ctx.note_first_user_second_factor(&handle, &second_factor);
+            let hint = if second_factor == "password" {
+                String::new()
+            } else {
+                format!(" REGISTER-2FA {second_factor}")
+            };
+            text_response(200, "OK", format!("BOOTSTRAPPED {handle}{hint}"))
+        }
         Err(BootstrapError::CellNameInUse) => text_response(
             409,
             "Conflict",
