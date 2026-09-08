@@ -21,11 +21,13 @@ mod yew_impl {
     use crate::auth::{use_auth, AuthAction};
     use crate::portal::{
         bootstrap_wire, friendly_error, http, input_value, interpret_bootstrap, interpret_login,
-        interpret_name_check, login_wire, NameHint, Portal,
+        interpret_name_check, login_wire, NameHint,
     };
+    use crate::router::Route;
     use pillar_web_api::{BootstrapStatus, NonceResponse};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
+    use yew_router::prelude::*;
 
     /// The TWO-FIELD node-side custody login. `GET /nonce` -> `POST /login`;
     /// on success dispatches [`AuthAction::LoginSuccess`] with the handle +
@@ -312,8 +314,12 @@ mod yew_impl {
             });
         }
 
+        // An authenticated session never belongs on the public entry screen.
+        // `guard()` already rewrites an authed Home/Login to the console home,
+        // but redirect here too so any path that mounts PortalEntry with a live
+        // session lands ON the console instead of the legacy single-page portal.
         if auth.is_authenticated() {
-            return html! { <Portal /> };
+            return html! { <Redirect<Route> to={Route::Overview} /> };
         }
 
         let on_bootstrapped = {

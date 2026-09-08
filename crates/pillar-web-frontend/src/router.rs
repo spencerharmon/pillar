@@ -143,7 +143,13 @@ impl Route {
 /// session mid-session, via [`crate::auth::AuthAction::Unauthorized`]).
 pub fn guard(route: Route, session: &AuthSession) -> Route {
     if route.requires_auth() && !session.is_authenticated() {
+        // A protected route without a session falls back to the login screen.
         Route::Login
+    } else if session.is_authenticated() && matches!(route, Route::Home | Route::Login) {
+        // An authenticated user has no business on the public entry / login
+        // screens — send them to the console home so signing in (or reloading
+        // `/`) lands ON the console, not the legacy single-page portal.
+        Route::Overview
     } else {
         route
     }
@@ -221,6 +227,7 @@ pub fn shell() -> Html {
 mod tests {
     use super::*;
     use crate::auth::{reduce, AuthAction};
+    use crate::console::Section;
 
     #[test]
     fn resource_detail_route_requires_auth_and_is_not_a_console_section() {
@@ -298,8 +305,38 @@ mod tests {
         // reused (a route change never re-derives the session), so it is
         // still authenticated for the new route too.
         assert!(session.is_authenticated());
-        assert_eq!(guard(Route::Home, &session), Route::Home);
+        // An authenticated user on the public Home is sent to the console home
+        // (see `authenticated_home_and_login_land_on_the_console`).
+        assert_eq!(guard(Route::Home, &session), Route::Overview);
         assert_eq!(guard(Route::Dashboard, &session), Route::Dashboard);
+    }
+
+    #[test]
+    fn authenticated_home_and_login_land_on_the_console() {
+        let session = reduce(
+            &AuthSession::default(),
+            AuthAction::LoginSuccess {
+                user: "alice".to_string(),
+                token: "tok-123".to_string(),
+            },
+        );
+        // The public entry (`/`) and the login screen both redirect an
+        // authenticated session onto the console home, so signing in — or
+        // reloading `/` — lands ON the console, never the legacy single-page
+        // portal. Regression guard for the "I don't see the console" facade gap.
+        assert_eq!(guard(Route::Home, &session), Route::Overview);
+        assert_eq!(guard(Route::Login, &session), Route::Overview);
+        // And Overview resolves to the console section (not a redirect loop).
+        assert_eq!(Route::Overview.section(), Some(Section::Overview));
+    }
+
+    #[test]
+    fn unauthenticated_home_and_login_stay_on_their_public_screens() {
+        let session = AuthSession::default();
+        // No session: the entry and login screens render as themselves (no
+        // redirect to the console, which would loop back to Login).
+        assert_eq!(guard(Route::Home, &session), Route::Home);
+        assert_eq!(guard(Route::Login, &session), Route::Login);
     }
 
     #[test]
