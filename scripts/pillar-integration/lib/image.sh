@@ -40,7 +40,7 @@ image_repo_root() {
 # working tree's flake and load it into the container runtime, printing the
 # loaded image reference. Fails loudly (non-zero) if nix or the load fails.
 image_build_local() {
-    local root tag streamer
+    local root tag streamer gcroot build_err build_rc
     root="$(image_repo_root)"
     tag="pillar-it-under-test:local"
 
@@ -50,9 +50,32 @@ image_build_local() {
     info "image: building reproducible image-under-test from $root/flake.nix (nix .#pillar-oci-image)"
     # streamLayeredImage yields a *streamer script*; run it to produce the OCI
     # tar on stdout and load it directly into the runtime.
+    #
+    # Anchor the build output under a REAL GC root (`--out-link`) for the whole
+    # lifetime of this function. `--no-link --print-out-paths` leaves the result
+    # unrooted, so on a busy shared build host the store path can be garbage-
+    # collected between the print and the `[ -x ]`/run — the recurring
+    # 'expected an executable streamer' failure. The GC root pins it until we
+    # remove the link at function end (via the RETURN trap below).
+    gcroot="$(mktemp -d "${TMPDIR:-/tmp}/pillar-it-gcroot.XXXXXX")/streamer"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '$(dirname "$gcroot")'" RETURN
+    # Capture stdout (the store path) and stderr SEPARATELY so a diagnostic
+    # stderr line can never be mistaken for the printed store path. stdout is the
+    # out-path; stderr is captured to a temp file for the failure message.
+    build_err="$(mktemp "${TMPDIR:-/tmp}/pillar-it-build-err.XXXXXX")"
     streamer="$(nix --extra-experimental-features "nix-command flakes" \
-        build --no-link --print-out-paths "$root#pillar-oci-image" 2>&1 | tail -1)" \
-        || fail "image_build_local: nix build .#pillar-oci-image failed:\n$streamer"
+        build --out-link "$gcroot" --print-out-paths "$root#pillar-oci-image" \
+        2>"$build_err")"
+    build_rc=$?
+    if [ "$build_rc" -ne 0 ]; then
+        local err_txt; err_txt="$(cat "$build_err")"; rm -f -- "$build_err"
+        fail "image_build_local: nix build .#pillar-oci-image failed:\n$err_txt"
+    fi
+    rm -f -- "$build_err"
+    # `--print-out-paths` may emit multiple paths (one per output); take the last
+    # non-empty stdout line as the streamer store path.
+    streamer="$(printf '%s\n' "$streamer" | sed '/^$/d' | tail -1)"
     [ -x "$streamer" ] \
         || fail "image_build_local: expected an executable streamer at '$streamer'"
 
