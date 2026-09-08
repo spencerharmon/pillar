@@ -1286,10 +1286,18 @@ impl WebAuthContext {
         let now = sub.latest_tick();
         let mut body = String::new();
         for r in sub.psl_query(&query, now) {
+            let labels = r
+                .labels
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(";");
             body.push_str(&format!(
-                "SIGNAL {} KIND {} PAYLOAD {}\n",
+                "SIGNAL {} KIND {} TICK {} LABELS {} PAYLOAD {}\n",
                 r.id.0,
                 signal_kind_tag(r.kind),
+                r.tick,
+                labels,
                 r.payload
             ));
         }

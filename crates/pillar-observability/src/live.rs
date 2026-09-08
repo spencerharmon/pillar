@@ -37,8 +37,11 @@ use pillar_topology::TierHierarchy;
 /// label — never a real cluster/rack identifier.
 pub const DEFAULT_EVAL_TIER: &str = "node";
 
-/// One rendered live-signal record: content-addressed id, kind, and the raw
-/// payload as text — the wire projection the portal serves.
+/// One rendered live-signal record: content-addressed id, kind, the raw
+/// payload as text, its write tick (logical timestamp), and its label set —
+/// the wire projection the portal serves. Tick + labels let the portal show a
+/// per-line timestamp and the signal's real labels (this is timeseries data),
+/// never just an opaque payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveRecord {
     /// The signal's content-addressed id.
@@ -47,6 +50,10 @@ pub struct LiveRecord {
     pub kind: SignalKind,
     /// The signal's raw payload, rendered as UTF-8 (lossy) text.
     pub payload: String,
+    /// The logical write tick (timestamp) the signal was ingested at.
+    pub tick: u64,
+    /// The signal's real label set (`node`, `metric`, `cell`, …).
+    pub labels: LabelSet,
 }
 
 /// The live observability substrate a running node shares with its portal.
@@ -90,14 +97,17 @@ impl LiveObservabilitySubstrate {
         store_capacity: usize,
         retention: u64,
     ) -> Self {
-        let mut metrics = MetricsProducer::new(NodeMetricSource::new(counters.clone()));
+        let mut metrics = MetricsProducer::new(NodeMetricSource::new(counters.clone()))
+            .with_base_labels(node_labels.clone());
         metrics.set_enabled(true);
         let logs = LogProducer::new(node_labels.clone());
         let mut traces = TraceProducer::new(node_labels.clone());
         traces.set_enabled(true);
-        let mut profiles = ProfilingProducer::new(NodeProfileSource::new());
+        let mut profiles =
+            ProfilingProducer::new(NodeProfileSource::new()).with_base_labels(node_labels.clone());
         profiles.set_enabled(true);
-        let mut node_metadata = MetadataProducer::new(metadata_source);
+        let mut node_metadata =
+            MetadataProducer::new(metadata_source).with_base_labels(node_labels.clone());
         node_metadata.set_enabled(true);
         // Sample every tick so metadata is observable without waiting a full
         // default period in an externally-driven black-box scenario.
@@ -195,6 +205,8 @@ impl LiveObservabilitySubstrate {
                 id: s.id(),
                 kind: s.kind(),
                 payload: String::from_utf8_lossy(s.payload()).into_owned(),
+                tick: self.store.write_tick_of(&s.id()).unwrap_or(0),
+                labels: s.labels().clone(),
             })
             .collect()
     }
@@ -215,7 +227,10 @@ impl LiveObservabilitySubstrate {
     /// black-box "was this kind really ingested?" probe.
     #[must_use]
     pub fn count_of_kind(&self, kind: SignalKind) -> usize {
-        self.store.held_signals().filter(|s| s.kind() == kind).count()
+        self.store
+            .held_signals()
+            .filter(|s| s.kind() == kind)
+            .count()
     }
 
     /// The highest write tick any held signal carries — the logical "now" a
@@ -247,6 +262,8 @@ impl LiveObservabilitySubstrate {
                         id: s.id(),
                         kind: s.kind(),
                         payload: String::from_utf8_lossy(s.payload()).into_owned(),
+                        tick: self.store.write_tick_of(&s.id()).unwrap_or(0),
+                        labels: s.labels().clone(),
                     })
             })
             .collect()

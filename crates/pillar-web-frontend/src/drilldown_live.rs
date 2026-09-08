@@ -50,11 +50,14 @@ pub fn parse_correlate_response(body: &str) -> CorrelateResponse {
     for line in body.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("SIGNAL ") {
-            // `<id> KIND <tag> PAYLOAD <payload>`
+            // `<id> KIND <tag> [TICK <n> LABELS <k=v;…>] PAYLOAD <payload>` — the
+            // kind tag is the first whitespace token after `KIND `, so this
+            // tolerates the optional TICK/LABELS fields between the tag and the
+            // payload without mistaking them for part of the tag.
             let Some((id, after)) = rest.split_once(" KIND ") else {
                 continue;
             };
-            let tag = after.split(" PAYLOAD ").next().unwrap_or("").trim();
+            let tag = after.split_whitespace().next().unwrap_or("").trim();
             if let Some(kind) = kind_from_tag(tag) {
                 resp.kinds.insert(id.trim().to_owned(), kind);
             }

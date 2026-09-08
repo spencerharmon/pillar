@@ -145,6 +145,10 @@ pub struct ProfilingProducer<S: ProfileSource> {
     /// Whether the enabled state was set explicitly by config (vs. the
     /// default), mirroring the spec's `overridden` set.
     overridden: bool,
+    /// Base labels stamped onto every emitted sample (e.g. `node=<peer-id>`),
+    /// so the node-identity dimension is consistent across kinds. Empty by
+    /// default.
+    base_labels: LabelSet,
 }
 
 impl<S: ProfileSource> ProfilingProducer<S> {
@@ -156,7 +160,17 @@ impl<S: ProfileSource> ProfilingProducer<S> {
             source,
             enabled: false,
             overridden: false,
+            base_labels: LabelSet::new(),
         }
+    }
+
+    /// Stamp `base_labels` (e.g. the node's `node=<peer-id>`) onto every sample
+    /// this producer writes — the shared node-identity dimension every kind
+    /// carries.
+    #[must_use]
+    pub fn with_base_labels(mut self, base_labels: LabelSet) -> Self {
+        self.base_labels = base_labels;
+        self
     }
 
     /// Whether this producer is currently live (writing samples).
@@ -204,7 +218,7 @@ impl<S: ProfileSource> ProfilingProducer<S> {
                 continue;
             };
             let name = kind.name();
-            let mut labels = LabelSet::new();
+            let mut labels = self.base_labels.clone();
             labels.insert("profile".to_string(), name.to_string());
             let payload = format!("{name} {} @{tick}\n{}", reading.weight, reading.stack);
             if store

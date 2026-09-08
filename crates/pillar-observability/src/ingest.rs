@@ -210,6 +210,10 @@ pub struct MetricsProducer<S: MetricSource> {
     /// default), mirroring the spec's `overridden` set so a reconcile can tell
     /// a deliberate toggle from an untouched default.
     overridden: bool,
+    /// Base labels stamped onto EVERY emitted sample (e.g. `node=<peer-id>`),
+    /// so a node identity dimension is consistently queryable across kinds.
+    /// Empty by default (no behavior change for callers that don't set it).
+    base_labels: LabelSet,
 }
 
 impl<S: MetricSource> MetricsProducer<S> {
@@ -221,7 +225,17 @@ impl<S: MetricSource> MetricsProducer<S> {
             source,
             enabled: true,
             overridden: false,
+            base_labels: LabelSet::new(),
         }
+    }
+
+    /// Stamp `base_labels` (e.g. the node's `node=<peer-id>`) onto every sample
+    /// this producer writes — the shared node-identity dimension every kind
+    /// carries, so `where: node = <id>` selects metrics too, not just logs.
+    #[must_use]
+    pub fn with_base_labels(mut self, base_labels: LabelSet) -> Self {
+        self.base_labels = base_labels;
+        self
     }
 
     /// Whether this producer is currently live (writing samples).
@@ -269,7 +283,7 @@ impl<S: MetricSource> MetricsProducer<S> {
                 continue;
             };
             let name = metric.name();
-            let mut labels = LabelSet::new();
+            let mut labels = self.base_labels.clone();
             labels.insert("metric".to_string(), name.to_string());
             // Payload carries name + value so identical (name,value,tick)
             // samples content-dedupe while distinct readings are distinct
@@ -345,16 +359,17 @@ mod tests {
         // non-zero (the source's readings were all >= 1, none fabricated to 0).
         let mut cache = ViewCache::new();
         let metric_ids = cache.materialize(&store, Query::of_kind(SignalKind::Metric));
-        assert!(!metric_ids.is_empty(), "metric kind ingested onto substrate");
+        assert!(
+            !metric_ids.is_empty(),
+            "metric kind ingested onto substrate"
+        );
 
         for metric in MetricKind::ALL {
             let name = metric.name();
             let found: Vec<_> = store
                 .held_signals()
                 .filter(|s| s.kind() == SignalKind::Metric)
-                .filter(|s| {
-                    s.labels().get("metric").map(String::as_str) == Some(name)
-                })
+                .filter(|s| s.labels().get("metric").map(String::as_str) == Some(name))
                 .collect();
             assert!(
                 !found.is_empty(),
@@ -388,7 +403,11 @@ mod tests {
         let mut store = TimeseriesStore::new(64, 10_000);
         let written = producer.sample(&mut store, 0);
         assert_eq!(written, 2, "exactly the two genuinely-observed metrics");
-        assert_eq!(store.held_len(), 2, "no fabricated signals for the other four");
+        assert_eq!(
+            store.held_len(),
+            2,
+            "no fabricated signals for the other four"
+        );
 
         // The four unobservable metrics have NO series at all.
         for metric in [
@@ -398,9 +417,9 @@ mod tests {
             MetricKind::IngestBytes,
         ] {
             let name = metric.name();
-            let any = store.held_signals().any(|s| {
-                s.labels().get("metric").map(String::as_str) == Some(name)
-            });
+            let any = store
+                .held_signals()
+                .any(|s| s.labels().get("metric").map(String::as_str) == Some(name));
             assert!(!any, "unobservable metric {name} was NOT fabricated");
         }
     }
@@ -458,7 +477,10 @@ mod tests {
         // cpu/mem come from real /proc on this host and may or may not be
         // available in the sandbox; the four counter metrics are always real.
         let n0 = producer.sample(&mut store, 0);
-        assert!(n0 >= 4, "at least the four live-counter metrics are written");
+        assert!(
+            n0 >= 4,
+            "at least the four live-counter metrics are written"
+        );
 
         producer.set_enabled(false);
         assert_eq!(producer.sample(&mut store, 1), 0);

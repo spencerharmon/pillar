@@ -82,12 +82,39 @@ pub fn format_psl_response(body: &str) -> Vec<String> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("SIGNAL ") {
-            // `<id> KIND <kind> PAYLOAD <payload>`
-            if let Some((id, tail)) = rest.split_once(" KIND ") {
-                if let Some((kind, payload)) = tail.split_once(" PAYLOAD ") {
-                    rows.push(format!("{kind} {id}: {payload}"));
-                    continue;
+            // `<id> KIND <kind> [TICK <n>] [LABELS <k=v;…>] PAYLOAD <payload>`
+            // — render a timeseries log line: `[t=<tick>] <kind> <labels>:
+            // <payload>`. TICK/LABELS are optional so an older/other response
+            // shape still renders (falls back to `<kind> <id>: <payload>`).
+            if let Some((id, after)) = rest.split_once(" KIND ") {
+                let (head, payload) = match after.split_once(" PAYLOAD ") {
+                    Some((h, p)) => (h, p.trim()),
+                    None => (after, ""),
+                };
+                let mut kind = head.trim();
+                let mut tick: Option<&str> = None;
+                let mut labels: Option<&str> = None;
+                if let Some((k, r2)) = head.split_once(" TICK ") {
+                    kind = k.trim();
+                    if let Some((t, l)) = r2.split_once(" LABELS ") {
+                        tick = Some(t.trim());
+                        labels = Some(l.trim());
+                    } else {
+                        tick = Some(r2.trim());
+                    }
                 }
+                let ts = tick.map(|t| format!("[t={t}] ")).unwrap_or_default();
+                let label_part = match labels {
+                    Some(l) if !l.is_empty() => format!(" {}", l.replace(';', " ")),
+                    _ => String::new(),
+                };
+                if tick.is_some() {
+                    rows.push(format!("{ts}{kind}{label_part}: {payload}"));
+                } else {
+                    // Fallback for a response without the TICK/LABELS fields.
+                    rows.push(format!("{kind} {}: {payload}", id.trim()));
+                }
+                continue;
             }
             rows.push(line.to_owned());
         } else if let Some(rest) = line.strip_prefix("GROUP ") {
@@ -1706,6 +1733,35 @@ mod yew_impl {
         let psl = use_state(String::new);
         let psl_rows = use_state(Vec::<String>::new);
         let psl_msg = use_state(|| None::<(String, bool)>);
+        // Schema hints: the live store's real metric names + label keys, so the
+        // operator isn't guessing what to select/filter on in a raw PSL query.
+        let schema_metrics = use_state(Vec::<String>::new);
+        let schema_keys = use_state(Vec::<String>::new);
+        {
+            let (auth, schema_metrics, schema_keys) =
+                (auth.clone(), schema_metrics.clone(), schema_keys.clone());
+            use_effect_with(auth.token.clone(), move |token| {
+                if let Some(token) = token.clone() {
+                    let (schema_metrics, schema_keys) =
+                        (schema_metrics.clone(), schema_keys.clone());
+                    let mnames = get_url("/portal/obs/live/metric-names", &token, &[]);
+                    let lkeys = get_url("/portal/obs/live/label-keys", &token, &[]);
+                    spawn_local(async move {
+                        if let Ok(r) = http("GET", &mnames, None).await {
+                            if r.ok() {
+                                schema_metrics.set(crate::panels::parse_lines(&r.body, ""));
+                            }
+                        }
+                        if let Ok(r) = http("GET", &lkeys, None).await {
+                            if r.ok() {
+                                schema_keys.set(crate::panels::parse_lines(&r.body, ""));
+                            }
+                        }
+                    });
+                }
+                || ()
+            });
+        }
 
         let explore = {
             let (auth, rows, kind) = (auth.clone(), rows.clone(), kind.clone());
@@ -1881,8 +1937,31 @@ mod yew_impl {
                     Returns matched signals plus any correlate groups; a malformed query \
                     reports the parse error. (The 'filter' box below is a plain substring \
                     match, not PSL.)" }</p>
+                <div id="obs-schema" class="obs-schema">
+                    <p class="hint">{ "Available in the live store right now — click nothing, \
+                        just use these in your query:" }</p>
+                    <p class="hint">
+                        <strong>{ "label keys: " }</strong>
+                        if schema_keys.is_empty() {
+                            { "(none yet)" }
+                        } else {
+                            { schema_keys.join(", ") }
+                        }
+                    </p>
+                    <p class="hint">
+                        <strong>{ "metric names: " }</strong>
+                        if schema_metrics.is_empty() {
+                            { "(none yet)" }
+                        } else {
+                            { schema_metrics.join(", ") }
+                        }
+                    </p>
+                    <p class="hint">{ "Every signal is stamped node=<this node's peer id>; \
+                        filter any kind with where: node = <id>. Metrics also carry \
+                        metric=<name>; logs/traces carry node; metadata carries cell/peer." }</p>
+                </div>
                 <textarea id="obs-psl" rows="3"
-                    placeholder="select: metrics(name = ingest_bandwidth), logs where: cell = testpillarcell range: now-1d correlate: { window: 1s, anchor: metrics }"
+                    placeholder="select: logs where: node = <peer-id> range: now-1d"
                     value={(*psl).clone()} oninput={on_psl}></textarea>
                 <button type="button" id="obs-psl-btn" onclick={run_psl}>{ "Run PSL query" }</button>
                 { message_line("obs-psl-msg", &psl_msg) }
@@ -2026,16 +2105,27 @@ mod tests {
 
     #[test]
     fn format_psl_response_renders_signals_and_correlate_groups() {
-        let body = "SIGNAL abc123 KIND metric PAYLOAD name=ingest_bandwidth value=42\n\
-                    SIGNAL def456 KIND log PAYLOAD level=info msg=served request\n\
+        let body = "SIGNAL abc123 KIND metric TICK 7 LABELS node=peer1;metric=node_cpu_ticks \
+                     PAYLOAD node_cpu_ticks 42 @7\n\
+                    SIGNAL def456 KIND log TICK 8 LABELS node=peer1 \
+                     PAYLOAD level=info msg=served request\n\
                     GROUP abc123 MEMBERS abc123,def456\n";
         assert_eq!(
             format_psl_response(body),
             vec![
-                "metric abc123: name=ingest_bandwidth value=42".to_owned(),
-                "log def456: level=info msg=served request".to_owned(),
+                "[t=7] metric node=peer1 metric=node_cpu_ticks: node_cpu_ticks 42 @7".to_owned(),
+                "[t=8] log node=peer1: level=info msg=served request".to_owned(),
                 "group abc123: abc123, def456".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn format_psl_response_falls_back_without_tick_labels_fields() {
+        // A SIGNAL line without the TICK/LABELS fields still renders.
+        assert_eq!(
+            format_psl_response("SIGNAL abc KIND log PAYLOAD hello world"),
+            vec!["log abc: hello world".to_owned()]
         );
     }
 

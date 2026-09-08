@@ -120,10 +120,7 @@ impl MetadataSource for NodeMetadataSource {
         // Cell membership snapshot.
         labels.insert("cell".to_string(), self.cell.clone());
         labels.insert("members".to_string(), self.members.join(","));
-        labels.insert(
-            "member_count".to_string(),
-            self.members.len().to_string(),
-        );
+        labels.insert("member_count".to_string(), self.members.len().to_string());
         // Version/build info.
         labels.insert("version".to_string(), self.version.clone());
         if let Some(build) = &self.build {
@@ -161,6 +158,10 @@ pub struct MetadataProducer<S: MetadataSource> {
     enabled_overridden: bool,
     /// Whether the period was set explicitly by config (vs. the default).
     period_overridden: bool,
+    /// Base labels stamped onto every emitted snapshot (e.g. `node=<peer-id>`),
+    /// so the node-identity dimension is consistent across kinds. Empty by
+    /// default.
+    base_labels: LabelSet,
 }
 
 impl<S: MetadataSource> MetadataProducer<S> {
@@ -179,7 +180,17 @@ impl<S: MetadataSource> MetadataProducer<S> {
             period: DEFAULT_METADATA_PERIOD,
             enabled_overridden: false,
             period_overridden: false,
+            base_labels: LabelSet::new(),
         }
+    }
+
+    /// Stamp `base_labels` (e.g. the node's `node=<peer-id>`) onto every
+    /// snapshot this producer writes — the shared node-identity dimension every
+    /// kind carries.
+    #[must_use]
+    pub fn with_base_labels(mut self, base_labels: LabelSet) -> Self {
+        self.base_labels = base_labels;
+        self
     }
 
     /// Whether this producer is currently live (writing samples).
@@ -262,14 +273,14 @@ impl<S: MetadataSource> MetadataProducer<S> {
             tick,
         ));
 
-        // Signal labels = snapshot labels + the entity id.
-        let mut labels = snapshot.clone();
+        // Signal labels = node base labels + snapshot labels + the entity id.
+        let mut labels = self.base_labels.clone();
+        for (k, v) in snapshot.clone() {
+            labels.insert(k, v);
+        }
         labels.insert("entity".to_string(), entity.0.clone());
 
-        let mut kv: Vec<String> = snapshot
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        let mut kv: Vec<String> = snapshot.iter().map(|(k, v)| format!("{k}={v}")).collect();
         kv.sort();
         let payload = format!("entity={} {} @{}", entity.0, kv.join(" "), tick);
 
@@ -310,7 +321,10 @@ mod tests {
         );
         let producer = MetadataProducer::new(node_source());
         assert!(producer.is_enabled(), "metadata producer is ON by default");
-        assert!(!producer.is_enabled_overridden(), "no override on fresh boot");
+        assert!(
+            !producer.is_enabled_overridden(),
+            "no override on fresh boot"
+        );
         assert_eq!(producer.period(), DEFAULT_METADATA_PERIOD);
 
         let mut store = TimeseriesStore::new(64, 10_000);
@@ -326,12 +340,19 @@ mod tests {
         }
         // Periodic: one sample per period boundary (ticks 0, P, 2P over
         // [0, 3P)).
-        assert_eq!(written, 3, "a booted node ingests periodic metadata samples");
+        assert_eq!(
+            written, 3,
+            "a booted node ingests periodic metadata samples"
+        );
 
         // The samples are real MetadataSample signals on the one substrate.
         let mut cache = ViewCache::new();
         let ids = cache.materialize(&store, Query::of_kind(SignalKind::MetadataSample));
-        assert_eq!(ids.len(), 3, "periodic metadata samples ingested onto substrate");
+        assert_eq!(
+            ids.len(),
+            3,
+            "periodic metadata samples ingested onto substrate"
+        );
 
         // Each sample carries the real snapshot: peer identity, cell
         // membership snapshot, version/build info.
@@ -370,7 +391,10 @@ mod tests {
         let mut meta = MetadataStore::new();
         let mut default_count = 0;
         for tick in 0..ticks {
-            if default_producer.sample(&mut store, &mut meta, tick).is_some() {
+            if default_producer
+                .sample(&mut store, &mut meta, tick)
+                .is_some()
+            {
                 default_count += 1;
             }
         }
@@ -460,7 +484,8 @@ mod tests {
         assert!(producer.sample(&mut store, &mut meta, 0).is_none());
         assert_eq!(store.held_len(), 0, "no fabricated metadata sample");
         assert!(
-            meta.current_labels(&EntityId("peer-x".to_string())).is_none(),
+            meta.current_labels(&EntityId("peer-x".to_string()))
+                .is_none(),
             "nothing materialized from an absent snapshot"
         );
     }
@@ -490,7 +515,11 @@ mod tests {
 
         // A real membership change: rebuild the producer with an updated
         // source snapshot and sample again -> a genuine transition.
-        src.set_members(["peer-1".to_string(), "peer-2".to_string(), "peer-3".to_string()]);
+        src.set_members([
+            "peer-1".to_string(),
+            "peer-2".to_string(),
+            "peer-3".to_string(),
+        ]);
         producer = MetadataProducer::new(src);
         producer.set_period(1);
         producer.sample(&mut store, &mut meta, 3);
