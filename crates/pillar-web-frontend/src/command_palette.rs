@@ -64,6 +64,27 @@ pub fn verb_commands(inventory_json: &str) -> Vec<Command> {
         .collect()
 }
 
+/// Move the palette's highlighted-row index by `delta` over a list of `len`
+/// visible rows, wrapping around both ends (Linear/VS-Code palette behavior:
+/// ArrowDown past the last row lands on the first, ArrowUp past the first lands
+/// on the last). An empty list has no selectable row, so the selection stays at
+/// `0` (nothing is highlighted when `len == 0`). This is the keyboard-navigation
+/// core, kept pure so the wrap contract is pinned by a host test rather than
+/// only exercised in the browser.
+#[must_use]
+pub fn move_selection(current: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len_i = len as i32;
+    // Clamp an out-of-range `current` (e.g. after the visible list shrank on a
+    // keystroke) into range before moving, so navigation never indexes past the
+    // end.
+    let cur = (current.min(len - 1)) as i32;
+    let next = (cur + delta).rem_euclid(len_i);
+    next as usize
+}
+
 /// One surface-inventory entry read out of the emitted `pillar-integration/v1`
 /// document.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +189,7 @@ pub use yew_impl::CommandPalette;
 
 #[cfg(feature = "yew")]
 mod yew_impl {
-    use super::{filter_commands, verb_commands, Command};
+    use super::{filter_commands, move_selection, verb_commands, Command};
     use crate::components::use_toaster;
     use crate::console::section_route;
     use crate::console::Section;
@@ -196,6 +217,10 @@ mod yew_impl {
     pub fn command_palette() -> Html {
         let open = use_state(|| false);
         let query = use_state(String::new);
+        // The keyboard-highlighted row, an index into the currently-visible
+        // (filtered) command list. Reset to 0 whenever the palette opens or the
+        // query changes so ArrowDown/ArrowUp always start from the top match.
+        let selected = use_state(|| 0usize);
         let navigator = use_navigator();
         let toaster = use_toaster();
         // The verb commands projected from the node's live surface inventory,
@@ -222,11 +247,14 @@ mod yew_impl {
         // kept alive for the component's lifetime.
         {
             let open = open.clone();
+            let selected = selected.clone();
             use_effect_with((), move |()| {
                 let handler = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::wrap(Box::new(
                     move |e: web_sys::KeyboardEvent| {
                         if (e.meta_key() || e.ctrl_key()) && e.key().eq_ignore_ascii_case("k") {
                             e.prevent_default();
+                            // Opening resets the highlight to the top match.
+                            selected.set(0);
                             open.set(!*open);
                         } else if e.key() == "Escape" {
                             open.set(false);
@@ -263,7 +291,7 @@ mod yew_impl {
         let mut commands = sections;
         commands.extend((*verbs).clone());
         let on_input = {
-            let query = query.clone();
+            let (query, selected) = (query.clone(), selected.clone());
             Callback::from(move |e: InputEvent| {
                 use wasm_bindgen::JsCast;
                 if let Some(t) = e
@@ -271,28 +299,81 @@ mod yew_impl {
                     .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
                 {
                     query.set(t.value());
+                    // A changed query re-filters the list; drop the highlight
+                    // back to the top match so it never dangles off the end.
+                    selected.set(0);
                 }
             })
         };
         let visible = filter_commands(&commands, &query);
+        // Clamp the highlighted row into the visible range for rendering (the
+        // list may have shrunk since the last keystroke).
+        let active = (*selected).min(visible.len().saturating_sub(1));
 
         let close = {
             let open = open.clone();
             Callback::from(move |_: MouseEvent| open.set(false))
         };
 
-        // Navigate to a section (for a section entry) and always close.
-        let run = {
+        // Navigate to a section (for a section entry) and always close. Shared by
+        // the click handler and the Enter-key handler.
+        let go = {
             let (open, navigator) = (open.clone(), navigator.clone());
             move |section: Option<Section>| {
-                let (open, navigator) = (open.clone(), navigator.clone());
-                Callback::from(move |_: MouseEvent| {
-                    if let (Some(section), Some(nav)) = (section, navigator.as_ref()) {
-                        nav.push(&section_route(section));
+                if let (Some(section), Some(nav)) = (section, navigator.as_ref()) {
+                    nav.push(&section_route(section));
+                }
+                open.set(false);
+            }
+        };
+        // The Section for a visible-list position, mapping the filtered index
+        // back through `visible` to the original command index.
+        let section_at = {
+            let visible = visible.clone();
+            move |pos: usize| -> Option<Section> {
+                visible.get(pos).and_then(|&i| {
+                    if i < section_count {
+                        Some(Section::all()[i])
+                    } else {
+                        None
                     }
-                    open.set(false);
                 })
             }
+        };
+        let run = {
+            let (go, section_at) = (go.clone(), section_at.clone());
+            move |pos: usize| {
+                let (go, section_at) = (go.clone(), section_at.clone());
+                Callback::from(move |_: MouseEvent| go(section_at(pos)))
+            }
+        };
+
+        // Keyboard navigation on the palette input: ArrowDown/ArrowUp move the
+        // highlight (wrapping via the pure `move_selection`), Enter runs the
+        // highlighted command, Escape closes. Keeping the keys on the always-
+        // focused input means the palette is fully operable without a mouse.
+        let on_keydown = {
+            let (selected, open, go, section_at) =
+                (selected.clone(), open.clone(), go.clone(), section_at.clone());
+            let len = visible.len();
+            Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
+                "ArrowDown" => {
+                    e.prevent_default();
+                    selected.set(move_selection(active, len, 1));
+                }
+                "ArrowUp" => {
+                    e.prevent_default();
+                    selected.set(move_selection(active, len, -1));
+                }
+                "Enter" => {
+                    e.prevent_default();
+                    if len > 0 {
+                        go(section_at(active));
+                    }
+                }
+                "Escape" => open.set(false),
+                _ => {}
+            })
         };
 
         html! {
@@ -301,18 +382,19 @@ mod yew_impl {
                 <div class="cmdk__panel" role="dialog" aria-label="Command palette">
                     <input class="cmdk__input" type="text" autofocus=true
                            placeholder="Jump to\u{2026}" value={(*query).clone()}
-                           oninput={on_input} />
-                    <ul class="cmdk__list">
-                        { for visible.iter().map(|&i| {
-                            // The first `section_count` entries are navigable
-                            // sections; the rest are surface-inventory verbs.
-                            let section = if i < section_count {
-                                Some(Section::all()[i])
+                           oninput={on_input} onkeydown={on_keydown} />
+                    <ul class="cmdk__list" role="listbox">
+                        { for visible.iter().enumerate().map(|(pos, &i)| {
+                            let is_active = pos == active;
+                            let class = if is_active {
+                                "cmdk__item is-active"
                             } else {
-                                None
+                                "cmdk__item"
                             };
                             html! {
-                                <li class="cmdk__item" onclick={run(section)}>
+                                <li class={class} role="option"
+                                    aria-selected={is_active.to_string()}
+                                    onclick={run(pos)}>
                                     <span class="cmdk__label">{ &commands[i].label }</span>
                                     <span class="cmdk__hint">{ &commands[i].hint }</span>
                                 </li>
@@ -490,6 +572,57 @@ mod tests {
         assert!(
             n >= 2,
             "palette inventory fetch must surface both failure arms via toaster.error(...), found {n}"
+        );
+    }
+
+    #[test]
+    fn move_selection_advances_and_wraps_both_ends() {
+        // Plain forward/backward moves within range.
+        assert_eq!(move_selection(0, 4, 1), 1);
+        assert_eq!(move_selection(2, 4, 1), 3);
+        assert_eq!(move_selection(2, 4, -1), 1);
+        // ArrowDown past the last row wraps to the first…
+        assert_eq!(move_selection(3, 4, 1), 0);
+        // …and ArrowUp past the first wraps to the last.
+        assert_eq!(move_selection(0, 4, -1), 3);
+    }
+
+    #[test]
+    fn move_selection_is_safe_on_empty_and_out_of_range() {
+        // No rows: nothing is selectable, selection stays at 0.
+        assert_eq!(move_selection(0, 0, 1), 0);
+        assert_eq!(move_selection(5, 0, -1), 0);
+        // A stale index past the (shrunk) end is clamped before moving, so it
+        // never indexes out of bounds: from clamped-2, +1 wraps to 0.
+        assert_eq!(move_selection(9, 3, 1), 0);
+        assert_eq!(move_selection(9, 3, -1), 1);
+    }
+
+    /// Source audit (anti-facade DoD): the palette is operable from the keyboard
+    /// — the input wires an `onkeydown` that drives ArrowUp/ArrowDown selection
+    /// through the pure `move_selection` and runs the highlighted command on
+    /// Enter, and the highlighted row is marked `aria-selected`. This pins that
+    /// a future edit cannot silently drop the keyboard navigation.
+    #[test]
+    fn palette_wires_keyboard_navigation() {
+        let src = include_str!("command_palette.rs");
+        assert!(
+            src.contains("onkeydown={on_keydown}"),
+            "palette input no longer wires an onkeydown handler"
+        );
+        for key in ["\"ArrowDown\"", "\"ArrowUp\"", "\"Enter\""] {
+            assert!(
+                src.contains(key),
+                "palette keyboard handler no longer handles {key}"
+            );
+        }
+        assert!(
+            src.contains("move_selection("),
+            "palette navigation no longer routes through the pure move_selection"
+        );
+        assert!(
+            src.contains("aria-selected="),
+            "palette rows no longer mark the highlighted option aria-selected"
         );
     }
 }

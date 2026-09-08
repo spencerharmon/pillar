@@ -574,6 +574,10 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
             padding: 0.55rem 0.75rem; border-radius: 8px; cursor: pointer;
         }}
         .cmdk__item:hover {{ background-color: {surface_overlay}; }}
+        .cmdk__item.is-active {{
+            background-color: {surface_overlay};
+            box-shadow: inset 2px 0 0 {accent};
+        }}
         .cmdk__label {{ color: {text}; font-size: 0.9rem; }}
         .cmdk__hint {{ color: {muted}; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }}
         .cmdk__empty {{ color: {muted}; padding: 0.75rem; font-size: 0.85rem; }}
@@ -602,6 +606,27 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
             cursor: pointer; font-size: 1rem; line-height: 1; padding: 0;
         }}
         .pillar-toast__dismiss:hover {{ color: {text}; }}
+
+        /* ---- small-viewport responsive passes (a11y/responsive polish) ---- */
+        @media (max-width: 640px) {{
+            /* Console content loses its wide side padding on a phone. */
+            .console-content {{ padding: 1rem 0.85rem; gap: 1rem; }}
+            .console-topbar {{ padding: 0.7rem 0.85rem; }}
+            /* KPI + stat grids collapse to a single readable column. */
+            .ov-kpis, .obs-statgrid {{ grid-template-columns: 1fr; }}
+            /* The command palette becomes a near-fullscreen sheet from the top. */
+            .cmdk {{ align-items: stretch; }}
+            .cmdk__panel {{
+                margin-top: 0; width: 100vw; height: 100%;
+                border-radius: 0; border-left: none; border-right: none;
+            }}
+            .cmdk__list {{ max-height: none; flex: 1; }}
+            /* Detail drawers go full-width so their content is legible. */
+            .ds-drawer__panel {{ width: 100vw; border-left: none; }}
+            .pillar-drawer {{ width: 100vw; }}
+            /* Toasts span the bottom instead of a fixed narrow column. */
+            .pillar-toaststack {{ left: 0.75rem; right: 0.75rem; max-width: none; }}
+        }}
 
         /* ---- prefers-reduced-motion fallback (covers scoped styles too) ---- */
         @media (prefers-reduced-motion: reduce) {{

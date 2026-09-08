@@ -325,4 +325,35 @@ mod tests {
             "reduced-motion global still emits an active transition"
         );
     }
+
+    #[test]
+    fn global_stylesheet_carries_small_viewport_responsive_passes() {
+        let t = Theme::dark();
+        let g = styles::global(&t, Motion::Full);
+        // A phone-width breakpoint exists…
+        assert!(
+            g.contains("max-width: 640px"),
+            "global missing the small-viewport (<=640px) media breakpoint"
+        );
+        // …and within it the console content, command palette, and detail
+        // drawer all get a small-screen layout pass (single-column KPIs, a
+        // full-bleed palette sheet, full-width drawers).
+        for sel in [
+            ".console-content",
+            ".ov-kpis",
+            ".cmdk__panel",
+            ".ds-drawer__panel",
+            ".pillar-drawer",
+        ] {
+            assert!(
+                g.contains(sel),
+                "small-viewport pass does not restyle {sel}"
+            );
+        }
+        // The palette highlighted-row style (keyboard-nav affordance) is themed.
+        assert!(
+            g.contains(".cmdk__item.is-active"),
+            "global missing the command-palette active-row (keyboard nav) style"
+        );
+    }
 }
