@@ -293,10 +293,34 @@ mod yew_impl {
         parse_trust_edges, trust_node_index, TopoTreeNode, TopologyTree,
     };
     use crate::auth::use_auth;
-    use crate::portal::{get_url, http, input_value};
+    use crate::portal::{body_lines, get_url, http, input_value};
     use crate::primitives::{Badge, DataTable, Graph, GraphEdge, Tabs, Tone, Tree, TreeNode};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
+
+    /// The label declare/attest form fields (mirrors the fields the
+    /// `/portal/topology/label/declare` and `/portal/topology/label/attest`
+    /// dispatchers read, ported from the dead `portal::TopologyTile`).
+    #[derive(Clone, Default, PartialEq)]
+    struct LabelFields {
+        issuer: String,
+        capacity: String,
+        authority: String,
+        subject: String,
+        tier: String,
+        value: String,
+        scope: String,
+    }
+
+    /// A status/error message line (empty when `None`).
+    fn message_line(id: &'static str, msg: &Option<(String, bool)>) -> Html {
+        match msg {
+            Some((text, ok)) => {
+                html! { <p class={classes!("msg", if *ok { "ok" } else { "err" })} id={id}>{ text.clone() }</p> }
+            }
+            None => html! { <p class="msg" id={id}></p> },
+        }
+    }
 
     fn to_tree_node(n: &TopoTreeNode) -> TreeNode {
         TreeNode {
@@ -317,31 +341,126 @@ mod yew_impl {
         let spread_nodes = use_state(String::new);
         let spread_tier = use_state(|| "rack".to_owned());
         let spread = use_state(super::SpreadOverlay::default);
+        let label_fields = use_state(LabelFields::default);
+        let label_msg = use_state(|| None::<(String, bool)>);
+        let label_busy = use_state(|| false);
 
-        // Load the placement tree + mismatches on mount / token change.
-        {
+        // Refresh the placement tree + mismatches (mount / token change, and
+        // after a successful label declare/attest so the tree reflects it).
+        let refresh_tree = {
             let (auth, tree, mismatches) = (auth.clone(), tree.clone(), mismatches.clone());
-            use_effect_with(auth.token.clone(), move |token| {
-                if let Some(token) = token.clone() {
-                    let (tree, mismatches) = (tree.clone(), mismatches.clone());
-                    let tree_url = get_url("/portal/topology/tree", &token, &[]);
-                    let mm_url = get_url("/portal/topology/mismatches", &token, &[]);
-                    spawn_local(async move {
-                        if let Ok(r) = http("GET", &tree_url, None).await {
-                            if r.ok() {
-                                tree.set(parse_topology_tree(&r.body));
-                            }
+            Callback::from(move |_: ()| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let (tree, mismatches) = (tree.clone(), mismatches.clone());
+                let tree_url = get_url("/portal/topology/tree", &token, &[]);
+                let mm_url = get_url("/portal/topology/mismatches", &token, &[]);
+                spawn_local(async move {
+                    if let Ok(r) = http("GET", &tree_url, None).await {
+                        if r.ok() {
+                            tree.set(parse_topology_tree(&r.body));
                         }
-                        if let Ok(r) = http("GET", &mm_url, None).await {
-                            if r.ok() {
-                                mismatches.set(parse_mismatches(&r.body));
-                            }
+                    }
+                    if let Ok(r) = http("GET", &mm_url, None).await {
+                        if r.ok() {
+                            mismatches.set(parse_mismatches(&r.body));
                         }
-                    });
-                }
+                    }
+                });
+            })
+        };
+        {
+            let refresh_tree = refresh_tree.clone();
+            use_effect_with(auth.token.clone(), move |_| {
+                refresh_tree.emit(());
                 || ()
             });
         }
+
+        let lf = label_fields.clone();
+        let label_field = move |set: fn(&mut LabelFields, String)| {
+            let lf = lf.clone();
+            Callback::from(move |e: InputEvent| {
+                let mut cur = (*lf).clone();
+                set(&mut cur, input_value(&e));
+                lf.set(cur);
+            })
+        };
+        let declare_label = {
+            let (auth, label_busy, label_msg, label_fields, refresh_tree) = (
+                auth.clone(),
+                label_busy.clone(),
+                label_msg.clone(),
+                label_fields.clone(),
+                refresh_tree.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                if *label_busy {
+                    return;
+                }
+                let token = auth.token.clone().unwrap_or_default();
+                let f = (*label_fields).clone();
+                let body = body_lines(&[&token, f.subject.trim(), f.tier.trim(), f.value.trim()]);
+                let (label_busy, label_msg, refresh_tree) =
+                    (label_busy.clone(), label_msg.clone(), refresh_tree.clone());
+                label_busy.set(true);
+                spawn_local(async move {
+                    if let Ok(r) = http("POST", "/portal/topology/label/declare", Some(&body)).await
+                    {
+                        label_msg.set(Some((r.body.trim().to_owned(), r.ok())));
+                        if r.ok() {
+                            refresh_tree.emit(());
+                        }
+                    }
+                    label_busy.set(false);
+                });
+            })
+        };
+        let attest_label = {
+            let (auth, label_busy, label_msg, label_fields, refresh_tree) = (
+                auth.clone(),
+                label_busy.clone(),
+                label_msg.clone(),
+                label_fields.clone(),
+                refresh_tree.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                if *label_busy {
+                    return;
+                }
+                let token = auth.token.clone().unwrap_or_default();
+                let f = (*label_fields).clone();
+                let capacity = if f.capacity.trim().is_empty() {
+                    "self".to_owned()
+                } else {
+                    f.capacity.trim().to_owned()
+                };
+                let body = body_lines(&[
+                    &token,
+                    f.issuer.trim(),
+                    &capacity,
+                    f.authority.trim(),
+                    f.subject.trim(),
+                    f.tier.trim(),
+                    f.value.trim(),
+                    f.scope.trim(),
+                ]);
+                let (label_busy, label_msg, refresh_tree) =
+                    (label_busy.clone(), label_msg.clone(), refresh_tree.clone());
+                label_busy.set(true);
+                spawn_local(async move {
+                    if let Ok(r) = http("POST", "/portal/topology/label/attest", Some(&body)).await
+                    {
+                        label_msg.set(Some((r.body.trim().to_owned(), r.ok())));
+                        if r.ok() {
+                            refresh_tree.emit(());
+                        }
+                    }
+                    label_busy.set(false);
+                });
+            })
+        };
 
         let on_spread_nodes = {
             let spread_nodes = spread_nodes.clone();
@@ -383,6 +502,7 @@ mod yew_impl {
             "Rollups".to_owned(),
             "Mismatches".to_owned(),
             "Spread check".to_owned(),
+            "Labels".to_owned(),
         ];
         let onselect = {
             let tab = tab.clone();
@@ -445,7 +565,7 @@ mod yew_impl {
                     }
                 }
             }
-            _ => {
+            3 => {
                 let assign_cols = vec!["node".to_owned(), "domain".to_owned()];
                 let assign_rows: Vec<Vec<String>> = spread
                     .assignments
@@ -471,6 +591,25 @@ mod yew_impl {
                                 } }
                             </div>
                         }
+                    </div>
+                }
+            }
+            _ => {
+                html! {
+                    <div class="res-change" id="topology-label-tile">
+                        <label>{ "Attest a topology label" }</label>
+                        <input id="topology-issuer" type="text" placeholder="issuer" value={label_fields.issuer.clone()} oninput={label_field(|f, v| f.issuer = v)} />
+                        <input id="topology-capacity" type="text" placeholder="capacity (self or role@scope)" value={label_fields.capacity.clone()} oninput={label_field(|f, v| f.capacity = v)} />
+                        <input id="topology-authority" type="text" placeholder="authority cid (optional)" value={label_fields.authority.clone()} oninput={label_field(|f, v| f.authority = v)} />
+                        <input id="topology-subject" type="text" placeholder="subject (node)" value={label_fields.subject.clone()} oninput={label_field(|f, v| f.subject = v)} />
+                        <input id="topology-tier" type="text" placeholder="tier" value={label_fields.tier.clone()} oninput={label_field(|f, v| f.tier = v)} />
+                        <input id="topology-value" type="text" placeholder="value" value={label_fields.value.clone()} oninput={label_field(|f, v| f.value = v)} />
+                        <input id="topology-scope" type="text" placeholder="scope" value={label_fields.scope.clone()} oninput={label_field(|f, v| f.scope = v)} />
+                        <div class="row">
+                            <button class="ds-tab" id="topology-declare-btn" disabled={*label_busy} onclick={declare_label}>{ "Declare" }</button>
+                            <button class="ds-tab" id="topology-attest-btn" disabled={*label_busy} onclick={attest_label}>{ "Attest" }</button>
+                        </div>
+                        { message_line("topology-label-msg", &label_msg) }
                     </div>
                 }
             }
