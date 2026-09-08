@@ -24,6 +24,14 @@
 //!    [`plan_lint::feature_done_without_real_io`]) — a feature-tier task may not
 //!    be flipped DONE in the same reconcile that files it, nor reach DONE with a
 //!    Check whose output shows no real socket/process I/O.
+//! 4. **Integration-scenario gate**
+//!    ([`plan_lint::feature_missing_integration_scenario`],
+//!    [`plan_lint::feature_done_scenario_not_green`]) — every FEATURE-tier task
+//!    must carry an `integration-scenario:` field naming the `pillar-integration`
+//!    scenario family that proves it, and a feature-tier task's DONE is refused
+//!    unless that named scenario is GREEN on the Gitea Actions runner (queried
+//!    the same way `pillar-integration-gitea-actions-workflow`'s own Check reads
+//!    a run's status).
 //!
 //! The crate is a library so the same logic backs both the merge gate (its own
 //! `cargo test -p pillar-realness-gate`, wired into CI as a REQUIRED status
@@ -35,7 +43,8 @@ pub mod plan_lint;
 pub mod scan;
 
 pub use plan_lint::{
-    feature_done_without_real_io, same_reconcile_feature_done, verb_claim_offenses, PlanOffense,
-    Task,
+    feature_done_scenario_not_green, feature_done_without_real_io,
+    feature_missing_integration_scenario, same_reconcile_feature_done, verb_claim_offenses,
+    PlanOffense, ScenarioOracle, ScenarioStatus, Task,
 };
 pub use scan::{scan_source, scan_workspace, Offense};

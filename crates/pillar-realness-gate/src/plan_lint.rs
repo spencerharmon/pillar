@@ -33,6 +33,9 @@ pub struct Task {
     pub check: Option<String>,
     /// True if the body declares `check=none`.
     pub check_none: bool,
+    /// The `integration-scenario:` field — the `pillar-integration` scenario
+    /// family that PROVES this feature-tier task, if the body declares one.
+    pub integration_scenario: Option<String>,
 }
 
 /// A plan-level offense.
@@ -237,6 +240,114 @@ pub fn feature_done_without_real_io(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Tooth 4 — feature-tier tasks MUST name a pillar-integration scenario, and a
+// feature-tier DONE is only legal when its named scenario is GREEN on the
+// Gitea Actions runner (queried the same way the
+// pillar-integration-gitea-actions-workflow Check queries a run's status).
+// ---------------------------------------------------------------------------
+
+/// The runner-observed status of a named `pillar-integration` scenario family.
+/// Mirrors the `verify-actions-run.sh` exit-code contract: a scenario is either
+/// green (its Actions run concluded `success`), not-yet-green (queued/in
+/// progress/failed/absent), so a feature-DONE gated on a non-green scenario is
+/// refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenarioStatus {
+    /// The scenario's latest Gitea Actions run concluded `success`.
+    Green,
+    /// The scenario is queued/in-progress/failed, or no run exists yet.
+    NotGreen,
+    /// The scenario name is not a known `pillar-integration` scenario family.
+    Unknown,
+}
+
+/// A resolver from a scenario-family name to its runner-observed status. The
+/// production implementation queries the Gitea Actions REST API exactly as
+/// `scripts/verify-actions-run.sh` does (the `pillar-integration` workflow's
+/// per-scenario job conclusion); tests inject a deterministic map so the lint's
+/// decision logic is proven offline without live reachability or a token.
+pub trait ScenarioOracle {
+    /// Return the runner-observed status of scenario family `name`.
+    fn status(&self, name: &str) -> ScenarioStatus;
+}
+
+impl<F: Fn(&str) -> ScenarioStatus> ScenarioOracle for F {
+    fn status(&self, name: &str) -> ScenarioStatus {
+        (self)(name)
+    }
+}
+
+/// Tooth 4a. Every FEATURE-tier task MUST carry an `integration-scenario:` field
+/// naming the `pillar-integration` scenario family that proves it. A feature-tier
+/// task lacking the field is an offense — the gate cannot know which real
+/// integration scenario would demonstrate the claimed running effect.
+pub fn feature_missing_integration_scenario(tasks: &[Task]) -> Vec<PlanOffense> {
+    let mut out = Vec::new();
+    for t in tasks {
+        if !is_feature_tier(t) {
+            continue;
+        }
+        if t.integration_scenario.is_none() {
+            out.push(PlanOffense {
+                task: t.id.clone(),
+                kind: "feature-missing-integration-scenario".to_string(),
+                detail: "feature-tier task lacks a mandatory `integration-scenario:` field \
+                         naming the pillar-integration scenario family that proves it"
+                    .to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Tooth 4b. A feature-tier task may not be `DONE` unless the scenario named by
+/// its `integration-scenario:` field is GREEN on the Gitea Actions runner. A
+/// DONE whose named scenario is missing, unknown, or not-green is refused. A
+/// feature-tier DONE with NO `integration-scenario:` field is likewise refused
+/// (tooth 4a flags it separately, but a DONE without the field can never be
+/// proven green here, so it is an offense at this gate too).
+pub fn feature_done_scenario_not_green<O: ScenarioOracle>(
+    tasks: &[Task],
+    oracle: &O,
+) -> Vec<PlanOffense> {
+    let mut out = Vec::new();
+    for t in tasks {
+        if t.status != "DONE" || !is_feature_tier(t) {
+            continue;
+        }
+        match &t.integration_scenario {
+            None => out.push(PlanOffense {
+                task: t.id.clone(),
+                kind: "feature-done-no-integration-scenario".to_string(),
+                detail: "feature-tier task is DONE but names no `integration-scenario:` \
+                         to prove it green on the runner"
+                    .to_string(),
+            }),
+            Some(name) => match oracle.status(name) {
+                ScenarioStatus::Green => {}
+                ScenarioStatus::NotGreen => out.push(PlanOffense {
+                    task: t.id.clone(),
+                    kind: "feature-done-scenario-not-green".to_string(),
+                    detail: format!(
+                        "feature-tier task is DONE but its integration-scenario {name:?} \
+                         is not green on the Gitea Actions runner"
+                    ),
+                }),
+                ScenarioStatus::Unknown => out.push(PlanOffense {
+                    task: t.id.clone(),
+                    kind: "feature-done-scenario-unknown".to_string(),
+                    detail: format!(
+                        "feature-tier task is DONE but its integration-scenario {name:?} \
+                         is not a known pillar-integration scenario family"
+                    ),
+                }),
+            },
+        }
+    }
+    out
+}
+
 /// Parse a `PLAN.md` into the tasks the lints need. A task begins at a line
 /// `## <id> [<STATUS>] <!-- ... -->` and its body runs to the next `## ` header
 /// (or a top-level `# ` heading / EOF).
@@ -282,6 +393,12 @@ fn finish_body(t: &mut Task, lines: &[String]) {
         if let Some(rest) = trimmed.strip_prefix("Check:") {
             t.check = Some(rest.trim().to_string());
         }
+        if let Some(rest) = trimmed.strip_prefix("integration-scenario:") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                t.integration_scenario = Some(v.to_string());
+            }
+        }
     }
     if t.body.contains("check=none") || t.body.contains("check-none") {
         t.check_none = true;
@@ -315,6 +432,7 @@ fn parse_header(line: &str) -> Option<Task> {
         body: String::new(),
         check: None,
         check_none: false,
+        integration_scenario: None,
     })
 }
 
@@ -330,10 +448,17 @@ mod unit {
             body: body.to_string(),
             check: None,
             check_none: false,
+            integration_scenario: None,
         };
         for l in body.lines() {
             if let Some(rest) = l.trim().strip_prefix("Check:") {
                 task.check = Some(rest.trim().to_string());
+            }
+            if let Some(rest) = l.trim().strip_prefix("integration-scenario:") {
+                let v = rest.trim();
+                if !v.is_empty() {
+                    task.integration_scenario = Some(v.to_string());
+                }
             }
         }
         if body.contains("check=none") {
@@ -392,12 +517,82 @@ mod unit {
     #[test]
     fn parse_header_extracts_fields() {
         let tasks = parse_plan(
-            "## foo-task [DONE] <!-- attempts=3 deps=bar weight=64 commits=abc -->\nbody line\nCheck: cargo test --all\n## next-task [TODO] <!-- attempts=0 -->\nx",
+            "## foo-task [DONE] <!-- attempts=3 deps=bar weight=64 commits=abc -->\nbody line\nCheck: cargo test --all\nintegration-scenario: pillar-integration-scenarios-workload-runtime\n## next-task [TODO] <!-- attempts=0 -->\nx",
         );
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].id, "foo-task");
         assert_eq!(tasks[0].status, "DONE");
         assert_eq!(tasks[0].attempts, 3);
         assert_eq!(tasks[0].check.as_deref(), Some("cargo test --all"));
+        assert_eq!(
+            tasks[0].integration_scenario.as_deref(),
+            Some("pillar-integration-scenarios-workload-runtime")
+        );
+    }
+
+    #[test]
+    fn feature_tier_without_scenario_is_flagged() {
+        let tasks = vec![t(
+            "workload-run",
+            "TODO",
+            1,
+            "The controller runs the workload as a real process.\nCheck: cargo test -p pillar-e2e --test workload_run",
+        )];
+        let o = feature_missing_integration_scenario(&tasks);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(o[0].kind, "feature-missing-integration-scenario");
+    }
+
+    #[test]
+    fn feature_tier_with_scenario_is_accepted() {
+        let tasks = vec![t(
+            "workload-run",
+            "TODO",
+            1,
+            "The controller runs the workload as a real process.\nCheck: cargo test -p pillar-e2e --test workload_run\nintegration-scenario: pillar-integration-scenarios-workload-runtime",
+        )];
+        assert!(feature_missing_integration_scenario(&tasks).is_empty());
+    }
+
+    #[test]
+    fn feature_done_gated_on_scenario_greenness() {
+        let tasks = vec![t(
+            "workload-run",
+            "DONE",
+            2,
+            "runs the workload.\nCheck: cargo test -p pillar-e2e --test workload_run\nintegration-scenario: pillar-integration-scenarios-workload-runtime",
+        )];
+        let green = |name: &str| {
+            if name == "pillar-integration-scenarios-workload-runtime" {
+                ScenarioStatus::Green
+            } else {
+                ScenarioStatus::Unknown
+            }
+        };
+        assert!(feature_done_scenario_not_green(&tasks, &green).is_empty());
+
+        let red = |_: &str| ScenarioStatus::NotGreen;
+        let o = feature_done_scenario_not_green(&tasks, &red);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(o[0].kind, "feature-done-scenario-not-green");
+
+        let unknown = |_: &str| ScenarioStatus::Unknown;
+        let o = feature_done_scenario_not_green(&tasks, &unknown);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(o[0].kind, "feature-done-scenario-unknown");
+    }
+
+    #[test]
+    fn feature_done_without_scenario_field_is_flagged() {
+        let tasks = vec![t(
+            "workload-run",
+            "DONE",
+            2,
+            "runs the workload.\nCheck: cargo test -p pillar-e2e --test workload_run",
+        )];
+        let any = |_: &str| ScenarioStatus::Green;
+        let o = feature_done_scenario_not_green(&tasks, &any);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(o[0].kind, "feature-done-no-integration-scenario");
     }
 }

@@ -4,7 +4,9 @@
 //! run the static scan against the ACTUAL workspace tree (which must be clean).
 
 use pillar_realness_gate::plan_lint::{
-    feature_done_without_real_io, parse_plan, same_reconcile_feature_done, verb_claim_offenses,
+    feature_done_scenario_not_green, feature_done_without_real_io,
+    feature_missing_integration_scenario, parse_plan, same_reconcile_feature_done,
+    verb_claim_offenses, ScenarioStatus,
 };
 use pillar_realness_gate::scan::{scan_source, scan_workspace, workspace_root_path};
 
@@ -196,4 +198,71 @@ Check: cargo test -p pillar-e2e --test workload_run
         "child pid=48213 listening on 127.0.0.1:34871; echoed datagram ok".to_string(),
     )];
     assert!(feature_done_without_real_io(&tasks, &with_io).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Tooth 4 — integration-scenario gate: a feature-tier task must name a
+// pillar-integration scenario, and a feature-tier DONE requires that scenario
+// to be GREEN on the runner.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tooth4_rejects_feature_tier_lacking_integration_scenario() {
+    let plan = "\
+## workload-run [TODO] <!-- attempts=1 deps=none weight=64 -->
+The controller runs the workload as a real process on the node.
+Check: cargo test -p pillar-e2e --test workload_run
+";
+    let tasks = parse_plan(plan);
+    let offenses = feature_missing_integration_scenario(&tasks);
+    assert_eq!(offenses.len(), 1, "{offenses:?}");
+    assert_eq!(offenses[0].task, "workload-run");
+    assert_eq!(offenses[0].kind, "feature-missing-integration-scenario");
+}
+
+#[test]
+fn tooth4_accepts_feature_tier_naming_integration_scenario() {
+    let plan = "\
+## workload-run [TODO] <!-- attempts=1 deps=none weight=64 -->
+The controller runs the workload as a real process on the node.
+Check: cargo test -p pillar-e2e --test workload_run
+integration-scenario: pillar-integration-scenarios-workload-runtime
+";
+    let tasks = parse_plan(plan);
+    assert!(feature_missing_integration_scenario(&tasks).is_empty());
+}
+
+#[test]
+fn tooth4_rejects_feature_done_whose_scenario_is_not_green() {
+    let plan = "\
+## workload-run [DONE] <!-- attempts=2 deps=none weight=64 -->
+The controller runs the workload as a real process on the node.
+Check: cargo test -p pillar-e2e --test workload_run
+integration-scenario: pillar-integration-scenarios-workload-runtime
+";
+    let tasks = parse_plan(plan);
+    // Runner reports the scenario is NOT green (still red/absent).
+    let red = |_: &str| ScenarioStatus::NotGreen;
+    let offenses = feature_done_scenario_not_green(&tasks, &red);
+    assert_eq!(offenses.len(), 1, "{offenses:?}");
+    assert_eq!(offenses[0].kind, "feature-done-scenario-not-green");
+}
+
+#[test]
+fn tooth4_accepts_feature_done_whose_scenario_is_green() {
+    let plan = "\
+## workload-run [DONE] <!-- attempts=2 deps=none weight=64 -->
+The controller runs the workload as a real process on the node.
+Check: cargo test -p pillar-e2e --test workload_run
+integration-scenario: pillar-integration-scenarios-workload-runtime
+";
+    let tasks = parse_plan(plan);
+    let green = |name: &str| {
+        if name == "pillar-integration-scenarios-workload-runtime" {
+            ScenarioStatus::Green
+        } else {
+            ScenarioStatus::Unknown
+        }
+    };
+    assert!(feature_done_scenario_not_green(&tasks, &green).is_empty());
 }
