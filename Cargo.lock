@@ -3187,6 +3187,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-integration-coverage"
+version = "0.1.0"
+dependencies = [
+ "pillar-surface-inventory",
+]
+
+[[package]]
 name = "pillar-ipam"
 version = "0.1.0"
 dependencies = [

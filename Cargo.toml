@@ -32,6 +32,7 @@ members = [
     "crates/pillar-surface-inventory",
     "crates/pillar-e2e",
     "crates/pillar-blob-provider",
+    "crates/pillar-integration-coverage",
 ]
 # pillar-frontend targets wasm32-unknown-unknown and carries the yew/stylist/
 # wasm-bindgen closure with its OWN Cargo.lock; excluding it keeps the wasm

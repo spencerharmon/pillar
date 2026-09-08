@@ -1,0 +1,14 @@
+[package]
+name = "pillar-integration-coverage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The pillar-integration coverage ledger — the anti-false-done spine. Gate 1: no orphan surface (an inventory entry claimed by zero scenarios, or a claim with no realness oracle, FAILS). Gate 3: a skipped/xfail'd scenario is a warning that becomes an error past its declared deadline — the proof cannot be quietly disabled. Gate 2 (a feature-tier PLAN task cannot reach DONE unless its named pillar-integration scenario is green in CI) is wired into pillar-realness-gate tooth #2 by the follow-on feature-realness-gate-integration-scenario-gate task."
+
+[dependencies]
+pillar-surface-inventory = { path = "../pillar-surface-inventory" }
+
+[lints]
+workspace = true
