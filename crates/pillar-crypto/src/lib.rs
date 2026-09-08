@@ -50,6 +50,7 @@ pub mod content;
 pub mod custody;
 pub mod kdf;
 pub mod node;
+pub mod openpgp;
 pub mod principal;
 pub mod seal;
 pub mod sign;
