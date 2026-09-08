@@ -21,6 +21,7 @@ fn main() {
         signing_pub: cell_pub.signing.clone(),
         signing_sec: Some(cell_sec.signing.clone()),
         sealing_pub: cell_pub.sealing.clone(),
+        sealing_sec: None,
         certifications: vec![],
     };
 
@@ -30,6 +31,7 @@ fn main() {
         signing_pub: user_pub.signing.clone(),
         signing_sec: Some(user_sec.signing.clone()),
         sealing_pub: user_pub.sealing.clone(),
+        sealing_sec: Some(user_sec.sealing.clone()),
         certifications: vec![TrustCertification {
             issuer_signing_pub: cell_pub.signing.clone(),
             issuer_signing_sec: cell_sec.signing.clone(),

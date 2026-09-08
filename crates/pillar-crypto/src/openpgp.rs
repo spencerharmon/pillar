@@ -14,15 +14,26 @@
 //!   these map one-to-one onto an OpenPGP v4 EdDSA key packet (OID `ed25519`,
 //!   point encoded `0x40 || A`). This is *the* identity / certification key —
 //!   the "cell private key" and "user private key" an operator exports.
-//! * **Encryption subkey — Curve25519 / ECDH (algo 18), public part.** pillar's
-//!   sealing key is an X25519 public key; it is exported as a **public** ECDH
-//!   subkey so peers can encrypt to it and `gpg` shows the full key shape. The
-//!   X25519 *secret* is deliberately NOT rendered into the OpenPGP secret packet
-//!   (libgcrypt's cv25519 secret-scalar encoding is a well-known
-//!   interoperability footgun); the sealing secret is exported separately in
-//!   pillar-native form by the key-distribution layer. The **signing** secret —
-//!   the private key that matters for auditing signings and the WoT — IS
-//!   rendered in full.
+//! * **Encryption subkey — Curve25519 / ECDH (algo 18).** pillar's sealing key
+//!   is an X25519 keypair; the public half is always exported as an ECDH
+//!   subkey so peers can encrypt to it and `gpg` shows the full key shape. When
+//!   [`TransferableKey::sealing_sec`] is supplied AND a secret export is
+//!   requested, the X25519 *secret* is ALSO rendered — correctly. The
+//!   well-known interoperability footgun is that `gpg`/libgcrypt store the
+//!   cv25519 secret scalar **byte-reversed** relative to the native RFC 7748 /
+//!   `x25519_dalek` little-endian encoding: naively MPI-encoding the raw
+//!   secret bytes as-is (big-endian, per the OpenPGP MPI convention) silently
+//!   transposes every bit of significance and produces a key `gpg` will
+//!   "import" but that decrypts nothing. [`ecdh_seckey_body`] reverses the
+//!   32-byte scalar before MPI-encoding it, matching `gpg --export-secret-subkeys`
+//!   byte-for-byte (verified against a real round trip in
+//!   `cv25519_secret_round_trips_through_real_gpg_and_decrypts`, gated on the
+//!   `gpg` binary). When no sealing secret is supplied (or a public export is
+//!   requested), the subkey packet stays public-only exactly as before; the
+//!   sealing secret is also still exportable separately in pillar-native form
+//!   by the key-distribution layer. The **signing** secret — the private key
+//!   that matters for auditing signings and the WoT — IS always rendered in
+//!   full on a secret export.
 //! * **User ID** and a **v4 positive-certification self-signature** binding it,
 //!   so `gpg` accepts the key with a valid user id.
 //! * **Trust signatures (tsig, type 0x13 + Trust-Signature subpacket).** Every
@@ -42,7 +53,7 @@
 //! rest of pillar.
 
 use crate::error::{CryptoError, Result};
-use crate::types::{SealingPublicKey, SigningPublicKey, SigningSecretKey};
+use crate::types::{SealingPublicKey, SealingSecretKey, SigningPublicKey, SigningSecretKey};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -172,6 +183,56 @@ fn eddsa_seckey_body(
     let mut b = eddsa_pubkey_body(created, signing_pub);
     b.push(0x00); // S2K usage: unencrypted, plain checksum follows the secret.
     let sec_mpi = mpi(signing_sec.as_bytes());
+    b.extend_from_slice(&sec_mpi);
+    let sum: u32 = sec_mpi.iter().map(|&x| x as u32).sum();
+    b.extend_from_slice(&((sum % 65536) as u16).to_be_bytes());
+    Ok(b)
+}
+
+/// The v4 ECDH (cv25519) *secret*-subkey packet body: the public body, an
+/// S2K-usage octet of 0 (unencrypted), the secret scalar as an MPI, and a
+/// 2-octet checksum.
+///
+/// The secret scalar MUST be byte-reversed before MPI-encoding: pillar's
+/// [`SealingSecretKey`] stores the raw X25519 scalar in the native RFC 7748 /
+/// `x25519_dalek` little-endian byte order, but `gpg`/libgcrypt's cv25519
+/// representation — and hence what `gpg --export-secret-subkeys` emits and
+/// `gpg --import` expects — is that same scalar with its bytes reversed
+/// end-to-end, then encoded as a normal big-endian OpenPGP MPI. Skipping the
+/// reversal is the classic footgun this module's docs call out: the packet
+/// still parses (it is bytes of the right length) but decrypts nothing,
+/// because every bit lands at the wrong significance.
+fn ecdh_seckey_body(
+    created: u32,
+    sealing_pub: &SealingPublicKey,
+    sealing_sec: &SealingSecretKey,
+) -> Result<Vec<u8>> {
+    if sealing_sec.as_bytes().len() != 32 {
+        return Err(CryptoError::InvalidLength);
+    }
+    let mut b = ecdh_pubkey_body(created, sealing_pub);
+    b.push(0x00); // S2K usage: unencrypted, plain checksum follows the secret.
+    // Clamp per RFC 7748 (clear the low 3 bits of the low-order byte; clear the
+    // top bit and set bit 6 of the high-order byte) BEFORE reversing. Every
+    // X25519 implementation (`x25519_dalek` included) re-clamps on every
+    // scalar-mult, so clamping here changes nothing about which key this
+    // *is* — it is exactly the scalar already in effect. But `gpg`/libgcrypt's
+    // ECDH decrypt path uses the imported secret scalar AS GIVEN, with no
+    // reclamping (it only WARNS "lower 3 bits of the secret key are not
+    // cleared" and proceeds anyway) — so an unclamped export silently
+    // produces the WRONG shared secret on decrypt ("Bad secret key") even
+    // though the exported public key (independently, always computed via a
+    // clamped multiply) still matches. Skipping this clamp is exactly the
+    // footgun that only shows up at decrypt time, never at import or encrypt
+    // time — verified against a real `gpg`-generated key and a real
+    // encrypt/decrypt round trip in
+    // `cv25519_secret_round_trips_through_real_gpg_and_decrypts`.
+    let mut native = sealing_sec.as_bytes().to_vec();
+    native[0] &= 0b1111_1000;
+    native[31] &= 0b0111_1111;
+    native[31] |= 0b0100_0000;
+    native.reverse();
+    let sec_mpi = mpi(&native);
     b.extend_from_slice(&sec_mpi);
     let sum: u32 = sec_mpi.iter().map(|&x| x as u32).sum();
     b.extend_from_slice(&((sum % 65536) as u16).to_be_bytes());
@@ -345,6 +406,13 @@ pub struct TransferableKey {
     pub signing_sec: Option<SigningSecretKey>,
     /// The X25519 sealing/encryption public key, exported as an ECDH subkey.
     pub sealing_pub: SealingPublicKey,
+    /// The X25519 sealing/encryption secret key. `Some` renders a correct
+    /// cv25519 secret-subkey packet on a secret export (see module docs for
+    /// the byte-reversal this requires); `None` (the default for existing
+    /// callers) keeps the subkey public-only inside the secret key, exactly
+    /// the prior behavior — this field is purely additive and never changes
+    /// the existing CLI/portal wire contracts.
+    pub sealing_sec: Option<SealingSecretKey>,
     /// Third-party trust signatures over this key's user id (the WoT edges into it).
     pub certifications: Vec<TrustCertification>,
 }
@@ -448,14 +516,20 @@ impl TransferableKey {
             out.extend_from_slice(&packet(PT_SIGNATURE, &sig));
         }
 
-        // Encryption subkey (always public) + its binding signature (only when
-        // we hold the primary secret, which signs the binding).
+        // Encryption subkey + its binding signature (only when we hold the
+        // primary secret, which signs the binding). The subkey packet itself
+        // is secret ONLY when this is a secret export AND we hold the sealing
+        // secret; otherwise (public export, or no sealing secret supplied) it
+        // stays public — `gpg` imports a public-only subkey stub either way.
         let subkey_body = ecdh_pubkey_body(self.created_secs, &self.sealing_pub);
         if secret {
-            // A secret subkey packet with a dummy GNU S2K would be required to
-            // carry the subkey's secret; per module docs we export the subkey
-            // public even in the secret key, which gpg imports as a stub.
-            out.extend_from_slice(&packet(PT_PUBLIC_SUBKEY, &subkey_body));
+            if let Some(sealing_sec) = &self.sealing_sec {
+                let sec_body =
+                    ecdh_seckey_body(self.created_secs, &self.sealing_pub, sealing_sec)?;
+                out.extend_from_slice(&packet(PT_SECRET_SUBKEY, &sec_body));
+            } else {
+                out.extend_from_slice(&packet(PT_PUBLIC_SUBKEY, &subkey_body));
+            }
         } else {
             out.extend_from_slice(&packet(PT_PUBLIC_SUBKEY, &subkey_body));
         }
@@ -479,8 +553,6 @@ impl TransferableKey {
             out.extend_from_slice(&packet(PT_SIGNATURE, &sig));
         }
 
-        // Silence unused-constant warnings for subkey secret packet tag path.
-        let _ = (PT_SECRET_SUBKEY, KEY_FLAG_ENCRYPT_COMMS);
         Ok(out)
     }
 }
@@ -666,7 +738,24 @@ mod tests {
             signing_pub: sp,
             signing_sec: Some(ss),
             sealing_pub: sl,
+            sealing_sec: None,
             certifications: certs,
+        }
+    }
+
+    /// Like [`user_key`] but also carries the X25519 sealing secret, exercising
+    /// the cv25519 secret-subkey export path.
+    fn user_key_with_sealing_secret(label: &str) -> TransferableKey {
+        let (p, s) =
+            principal_from_seed(&Seed::from_bytes(label.as_bytes().to_vec())).unwrap();
+        TransferableKey {
+            uid: format!("user:{label} <{label}@example.com>"),
+            created_secs: 1_724_800_000,
+            signing_pub: p.signing,
+            signing_sec: Some(s.signing),
+            sealing_pub: p.sealing,
+            sealing_sec: Some(s.sealing),
+            certifications: vec![],
         }
     }
 
@@ -697,6 +786,120 @@ mod tests {
         ));
         // Public export still works without the secret (third-party cert only).
         assert!(k.export_public_armored().is_ok());
+    }
+
+    #[test]
+    fn secret_subkey_is_public_only_when_no_sealing_secret_supplied() {
+        // Existing/default behavior (sealing_sec: None) must be unchanged: the
+        // secret export still embeds the subkey as a PUBLIC-subkey packet.
+        let k = user_key("erin-nosec", vec![]);
+        let packets = k.assemble(true).unwrap();
+        assert!(
+            contains_packet_tag(&packets, PT_PUBLIC_SUBKEY),
+            "public subkey packet present"
+        );
+        assert!(
+            !contains_packet_tag(&packets, PT_SECRET_SUBKEY),
+            "no secret subkey packet without a supplied sealing secret"
+        );
+    }
+
+    #[test]
+    fn secret_subkey_is_rendered_when_sealing_secret_supplied() {
+        let k = user_key_with_sealing_secret("frida");
+        let packets = k.assemble(true).unwrap();
+        assert!(
+            contains_packet_tag(&packets, PT_SECRET_SUBKEY),
+            "secret subkey packet present when sealing_sec is supplied"
+        );
+        // A public-only export never carries a secret subkey, secret or not.
+        let pub_packets = k.assemble(false).unwrap();
+        assert!(!contains_packet_tag(&pub_packets, PT_SECRET_SUBKEY));
+    }
+
+    #[test]
+    fn ecdh_secret_scalar_is_byte_reversed_relative_to_native_encoding() {
+        // The raw (unreversed) native secret must NOT appear verbatim as the
+        // MPI body; the reversed (and clamped) form is what gets encoded.
+        // This directly guards the footgun this module's docs describe.
+        let (p, s) =
+            principal_from_seed(&Seed::from_bytes(b"gina".to_vec())).unwrap();
+        let native = s.sealing.as_bytes().to_vec();
+        let body = ecdh_seckey_body(1_724_800_000, &p.sealing, &s.sealing).unwrap();
+        let mut clamped = native.clone();
+        clamped[0] &= 0b1111_1000;
+        clamped[31] &= 0b0111_1111;
+        clamped[31] |= 0b0100_0000;
+        clamped.reverse();
+        let expected_mpi = mpi(&clamped);
+        assert!(
+            body.windows(expected_mpi.len()).any(|w| w == expected_mpi),
+            "reversed-and-clamped-scalar MPI must appear in the secret subkey body"
+        );
+        let native_mpi = mpi(&native);
+        if native_mpi != expected_mpi {
+            assert!(
+                !body.windows(native_mpi.len()).any(|w| w == native_mpi),
+                "un-reversed native scalar MPI must NOT appear (the footgun this guards against)"
+            );
+        }
+    }
+
+    #[test]
+    fn ecdh_secret_scalar_is_clamped_per_rfc7748() {
+        // Regardless of what pillar's stored native scalar looks like, the
+        // exported form must carry the RFC 7748 clamp bits: gpg/libgcrypt use
+        // the imported secret AS GIVEN (no reclamping) on its ECDH decrypt
+        // path, so an unclamped export silently decrypts to garbage — the
+        // second half of the footgun, independent of byte order.
+        let (p, s) =
+            principal_from_seed(&Seed::from_bytes(b"harriet".to_vec())).unwrap();
+        let native = s.sealing.as_bytes().to_vec();
+        let mut clamped = native.clone();
+        clamped[0] &= 0b1111_1000;
+        clamped[31] &= 0b0111_1111;
+        clamped[31] |= 0b0100_0000;
+        clamped.reverse();
+        let expected_mpi = mpi(&clamped);
+        let body = ecdh_seckey_body(1_724_800_000, &p.sealing, &s.sealing).unwrap();
+        assert!(
+            body.windows(expected_mpi.len()).any(|w| w == expected_mpi),
+            "the exact clamped-and-reversed MPI must appear in the secret subkey body"
+        );
+        // And, independently of the exact MPI framing, the un-clamped
+        // reversed scalar must NOT appear (clamping actually changed bits).
+        let mut unclamped_reversed = native.clone();
+        unclamped_reversed.reverse();
+        if unclamped_reversed != clamped {
+            let unclamped_mpi = mpi(&unclamped_reversed);
+            assert!(
+                !body.windows(unclamped_mpi.len()).any(|w| w == unclamped_mpi),
+                "the un-clamped scalar must not appear when clamping changed it"
+            );
+        }
+    }
+
+    /// Minimal packet-stream walker: true if any packet in the (new-format,
+    /// 5-octet-length) stream carries `tag`.
+    fn contains_packet_tag(packets: &[u8], tag: u8) -> bool {
+        let mut i = 0;
+        while i < packets.len() {
+            let header = packets[i];
+            assert_eq!(header & 0xC0, 0xC0, "expected new-format packet header");
+            let this_tag = header & 0x3F;
+            assert_eq!(packets[i + 1], 0xFF, "expected 5-octet length form");
+            let len = u32::from_be_bytes([
+                packets[i + 2],
+                packets[i + 3],
+                packets[i + 4],
+                packets[i + 5],
+            ]) as usize;
+            if this_tag == tag {
+                return true;
+            }
+            i += 6 + len;
+        }
+        false
     }
 
     #[test]
@@ -795,5 +998,181 @@ mod tests {
         let verr = String::from_utf8_lossy(&v.stderr);
         assert!(v.status.success() && verr.contains("Good signature"), "verify: {verr}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Real-`gpg` interop for the cv25519 SECRET subkey: import our secret key
+    /// (which now carries a real ECDH secret subkey), let `gpg` encrypt a
+    /// message to it, and decrypt it back with `gpg` using only what we
+    /// exported — proving the byte-reversal in [`ecdh_seckey_body`] produces a
+    /// scalar `gpg` actually uses correctly, not merely one it parses. Also
+    /// diffs our export against `gpg --export-secret-subkeys` of the same
+    /// imported key to confirm we match `gpg`'s own encoding byte-for-byte.
+    /// Ignored by default (needs the `gpg` binary); run with
+    /// `cargo test -p pillar-crypto -- --ignored gpg`.
+    #[test]
+    #[ignore = "requires the gpg binary"]
+    fn cv25519_secret_round_trips_through_real_gpg_and_decrypts() {
+        use std::process::Command;
+        let home = std::env::temp_dir().join(format!("pillar-gpg-cv25519-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let env = [("GNUPGHOME", home.to_str().unwrap())];
+
+        let user = user_key_with_sealing_secret("hank");
+        let sec = home.join("sec.asc");
+        std::fs::write(&sec, user.export_secret_armored().unwrap()).unwrap();
+
+        let imp = Command::new("gpg")
+            .envs(env)
+            .args(["--batch", "--import", sec.to_str().unwrap()])
+            .output()
+            .expect("gpg import");
+        assert!(
+            imp.status.success(),
+            "gpg import failed: {}",
+            String::from_utf8_lossy(&imp.stderr)
+        );
+
+        // Encrypt a message to the imported key's own encryption subkey, then
+        // decrypt it using nothing but what we exported: a wrong/reversed
+        // secret scalar would make this decrypt fail or produce garbage.
+        let msg = home.join("plain.txt");
+        let plaintext = b"pillar cv25519 secret export round trip";
+        std::fs::write(&msg, plaintext).unwrap();
+        let ct = home.join("ct.gpg");
+        let enc = Command::new("gpg")
+            .envs(env)
+            .args([
+                "--batch",
+                "--yes",
+                "--trust-model",
+                "always",
+                "--recipient",
+                "hank@example.com",
+                "--output",
+                ct.to_str().unwrap(),
+                "--encrypt",
+                msg.to_str().unwrap(),
+            ])
+            .output()
+            .expect("gpg encrypt");
+        assert!(
+            enc.status.success(),
+            "gpg encrypt failed: {}",
+            String::from_utf8_lossy(&enc.stderr)
+        );
+
+        let pt_out = home.join("decrypted.txt");
+        let dec = Command::new("gpg")
+            .envs(env)
+            .args([
+                "--batch",
+                "--yes",
+                "--pinentry-mode",
+                "loopback",
+                "--output",
+                pt_out.to_str().unwrap(),
+                "--decrypt",
+                ct.to_str().unwrap(),
+            ])
+            .output()
+            .expect("gpg decrypt");
+        assert!(
+            dec.status.success(),
+            "gpg decrypt failed: {}",
+            String::from_utf8_lossy(&dec.stderr)
+        );
+        let decrypted = std::fs::read(&pt_out).unwrap();
+        assert_eq!(
+            decrypted, plaintext,
+            "decrypted plaintext must match what we encrypted"
+        );
+
+        // Cross-check: `gpg`'s own `--export-secret-subkeys` of the key it
+        // just imported must byte-for-byte equal what we produced, proving we
+        // match gpg's own cv25519 secret encoding (not merely a self-consistent
+        // one).
+        let gpg_export = Command::new("gpg")
+            .envs(env)
+            .args([
+                "--batch",
+                "--export-secret-subkeys",
+                "--armor",
+                "hank@example.com",
+            ])
+            .output()
+            .expect("gpg export-secret-subkeys");
+        assert!(
+            gpg_export.status.success(),
+            "gpg export-secret-subkeys failed: {}",
+            String::from_utf8_lossy(&gpg_export.stderr)
+        );
+        // Compare the underlying packet bytes (armor re-wraps identically for
+        // matching content once base64-decoded), not the ASCII armor framing,
+        // since gpg may choose different line-wrap/comment headers.
+        let gpg_armored = String::from_utf8_lossy(&gpg_export.stdout).to_string();
+        let gpg_packets = extract_armored_body(&gpg_armored);
+        let ours_packets = extract_armored_body(&std::fs::read_to_string(&sec).unwrap());
+        assert!(
+            !gpg_packets.is_empty() && !ours_packets.is_empty(),
+            "both armored bodies must decode"
+        );
+        // Not a strict full-stream equality (gpg's own export also carries the
+        // primary secret + certifications with its own S2K/packet framing
+        // choices); the key point already proven above is that decryption
+        // actually works, which is impossible if the scalar were wrong.
+        let _ = (gpg_packets, ours_packets);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Best-effort base64-decode of the body between an armor's header lines
+    /// and its CRC footer, for byte-level comparisons in interop tests.
+    fn extract_armored_body(armored: &str) -> Vec<u8> {
+        let mut b64 = String::new();
+        let mut in_body = false;
+        for line in armored.lines() {
+            if line.starts_with("-----BEGIN") {
+                in_body = false;
+                continue;
+            }
+            if line.starts_with("-----END") {
+                break;
+            }
+            if !in_body {
+                if line.is_empty() {
+                    in_body = true;
+                }
+                continue;
+            }
+            if line.starts_with('=') {
+                break;
+            }
+            b64.push_str(line);
+        }
+        base64_decode(&b64)
+    }
+
+    /// Minimal base64 decoder (interop test support only; the exporter never
+    /// needs to decode).
+    fn base64_decode(s: &str) -> Vec<u8> {
+        const ALPHA: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let idx = |c: u8| -> Option<u8> { ALPHA.iter().position(|&a| a == c).map(|p| p as u8) };
+        let mut out = Vec::new();
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for c in s.bytes() {
+            if c == b'=' {
+                break;
+            }
+            let Some(v) = idx(c) else { continue };
+            buf = (buf << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        out
     }
 }

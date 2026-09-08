@@ -18,8 +18,7 @@
 //!   held fails with [`ExportError::NoSecret`]. There is no unauthorized path.
 
 use pillar_crypto::openpgp::{TransferableKey, TrustCertification};
-use pillar_crypto::{SealingPublicKey, SigningPublicKey, SigningSecretKey};
-use pillar_rbac::Decision;
+use pillar_crypto::{SealingPublicKey, SealingSecretKey, SigningPublicKey, SigningSecretKey};use pillar_rbac::Decision;
 use pillar_core::NodeId;
 use pillar_trust_artifacts::{identity_principal, public_key_for, TrustStore};
 
@@ -42,6 +41,7 @@ pub fn node_key_fingerprint(node: &NodeId) -> String {
         signing_pub: public_key_for(node),
         signing_sec: None,
         sealing_pub: SealingPublicKey::default(),
+        sealing_sec: None,
         certifications: vec![],
     }
     .fingerprint_hex()
@@ -146,6 +146,13 @@ pub struct ExportRequest {
     pub signing_sec: Option<SigningSecretKey>,
     /// The principal's X25519 sealing/encryption public key.
     pub sealing_pub: SealingPublicKey,
+    /// The principal's X25519 sealing/encryption secret. Optional and
+    /// additive: `None` (the default for existing callers) keeps the prior
+    /// wire behavior — a public-only encryption subkey even inside a secret
+    /// export. `Some` renders a correct cv25519 secret subkey (gated behind
+    /// the same `cell:key-export` decision as everything else in this
+    /// request; carries no separate authorization).
+    pub sealing_sec: Option<SealingSecretKey>,
     /// Inbound trust certifications to embed (WoT edges the exporter can sign).
     pub certifications: Vec<TrustCertification>,
     /// Whether to render the secret key (`true`) or the public key (`false`).
@@ -197,6 +204,7 @@ pub fn export_openpgp(decision: Decision, req: ExportRequest) -> Result<String, 
         signing_pub: req.signing_pub,
         signing_sec: req.signing_sec,
         sealing_pub: req.sealing_pub,
+        sealing_sec: req.sealing_sec,
         certifications: req.certifications,
     };
     let armored = if req.include_secret {
@@ -247,6 +255,11 @@ pub fn export_named_principal(
             None
         },
         sealing_pub: pubk.sealing,
+        sealing_sec: if include_secret {
+            Some(seck.sealing)
+        } else {
+            None
+        },
         certifications,
         include_secret,
     };
@@ -310,6 +323,7 @@ mod tests {
             signing_pub: p.signing.clone(),
             signing_sec: Some(s.signing.clone()),
             sealing_pub: p.sealing.clone(),
+            sealing_sec: Some(s.sealing.clone()),
             certifications: vec![],
             include_secret: true,
         };
@@ -330,6 +344,7 @@ mod tests {
             signing_pub: p.signing,
             signing_sec: None,
             sealing_pub: p.sealing,
+            sealing_sec: None,
             certifications: vec![],
             include_secret: true,
         };
@@ -360,6 +375,24 @@ mod tests {
             ),
             Err(ExportError::NotAuthorized)
         );
+    }
+
+    #[test]
+    fn named_principal_secret_export_carries_the_sealing_secret() {
+        // A secret export via export_named_principal must pass the real
+        // sealing secret through to ExportRequest so the cv25519 secret
+        // subkey is actually rendered — not silently left public-only.
+        let store = store_with_edge();
+        let asc = export_named_principal(
+            Decision::Allow,
+            &store,
+            &NodeId::from("user:alice"),
+            "user:alice <a@example.com>",
+            1_724_800_000,
+            true,
+        )
+        .expect("secret export");
+        assert!(asc.starts_with("-----BEGIN PGP PRIVATE KEY BLOCK-----"));
     }
 }
 
