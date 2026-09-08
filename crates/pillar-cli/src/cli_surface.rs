@@ -70,7 +70,11 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "key",
-        handler: identity_trust,
+        handler: |_v, args| key_verb(args),
+    },
+    VerbSpec {
+        name: "wot",
+        handler: |_v, args| wot_verb(args),
     },
     VerbSpec {
         name: "offer",
@@ -348,6 +352,40 @@ fn webauthn(args: &[String]) -> ExitCode {
     match crate::webauthn_cli::run(args) {
         Ok(msg) => {
             println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `pillar key …`: `export` runs the real gpg-auditable key-export against a
+/// live node; every other `key` subverb keeps the identity/trust library-API
+/// surface.
+fn key_verb(args: &[String]) -> ExitCode {
+    if args.first().map(String::as_str) == Some("export") {
+        return match crate::wot_cli::run_key_export(&args[1..]) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    identity_trust("key", args)
+}
+
+/// `pillar wot {graph|list-trust|list-signatures|list-attestations} …`: the
+/// live web-of-trust views (public keys, signatures, attestations, trust edges).
+fn wot_verb(args: &[String]) -> ExitCode {
+    match crate::wot_cli::run_wot(args) {
+        Ok(out) => {
+            print!("{out}");
             ExitCode::SUCCESS
         }
         Err(e) => {

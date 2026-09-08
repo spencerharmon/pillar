@@ -118,6 +118,23 @@ pub fn public_key_for(name: &NodeId) -> SigningPublicKey {
     public
 }
 
+/// The **canonical identity principal** a name derives to: the SAME signing
+/// keypair as [`IdentityKeypair::for_name`] / [`public_key_for`] PLUS the
+/// matching sealing (X25519 recipient) keypair, both from the one
+/// domain-separated name seed. This is the single source the gpg-auditable key
+/// export and the trust-graph key display both build from, so a node's key shown
+/// in the graph is exactly the key an operator exports.
+#[must_use]
+pub fn identity_principal(
+    name: &NodeId,
+) -> (
+    pillar_crypto::principal::PrincipalPublic,
+    pillar_crypto::principal::PrincipalSecret,
+) {
+    pillar_crypto::principal::principal_from_seed(&name_seed(name))
+        .expect("a name seed always yields a principal keypair")
+}
+
 /// Domain-separated seed derivation binding an identity name to its keypair.
 fn name_seed(name: &NodeId) -> Seed {
     use sha2::{Digest, Sha256};
@@ -945,6 +962,25 @@ impl TrustStore {
             .collect();
         edges.sort_by(|a, b| a.cid.cmp(&b.cid));
         edges
+    }
+
+    /// Read-only access to one currently-stored attest by its [`Cid`] (the
+    /// signature/attestation a trust-graph edge references), so a viewer can
+    /// surface the issuer's signing public key and the exact signed predicate
+    /// alongside the edge. Returns `None` for an unknown cid.
+    #[must_use]
+    pub fn attestation(&self, cid: &Cid) -> Option<&Attest> {
+        self.attests.get(cid)
+    }
+
+    /// The [`Cid`]s of every currently-live (non-revoked, chain-verified)
+    /// attest, sorted, for enumerating attestations/signatures in a stable
+    /// order (CLI `pillar wot list-*`, portal trust-graph view).
+    #[must_use]
+    pub fn live_attestation_cids(&self) -> Vec<Cid> {
+        let mut cids: Vec<Cid> = self.live_attests().map(|(cid, _)| cid.clone()).collect();
+        cids.sort_by(|a, b| a.0.cmp(&b.0));
+        cids
     }
 }
 

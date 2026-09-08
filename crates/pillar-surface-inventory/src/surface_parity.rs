@@ -87,6 +87,12 @@ pub static PARITY_MAP: &[ParityRule] = &[
     ParityRule::Paired { verb: "domain", route_prefix: "/portal/domains" },
     ParityRule::Paired { verb: "attest", route_prefix: "/portal/attestations" },
     ParityRule::Paired { verb: "trust", route_prefix: "/portal/trust-graph" },
+    // The web-of-trust transparency + export surface: the `wot` verb family
+    // (graph / list-trust / list-signatures / list-attestations) reads the same
+    // `/portal/trust-graph` view the `trust` verb pairs, and the CLI
+    // `pillar key export` / portal Export control share `/portal/key-export`.
+    // One pairing claims the export route and the `wot` verb.
+    ParityRule::Paired { verb: "wot", route_prefix: "/portal/key-export" },
     ParityRule::Paired { verb: "obs", route_prefix: "/portal/obs" },
     ParityRule::Paired { verb: "key", route_prefix: "/portal/custody" },
     // The kubectl-parity resource plane: the CLI `apply`/`get`/`describe` verb
