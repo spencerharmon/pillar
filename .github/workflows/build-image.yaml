@@ -122,7 +122,24 @@ jobs:
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # On main we publish the immutable release tag (:<version>) plus the
+          # moving :latest pointer. On any other ref (a workflow_dispatch
+          # preview build of a feature branch) we publish ONLY a
+          # branch-scoped preview tag and NEVER touch :<version>/:latest, so an
+          # unmerged branch build can never clobber a release tag.
+          ref="${GITHUB_REF_NAME:-}"
+          short=$(echo "${GITHUB_SHA}" | cut -c1-12)
+          if [ "$ref" = "main" ]; then
+            tag="${version}"
+            push_release="true"
+          else
+            safe=$(echo "$ref" | sed 's/[^a-zA-Z0-9._-]/-/g')
+            tag="preview-${safe}-${short}"
+            push_release="false"
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "push_release=${push_release}" >> "$GITHUB_OUTPUT"
 
       - name: Build OCI image from flake
         run: |
@@ -173,26 +190,27 @@ jobs:
           mkdir -p /etc/containers
           echo '{"default":[{"type":"insecureAcceptAnything"}]}' > /etc/containers/policy.json
           version="${{ steps.tag.outputs.version }}"
-          dest_version="docker://${REGISTRY}/${IMAGE}:${version}"
-          dest_latest="docker://${REGISTRY}/${IMAGE}:latest"
-          # Push both the immutable version tag and the moving `latest` tag
-          # from the single built tarball. Auth is passed directly via
-          # `--dest-creds` (this build image has no `docker` binary at all,
-          # so a prior `docker login` step is neither possible nor needed —
-          # skopeo never reads/needs a docker credential store here).
+          tag="${{ steps.tag.outputs.tag }}"
+          dest_tag="docker://${REGISTRY}/${IMAGE}:${tag}"
+          # Always publish the computed tag (release :<version> on main, or a
+          # preview tag on a branch). Only a main build additionally moves
+          # :latest.
           skopeo copy \
             --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            docker-archive:pillar-image.tar "$dest_version"
-          skopeo copy \
-            --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            docker-archive:pillar-image.tar "$dest_latest"
+            docker-archive:pillar-image.tar "$dest_tag"
+          if [ "${{ steps.tag.outputs.push_release }}" = "true" ]; then
+            skopeo copy \
+              --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+              docker-archive:pillar-image.tar "docker://${REGISTRY}/${IMAGE}:latest"
+          fi
 
       - name: Resolve registry-served digest
         run: |
           set -euo pipefail
           version="${{ steps.tag.outputs.version }}"
+          tag="${{ steps.tag.outputs.tag }}"
           digest="$(skopeo inspect \
             --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
             --format '{{.Digest}}' \
-            "docker://${REGISTRY}/${IMAGE}:${version}")"
-          echo "Published ${REGISTRY}/${IMAGE}:${version} (and :latest) @ ${digest}"
+            "docker://${REGISTRY}/${IMAGE}:${tag}")"
+          echo "Published ${REGISTRY}/${IMAGE}:${tag} @ ${digest}"
