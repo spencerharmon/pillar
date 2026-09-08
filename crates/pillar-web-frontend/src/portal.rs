@@ -64,6 +64,51 @@ pub fn body_lines(fields: &[&str]) -> String {
     fields.join("\n")
 }
 
+/// Format a `/portal/obs/live/query` (PSL) response body into human-readable
+/// display rows. The live substrate emits one
+/// `SIGNAL <id> KIND <kind> PAYLOAD <payload>` line per matched signal and one
+/// `GROUP <anchor> MEMBERS <id,id,...>` line per correlate group (see
+/// `web_serve::WebAuthContext::live_obs_psl`); this renders each as a compact
+/// one-line row. A line matching neither shape is passed through verbatim so
+/// nothing is silently dropped. An empty / whitespace-only body yields an empty
+/// vec — the caller shows a "no matching signals" notice, never a blank panel
+/// masquerading as a result.
+#[must_use]
+pub fn format_psl_response(body: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("SIGNAL ") {
+            // `<id> KIND <kind> PAYLOAD <payload>`
+            if let Some((id, tail)) = rest.split_once(" KIND ") {
+                if let Some((kind, payload)) = tail.split_once(" PAYLOAD ") {
+                    rows.push(format!("{kind} {id}: {payload}"));
+                    continue;
+                }
+            }
+            rows.push(line.to_owned());
+        } else if let Some(rest) = line.strip_prefix("GROUP ") {
+            // `<anchor> MEMBERS <id,id,...>`
+            if let Some((anchor, members)) = rest.split_once(" MEMBERS ") {
+                let members = members
+                    .split(',')
+                    .filter(|m| !m.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                rows.push(format!("group {anchor}: {members}"));
+                continue;
+            }
+            rows.push(line.to_owned());
+        } else {
+            rows.push(line.to_owned());
+        }
+    }
+    rows
+}
+
 /// The `POST /login` body for the two human fields bound to a `/nonce` id.
 #[must_use]
 pub fn login_wire(identifier: &str, password: &str, nonce_id: u64) -> String {
@@ -460,7 +505,8 @@ mod yew_impl {
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::{spawn_local, JsFuture};
     use web_sys::{
-        Headers, HtmlInputElement, HtmlSelectElement, RequestInit, RequestMode, Response,
+        Headers, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, RequestInit,
+        RequestMode, Response,
     };
     use yew::prelude::*;
 
@@ -513,6 +559,17 @@ mod yew_impl {
         e.target()
             .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
             .map(|i| i.value())
+            .unwrap_or_default()
+    }
+
+    /// Read the current value of the `<textarea>` an event fired on — the
+    /// multi-line analogue of [`input_value`] for the raw-PSL query box (a
+    /// `<textarea>` is `HtmlTextAreaElement`, not `HtmlInputElement`, so the
+    /// input-element cast would silently yield an empty string).
+    pub(crate) fn textarea_value(e: &InputEvent) -> String {
+        e.target()
+            .and_then(|t| t.dyn_into::<HtmlTextAreaElement>().ok())
+            .map(|t| t.value())
             .unwrap_or_default()
     }
 
@@ -723,8 +780,7 @@ mod yew_impl {
                             handle_401(&auth, r.status);
                             minted.set(Some(interpret_generate(r.ok(), &r.body)));
                         }
-                        Err(_) => minted
-                            .set(Some(Err("the node refused the request".to_owned()))),
+                        Err(_) => minted.set(Some(Err("the node refused the request".to_owned()))),
                     }
                     busy.set(false);
                 });
@@ -1808,6 +1864,12 @@ mod yew_impl {
         let dash_spec = use_state(String::new);
         let msg = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
+        // Raw PSL query surface: the full observability query language the live
+        // store already parses (`/portal/obs/live/query`), which the plain
+        // `filter` substring box below cannot express.
+        let psl = use_state(String::new);
+        let psl_rows = use_state(Vec::<String>::new);
+        let psl_msg = use_state(|| None::<(String, bool)>);
 
         let explore = {
             let (auth, rows, kind) = (auth.clone(), rows.clone(), kind.clone());
@@ -1888,6 +1950,57 @@ mod yew_impl {
             let filter = filter.clone();
             Callback::from(move |e: InputEvent| filter.set(input_value(&e)))
         };
+        let on_psl = {
+            let psl = psl.clone();
+            Callback::from(move |e: InputEvent| psl.set(textarea_value(&e)))
+        };
+        let run_psl = {
+            let (auth, psl, psl_rows, psl_msg) =
+                (auth.clone(), psl.clone(), psl_rows.clone(), psl_msg.clone());
+            Callback::from(move |_: MouseEvent| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let query = (*psl).trim().to_owned();
+                if query.is_empty() {
+                    psl_msg.set(Some((
+                        "Enter a PSL query, e.g. select: metrics(name = ingest_bandwidth) \
+                         range: now-1d"
+                            .to_owned(),
+                        false,
+                    )));
+                    return;
+                }
+                let body = format!("{token}\n{query}");
+                let (psl_rows, psl_msg) = (psl_rows.clone(), psl_msg.clone());
+                spawn_local(async move {
+                    match http("POST", "/portal/obs/live/query", Some(&body)).await {
+                        Ok(r) if r.ok() => {
+                            let rows = format_psl_response(&r.body);
+                            if rows.is_empty() {
+                                psl_msg.set(Some((
+                                    "Query ran; no matching signals in the live store.".to_owned(),
+                                    true,
+                                )));
+                            } else {
+                                psl_msg.set(None);
+                            }
+                            psl_rows.set(rows);
+                        }
+                        // Surface the backend's real error (e.g. `PSL-PARSE …`,
+                        // `NO-LIVE-SUBSTRATE`) instead of a silent empty result.
+                        Ok(r) => {
+                            psl_rows.set(Vec::new());
+                            psl_msg.set(Some((r.body.trim().to_owned(), false)));
+                        }
+                        Err(_) => {
+                            psl_rows.set(Vec::new());
+                            psl_msg.set(Some(("request failed".to_owned(), false)));
+                        }
+                    }
+                });
+            })
+        };
         let on_name = {
             let dash_name = dash_name.clone();
             Callback::from(move |e: InputEvent| dash_name.set(input_value(&e)))
@@ -1904,6 +2017,21 @@ mod yew_impl {
             <div class="tile" id="observability-tile">
                 <h3>{ "Observability" }</h3>
                 <p>{ "Explore and query metrics/logs/traces/profiles/metadata; save a dashboard." }</p>
+                <label>{ "Run a PSL query" }</label>
+                <p class="hint">{ "The full observability query language, run over the live store: \
+                    select: <kind>(<label = value>, …) [where: <label = value>, …] \
+                    range: now-<dur> [correlate: { window: <dur>, anchor: <kind> }]. \
+                    Returns matched signals plus any correlate groups; a malformed query \
+                    reports the parse error. (The 'filter' box below is a plain substring \
+                    match, not PSL.)" }</p>
+                <textarea id="obs-psl" rows="3"
+                    placeholder="select: metrics(name = ingest_bandwidth), logs where: cell = testpillarcell range: now-1d correlate: { window: 1s, anchor: metrics }"
+                    value={(*psl).clone()} oninput={on_psl}></textarea>
+                <button type="button" id="obs-psl-btn" onclick={run_psl}>{ "Run PSL query" }</button>
+                { message_line("obs-psl-msg", &psl_msg) }
+                <div id="obs-psl-list">
+                    { for psl_rows.iter().map(|r| html! { <p class="obs-row">{ r.clone() }</p> }) }
+                </div>
                 <label>{ "Explore / query signals" }</label>
                 <select id="obs-kind" onchange={on_kind}>
                     <option value="metric">{ "metric" }</option>
@@ -1912,7 +2040,7 @@ mod yew_impl {
                     <option value="profile">{ "profile" }</option>
                     <option value="metadata">{ "metadata" }</option>
                 </select>
-                <input id="obs-filter" type="text" placeholder="filter (optional)" value={(*filter).clone()} oninput={on_filter} />
+                <input id="obs-filter" type="text" placeholder="substring filter (optional) — not PSL" value={(*filter).clone()} oninput={on_filter} />
                 <div class="row">
                     <button type="button" id="obs-explore-btn" onclick={explore_click}>{ "Explore" }</button>
                     <button type="button" id="obs-query-btn" onclick={query}>{ "Query" }</button>
@@ -2015,6 +2143,42 @@ mod tests {
     }
 
     #[test]
+    fn format_psl_response_renders_signals_and_correlate_groups() {
+        let body = "SIGNAL abc123 KIND metric PAYLOAD name=ingest_bandwidth value=42\n\
+                    SIGNAL def456 KIND log PAYLOAD level=info msg=served request\n\
+                    GROUP abc123 MEMBERS abc123,def456\n";
+        assert_eq!(
+            format_psl_response(body),
+            vec![
+                "metric abc123: name=ingest_bandwidth value=42".to_owned(),
+                "log def456: level=info msg=served request".to_owned(),
+                "group abc123: abc123, def456".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_psl_response_is_empty_for_a_no_match_body() {
+        // An empty / whitespace-only body must yield no rows (the caller shows
+        // a "no matching signals" notice) — never a fabricated placeholder row.
+        assert!(format_psl_response("").is_empty());
+        assert!(format_psl_response("   \n  \n").is_empty());
+    }
+
+    #[test]
+    fn format_psl_response_passes_unrecognized_lines_through_verbatim() {
+        // A line matching neither shape is preserved, so nothing is silently
+        // dropped (e.g. a future line kind, or a malformed member list).
+        assert_eq!(
+            format_psl_response("SIGNAL only-an-id-no-kind\nGROUP anchor-with-no-members"),
+            vec![
+                "SIGNAL only-an-id-no-kind".to_owned(),
+                "GROUP anchor-with-no-members".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn get_url_appends_token_and_nonempty_params_only() {
         assert_eq!(
             get_url(
@@ -2094,7 +2258,8 @@ mod tests {
 
     #[test]
     fn swarm_parse_and_generate_round_trip() {
-        let v = parse_swarm("SWARM public 0011223344556677\nSEED /ip4/192.0.2.5/tcp/4001/p2p/abc\n");
+        let v =
+            parse_swarm("SWARM public 0011223344556677\nSEED /ip4/192.0.2.5/tcp/4001/p2p/abc\n");
         assert_eq!(v.kind, "public");
         assert_eq!(v.fingerprint, "0011223344556677");
         assert_eq!(v.seeds, vec!["/ip4/192.0.2.5/tcp/4001/p2p/abc".to_owned()]);
