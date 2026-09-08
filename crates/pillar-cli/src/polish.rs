@@ -220,7 +220,10 @@ fn render_explain(source: &str, query: &PslQuery) -> String {
             out.push_str(&format!("    - {} = {}\n", p.key, p.value));
         }
     }
-    out.push_str(&format!("  range: now-{}s\n", query.range.seconds));
+    match query.range.relative_seconds() {
+        Some(s) => out.push_str(&format!("  range: now-{s}s\n")),
+        None => out.push_str(&format!("  range: {}\n", query.range.to_text())),
+    }
     match query.correlate {
         Some(c) => out.push_str(&format!(
             "  correlate: {{ window: {}s, anchor: {:?} }}\n",
@@ -235,10 +238,15 @@ fn render_explain(source: &str, query: &PslQuery) -> String {
     // flow, not an invented plan.
     out.push_str("\nexecution plan:\n");
     let mut step = 1;
-    out.push_str(&format!(
-        "  {step}. time-window scan: keep signals written within [now-{}s, now]\n",
-        query.range.seconds
-    ));
+    match query.range.relative_seconds() {
+        Some(s) => out.push_str(&format!(
+            "  {step}. time-window scan: keep signals written within [now-{s}s, now]\n"
+        )),
+        None => out.push_str(&format!(
+            "  {step}. time-window scan: keep signals written within the range {}\n",
+            query.range.to_text()
+        )),
+    }
     step += 1;
     let kinds: Vec<String> = query
         .selects

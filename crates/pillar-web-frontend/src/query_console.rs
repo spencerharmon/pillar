@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 
-use pillar_observability::SignalKind;
+use pillar_observability::{PslQuery, SelectClause, SignalKind, TimeBound, TimeRange};
 
 /// The five signal kinds paired with their plural PSL token, in menu order.
 pub const KINDS: [(SignalKind, &str); 5] = [
@@ -666,10 +666,64 @@ pub fn psl_from_hash(hash: &str) -> Option<String> {
     Some(url_decode(q))
 }
 
-/// The default query a fresh console opens with.
+/// The default query a fresh console opens with, as the real AST.
+#[must_use]
+pub fn default_query() -> PslQuery {
+    PslQuery {
+        selects: vec![SelectClause::new(SignalKind::Log, Vec::new())],
+        where_predicates: Vec::new(),
+        range: TimeRange::seconds(3600),
+        correlate: None,
+    }
+}
+
+/// The default query text a fresh console opens with.
 #[must_use]
 pub fn default_query_text() -> String {
-    "select: logs range: now-1h".to_owned()
+    default_query().to_text()
+}
+
+/// Serialize a builder-draft query to canonical PSL text, DROPPING any
+/// incomplete predicate (empty key or value). The builder keeps half-entered
+/// predicates as editable rows, but the raw/runnable text must stay valid PSL,
+/// so an in-progress `+ filter` row never corrupts the query (or blanks the
+/// builder by making the text unparseable).
+#[must_use]
+pub fn sanitized_text(query: &PslQuery) -> String {
+    let mut q = query.clone();
+    for s in &mut q.selects {
+        s.predicates
+            .retain(|p| !p.key.trim().is_empty() && !p.value.trim().is_empty());
+    }
+    q.where_predicates
+        .retain(|p| !p.key.trim().is_empty() && !p.value.trim().is_empty());
+    q.to_text()
+}
+
+/// Render one range endpoint as its PSL text (`now`, `now-<dur>`, `<tick>`).
+#[must_use]
+pub fn bound_to_text(bound: &TimeBound) -> String {
+    match bound {
+        TimeBound::Now => "now".to_owned(),
+        TimeBound::Ago(s) => format!("now-{}", format_duration(*s)),
+        TimeBound::Tick(t) => t.to_string(),
+    }
+}
+
+/// Parse one range endpoint typed in the builder: `now`, `now-<dur>`, or an
+/// absolute tick. Mirrors the engine's `parse_bound` so the two agree.
+#[must_use]
+pub fn parse_bound_text(s: &str) -> Option<TimeBound> {
+    let s = s.trim();
+    if s == "now" {
+        Some(TimeBound::Now)
+    } else if let Some(rest) = s.strip_prefix("now-") {
+        parse_duration(rest).map(TimeBound::Ago)
+    } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse::<u64>().ok().map(TimeBound::Tick)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -854,6 +908,47 @@ mod tests {
         let back = parse_psl(&text).unwrap();
         assert_eq!(back, q);
     }
+
+    #[test]
+    fn sanitized_text_drops_incomplete_predicates() {
+        use pillar_observability::{parse_psl, Predicate};
+        // A draft with a half-typed `+ filter` row (empty key AND value) in a
+        // select and in the global where.
+        let mut q = default_query();
+        q.selects[0].predicates.push(Predicate::eq("", ""));
+        q.where_predicates.push(Predicate::eq("", ""));
+        q.where_predicates.push(Predicate::eq("level", "warn"));
+        // to_text() of the raw draft would be UNPARSEABLE (a bare ` = `)...
+        assert!(parse_psl(&q.to_text()).is_err());
+        // ...but the sanitized text drops the empty rows and stays valid PSL,
+        // keeping only the completed predicate.
+        let text = sanitized_text(&q);
+        assert_eq!(text, "select: logs where: level = warn range: now-1h");
+        assert!(parse_psl(&text).is_ok());
+    }
+
+    #[test]
+    fn range_bounds_parse_and_render() {
+        assert_eq!(parse_bound_text("now"), Some(TimeBound::Now));
+        assert_eq!(parse_bound_text("now-15m"), Some(TimeBound::Ago(900)));
+        assert_eq!(parse_bound_text("2000"), Some(TimeBound::Tick(2000)));
+        assert_eq!(parse_bound_text("garbage"), None);
+        assert_eq!(parse_bound_text(""), None);
+        assert_eq!(bound_to_text(&TimeBound::Now), "now");
+        assert_eq!(bound_to_text(&TimeBound::Ago(3600)), "now-1h");
+        assert_eq!(bound_to_text(&TimeBound::Tick(2000)), "2000");
+    }
+
+    #[test]
+    fn arbitrary_range_survives_the_builder_round_trip() {
+        use pillar_observability::parse_psl;
+        // An explicit past window set via the builder serializes and re-parses.
+        let mut q = default_query();
+        q.range = TimeRange::window(TimeBound::Ago(7200), TimeBound::Ago(3600));
+        let text = sanitized_text(&q);
+        assert_eq!(text, "select: logs range: now-2h..now-1h");
+        assert_eq!(parse_psl(&text).unwrap(), q);
+    }
 }
 
 #[cfg(feature = "yew")]
@@ -864,7 +959,7 @@ mod yew_impl {
     use super::*;
     use crate::auth::use_auth;
     use crate::portal::{http, input_value};
-    use pillar_observability::{parse_psl, CorrelateSpec, Predicate, RelativeRange, SelectClause};
+    use pillar_observability::{parse_psl, CorrelateSpec, Predicate, SelectClause, TimeRange};
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::spawn_local;
@@ -940,6 +1035,10 @@ mod yew_impl {
     pub fn query_console() -> Html {
         let auth = use_auth();
         let text = use_state(default_query_text);
+        // The persistent builder-draft AST. The builder renders from THIS (so a
+        // half-typed `+ filter` row never blanks the builder); `text` is this
+        // draft serialized with incomplete predicates dropped, kept valid PSL.
+        let query = use_state(default_query);
         let rows = use_state(Vec::<SignalRow>::new);
         let groups = use_state(Vec::<(String, Vec<String>)>::new);
         let msg = use_state(|| None::<(String, bool)>);
@@ -953,12 +1052,15 @@ mod yew_impl {
 
         // On mount: seed from a shared #query hash, and load typeahead schema.
         {
-            let text = text.clone();
+            let (text, query) = (text.clone(), query.clone());
             use_effect_with((), move |_| {
                 if let Some(window) = web_sys::window() {
                     if let Ok(hash) = window.location().hash() {
                         if let Some(shared) = psl_from_hash(&hash) {
                             if !shared.trim().is_empty() {
+                                if let Ok(q) = parse_psl(&shared) {
+                                    query.set(q);
+                                }
                                 text.set(shared);
                             }
                         }
@@ -1082,19 +1184,18 @@ mod yew_impl {
             });
         }
 
-        // Parse the current text into the real AST for the builder projection.
-        let parsed = parse_psl(&text);
-
-        // A helper producing a callback that mutates the parsed query and
-        // writes `to_text()` back. Each control clones this and applies its
-        // own edit closure.
+        // A helper producing a callback that mutates the builder-draft AST and
+        // writes the sanitized text back. Each control clones this and applies
+        // its own edit closure. Incomplete predicates survive in the draft (so
+        // the row stays editable) but are dropped from `text` (so it stays
+        // valid PSL and the builder never disappears).
         let apply = {
-            let text = text.clone();
+            let (query, text) = (query.clone(), text.clone());
             move |edit: Box<dyn Fn(&mut pillar_observability::PslQuery)>| {
-                if let Ok(mut q) = parse_psl(&text) {
-                    edit(&mut q);
-                    text.set(q.to_text());
-                }
+                let mut q = (*query).clone();
+                edit(&mut q);
+                text.set(sanitized_text(&q));
+                query.set(q);
             }
         };
 
@@ -1103,8 +1204,16 @@ mod yew_impl {
             Callback::from(move |_: MouseEvent| run.emit(()))
         };
         let on_raw = {
-            let text = text.clone();
-            Callback::from(move |e: InputEvent| text.set(textarea_value(&e)))
+            let (query, text) = (query.clone(), text.clone());
+            Callback::from(move |e: InputEvent| {
+                let raw = textarea_value(&e);
+                // A valid raw edit re-projects the builder; an invalid one keeps
+                // the last good draft (builder stays put) and surfaces a hint.
+                if let Ok(q) = parse_psl(&raw) {
+                    query.set(q);
+                }
+                text.set(raw);
+            })
         };
         let toggle_live = {
             let live = live.clone();
@@ -1180,16 +1289,16 @@ mod yew_impl {
 
         // Click a label chip -> add a `where: key = value` predicate.
         let push_where = {
-            let text = text.clone();
+            let (query, text) = (query.clone(), text.clone());
             move |key: String, value: String| {
-                let text = text.clone();
+                let (query, text) = (query.clone(), text.clone());
                 Callback::from(move |_: MouseEvent| {
-                    if let Ok(mut q) = parse_psl(&text) {
-                        let pred = Predicate::eq(key.clone(), value.clone());
-                        if !q.where_predicates.contains(&pred) {
-                            q.where_predicates.push(pred);
-                            text.set(q.to_text());
-                        }
+                    let mut q = (*query).clone();
+                    let pred = Predicate::eq(key.clone(), value.clone());
+                    if !q.where_predicates.contains(&pred) {
+                        q.where_predicates.push(pred);
+                        text.set(sanitized_text(&q));
+                        query.set(q);
                     }
                 })
             }
@@ -1208,12 +1317,18 @@ mod yew_impl {
             }
         };
 
-        let builder = match &parsed {
-            Ok(q) => render_builder(q, &apply, &label_keys, &metric_names, &values, &load_values),
-            Err(e) => html! {
-                <p class="msg-err">{ format!("PSL parse error: {} — edit the raw query below.", e.0) }</p>
-            },
-        };
+        // The builder always renders from the persistent draft (never blanks).
+        let builder = render_builder(
+            &*query,
+            &apply,
+            &label_keys,
+            &metric_names,
+            &values,
+            &load_values,
+        );
+        // Non-fatal: the raw text only diverges from a valid draft while it is
+        // being hand-edited; surface a parse hint without hiding the builder.
+        let raw_parse_err = parse_psl(&text).err().map(|e| e.0);
 
         html! {
             <div class="tile" id="query-console">
@@ -1229,6 +1344,11 @@ mod yew_impl {
                 <label class="query-rawlabel">{ "raw PSL" }</label>
                 <textarea id="query-raw" class="mono query-raw" rows="2"
                     value={(*text).clone()} oninput={on_raw} />
+                if let Some(err) = raw_parse_err {
+                    <p class="msg-err query-parse-hint">
+                        { format!("PSL parse error: {err} — the builder shows the last valid query.") }
+                    </p>
+                }
 
                 <div class="row query-actions">
                     <button type="button" id="query-run" onclick={run_click}>{ "Run" }</button>
@@ -1582,16 +1702,27 @@ mod yew_impl {
     }
 
     fn render_range(
-        range: RelativeRange,
+        range: TimeRange,
         apply: &(impl Fn(Box<dyn Fn(&mut pillar_observability::PslQuery)>) + Clone + 'static),
     ) -> Html {
-        let current = format_duration(range.seconds);
-        let on_range = {
+        // Two endpoints, each an arbitrary bound (`now`, `now-<dur>`, or an
+        // absolute tick) — so a query can cover ANY window, not just one
+        // ending at "now". Presets set the common `now-<dur> .. now` form.
+        let start_text = bound_to_text(&range.start);
+        let end_text = bound_to_text(&range.end);
+        let on_start = {
             let apply = apply.clone();
             Callback::from(move |e: InputEvent| {
-                let raw = input_value(&e);
-                if let Some(secs) = parse_duration(&raw) {
-                    apply(Box::new(move |q| q.range = RelativeRange::seconds(secs)));
+                if let Some(b) = parse_bound_text(&input_value(&e)) {
+                    apply(Box::new(move |q| q.range.start = b));
+                }
+            })
+        };
+        let on_end = {
+            let apply = apply.clone();
+            Callback::from(move |e: InputEvent| {
+                if let Some(b) = parse_bound_text(&input_value(&e)) {
+                    apply(Box::new(move |q| q.range.end = b));
                 }
             })
         };
@@ -1605,13 +1736,21 @@ mod yew_impl {
         html! {
             <div class="query-section query-range">
                 <label>{ "range" }</label>
-                <span class="query-nowdash mono">{ "now-" }</span>
-                <input class="query-rangeinput mono" value={current} oninput={on_range}
-                    placeholder="1h / 90m / 3600s / 2d" />
+                <input class="query-rangeinput mono" value={start_text} oninput={on_start}
+                    list="query-boundlist" placeholder="now-1h / 1000 / now" />
+                <span class="query-nowdash mono">{ "→" }</span>
+                <input class="query-rangeinput mono" value={end_text} oninput={on_end}
+                    list="query-boundlist" placeholder="now / now-5m / 2000" />
+                <datalist id="query-boundlist">
+                    <option value="now" />
+                    <option value="now-15m" />
+                    <option value="now-1h" />
+                    <option value="now-24h" />
+                </datalist>
                 { for preset_buttons.into_iter().map(|(lbl, secs)| {
                     let apply = apply.clone();
                     let cb = Callback::from(move |_: MouseEvent| {
-                        apply(Box::new(move |q| q.range = RelativeRange::seconds(secs)));
+                        apply(Box::new(move |q| q.range = TimeRange::seconds(secs)));
                     });
                     html!{ <button type="button" class="query-preset" onclick={cb}>{ lbl }</button> }
                 }) }

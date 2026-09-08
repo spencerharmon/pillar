@@ -79,7 +79,8 @@ pub use profiling::{
 };
 pub use psl::{
     parse as parse_psl, execute as execute_psl, CorrelateSpec, CorrelationGroup, Predicate,
-    PslError, PslQuery, PslQueryBuilder, PslResult, RelativeRange, SelectClause,
+    PslError, PslQuery, PslQueryBuilder, PslResult, RelativeRange, SelectClause, TimeBound,
+    TimeRange,
 };
 pub use query::{PersistedMaterializedView, Query, ViewCache, ViewPersistError};
 pub use recording::{

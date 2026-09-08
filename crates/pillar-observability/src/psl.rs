@@ -155,25 +155,112 @@ impl SelectClause {
     }
 }
 
-/// `range: now-<N><unit>` — a relative window ending "now", expressed in
-/// seconds (this crate's ticks are already second-granular logical time).
+/// One endpoint of a `range:` window. `now` is the query's read time;
+/// `now-<dur>` is a relative offset before now; a bare integer is an absolute
+/// logical tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RelativeRange {
-    /// The window length in seconds, ending at "now".
-    pub seconds: u64,
+pub enum TimeBound {
+    /// The read-time "now".
+    Now,
+    /// `<seconds>` before now (`now-<dur>`).
+    Ago(u64),
+    /// An absolute logical tick.
+    Tick(u64),
 }
 
-impl RelativeRange {
-    /// A relative range of `seconds` ending "now".
+impl TimeBound {
+    /// Resolve this endpoint to a concrete tick against `now`.
     #[must_use]
-    pub fn seconds(seconds: u64) -> Self {
-        RelativeRange { seconds }
+    pub fn resolve(self, now: u64) -> u64 {
+        match self {
+            TimeBound::Now => now,
+            TimeBound::Ago(s) => now.saturating_sub(s),
+            TimeBound::Tick(t) => t,
+        }
     }
 
     fn to_text(self) -> String {
-        format!("now-{}", duration_to_text(self.seconds))
+        match self {
+            TimeBound::Now => "now".to_string(),
+            TimeBound::Ago(s) => format!("now-{}", duration_to_text(s)),
+            TimeBound::Tick(t) => t.to_string(),
+        }
     }
 }
+
+/// `range:` — the time window a query covers. Either the relative `now-<dur>`
+/// form (a window of `<dur>` ending at "now") or an explicit `<start>..<end>`
+/// window whose endpoints are each `now`, `now-<dur>`, or an absolute tick — so
+/// a query can cover ANY window, not only one ending at "now".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeRange {
+    /// The window's start endpoint.
+    pub start: TimeBound,
+    /// The window's end endpoint.
+    pub end: TimeBound,
+}
+
+impl TimeRange {
+    /// A relative window of `seconds` ending at "now" (`now-<dur>`) — the
+    /// original PSL range form.
+    #[must_use]
+    pub fn seconds(seconds: u64) -> Self {
+        TimeRange {
+            start: TimeBound::Ago(seconds),
+            end: TimeBound::Now,
+        }
+    }
+
+    /// An explicit `<start>..<end>` window.
+    #[must_use]
+    pub fn window(start: TimeBound, end: TimeBound) -> Self {
+        TimeRange { start, end }
+    }
+
+    /// Resolve both endpoints against `now`, returned low..high (the endpoints
+    /// are normalized so start <= end regardless of the written order).
+    #[must_use]
+    pub fn resolve(self, now: u64) -> (u64, u64) {
+        let a = self.start.resolve(now);
+        let b = self.end.resolve(now);
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    /// The window length in seconds — the rate/aggregate denominator.
+    #[must_use]
+    pub fn window_seconds(self, now: u64) -> u64 {
+        let (lo, hi) = self.resolve(now);
+        hi - lo
+    }
+
+    /// The window length in seconds IF this is the relative `now-<dur>` form,
+    /// else `None` — lets a consumer with no `now` render the classic form.
+    #[must_use]
+    pub fn relative_seconds(self) -> Option<u64> {
+        match (self.start, self.end) {
+            (TimeBound::Ago(s), TimeBound::Now) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The canonical text form of this range (`now-<dur>` for the relative
+    /// form, else `<start>..<end>`) — the same string [`parse`] accepts.
+    #[must_use]
+    pub fn to_text(self) -> String {
+        match (self.start, self.end) {
+            (TimeBound::Ago(s), TimeBound::Now) => format!("now-{}", duration_to_text(s)),
+            (start, end) => format!("{}..{}", start.to_text(), end.to_text()),
+        }
+    }
+}
+
+/// Back-compat alias: the range was originally only the relative `now-<dur>`
+/// form. New code should prefer [`TimeRange`].
+pub type RelativeRange = TimeRange;
 
 /// `correlate: { window: <duration>, anchor: <kind> }` — group the matched
 /// `anchor`-kind signals with their causal-thread peers within `window`.
@@ -203,7 +290,7 @@ pub struct PslQuery {
     /// The `where:` predicates, applied across every selected kind.
     pub where_predicates: Vec<Predicate>,
     /// The `range:` clause.
-    pub range: RelativeRange,
+    pub range: TimeRange,
     /// The optional `correlate:` clause.
     pub correlate: Option<CorrelateSpec>,
 }
@@ -252,7 +339,7 @@ impl PslQuery {
 pub struct PslQueryBuilder {
     selects: Vec<SelectClause>,
     where_predicates: Vec<Predicate>,
-    range: Option<RelativeRange>,
+    range: Option<TimeRange>,
     correlate: Option<CorrelateSpec>,
 }
 
@@ -280,7 +367,7 @@ impl PslQueryBuilder {
     /// Set the `range:` clause to `seconds` ending "now".
     #[must_use]
     pub fn range_relative(mut self, seconds: u64) -> Self {
-        self.range = Some(RelativeRange::seconds(seconds));
+        self.range = Some(TimeRange::seconds(seconds));
         self
     }
 
@@ -367,14 +454,21 @@ fn parse_duration_seconds(s: &str) -> Result<u64, PslError> {
         "m" => 60,
         "h" => 3_600,
         "d" => 86_400,
-        other => return Err(PslError(format!("duration '{s}' has unknown unit '{other}'"))),
+        other => {
+            return Err(PslError(format!(
+                "duration '{s}' has unknown unit '{other}'"
+            )))
+        }
     };
     Ok(num * mult)
 }
 
 /// Split `s` at the first occurrence of any of `keywords`, returning
 /// `(before, Some(matched_keyword_and_rest))` or `(s, None)` if none occur.
-fn split_at_first_keyword<'a>(s: &'a str, keywords: &[&'a str]) -> (&'a str, Option<(&'a str, &'a str)>) {
+fn split_at_first_keyword<'a>(
+    s: &'a str,
+    keywords: &[&'a str],
+) -> (&'a str, Option<(&'a str, &'a str)>) {
     let mut best: Option<(usize, &str)> = None;
     for kw in keywords {
         if let Some(idx) = s.find(kw) {
@@ -393,7 +487,9 @@ fn split_at_first_keyword<'a>(s: &'a str, keywords: &[&'a str]) -> (&'a str, Opt
 fn parse_selects(body: &str) -> Result<Vec<SelectClause>, PslError> {
     let body = body.trim();
     if body.is_empty() {
-        return Err(PslError("select clause must name at least one kind".to_string()));
+        return Err(PslError(
+            "select clause must name at least one kind".to_string(),
+        ));
     }
     let mut selects = Vec::new();
     // Split on top-level commas (not inside parens).
@@ -415,7 +511,9 @@ fn parse_selects(body: &str) -> Result<Vec<SelectClause>, PslError> {
         selects.push(SelectClause::new(kind_from_name(name)?, predicates));
     }
     if selects.is_empty() {
-        return Err(PslError("select clause must name at least one kind".to_string()));
+        return Err(PslError(
+            "select clause must name at least one kind".to_string(),
+        ));
     }
     Ok(selects)
 }
@@ -463,13 +561,41 @@ fn unquote(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// Parse a `range:` body: `now-<duration>`.
-fn parse_range(body: &str) -> Result<RelativeRange, PslError> {
+/// Parse a `range:` body: either `now-<duration>` (a window of that length
+/// ending at "now") or an explicit `<start>..<end>` window whose endpoints are
+/// each `now`, `now-<duration>`, or an absolute logical tick.
+fn parse_range(body: &str) -> Result<TimeRange, PslError> {
     let body = body.trim();
-    let rest = body
-        .strip_prefix("now-")
-        .ok_or_else(|| PslError(format!("range '{body}' must be of the form now-<duration>")))?;
-    Ok(RelativeRange::seconds(parse_duration_seconds(rest)?))
+    if let Some((start, end)) = body.split_once("..") {
+        Ok(TimeRange {
+            start: parse_bound(start)?,
+            end: parse_bound(end)?,
+        })
+    } else if let Some(rest) = body.strip_prefix("now-") {
+        Ok(TimeRange::seconds(parse_duration_seconds(rest)?))
+    } else {
+        Err(PslError(format!(
+            "range '{body}' must be 'now-<duration>' or '<start>..<end>'"
+        )))
+    }
+}
+
+/// Parse one `range:` endpoint: `now`, `now-<duration>`, or an absolute tick.
+fn parse_bound(s: &str) -> Result<TimeBound, PslError> {
+    let s = s.trim();
+    if s == "now" {
+        Ok(TimeBound::Now)
+    } else if let Some(rest) = s.strip_prefix("now-") {
+        Ok(TimeBound::Ago(parse_duration_seconds(rest)?))
+    } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse::<u64>()
+            .map(TimeBound::Tick)
+            .map_err(|_| PslError(format!("range bound '{s}' is not a valid tick")))
+    } else {
+        Err(PslError(format!(
+            "range bound '{s}' must be 'now', 'now-<duration>', or an absolute tick"
+        )))
+    }
 }
 
 /// Parse a `correlate:` body: `{ window: <duration>, anchor: <kind> }`.
@@ -502,8 +628,7 @@ fn parse_correlate(body: &str) -> Result<CorrelateSpec, PslError> {
         }
     }
     Ok(CorrelateSpec {
-        window_seconds: window
-            .ok_or_else(|| PslError("correlate missing 'window'".to_string()))?,
+        window_seconds: window.ok_or_else(|| PslError("correlate missing 'window'".to_string()))?,
         anchor: anchor.ok_or_else(|| PslError("correlate missing 'anchor'".to_string()))?,
     })
 }
@@ -545,8 +670,8 @@ pub fn parse(input: &str) -> Result<PslQuery, PslError> {
         split_at_first_keyword(rest, &["where:", "range:", "correlate:"]);
     let selects = parse_selects(select_body)?;
 
-    let (kw, rest) = after_select
-        .ok_or_else(|| PslError("query is missing a 'range:' clause".to_string()))?;
+    let (kw, rest) =
+        after_select.ok_or_else(|| PslError("query is missing a 'range:' clause".to_string()))?;
 
     let (where_predicates, kw, rest) = if kw == "where:" {
         let (where_body, after_where) = split_at_first_keyword(rest, &["range:", "correlate:"]);
@@ -671,7 +796,7 @@ pub fn execute(
     index: &CorrelationIndex,
     now: u64,
 ) -> PslResult {
-    let range_start = now.saturating_sub(query.range.seconds);
+    let (range_start, range_end) = query.range.resolve(now);
 
     // kind -> per-kind predicates, so a signal must match its OWN select
     // clause's predicates (never another kind's).
@@ -691,7 +816,7 @@ pub fn execute(
         let Some(tick) = store.write_tick_of(&signal.id()) else {
             continue;
         };
-        if tick < range_start || tick > now {
+        if tick < range_start || tick > range_end {
             continue;
         }
         if !signal_matches_predicates(signal.labels(), signal.payload(), kind_predicates) {
@@ -853,18 +978,26 @@ pub fn aggregate(
     groups
         .into_iter()
         .map(|(group, signals)| {
-            let values = apply_aggregate(agg, &signals, query.range.seconds);
+            let values = apply_aggregate(agg, &signals, query.range.window_seconds(now));
             AggregateRow { group, values }
         })
         .collect()
 }
 
 /// Compute one group's aggregate value(s) from its matched signals.
-fn apply_aggregate(agg: Aggregate, signals: &[&crate::block::Signal], range_seconds: u64) -> Vec<f64> {
+fn apply_aggregate(
+    agg: Aggregate,
+    signals: &[&crate::block::Signal],
+    range_seconds: u64,
+) -> Vec<f64> {
     match agg {
         Aggregate::Count => vec![signals.len() as f64],
         Aggregate::Rate => {
-            let denom = if range_seconds == 0 { 1.0 } else { range_seconds as f64 };
+            let denom = if range_seconds == 0 {
+                1.0
+            } else {
+                range_seconds as f64
+            };
             vec![signals.len() as f64 / denom]
         }
         Aggregate::Sum => {
@@ -1042,7 +1175,12 @@ mod tests {
         let mut wrong_cell = std::collections::BTreeMap::new();
         wrong_cell.insert("cell".to_string(), "other-cell".to_string());
         let noise_log = store
-            .write_labeled(SignalKind::Log, b"level=info msg=noise".to_vec(), wrong_cell, 199_001)
+            .write_labeled(
+                SignalKind::Log,
+                b"level=info msg=noise".to_vec(),
+                wrong_cell,
+                199_001,
+            )
             .expect("log write is never downsampled");
         index.register(
             noise_log,
@@ -1058,7 +1196,12 @@ mod tests {
         wrong_name.insert("name".to_string(), "unrelated_metric".to_string());
         cell_label(&mut wrong_name);
         store
-            .write_labeled(SignalKind::Metric, b"unrelated 1".to_vec(), wrong_name, 199_001)
+            .write_labeled(
+                SignalKind::Metric,
+                b"unrelated 1".to_vec(),
+                wrong_name,
+                199_001,
+            )
             .expect("metric write is never downsampled");
 
         // Noise: outside the range window (now=200_000, range=1d=86_400s ->
@@ -1066,7 +1209,12 @@ mod tests {
         let mut old_labels = std::collections::BTreeMap::new();
         cell_label(&mut old_labels);
         store
-            .write_labeled(SignalKind::Log, b"level=info msg=ancient".to_vec(), old_labels, 1)
+            .write_labeled(
+                SignalKind::Log,
+                b"level=info msg=ancient".to_vec(),
+                old_labels,
+                1,
+            )
             .expect("log write is never downsampled");
 
         (store, index, metric_id, log_in_window)
@@ -1086,7 +1234,12 @@ mod tests {
 
         // matched: the anchor metric + the two same-cell logs (in-window and
         // out-of-window), but NEITHER noise signal.
-        assert_eq!(result.matched.len(), 3, "expected exactly 3 matched signals, got {:?}", result.matched);
+        assert_eq!(
+            result.matched.len(),
+            3,
+            "expected exactly 3 matched signals, got {:?}",
+            result.matched
+        );
         assert!(result.matched.contains(&metric_id));
         assert!(result.matched.contains(&log_in_window));
 
@@ -1195,7 +1348,11 @@ mod tests {
         let (store, index, query, now) = numeric_fixture();
         let rows = aggregate(&query, &store, &index, now, Aggregate::Rate, &[]);
         assert_eq!(rows.len(), 1);
-        assert!((rows[0].values[0] - 0.05).abs() < 1e-12, "5/100 = 0.05, got {:?}", rows[0].values);
+        assert!(
+            (rows[0].values[0] - 0.05).abs() < 1e-12,
+            "5/100 = 0.05, got {:?}",
+            rows[0].values
+        );
     }
 
     /// `sum` totals every matched signal's numeric payload value
@@ -1205,7 +1362,11 @@ mod tests {
         let (store, index, query, now) = numeric_fixture();
         let rows = aggregate(&query, &store, &index, now, Aggregate::Sum, &[]);
         assert_eq!(rows.len(), 1);
-        assert!((rows[0].values[0] - 150.0).abs() < 1e-9, "got {:?}", rows[0].values);
+        assert!(
+            (rows[0].values[0] - 150.0).abs() < 1e-9,
+            "got {:?}",
+            rows[0].values
+        );
     }
 
     /// `quantile` uses nearest-rank on the sorted values [10,20,30,40,50]:
@@ -1241,9 +1402,15 @@ mod tests {
 
         let sums = aggregate(&query, &store, &index, now, Aggregate::Sum, &by);
         assert_eq!(sums.len(), 2, "one row per service group");
-        assert_eq!(sums[0].group, vec![("service".to_string(), "a".to_string())]);
+        assert_eq!(
+            sums[0].group,
+            vec![("service".to_string(), "a".to_string())]
+        );
         assert!((sums[0].values[0] - 30.0).abs() < 1e-9);
-        assert_eq!(sums[1].group, vec![("service".to_string(), "b".to_string())]);
+        assert_eq!(
+            sums[1].group,
+            vec![("service".to_string(), "b".to_string())]
+        );
         assert!((sums[1].values[0] - 120.0).abs() < 1e-9);
 
         let counts = aggregate(&query, &store, &index, now, Aggregate::Count, &by);
@@ -1308,17 +1475,21 @@ mod tests {
         let (store, index, [err_timeout, err_timeout_2, err_other, info_timeout]) =
             log_payload_fixture();
 
-        let query = parse(
-            r#"select: logs(level = error, message =~ "timeout") range: now-1000s"#,
-        )
-        .expect("log filter query must parse");
+        let query = parse(r#"select: logs(level = error, message =~ "timeout") range: now-1000s"#)
+            .expect("log filter query must parse");
 
         let result = execute(&query, &store, &index, 100);
         let mut expected = vec![err_timeout.clone(), err_timeout_2.clone()];
         expected.sort();
         assert_eq!(result.matched, expected);
-        assert!(!result.matched.contains(&err_other), "no-timeout error excluded");
-        assert!(!result.matched.contains(&info_timeout), "info-level excluded");
+        assert!(
+            !result.matched.contains(&err_other),
+            "no-timeout error excluded"
+        );
+        assert!(
+            !result.matched.contains(&info_timeout),
+            "info-level excluded"
+        );
     }
 
     /// A `field.x = <value>` LOG filter matches the nested payload field: only
@@ -1346,11 +1517,113 @@ mod tests {
     /// text surface — a quoted multi-word `=~` value survives to_text→parse.
     #[test]
     fn log_filter_predicates_round_trip_through_text() {
-        let original = parse(
-            r#"select: logs(level = error, message =~ "connection timeout") range: now-1d"#,
-        )
-        .expect("must parse");
+        let original =
+            parse(r#"select: logs(level = error, message =~ "connection timeout") range: now-1d"#)
+                .expect("must parse");
         let reparsed = parse(&original.to_text()).expect("canonical text must re-parse");
         assert_eq!(original, reparsed);
+    }
+
+    /// An explicit `<start>..<end>` range parses into the two bounds, and the
+    /// classic `now-<dur>` form still parses to the relative window ending now.
+    #[test]
+    fn range_parses_relative_and_explicit_windows() {
+        // Classic relative form: a window ending at "now".
+        let rel = parse("select: logs range: now-1h").expect("relative parses");
+        assert_eq!(rel.range, TimeRange::seconds(3600));
+        assert_eq!(rel.range.relative_seconds(), Some(3600));
+
+        // Explicit window that does NOT end at now (a past sub-window).
+        let past = parse("select: logs range: now-2h..now-1h").expect("explicit parses");
+        assert_eq!(
+            past.range,
+            TimeRange::window(TimeBound::Ago(7200), TimeBound::Ago(3600))
+        );
+        assert_eq!(past.range.relative_seconds(), None);
+
+        // Absolute logical ticks as endpoints.
+        let abs = parse("select: metrics range: 1000..2000").expect("absolute parses");
+        assert_eq!(
+            abs.range,
+            TimeRange::window(TimeBound::Tick(1000), TimeBound::Tick(2000))
+        );
+
+        // Mixed: an absolute start up to now.
+        let mixed = parse("select: logs range: 500..now").expect("mixed parses");
+        assert_eq!(
+            mixed.range,
+            TimeRange::window(TimeBound::Tick(500), TimeBound::Now)
+        );
+    }
+
+    /// Every range form round-trips through the canonical text surface, and the
+    /// relative form still serializes to `now-<dur>` (not `<start>..<end>`) so
+    /// existing queries render unchanged.
+    #[test]
+    fn range_round_trips_and_relative_form_is_canonical() {
+        for text in [
+            "select: logs range: now-1h",
+            "select: logs range: now-2h..now-1h",
+            "select: metrics range: 1000..2000",
+            "select: logs range: 500..now",
+        ] {
+            let q = parse(text).expect("must parse");
+            assert_eq!(
+                parse(&q.to_text()).expect("re-parse"),
+                q,
+                "round-trip {text}"
+            );
+        }
+        // The relative window keeps its compact canonical form.
+        assert_eq!(
+            parse("select: logs range: now-1h").unwrap().to_text(),
+            "select: logs range: now-1h"
+        );
+        // An explicit window serializes with the `..` form.
+        assert_eq!(
+            parse("select: logs range: now-2h..now-1h")
+                .unwrap()
+                .to_text(),
+            "select: logs range: now-2h..now-1h"
+        );
+    }
+
+    /// `execute` honours an explicit past window: a signal inside the window is
+    /// matched, one after the window's end (nearer "now") is excluded, and one
+    /// before the window's start is excluded — proving the range is a genuine
+    /// two-sided window, not just `now-<dur>..now`.
+    #[test]
+    fn execute_honours_an_explicit_past_window() {
+        let mut store = TimeseriesStore::new(64, 10_000);
+        let index = CorrelationIndex::new();
+        let now = 1000;
+        let mut write = |tick: u64| {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert("cell".to_string(), "c".to_string());
+            // Distinct payloads so the content-addressed ids differ per tick.
+            store
+                .write_labeled(
+                    SignalKind::Metric,
+                    format!("m {tick}").into_bytes(),
+                    labels,
+                    tick,
+                )
+                .expect("metric write is never downsampled")
+        };
+        // window: now-500s .. now-100s  => ticks [500, 900].
+        let before = write(400); // before start -> excluded
+        let inside = write(700); // inside -> matched
+        let after = write(950); // after end -> excluded
+        let query = parse("select: metrics(cell = c) range: now-500s..now-100s").expect("parses");
+        let result = execute(&query, &store, &index, now);
+        assert!(result.matched.contains(&inside), "in-window signal matched");
+        assert!(
+            !result.matched.contains(&before),
+            "pre-window signal excluded"
+        );
+        assert!(
+            !result.matched.contains(&after),
+            "post-window signal excluded"
+        );
     }
 }
