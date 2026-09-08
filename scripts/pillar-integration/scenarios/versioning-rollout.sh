@@ -50,6 +50,14 @@
 scenario_versioning-rollout() {
     local n="${PILLAR_IT_NODES:-3}"
 
+    # Ensure the image under test actually serves the `versioning-rollout` CLI
+    # verb this scenario drives. If the published image lags the working
+    # tree (a publish-lag window right after a merge), build a reproducible
+    # image-under-test from the flake and repoint $PILLAR_IMAGE at it — the
+    # scenario stays black-box either way. Matches the pattern already
+    # established by trust-rbac.sh's `image_require_verb apply-authz`.
+    image_require_verb versioning-rollout
+
     # (1) real >=3-node topology on the real ghcr image.
     topology_boot "$n"
 
