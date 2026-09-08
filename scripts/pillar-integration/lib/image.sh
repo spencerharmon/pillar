@@ -96,19 +96,35 @@ ls -la target dir (if resolvable): $(ls -la "$(readlink -f "$gcroot" 2>/dev/null
     fi
     local streamer="$gcroot"
 
+    # Discard any stale prior local build BEFORE loading: `nix build`'s
+    # reproducible output has a fixed (epoch) creation timestamp, so
+    # `podman images` has NO reliable recency ordering between a fresh load
+    # and a stale `pillar-it-under-test:local`/`localhost/pillar:*` left by an
+    # earlier run — a `grep | head -1` heuristic over the image list can pick
+    # the STALE image (confirmed: this previously caused
+    # "freshly built image-under-test still does not serve '<verb>'" even
+    # though the fresh build itself was correct). Removing any stale tag first
+    # means whatever `podman load` reports having just loaded is unambiguous.
+    "$CONTAINER_RUNTIME" rmi -f "$tag" >/dev/null 2>&1 || true
+
     info "image: loading the built image-under-test into $CONTAINER_RUNTIME as $tag"
-    "$streamer" | "$CONTAINER_RUNTIME" load 2>&1 | tail -3
-    local load_rc=$?
+    local load_out load_rc
+    load_out="$("$streamer" | "$CONTAINER_RUNTIME" load 2>&1)"
+    load_rc=$?
+    printf '%s\n' "$load_out" | tail -3
     rm -f "$gcroot"
     [ "$load_rc" -eq 0 ] \
-        || fail "image_build_local: loading the streamed image into $CONTAINER_RUNTIME failed"
-    # streamLayeredImage's config names the image; retag to our stable local
-    # ref so the topology fabric can reference it deterministically.
-    local built
-    built="$("$CONTAINER_RUNTIME" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-        | grep -E '^(localhost/)?pillar' | head -1)"
-    if [ -n "$built" ] && [ "$built" != "$tag" ]; then
-        "$CONTAINER_RUNTIME" tag "$built" "$tag" >/dev/null 2>&1 || true
+        || fail "image_build_local: loading the streamed image into $CONTAINER_RUNTIME failed:\n$load_out"
+    # Parse the EXACT reference podman/docker just loaded ("Loaded image:
+    # <ref>") rather than re-deriving it via a heuristic scan of the whole
+    # image list — deterministic regardless of any other pillar* tag present.
+    local loaded
+    loaded="$(printf '%s\n' "$load_out" | sed -n 's/^Loaded image: //p' | tail -1)"
+    if [ -n "$loaded" ] && [ "$loaded" != "$tag" ]; then
+        "$CONTAINER_RUNTIME" tag "$loaded" "$tag" \
+            || fail "image_build_local: failed to tag loaded image '$loaded' as '$tag'"
+    elif [ -z "$loaded" ]; then
+        fail "image_build_local: could not parse a 'Loaded image: <ref>' line from $CONTAINER_RUNTIME load output:\n$load_out"
     fi
     PILLAR_IMAGE="$tag"
     export PILLAR_IMAGE
