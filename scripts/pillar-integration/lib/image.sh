@@ -57,15 +57,36 @@ image_build_local() {
         || fail "image_build_local: expected an executable streamer at '$streamer'"
 
     info "image: loading the built image-under-test into $CONTAINER_RUNTIME as $tag"
-    "$streamer" | "$CONTAINER_RUNTIME" load 2>&1 | tail -3 \
-        || fail "image_build_local: loading the streamed image into $CONTAINER_RUNTIME failed"
-    # streamLayeredImage's config names the image; retag to our stable local
-    # ref so the topology fabric can reference it deterministically.
-    local built
-    built="$("$CONTAINER_RUNTIME" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-        | grep -E '^(localhost/)?pillar' | head -1)"
-    if [ -n "$built" ] && [ "$built" != "$tag" ]; then
-        "$CONTAINER_RUNTIME" tag "$built" "$tag" >/dev/null 2>&1 || true
+    # Capture the runtime's load output and adopt the EXACT ref it just loaded —
+    # never a `head -1` guess among pre-existing `pillar*` images (a stale
+    # `pillar-it-under-test:local` from a prior run sorts before
+    # `localhost/pillar:latest` and would be adopted instead, leaving
+    # `$PILLAR_IMAGE` on an image that does not serve the verb under test — a
+    # non-deterministic, cache-dependent DoD failure). Both podman and docker
+    # print a `Loaded image[(s)]: <ref>` line naming the concrete loaded ref.
+    local load_out loaded
+    load_out="$("$streamer" | "$CONTAINER_RUNTIME" load 2>&1)" \
+        || fail "image_build_local: loading the streamed image into $CONTAINER_RUNTIME failed:\n$load_out"
+    printf '%s\n' "$load_out" | tail -3 | while IFS= read -r l; do info "image: load: $l"; done
+    loaded="$(printf '%s\n' "$load_out" \
+        | sed -n 's/^Loaded image[s]*: *//p' | head -1)"
+    # The flake's `pillar-oci-image` has a FIXED name/tag (`pillar:latest`), so a
+    # runtime that does not print a Loaded-image line still lands it at
+    # `localhost/pillar:latest` (podman) or `pillar:latest` (docker); fall back
+    # to that fixed ref rather than guessing.
+    if [ -z "$loaded" ]; then
+        if "$CONTAINER_RUNTIME" image exists localhost/pillar:latest 2>/dev/null; then
+            loaded="localhost/pillar:latest"
+        else
+            loaded="pillar:latest"
+        fi
+    fi
+    "$CONTAINER_RUNTIME" image exists "$loaded" 2>/dev/null \
+        || fail "image_build_local: could not resolve the freshly-loaded image ref (parsed '$loaded') from:\n$load_out"
+    info "image: adopting freshly-loaded ref '$loaded' and retagging to $tag"
+    if [ "$loaded" != "$tag" ]; then
+        "$CONTAINER_RUNTIME" tag "$loaded" "$tag" >/dev/null 2>&1 \
+            || fail "image_build_local: could not retag '$loaded' -> '$tag'"
     fi
     PILLAR_IMAGE="$tag"
     export PILLAR_IMAGE

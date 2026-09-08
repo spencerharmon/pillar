@@ -82,6 +82,19 @@ fixtures_teardown() {
         # shellcheck disable=SC2086
         "$CONTAINER_RUNTIME" network rm $nets >/dev/null 2>&1 || true
     fi
+    # Host helper processes: a scenario that spawns real out-of-container host
+    # processes (e.g. the ingress/LB packet oracle's real UDP echo backends,
+    # which must share the host network namespace with a `--network host` serve
+    # container) records each pid, one per line, in `$FIXTURE_ROOT/host-pids`.
+    # Reap them here so they leave zero residue exactly like a container does.
+    if [ -n "${FIXTURE_ROOT:-}" ] && [ -f "$FIXTURE_ROOT/host-pids" ]; then
+        local hpid
+        while IFS= read -r hpid; do
+            [ -n "$hpid" ] || continue
+            kill "$hpid" >/dev/null 2>&1 || true
+        done < "$FIXTURE_ROOT/host-pids"
+        [ "$quiet" = quiet ] || info "fixtures: reaped host helper process(es) from $FIXTURE_ROOT/host-pids"
+    fi
     [ -n "${FIXTURE_ROOT:-}" ] && rm -rf "$FIXTURE_ROOT" 2>/dev/null || true
 }
 

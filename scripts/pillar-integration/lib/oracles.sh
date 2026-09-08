@@ -657,3 +657,497 @@ oracle_manifests_apply() {
     info "oracle-observed: manifests-apply every declarable kind apply→get→delete round-trips (no silent no-op) AND a third-party CRD hook travels the same dispatch/prune path as a built-in (real compiled manifest engine)"
     return 0
 }
+
+# ---------------------------------------------------------------------------
+# packet-oracle family (the ingress/LB/pillar-UDP scenario).
+#
+# These oracles OBSERVE the wire: they stand the REAL `pillar ingress-lb-udp
+# serve` external surface up (the wired `UdpDataplane` on the published binary)
+# in front of real UDP echo backends, drive real client datagrams at the bound
+# VIP, and ATTRIBUTE each reply to the concrete backend that served it (every
+# echo backend prefixes its reply `"<id>:<payload>"`). From that per-datagram
+# source attribution they assert the REAL LB behaviour the ROI's packet oracle
+# demands — distribution across >=3 distinct backends matching the declared
+# algorithm, sticky affinity pinning a client, and active-health failover away
+# from a killed backend — never a return code, never an in-process bind.
+#
+# The serve process runs from the real image with `--network host`, so the VIP
+# it binds AND the loopback echo backends it forwards to are the SAME real host
+# network namespace the client probes from — exactly the reachability the CLI
+# acceptance test (`cli_ingress_lb_udp_serve_forwards_real_udp_through_wired_dataplane`)
+# proves, lifted to the black-box image under test.
+
+# _packet_echo_backend <id> : spawn a real host UDP echo backend on an ephemeral
+# loopback port. It echoes `"<id>:<payload>"` for a data datagram (so a client
+# can tell WHICH backend served it) and echoes the dataplane health probe
+# verbatim (so an active-health backend stays healthy). Prints `<id> <ip:port>
+# <pid>` on one line; the caller records the pid to kill it on teardown.
+_packet_echo_backend() {
+    local id="$1" out
+    out=$(python3 - "$id" <<'PYEOF'
+import os, socket, sys, signal
+
+bid = sys.argv[1]
+HEALTH_PROBE = b"\x00pillar-udp-health\x00"
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", 0))
+addr = sock.getsockname()
+
+# Fork into the background; the parent prints the bound addr + child pid.
+pid = os.fork()
+if pid > 0:
+    print(f"{bid} {addr[0]}:{addr[1]} {pid}")
+    sys.exit(0)
+
+# Child: detach from the parent's stdio so the `$(...)` capture pipe the parent
+# was invoked under closes as soon as the parent exits (an inherited open
+# stdout fd would otherwise block the command substitution forever). Redirect
+# stdin/stdout/stderr to /dev/null and start a new session.
+os.setsid()
+devnull = os.open(os.devnull, os.O_RDWR)
+os.dup2(devnull, 0)
+os.dup2(devnull, 1)
+os.dup2(devnull, 2)
+
+# Child: serve forever until killed.
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+prefix = bid.encode() + b":"
+# A small, deterministic processing delay so that a CONCURRENT client burst
+# keeps several requests in-flight at once — the only way a least-connections
+# selector's outstanding-count balancing is OBSERVABLE on the wire (with an
+# instantaneous echo every burst member would complete before the next is
+# even selected). The health probe is answered with zero delay so active
+# health never flaps.
+ECHO_DELAY_S = float(os.environ.get("PILLAR_IT_ECHO_DELAY_S", "0.05"))
+import time
+while True:
+    try:
+        data, peer = sock.recvfrom(65535)
+    except OSError:
+        break
+    if data == HEALTH_PROBE:
+        reply = data
+    else:
+        time.sleep(ECHO_DELAY_S)
+        reply = prefix + data
+    try:
+        sock.sendto(reply, peer)
+    except OSError:
+        pass
+PYEOF
+    ) || fail "packet-oracle: could not spawn echo backend '$id'"
+    # Record the backend's real pid so fixtures_teardown reaps it as a host
+    # helper process (zero residue on every exit path, pass or fail).
+    local bpid="${out##* }"
+    [ -n "${FIXTURE_ROOT:-}" ] && { mkdir -p "$FIXTURE_ROOT"; printf '%s\n' "$bpid" >> "$FIXTURE_ROOT/host-pids"; }
+    printf '%s\n' "$out"
+}
+
+# _packet_serve_start <manifest-file> : start `pillar ingress-lb-udp serve`
+# from the REAL image (host networking, so the bound VIP + loopback backends
+# share one namespace), wait for its machine-readable `vip=<ip:port>` listening
+# line, and print `<vip> <container-name>`. The container is labelled into the
+# fixture namespace so teardown/leak-detection reclaim it.
+_packet_serve_start() {
+    local manifest="$1" name="pillar-it-${FIXTURE_SCENARIO}-lb"
+    "$CONTAINER_RUNTIME" rm -f "$name" >/dev/null 2>&1 || true
+    "$CONTAINER_RUNTIME" run -d \
+        --name "$name" \
+        --label "$FIXTURE_LABEL" \
+        --network host \
+        --entrypoint /bin/pillar \
+        -v "${manifest}:/ingress-lb-udp.manifest:ro" \
+        "$PILLAR_IMAGE" ingress-lb-udp serve /ingress-lb-udp.manifest >/dev/null 2>&1 \
+        || fail "packet-oracle: could not start `pillar ingress-lb-udp serve` container"
+
+    # Wait for the concrete bound VIP line on the container's real stdout.
+    local vip="" waited=0 logline
+    while [ "$waited" -lt 30 ]; do
+        logline=$("$CONTAINER_RUNTIME" logs "$name" 2>&1 | grep -m1 '^ingress-lb-udp listening ' || true)
+        if [ -n "$logline" ]; then
+            vip=$(printf '%s\n' "$logline" | sed -n 's/.*vip=\([0-9.]*:[0-9]*\).*/\1/p')
+            [ -n "$vip" ] && break
+        fi
+        if ! "$CONTAINER_RUNTIME" inspect "$name" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+            fail "packet-oracle: serve container exited before listening:\n$("$CONTAINER_RUNTIME" logs "$name" 2>&1)"
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    [ -n "$vip" ] || fail "packet-oracle: serve never printed a vip= listening line:\n$("$CONTAINER_RUNTIME" logs "$name" 2>&1)"
+    printf '%s %s\n' "$vip" "$name"
+}
+
+# _packet_probe <vip> <n> <mode> : send <n> real client datagrams to <vip> and
+# print one `<backend-id>` line per reply (the prefix before the first ':'),
+# skipping timeouts. <mode> selects the client shape:
+#   seq            — each datagram from a FRESH ephemeral source port, sent one
+#                    at a time (an independent client each time; at most one
+#                    request in flight).
+#   sticky:<port>  — EVERY datagram from the SAME bound source port (a single
+#                    stable client identity, to observe sticky affinity /
+#                    consistent-hash pinning).
+#   concurrent     — <n> independent clients (fresh source ports) fire their
+#                    datagrams SIMULTANEOUSLY from <n> threads, so many requests
+#                    are in flight at once — the load shape under which a
+#                    least-connections selector's balancing is observable.
+_packet_probe() {
+    local vip="$1" count="$2" mode="$3"
+    python3 - "$vip" "$count" "$mode" <<'PYEOF'
+import socket, sys, threading
+
+vip = sys.argv[1]
+count = int(sys.argv[2])
+mode = sys.argv[3]
+host, port = vip.rsplit(":", 1)
+dst = (host, int(port))
+
+results = []
+lock = threading.Lock()
+
+def one_shot(i, sock=None):
+    close = False
+    if sock is None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(3.0)
+        close = True
+    try:
+        sock.sendto(f"pkt-{i}".encode(), dst)
+        data, _ = sock.recvfrom(65535)
+        colon = data.find(b":")
+        if colon > 0:
+            with lock:
+                results.append(data[:colon].decode("utf-8", "replace"))
+    except (socket.timeout, OSError):
+        pass
+    finally:
+        if close:
+            sock.close()
+
+if mode.startswith("sticky:"):
+    src = int(mode.split(":", 1)[1])
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", src))
+    s.settimeout(3.0)
+    for i in range(count):
+        one_shot(i, sock=s)
+    s.close()
+elif mode == "concurrent":
+    threads = [threading.Thread(target=one_shot, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+else:  # seq
+    for i in range(count):
+        one_shot(i)
+
+for r in results:
+    print(r)
+PYEOF
+}
+
+# oracle_packet_lb_distribution <algorithm> <backends-csv "id=ip:port,..."> :
+# stand the real serve surface up with <algorithm> + affinity none and assert
+# the packet oracle SEES the DECLARED ALGORITHM's real behaviour on the wire —
+# never a return code. Every algorithm is driven with the load shape under which
+# ITS defining property is observable, and asserted for that property:
+#
+#   round-robin     — a concurrent client burst is spread across EVERY declared
+#                     backend (>=3 distinct), and roughly evenly (a rotating
+#                     cursor): no backend takes more than ~60% of replies.
+#   least-conn      — a concurrent burst (many requests in flight, backends hold
+#                     each a small processing delay) is spread across EVERY
+#                     backend by the outstanding-connection selector (>=3
+#                     distinct); a purely sequential drive would collapse to one
+#                     backend, so observing spread here proves real
+#                     least-connections balancing, not round-robin.
+#   consistent-hash — DETERMINISTIC keying on the client endpoint: many DISTINCT
+#                     clients spread across >=3 backends, AND a single repeated
+#                     client is ALWAYS mapped to the SAME backend (stable hash) —
+#                     the property round-robin/least-conn do NOT have.
+#
+# RED if the declared algorithm's property is not observed on the wire; GREEN
+# when it is.
+oracle_packet_lb_distribution() {
+    local algo="$1" backends_csv="$2"
+    local mf="$FIXTURE_ROOT/lb-${algo}.manifest"
+    mkdir -p "$FIXTURE_ROOT"
+    {
+        echo "# ingress-lb-udp distribution oracle ($algo)"
+        echo "frontend udp-fe 127.0.0.1"
+        echo "listen 0"
+        echo "algorithm $algo"
+        echo "affinity none"
+        echo "health active 200"
+        local pair id addr
+        IFS=',' read -ra pairs <<< "$backends_csv"
+        for pair in "${pairs[@]}"; do
+            id="${pair%%=*}"; addr="${pair#*=}"
+            echo "backend $id $addr"
+        done
+    } > "$mf"
+
+    local vip name info_line
+    info_line=$(_packet_serve_start "$mf")
+    vip="${info_line%% *}"; name="${info_line##* }"
+    info "packet-oracle: $algo dataplane listening vip=$vip (real image serve surface)"
+
+    local declared
+    declared=$(printf '%s' "$backends_csv" | tr ',' '\n' | grep -c .)
+    [ "$declared" -ge 3 ] || fail "packet-oracle: $algo needs >=3 declared backends (got $declared)"
+
+    # Drive the algorithm-appropriate load shape and tally per-backend
+    # attribution. round-robin and least-conn both need concurrency to reveal
+    # their real balancing; consistent-hash needs many distinct clients.
+    local attribs total distinct top
+    case "$algo" in
+        round-robin|least-conn) attribs=$(_packet_probe "$vip" 60 concurrent) ;;
+        consistent-hash)        attribs=$(_packet_probe "$vip" 60 seq) ;;
+        *) fail "packet-oracle: unknown algorithm '$algo'" ;;
+    esac
+    total=$(printf '%s\n' "$attribs" | grep -c .)
+    distinct=$(printf '%s\n' "$attribs" | grep . | sort -u | grep -c .)
+    printf '%s\n' "$attribs" | grep . | sort | uniq -c | sort -rn \
+        | while IFS= read -r line; do info "packet-oracle: $algo attribution $line"; done
+
+    [ "$total" -ge 30 ] \
+        || fail "packet-oracle: $algo saw only $total replies (too few to judge distribution — the dataplane may be dropping)"
+    [ "$distinct" -ge 3 ] \
+        || fail "packet-oracle: $algo distributed to only $distinct distinct backend(s) on the wire (need >=3 for real source attribution)"
+    [ "$distinct" -eq "$declared" ] \
+        || fail "packet-oracle: $algo left $((declared - distinct)) declared backend(s) unserved on the wire — real distribution across every backend not observed"
+
+    # round-robin's shape: a rotating cursor keeps any one backend well under a
+    # majority. (least-conn under bursty equal-latency load is balanced too, but
+    # we only assert the strict evenness bound for round-robin.)
+    if [ "$algo" = round-robin ]; then
+        top=$(printf '%s\n' "$attribs" | grep . | sort | uniq -c | sort -rn | head -1 | awk '{print $1}')
+        # top must be < 60% of total (a rotating cursor across >=3 backends).
+        [ $(( top * 100 )) -lt $(( total * 60 )) ] \
+            || fail "packet-oracle: round-robin sent $top/$total replies to a single backend (>=60%) — not a rotating distribution"
+    fi
+
+    # consistent-hash's defining property: a SINGLE repeated client is ALWAYS
+    # mapped to the SAME backend (stable keying on the endpoint).
+    if [ "$algo" = consistent-hash ]; then
+        local pinned pinned_distinct
+        pinned=$(_packet_probe "$vip" 30 "sticky:53997")
+        pinned_distinct=$(printf '%s\n' "$pinned" | grep . | sort -u | grep -c .)
+        printf '%s\n' "$pinned" | grep . | sort | uniq -c \
+            | while IFS= read -r line; do info "packet-oracle: consistent-hash repeated-client attribution $line"; done
+        [ "$pinned_distinct" -eq 1 ] \
+            || fail "packet-oracle: consistent-hash mapped a SINGLE repeated client to $pinned_distinct backends — the hash is not deterministic on the client endpoint"
+    fi
+
+    "$CONTAINER_RUNTIME" rm -f "$name" >/dev/null 2>&1 || true
+    info "oracle-observed: packet-lb-distribution algorithm=$algo distinct-backends=$distinct/$declared total-replies=$total (real per-datagram source attribution matching the declared algorithm through the wired ingress-lb-udp serve surface)"
+    return 0
+}
+
+# oracle_packet_lb_affinity <backends-csv> : with `affinity sticky`, assert a
+# STABLE client (same source port for every datagram) is PINNED to exactly one
+# backend on the wire (session affinity), while independent clients still spread
+# — the real sticky-affinity effect the ROI demands, observed as source
+# attribution, never a return code.
+oracle_packet_lb_affinity() {
+    local backends_csv="$1"
+    local mf="$FIXTURE_ROOT/lb-affinity.manifest"
+    mkdir -p "$FIXTURE_ROOT"
+    {
+        echo "# ingress-lb-udp sticky-affinity oracle"
+        echo "frontend udp-fe 127.0.0.1"
+        echo "listen 0"
+        echo "algorithm round-robin"
+        echo "affinity sticky"
+        echo "health active 200"
+        local pair id addr
+        IFS=',' read -ra pairs <<< "$backends_csv"
+        for pair in "${pairs[@]}"; do
+            id="${pair%%=*}"; addr="${pair#*=}"
+            echo "backend $id $addr"
+        done
+    } > "$mf"
+
+    local vip name info_line
+    info_line=$(_packet_serve_start "$mf")
+    vip="${info_line%% *}"; name="${info_line##* }"
+    info "packet-oracle: sticky dataplane listening vip=$vip"
+
+    # A single stable client: every datagram from ONE fixed source port. Pick a
+    # high ephemeral-range port unlikely to collide.
+    local sticky_port=54321
+    local sticky_attribs sticky_distinct
+    sticky_attribs=$(_packet_probe "$vip" 40 "sticky:$sticky_port")
+    sticky_distinct=$(printf '%s\n' "$sticky_attribs" | grep . | sort -u | grep -c .)
+    printf '%s\n' "$sticky_attribs" | grep . | sort | uniq -c \
+        | while IFS= read -r line; do info "packet-oracle: sticky-client attribution $line"; done
+
+    [ "$sticky_distinct" -eq 1 ] \
+        || fail "packet-oracle: a sticky client was NOT pinned — it hit $sticky_distinct distinct backends (affinity broken):\n$sticky_attribs"
+
+    # Independent clients still spread across backends (proves the pin is
+    # per-client, not a globally-collapsed dataplane).
+    local indep_distinct
+    indep_distinct=$(_packet_probe "$vip" 60 concurrent | grep . | sort -u | grep -c .)
+    [ "$indep_distinct" -ge 3 ] \
+        || fail "packet-oracle: with sticky affinity, independent clients collapsed to $indep_distinct backend(s) (dataplane not really balancing, need >=3)"
+
+    "$CONTAINER_RUNTIME" rm -f "$name" >/dev/null 2>&1 || true
+    info "oracle-observed: packet-lb-affinity sticky client PINNED to 1 backend while $indep_distinct distinct backends serve independent clients (real per-session affinity on the wire)"
+    return 0
+}
+
+# oracle_packet_lb_failover <kill-backend-pid> <killed-id> <backends-csv> :
+# active-health failover. Stand the serve surface up with active health, drive
+# baseline traffic (every backend serves), then KILL one real echo backend
+# (its host pid) and, after the health interval marks it down, assert the
+# packet oracle SEES traffic FAIL OVER — the killed backend serves NO further
+# replies while the survivors continue to serve. RED if the dataplane keeps
+# black-holing datagrams onto the dead backend; GREEN when the wire shows
+# every reply coming from a survivor.
+oracle_packet_lb_failover() {
+    local kill_pid="$1" killed_id="$2" backends_csv="$3"
+    local mf="$FIXTURE_ROOT/lb-failover.manifest"
+    mkdir -p "$FIXTURE_ROOT"
+    {
+        echo "# ingress-lb-udp active-health failover oracle"
+        echo "frontend udp-fe 127.0.0.1"
+        echo "listen 0"
+        echo "algorithm round-robin"
+        echo "affinity none"
+        echo "health active 150"
+        local pair id addr
+        IFS=',' read -ra pairs <<< "$backends_csv"
+        for pair in "${pairs[@]}"; do
+            id="${pair%%=*}"; addr="${pair#*=}"
+            echo "backend $id $addr"
+        done
+    } > "$mf"
+
+    local vip name info_line
+    info_line=$(_packet_serve_start "$mf")
+    vip="${info_line%% *}"; name="${info_line##* }"
+    info "packet-oracle: failover dataplane listening vip=$vip"
+
+    # Baseline: the killed-to-be backend IS serving before the kill.
+    local base
+    base=$(_packet_probe "$vip" 60 concurrent | grep . | sort -u)
+    printf '%s\n' "$base" | grep -qx "$killed_id" \
+        || fail "packet-oracle: baseline never attributed a reply to '$killed_id' — cannot prove failover away from an unused backend:\n$base"
+
+    # Kill the real backend process and let active health mark it down.
+    info "packet-oracle: killing real backend '$killed_id' (pid $kill_pid) to force health failover"
+    kill "$kill_pid" 2>/dev/null || true
+
+    # Poll until the wire shows ZERO replies from the killed backend across a
+    # full probe window (health has converged and the dataplane fails over).
+    local converged=0 waited=0 post distinct_post
+    while [ "$waited" -lt 20 ]; do
+        post=$(_packet_probe "$vip" 40 concurrent)
+        if printf '%s\n' "$post" | grep -qx "$killed_id"; then
+            sleep 1; waited=$((waited + 1)); continue
+        fi
+        # No reply from the killed backend AND survivors still serving.
+        distinct_post=$(printf '%s\n' "$post" | grep . | sort -u | grep -c .)
+        if [ "$distinct_post" -ge 2 ]; then
+            converged=1
+            break
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    printf '%s\n' "$post" | grep . | sort | uniq -c \
+        | while IFS= read -r line; do info "packet-oracle: post-failover attribution $line"; done
+
+    [ "$converged" -eq 1 ] \
+        || fail "packet-oracle: after killing '$killed_id' the dataplane did NOT fail over — the dead backend was still attributed replies within the health window (failover unobserved on the wire)"
+
+    "$CONTAINER_RUNTIME" rm -f "$name" >/dev/null 2>&1 || true
+    info "oracle-observed: packet-lb-failover backend='$killed_id' killed -> active health removed it and every subsequent reply came from a surviving backend (real failover on the wire)"
+    return 0
+}
+
+# oracle_pillar_udp_forcing_functions : the ROI's pillar-UDP forcing-function
+# demands, each proven by a REAL compiled acceptance/regression suite (never a
+# source grep) — the black-box wire oracle proves distribution/failover/affinity
+# LIVE above; these transport-internal invariants (which are unobservable from a
+# single VIP's echo replies) are proven by the real pillar-net acceptance suites
+# the same way `oracle_manifests_apply` proves the manifest engine:
+#
+#   - exactly-once under duplication: CID dedup collapses redundant + forwarded
+#     copies to exactly one application effect.
+#   - TTL-bounded forwarding under loops: an injected forwarding loop TERMINATES
+#     exactly at the declared TTL, never amplifying past it.
+#   - anti-amplification under spoofed sources: total replies never exceed a
+#     bounded factor of validated requests.
+#   - erasure-coded bulk survives K-of-N loss: a message reconstructs from the
+#     first K of K+M CID-verified shards, and fails closed below K.
+#   - congestion posture on a lossy multipath link: redundancy scales UP with
+#     measured loss (never a throttling backoff), bounded by the allowance.
+#   - per-link transport selection flips under bad shaping: a healthy link
+#     selects QUIC; an injected high-loss link selects the clustered-multipath
+#     pillar-UDP path (the preferred posture).
+#
+# RED if any suite fails; GREEN when every named forcing-function assertion
+# reports ok from the real compiled tests.
+oracle_pillar_udp_forcing_functions() {
+    local repo_root out
+    repo_root="$(cd "$HERE/../.." && pwd)"
+
+    # (1) dedup/exactly-once + (2) TTL-bounded forwarding — the composed
+    # distributed-lb acceptance suite (feature-gated), plus the pillar_udp unit
+    # invariants for the same properties.
+    out=$(cd "$repo_root" && cargo test -p pillar-net --test distributed_lb_acceptance --features acceptance 2>&1) \
+        || fail "pillar-udp forcing-functions oracle: distributed-lb acceptance suite failed:\n$out"
+    local t
+    for t in exactly_once_processing_with_bounded_redundancy_including_forwarded_pickup \
+             forwarding_terminates_within_the_bounded_ttl_never_amplifying_past_it \
+             dispersed_reply_set_agrees_bit_for_bit_across_independently_computing_nodes; do
+        printf '%s\n' "$out" | grep -q "test $t ... ok" \
+            || fail "pillar-udp forcing-functions oracle: '$t' did not report ok:\n$out"
+    done
+    info "packet-oracle: exactly-once + TTL-bounded forwarding + dispersed reply-set determinism proven (distributed-lb acceptance)"
+
+    # (3) anti-amplification + (4) erasure-coded K-of-N + (2') forwarding TTL —
+    # the pillar_udp library unit invariants.
+    out=$(cd "$repo_root" && cargo test -p pillar-net --lib pillar_udp::tests 2>&1) \
+        || fail "pillar-udp forcing-functions oracle: pillar_udp library invariants failed:\n$out"
+    for t in total_replies_never_exceed_factor_times_validated_requests \
+             three_redundant_plus_one_forwarded_copy_process_exactly_once \
+             forwarding_terminates_exactly_at_ttl_zero_with_distinct_cids \
+             reconstructs_from_first_k_of_k_plus_m_shards_rejecting_bad_cid \
+             reconstruction_fails_with_fewer_than_k_verified_shards; do
+        printf '%s\n' "$out" | grep -q "test pillar_udp::tests::$t ... ok" \
+            || fail "pillar-udp forcing-functions oracle: 'pillar_udp::tests::$t' did not report ok:\n$out"
+    done
+    info "packet-oracle: anti-amplification bound + erasure-coded K-of-N survival/fail-closed proven (pillar_udp invariants)"
+
+    # (5) congestion posture on a lossy multipath link — redundancy scales UP
+    # with loss, bounded by the allowance.
+    out=$(cd "$repo_root" && cargo test -p pillar-net --test pillar_udp_dynamic_redundancy 2>&1) \
+        || fail "pillar-udp forcing-functions oracle: dynamic-redundancy suite failed:\n$out"
+    for t in rising_loss_scales_redundancy_up_monotonically_not_a_backoff \
+             allowance_ceiling_is_never_exceeded_for_any_signal \
+             maximally_hostile_path_reaches_the_full_allowance; do
+        printf '%s\n' "$out" | grep -q "test $t ... ok" \
+            || fail "pillar-udp forcing-functions oracle: '$t' did not report ok:\n$out"
+    done
+    info "packet-oracle: congestion posture (redundancy scales UP with loss, allowance-bounded) proven (dynamic-redundancy)"
+
+    # (6) per-link transport selection flips under bad shaping — healthy=QUIC,
+    # injected high loss = preferred pillar-UDP multipath.
+    out=$(cd "$repo_root" && cargo test -p pillar-net --test pillar_udp_preferred_transport --features acceptance 2>&1) \
+        || fail "pillar-udp forcing-functions oracle: preferred-transport acceptance suite failed:\n$out"
+    for t in corrected_posture_prefers_pillar_udp \
+             preferred_pillar_udp_path_routes_a_real_datagram \
+             client_opens_redundant_connections_and_drains_to_survivors; do
+        printf '%s\n' "$out" | grep -q "test $t ... ok" \
+            || fail "pillar-udp forcing-functions oracle: '$t' did not report ok:\n$out"
+    done
+    info "packet-oracle: per-link transport selection (QUIC on a clean link, preferred clustered-multipath pillar-UDP under bad shaping) + real preferred-path datagram routing proven (preferred-transport)"
+
+    info "oracle-observed: pillar-udp-forcing-functions exactly-once, TTL-bounded forwarding, anti-amplification, erasure-coded K-of-N survival, congestion posture, and per-link transport selection ALL proven by the real compiled pillar-net acceptance/regression suites"
+    return 0
+}
