@@ -1316,7 +1316,7 @@ impl WebAuthContext {
                 r.tick,
                 r.unix_millis.map(|m| m.to_string()).unwrap_or_default(),
                 labels,
-                r.payload
+                escape_payload(&r.payload)
             ));
         }
         for (anchor, members) in sub.psl_correlate(&query, now) {
@@ -3602,6 +3602,27 @@ fn signal_kind_tag(kind: SignalKind) -> &'static str {
         SignalKind::ProfileSample => "profile",
         SignalKind::MetadataSample => "metadata",
     }
+}
+
+/// Escape a signal payload so it survives the line-delimited PSL query
+/// response. Profile-sample payloads embed a full multi-line backtrace
+/// (`"<name> <weight> @<tick>\n<stack>"`); rendered verbatim into a
+/// `SIGNAL ... PAYLOAD <payload>\n` line those newlines would split one
+/// record into several unparsable lines. Backslash is escaped first so the
+/// transform is unambiguously reversible: `\` -> `\\`, newline -> `\n`,
+/// carriage return -> `\r`. The client reverses this before rendering (e.g.
+/// to reconstruct a profile stack for a flame graph).
+fn escape_payload(payload: &str) -> String {
+    let mut out = String::with_capacity(payload.len());
+    for c in payload.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Which runtime-reach verb a `/portal/resource/{logs,exec,forward}` request is.
@@ -8388,5 +8409,35 @@ mod tests {
     #[test]
     fn ui_confirms_swarm_panel() {
         assert_ui_wires("swarm", &["/portal/swarm", "/portal/swarm/generate"]);
+    }
+
+    #[test]
+    fn escape_payload_is_reversible_and_single_line() {
+        // A profile-sample payload with an embedded multi-line backtrace.
+        let raw = "cpu 42 @7\n   0: pillar::sample\n   1: main";
+        let escaped = escape_payload(raw);
+        // No raw newline survives (so it is exactly one response line)...
+        assert!(!escaped.contains('\n'));
+        assert_eq!(escaped, "cpu 42 @7\\n   0: pillar::sample\\n   1: main");
+        // ...and a backslash-first escape is unambiguously reversible.
+        let with_backslash = "a\\b\nc";
+        let e = escape_payload(with_backslash);
+        assert_eq!(e, "a\\\\b\\nc");
+        let mut out = String::new();
+        let mut chars = e.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('\\') => out.push('\\'),
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        assert_eq!(out, with_backslash);
     }
 }

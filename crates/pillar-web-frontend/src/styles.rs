@@ -690,6 +690,80 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
             .logs-layout {{ grid-template-columns: 1fr; }}
             .logs-explorer {{ border-left: none; padding-left: 0; }}
         }}
+
+        /* ---- Canonical query console (builder + raw PSL + per-kind results) ---- */
+        #query-console .query-builder {{
+            display: flex; flex-direction: column; gap: 0.5rem;
+            border: 1px solid {border}; border-radius: 8px;
+            padding: 0.7rem; background: {surface_base}; margin-bottom: 0.6rem;
+        }}
+        #query-console .query-section {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }}
+        #query-console .query-section-head {{ display: flex; align-items: center; gap: 0.5rem; min-width: 5rem; }}
+        #query-console label {{ font-size: 0.76rem; opacity: 0.8; }}
+        #query-console .query-add {{
+            font-size: 0.74rem; padding: 0.1rem 0.5rem; border-radius: 999px;
+            border: 1px dashed {border}; background: transparent; cursor: pointer; color: inherit;
+        }}
+        #query-console .query-add.active {{ border-style: solid; outline: 1px solid {glow}; }}
+        #query-console .query-select {{
+            display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem;
+            width: 100%; padding: 0.25rem 0; border-bottom: 1px dashed {border};
+        }}
+        #query-console .query-paren {{ opacity: 0.5; font-family: ui-monospace, monospace; }}
+        #query-console .query-preds {{ display: flex; flex-wrap: wrap; gap: 0.3rem; }}
+        #query-console .query-pred {{ display: inline-flex; align-items: center; gap: 0.2rem; }}
+        #query-console .query-kind, #query-console .query-op {{
+            font-family: ui-monospace, monospace; font-size: 0.8rem;
+            padding: 0.15rem 0.3rem; border-radius: 5px;
+            border: 1px solid {border}; background: {surface_raised}; color: inherit;
+        }}
+        #query-console .query-key, #query-console .query-val, #query-console .query-rangeinput {{
+            font-family: ui-monospace, monospace; font-size: 0.8rem;
+            padding: 0.15rem 0.35rem; border-radius: 5px; width: 8.5rem;
+            border: 1px solid {border}; background: {surface_raised}; color: inherit;
+        }}
+        #query-console .query-rangeinput {{ width: 9rem; }}
+        #query-console .query-preset {{
+            font-size: 0.72rem; padding: 0.1rem 0.4rem; border-radius: 999px;
+            border: 1px solid {border}; background: transparent; cursor: pointer; color: inherit;
+        }}
+        #query-console .query-nowdash {{ opacity: 0.6; }}
+        #query-console .query-correlate {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; width: 100%; }}
+        #query-console .query-raw {{
+            width: 100%; box-sizing: border-box; resize: vertical;
+            padding: 0.5rem; border-radius: 6px;
+            border: 1px solid {border}; background: {surface_base}; color: inherit;
+            font-size: 0.82rem;
+        }}
+        #query-console .query-rawlabel {{ display: block; margin: 0.3rem 0 0.15rem; }}
+        #query-console .query-actions {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0; }}
+        #query-console .query-metrics, #query-console .query-profiles,
+        #query-console .query-rows-wrap {{ margin: 0.6rem 0; }}
+        #query-console .query-metric {{ margin: 0.4rem 0; }}
+        #query-console .query-metric-head {{
+            display: flex; justify-content: space-between; align-items: baseline;
+            font-size: 0.8rem; margin-bottom: 0.15rem;
+        }}
+        #query-console .query-metric-last {{ opacity: 0.65; font-size: 0.75rem; }}
+        #query-console .query-table {{ width: 100%; border-collapse: collapse; font-size: 0.8rem; }}
+        #query-console .query-table th, #query-console .query-table td {{
+            text-align: left; padding: 0.15rem 0.5rem; border-bottom: 1px solid {border};
+        }}
+        #query-console .query-group {{
+            border: 1px solid {border}; border-radius: 8px;
+            padding: 0.5rem; margin: 0.5rem 0; background: {surface_base};
+        }}
+        #query-console .query-group-head {{ opacity: 0.7; font-size: 0.78rem; margin: 0 0 0.3rem; }}
+        #query-console .flamegraph {{
+            width: 100%; height: auto; border: 1px solid {border};
+            border-radius: 6px; background: {surface_base};
+        }}
+        #query-console .flame-cell rect {{ stroke: {surface_base}; stroke-width: 0.5; }}
+        #query-console .flame-cell:hover rect {{ stroke: {glow}; stroke-width: 1; }}
+        #query-console .flame-label {{
+            font-size: 10px; fill: #f4f4f8; pointer-events: none;
+            font-family: ui-monospace, monospace;
+        }}
         "#,
         surface_base = theme.surface_base,
         surface_raised = theme.surface_raised,

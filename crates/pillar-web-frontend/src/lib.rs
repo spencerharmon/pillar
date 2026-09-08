@@ -20,10 +20,8 @@ pub mod auth;
 pub mod command_palette;
 pub mod console;
 pub mod dashboard;
-pub mod drilldown;
-pub mod drilldown_live;
 pub mod explore;
-pub mod logs_console;
+pub mod query_console;
 pub mod obs_console;
 pub mod overview;
 pub mod panels;
@@ -63,8 +61,6 @@ pub use explore::{
     ExploreBuilder, ExploreBuilderProps, ExploreLogsBuilder, ExploreMetadataBuilder,
     ExploreProfilesBuilder, ExploreTracesBuilder,
 };
-#[cfg(feature = "yew")]
-pub use drilldown::DrilldownPanel;
 #[cfg(feature = "yew")]
 pub use portal::Portal;
 #[cfg(feature = "yew")]

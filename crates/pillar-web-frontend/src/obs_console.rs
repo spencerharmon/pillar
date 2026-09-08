@@ -11,8 +11,8 @@
 //! against the exact line formats `pillar-cli`'s `dispatch_obs_live_*` emit.
 //! The [`ObservabilityConsole`] component (behind the `yew` feature) is the thin
 //! fetch/render wiring; it reuses the portal's shared `http`/`get_url` helpers
-//! and mounts the existing `ObservabilityTile` (the Explore builders) verbatim
-//! for the Explore tab.
+//! and mounts the single canonical [`QueryConsole`](crate::query_console::
+//! QueryConsole) for the Query tab.
 
 /// A parsed per-kind signal count from `GET /portal/obs/live/kinds`
 /// (`KIND <tag> COUNT <n>` lines).
@@ -150,11 +150,9 @@ mod yew_impl {
     };
     use crate::auth::use_auth;
     use crate::components::data_table::{Column, DataTable};
-    use crate::drilldown::DrilldownPanel;
-    use crate::drilldown_live::{build_drilldowns, parse_correlate_response};
-    use crate::logs_console::LogsConsole;
-    use crate::portal::{get_url, http, input_value, ObservabilityTile};
+    use crate::portal::{get_url, http, input_value};
     use crate::primitives::{Chart, ChartKind, StatCard, Tabs};
+    use crate::query_console::QueryConsole;
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
 
@@ -162,18 +160,16 @@ mod yew_impl {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Tab {
         Overview,
-        Explore,
-        Drilldown,
+        Query,
         Dashboards,
         Rules,
         Alerts,
     }
 
     impl Tab {
-        const ALL: [Tab; 6] = [
+        const ALL: [Tab; 5] = [
             Tab::Overview,
-            Tab::Explore,
-            Tab::Drilldown,
+            Tab::Query,
             Tab::Dashboards,
             Tab::Rules,
             Tab::Alerts,
@@ -181,8 +177,7 @@ mod yew_impl {
         fn label(self) -> &'static str {
             match self {
                 Tab::Overview => "Overview",
-                Tab::Explore => "Explore",
-                Tab::Drilldown => "Drilldown",
+                Tab::Query => "Query",
                 Tab::Dashboards => "Dashboards",
                 Tab::Rules => "Recording rules",
                 Tab::Alerts => "Alerts",
@@ -191,10 +186,11 @@ mod yew_impl {
     }
 
     /// The Observability section content: a tab bar over the live substrate.
-    /// Overview shows per-kind live signal counts; Explore mounts the existing
-    /// query builders; Dashboards materializes panels; Rules and Alerts register
-    /// + evaluate against the live store — every tab a real `/portal/obs/live/*`
-    /// round trip.
+    /// Overview shows per-kind live signal counts; Query mounts the single
+    /// canonical query console (builder + raw PSL, with per-kind result
+    /// rendering and correlations); Dashboards materializes panels; Rules and
+    /// Alerts register + evaluate against the live store — every tab a real
+    /// `/portal/obs/live/*` round trip.
     #[function_component(ObservabilityConsole)]
     pub fn observability_console() -> Html {
         let auth = use_auth();
@@ -234,8 +230,7 @@ mod yew_impl {
 
         let body = match *tab {
             Tab::Overview => render_overview(&counts),
-            Tab::Explore => html! { <><LogsConsole /><ObservabilityTile /></> },
-            Tab::Drilldown => html! { <DrilldownTab /> },
+            Tab::Query => html! { <QueryConsole /> },
             Tab::Dashboards => html! { <DashboardsTab /> },
             Tab::Rules => html! { <RulesTab /> },
             Tab::Alerts => html! { <AlertsTab /> },
@@ -272,70 +267,6 @@ mod yew_impl {
                     <Chart values={bars} kind={ChartKind::Bar} width={480.0} height={120.0} />
                 </div>
             </>
-        }
-    }
-
-    /// The Drilldown tab: runs a correlate PSL query against the live store and
-    /// reconstructs a real [`Drilldown`](crate::drilldown::Drilldown) per anchor
-    /// from the server's `SIGNAL`/`GROUP` response, mounting the shared
-    /// `DrilldownPanel` with the node's actual correlated signals. No
-    /// client-side store, no fabrication.
-    #[function_component(DrilldownTab)]
-    fn drilldown_tab() -> Html {
-        let auth = use_auth();
-        let query = use_state(|| "correlate: metric".to_owned());
-        let drills = use_state(Vec::new);
-        let msg = use_state(|| None::<String>);
-
-        let on_query = {
-            let query = query.clone();
-            Callback::from(move |e: InputEvent| query.set(input_value(&e)))
-        };
-        let run = {
-            let (auth, query, drills, msg) =
-                (auth.clone(), query.clone(), drills.clone(), msg.clone());
-            Callback::from(move |_: MouseEvent| {
-                let Some(token) = auth.token.clone() else {
-                    return;
-                };
-                let body = format!("{token}\n{}", *query);
-                let (drills, msg) = (drills.clone(), msg.clone());
-                spawn_local(async move {
-                    match http("POST", "/portal/obs/live/query", Some(&body)).await {
-                        Ok(r) if r.ok() => {
-                            let built = build_drilldowns(&parse_correlate_response(&r.body));
-                            if built.is_empty() {
-                                msg.set(Some(
-                                    "No correlated drilldowns for that query.".to_owned(),
-                                ));
-                            } else {
-                                msg.set(None);
-                            }
-                            drills.set(built);
-                        }
-                        Ok(r) => msg.set(Some(r.body.trim().to_owned())),
-                        Err(_) => msg.set(Some("request failed".to_owned())),
-                    }
-                });
-            })
-        };
-
-        html! {
-            <div class="res-change">
-                <div class="res-toolbar">
-                    <input class="ds-table__filter" type="text"
-                           placeholder="correlate PSL query"
-                           value={(*query).clone()} oninput={on_query} />
-                    <button class="ds-tab" onclick={run}>{ "Drill down" }</button>
-                </div>
-                <p class="ds-empty">{ "Runs psl_correlate over the live store and pivots \
-                    each metric anchor into its correlated logs, traces, profiles, and \
-                    metadata." }</p>
-                if let Some(m) = &*msg {
-                    <p class="obs-msg">{ m }</p>
-                }
-                { for drills.iter().map(|d| html! { <DrilldownPanel drilldown={d.clone()} /> }) }
-            </div>
         }
     }
 
@@ -649,23 +580,22 @@ mod tests {
         );
     }
 
-    /// Mount-audit (anti-facade DoD, ROI Priority 2 Phase 4): `DrilldownPanel`
-    /// (`crate::drilldown::DrilldownPanel`) was, per the ROI, built but never
-    /// mounted anywhere — an orphaned component. This module's `DrilldownTab`
-    /// now mounts it with real server-fed data (`drilldown_live::build_drilldowns`
-    /// over the live correlate join), closing that root-cause defect. Assert the
-    /// reference on this module's own source so a future edit can never silently
-    /// drop the mount and re-orphan the component.
+    /// Mount-audit (anti-facade DoD): the consolidated observability query
+    /// surface is the single canonical [`QueryConsole`](crate::query_console::
+    /// QueryConsole) — it replaced the former split Explore builders, raw-PSL
+    /// tile, interim logs console, and correlate-only Drilldown tab. Assert the
+    /// mount on this module's own source so a future edit can never silently
+    /// drop it and leave the section without its query console.
     #[test]
-    fn obs_console_mounts_the_drilldown_panel() {
+    fn obs_console_mounts_the_query_console() {
         let src = include_str!("obs_console.rs");
         assert!(
-            src.contains("crate::drilldown::DrilldownPanel"),
-            "obs_console.rs no longer imports crate::drilldown::DrilldownPanel"
+            src.contains("crate::query_console::QueryConsole"),
+            "obs_console.rs no longer imports crate::query_console::QueryConsole"
         );
         assert!(
-            src.contains("<DrilldownPanel"),
-            "obs_console.rs no longer renders the previously-orphaned DrilldownPanel"
+            src.contains("<QueryConsole"),
+            "obs_console.rs no longer renders the canonical QueryConsole"
         );
     }
 
