@@ -45,6 +45,7 @@ pub use alerting::{Alert, AlertEngine, AlertError, AlertPredicate, Notification,
 pub mod block;
 pub mod correlation;
 pub mod ingest;
+pub mod instrument;
 pub mod live;
 pub mod logs;
 pub mod metadata;
@@ -64,8 +65,12 @@ pub mod traces;
 pub use block::{Signal, SignalId, SignalKind, TimeseriesBlock, TimeseriesStore, RETENTION_NOTE};
 pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
 pub use ingest::{MetricKind, MetricSource, MetricsProducer, NodeCounters, NodeMetricSource};
+pub use instrument::{
+    Cx, MetricDescriptor, MetricRegistry, MetricType, COMPONENT_LABEL, METRIC_TYPE_LABEL,
+    METRIC_UNIT_LABEL,
+};
 pub use logs::{LogEvent, LogLevel, LogProducer};
-pub use live::{LiveObservabilitySubstrate, LiveRecord, DEFAULT_EVAL_TIER};
+pub use live::{ComponentProbe, LiveObservabilitySubstrate, LiveRecord, DEFAULT_EVAL_TIER};
 pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };

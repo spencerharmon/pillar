@@ -206,10 +206,28 @@ impl TraceProducer {
         event: &SpanEvent,
         tick: u64,
     ) -> Option<SignalId> {
+        self.record_with(store, index, event, &LabelSet::new(), tick)
+    }
+
+    /// As [`record`](TraceProducer::record), but merges arbitrary caller
+    /// `extra` labels over the node + `trace` labels — the per-component
+    /// instrumentation path (`crate::instrument`). The enabled gate, payload
+    /// format, and correlation-spine registration are identical.
+    pub fn record_with(
+        &self,
+        store: &mut TimeseriesStore,
+        index: &mut CorrelationIndex,
+        event: &SpanEvent,
+        extra: &LabelSet,
+        tick: u64,
+    ) -> Option<SignalId> {
         if !self.enabled {
             return None;
         }
-        let labels = self.span_labels(event);
+        let mut labels = self.span_labels(event);
+        for (k, v) in extra {
+            labels.insert(k.clone(), v.clone());
+        }
         let parent = event.parent_span_id.as_deref().unwrap_or("-");
         let payload = format!(
             "span={} parent={} op={} trace={} @{}",

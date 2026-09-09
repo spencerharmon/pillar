@@ -211,6 +211,21 @@ impl LogProducer {
         event: &LogEvent,
         tick: u64,
     ) -> Option<crate::block::SignalId> {
+        self.record_with(store, index, event, &LabelSet::new(), tick)
+    }
+
+    /// As [`record`](LogProducer::record), but merges arbitrary caller `extra`
+    /// labels over the node base + promoted `level`/`component` labels — the
+    /// per-component instrumentation path (`crate::instrument`). The min-level
+    /// gate, payload format, and correlation-spine registration are identical.
+    pub fn record_with(
+        &self,
+        store: &mut TimeseriesStore,
+        index: &mut CorrelationIndex,
+        event: &LogEvent,
+        extra: &LabelSet,
+        tick: u64,
+    ) -> Option<crate::block::SignalId> {
         if event.level < self.min_level {
             return None;
         }
@@ -221,6 +236,9 @@ impl LogProducer {
         let mut labels = self.log_labels();
         labels.insert("level".to_string(), event.level.as_str().to_string());
         labels.insert("component".to_string(), event.component().to_string());
+        for (k, v) in extra {
+            labels.insert(k.clone(), v.clone());
+        }
         let payload = format!(
             "level={} msg={} @{}",
             event.level.as_str(),

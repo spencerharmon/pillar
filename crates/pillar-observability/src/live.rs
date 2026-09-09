@@ -22,7 +22,7 @@ use crate::block::{SignalId, SignalKind, TimeseriesStore};
 use crate::correlation::{CorrelationId, CorrelationIndex};
 use crate::ingest::{MetricsProducer, NodeCounters, NodeMetricSource};
 use crate::logs::{LogEvent, LogLevel, LogProducer};
-use crate::metadata::{LabelSet, MetadataStore};
+use crate::metadata::{EntityId, LabelSet, MetadataStore};
 use crate::metadata_ingest::{MetadataProducer, NodeMetadataSource};
 use crate::profiling::{NodeProfileSource, ProfilingProducer};
 use crate::psl::{aggregate, execute, Aggregate, PslQuery};
@@ -91,6 +91,14 @@ pub struct LiveObservabilitySubstrate {
     /// resolve a real human timestamp for a record without a clock inside the
     /// pure store.
     tick_wallclock: std::collections::BTreeMap<u64, u64>,
+
+    /// The registry of component-defined metric series (open metric typing).
+    /// A component registers each series once; [`emit_metric`] consults this
+    /// to stamp the series' type/unit/component labels and fail-closed on an
+    /// unregistered name.
+    ///
+    /// [`emit_metric`]: LiveObservabilitySubstrate::emit_metric
+    metric_registry: crate::instrument::MetricRegistry,
 }
 
 impl LiveObservabilitySubstrate {
@@ -142,6 +150,7 @@ impl LiveObservabilitySubstrate {
             alerts,
             notifier: RecordingNotifier::default(),
             tick_wallclock: std::collections::BTreeMap::new(),
+            metric_registry: crate::instrument::MetricRegistry::new(),
         }
     }
 
@@ -234,6 +243,210 @@ impl LiveObservabilitySubstrate {
         let event = SpanEvent::root(trace_id, span_id, operation).with_component(component);
         self.traces
             .record(&mut self.store, &mut self.index, &event, tick)
+    }
+
+    // --------------------- Generic component emit surface --------------------
+    //
+    // The uniform per-component instrumentation path (see `crate::instrument`).
+    // Every method preserves the SAME proven invariants the node-self producers
+    // do: a kind that is disabled (or, for logs, below the min level) writes
+    // nothing; correlation spines are registered so cross-kind pivot works;
+    // metadata observations dedup unchanged snapshots (no double count). The
+    // only additions are (a) arbitrary caller `extra` labels merged over the
+    // node base labels, and (b) a `Cx` correlation carried on any kind.
+
+    /// Register a component metric series so [`emit_metric`] can stamp its
+    /// type/unit/component labels. Idempotent for the same descriptor;
+    /// returns `false` if a different descriptor is already registered under
+    /// the name (the first registration stands).
+    ///
+    /// [`emit_metric`]: LiveObservabilitySubstrate::emit_metric
+    pub fn register_metric(&mut self, descriptor: crate::instrument::MetricDescriptor) -> bool {
+        self.metric_registry.register(descriptor)
+    }
+
+    /// The metric registry (read-only) — the reader's source of a series'
+    /// type/unit so it applies the right aggregation.
+    #[must_use]
+    pub fn metric_registry(&self) -> &crate::instrument::MetricRegistry {
+        &self.metric_registry
+    }
+
+    /// Merge the node base labels, a `metric=<name>` label, the descriptor's
+    /// `mtype`/`unit`/`component` labels, and any caller `extra` labels into
+    /// one label set.
+    fn metric_labels(
+        &self,
+        descriptor: &crate::instrument::MetricDescriptor,
+        extra: &LabelSet,
+    ) -> LabelSet {
+        let mut labels = self.node_labels.clone();
+        labels.insert(
+            crate::metadata_index::METRIC_NAME_LABEL.to_string(),
+            descriptor.name.clone(),
+        );
+        for (k, v) in descriptor.label_pairs() {
+            labels.insert(k.to_string(), v);
+        }
+        for (k, v) in extra {
+            labels.insert(k.clone(), v.clone());
+        }
+        labels
+    }
+
+    /// Emit one reading of a component metric series at logical `tick`.
+    ///
+    /// Fail-closed: an UNREGISTERED series name writes nothing and returns
+    /// `None` — a metric whose type/unit is unknown would be mis-aggregated by
+    /// a reader, so it is rejected rather than emitted with a fabricated type.
+    /// The payload matches the node-self metric wire format exactly
+    /// (`"<name> <value> @<tick>"`), so a component series renders through the
+    /// identical query path as a node series.
+    pub fn emit_metric(
+        &mut self,
+        name: &str,
+        value: f64,
+        extra: &LabelSet,
+        tick: u64,
+    ) -> Option<SignalId> {
+        let descriptor = self.metric_registry.get(name)?.clone();
+        let labels = self.metric_labels(&descriptor, extra);
+        let payload = format!("{name} {value} @{tick}");
+        self.store
+            .write_labeled(SignalKind::Metric, payload.into_bytes(), labels, tick)
+    }
+
+    /// Emit one component-scoped log occurrence at logical `tick`, optionally
+    /// correlated by a [`Cx`] so it pivots with a concurrent metric/span/
+    /// profile of the same causal thread, and with arbitrary `extra` labels.
+    /// Honors the same min-level gate as [`record_log`]: an occurrence below
+    /// the configured minimum writes nothing.
+    ///
+    /// [`record_log`]: LiveObservabilitySubstrate::record_log
+    /// [`Cx`]: crate::instrument::Cx
+    pub fn emit_log(
+        &mut self,
+        level: LogLevel,
+        message: impl Into<String>,
+        component: impl Into<String>,
+        cx: Option<&crate::instrument::Cx>,
+        extra: &LabelSet,
+        tick: u64,
+    ) -> Option<SignalId> {
+        let event = match cx {
+            Some(cx) => LogEvent::correlated(level, message, cx.correlation.0.clone())
+                .with_component(component),
+            None => LogEvent::new(level, message).with_component(component),
+        };
+        self.logs
+            .record_with(&mut self.store, &mut self.index, &event, extra, tick)
+    }
+
+    /// Emit one component-scoped trace span at logical `tick`, correlated by
+    /// `cx` (its correlation id is the trace id), parented at `cx.span` when a
+    /// parent span is open, with arbitrary `extra` labels. Honors the same
+    /// enabled gate as [`record_span`] (tracing OFF -> writes nothing).
+    ///
+    /// [`record_span`]: LiveObservabilitySubstrate::record_span
+    pub fn emit_span(
+        &mut self,
+        cx: &crate::instrument::Cx,
+        span_id: impl Into<String>,
+        operation: impl Into<String>,
+        component: impl Into<String>,
+        extra: &LabelSet,
+        tick: u64,
+    ) -> Option<SignalId> {
+        let operation = operation.into();
+        let event = match &cx.span {
+            Some(parent) => {
+                SpanEvent::child(cx.correlation.0.clone(), span_id, parent.clone(), operation)
+            }
+            None => SpanEvent::root(cx.correlation.0.clone(), span_id, operation),
+        }
+        .with_component(component);
+        self.traces
+            .record_with(&mut self.store, &mut self.index, &event, extra, tick)
+    }
+
+    /// Emit one component profile sample at logical `tick`: `weight` (the
+    /// sample's cost, e.g. cpu ticks or bytes) attributed to `stack` (root ->
+    /// leaf frames, one per line). Honors the same enabled gate as the node
+    /// profiling producer (profiling OFF -> writes nothing).
+    pub fn emit_profile(
+        &mut self,
+        profile_kind: crate::ProfileKind,
+        weight: u64,
+        stack: impl Into<String>,
+        component: impl Into<String>,
+        extra: &LabelSet,
+        tick: u64,
+    ) -> Option<SignalId> {
+        if !self.profiles.is_enabled() {
+            return None;
+        }
+        let name = profile_kind.name();
+        let mut labels = self.node_labels.clone();
+        labels.insert("profile".to_string(), name.to_string());
+        labels.insert(
+            crate::instrument::COMPONENT_LABEL.to_string(),
+            component.into(),
+        );
+        for (k, v) in extra {
+            labels.insert(k.clone(), v.clone());
+        }
+        let payload = format!("{name} {weight} @{tick}\n{}", stack.into());
+        self.store.write_labeled(
+            SignalKind::ProfileSample,
+            payload.into_bytes(),
+            labels,
+            tick,
+        )
+    }
+
+    /// Record a component entity's current label set at logical `tick` — the
+    /// per-component metadata-over-time observation. Dedups an unchanged
+    /// snapshot through the same [`MetadataStore`] the node metadata producer
+    /// uses (NoDoubleCount), and writes a `MetadataSample` signal so the
+    /// observation is queryable. Returns the signal id when a NEW observation
+    /// was written (labels changed since the last one for this entity), else
+    /// `None`.
+    pub fn observe_metadata(
+        &mut self,
+        entity: EntityId,
+        entity_labels: LabelSet,
+        component: impl Into<String>,
+        tick: u64,
+    ) -> Option<SignalId> {
+        // Feed the label-over-time view; it returns a transition only when the
+        // snapshot genuinely changed, which is exactly when we emit a signal.
+        let transition = self.metadata.ingest(crate::metadata::LabelObservation::new(
+            entity.clone(),
+            entity_labels.clone(),
+            tick,
+        ));
+        transition.as_ref()?;
+        let mut labels = self.node_labels.clone();
+        for (k, v) in &entity_labels {
+            labels.insert(k.clone(), v.clone());
+        }
+        labels.insert("entity".to_string(), entity.0.clone());
+        labels.insert(
+            crate::instrument::COMPONENT_LABEL.to_string(),
+            component.into(),
+        );
+        let mut kv: Vec<String> = entity_labels
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        kv.sort();
+        let payload = format!("entity={} {} @{}", entity.0, kv.join(" "), tick);
+        self.store.write_labeled(
+            SignalKind::MetadataSample,
+            payload.into_bytes(),
+            labels,
+            tick,
+        )
     }
 
     // ------------------------------- Read paths ------------------------------
@@ -438,5 +651,288 @@ impl LiveObservabilitySubstrate {
     #[must_use]
     pub fn pivot_by_correlation(&self, correlation: &CorrelationId) -> BTreeSet<SignalId> {
         self.index.by_correlation(correlation)
+    }
+}
+
+/// A per-component instrumentation handle: the one object a pillar component
+/// holds to emit across all five signal kinds without ever touching the five
+/// producers directly.
+///
+/// It bundles (a) the shared substrate handle, (b) the emitting `component`
+/// name, and (c) `base_labels` baked into every signal (e.g. a subsystem or a
+/// role dimension). A component clones a probe cheaply (both fields are
+/// shared/small) and threads a [`Cx`](crate::instrument::Cx) through its hot
+/// path so its log/metric/span/profile of one operation correlate.
+///
+/// Every method locks the shared substrate briefly and forwards to the
+/// substrate's generic emit surface, so a probe cannot bypass the proven
+/// gating/dedup invariants — it is a convenience facade, not a second path.
+#[derive(Clone)]
+pub struct ComponentProbe {
+    component: String,
+    base_labels: LabelSet,
+    substrate: std::sync::Arc<std::sync::Mutex<LiveObservabilitySubstrate>>,
+}
+
+impl ComponentProbe {
+    /// A probe for `component`, sharing `substrate`, stamping `base_labels`
+    /// onto every signal it emits.
+    #[must_use]
+    pub fn new(
+        component: impl Into<String>,
+        base_labels: LabelSet,
+        substrate: std::sync::Arc<std::sync::Mutex<LiveObservabilitySubstrate>>,
+    ) -> ComponentProbe {
+        ComponentProbe {
+            component: component.into(),
+            base_labels,
+            substrate,
+        }
+    }
+
+    /// The component this probe emits as.
+    #[must_use]
+    pub fn component(&self) -> &str {
+        &self.component
+    }
+
+    /// Register a metric series this component will emit. Idempotent; returns
+    /// `false` on a conflicting redefinition (see
+    /// [`MetricRegistry::register`](crate::instrument::MetricRegistry::register)).
+    pub fn register_metric(&self, descriptor: crate::instrument::MetricDescriptor) -> bool {
+        self.lock().register_metric(descriptor)
+    }
+
+    /// Emit one reading of a registered metric series at `tick`.
+    pub fn metric(&self, name: &str, value: f64, tick: u64) -> Option<SignalId> {
+        let base = self.base_labels.clone();
+        self.lock().emit_metric(name, value, &base, tick)
+    }
+
+    /// Emit one component log occurrence at `tick`, optionally correlated.
+    pub fn log(
+        &self,
+        level: LogLevel,
+        message: impl Into<String>,
+        cx: Option<&crate::instrument::Cx>,
+        tick: u64,
+    ) -> Option<SignalId> {
+        let (component, base) = (self.component.clone(), self.base_labels.clone());
+        self.lock()
+            .emit_log(level, message, component, cx, &base, tick)
+    }
+
+    /// Emit one component trace span at `tick`, correlated by `cx`.
+    pub fn span(
+        &self,
+        cx: &crate::instrument::Cx,
+        span_id: impl Into<String>,
+        operation: impl Into<String>,
+        tick: u64,
+    ) -> Option<SignalId> {
+        let (component, base) = (self.component.clone(), self.base_labels.clone());
+        self.lock()
+            .emit_span(cx, span_id, operation, component, &base, tick)
+    }
+
+    /// Emit one component profile sample at `tick`.
+    pub fn profile(
+        &self,
+        profile_kind: crate::ProfileKind,
+        weight: u64,
+        stack: impl Into<String>,
+        tick: u64,
+    ) -> Option<SignalId> {
+        let (component, base) = (self.component.clone(), self.base_labels.clone());
+        self.lock()
+            .emit_profile(profile_kind, weight, stack, component, &base, tick)
+    }
+
+    /// Record a component entity's current labels at `tick` (metadata-over-
+    /// time). Returns the signal id only when the labels changed.
+    pub fn observe(
+        &self,
+        entity: EntityId,
+        entity_labels: LabelSet,
+        tick: u64,
+    ) -> Option<SignalId> {
+        let component = self.component.clone();
+        self.lock()
+            .observe_metadata(entity, entity_labels, component, tick)
+    }
+
+    /// Lock the shared substrate, recovering a poisoned lock (a panic in
+    /// another holder must not wedge every component's instrumentation).
+    fn lock(&self) -> std::sync::MutexGuard<'_, LiveObservabilitySubstrate> {
+        self.substrate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::instrument::{Cx, MetricDescriptor, MetricType};
+    use crate::metadata_index::METRIC_NAME_LABEL;
+
+    fn substrate() -> LiveObservabilitySubstrate {
+        let mut node_labels = LabelSet::new();
+        node_labels.insert("node".to_string(), "n-probe".to_string());
+        let counters = NodeCounters::new();
+        let metadata_source = NodeMetadataSource::new(
+            "n-probe",
+            Some("cell-probe".to_string()),
+            std::iter::once("n-probe".to_string()),
+            "0.0.0",
+            None,
+        );
+        LiveObservabilitySubstrate::new(node_labels, counters, metadata_source, 256, 100_000)
+    }
+
+    /// A registered component metric emits a real Metric signal that carries
+    /// the series name AND the descriptor's type/unit/component labels, and is
+    /// queryable through the same path as a node self-metric.
+    #[test]
+    fn registered_component_metric_emits_with_type_unit_component_labels() {
+        let mut sub = substrate();
+        assert!(sub.register_metric(MetricDescriptor::new(
+            "ipam_pool_used_bytes",
+            MetricType::Gauge,
+            "bytes",
+            "ipam",
+        )));
+        let id = sub
+            .emit_metric("ipam_pool_used_bytes", 4096.0, &LabelSet::new(), 5)
+            .expect("registered metric emits");
+        let rec = sub
+            .explore(SignalKind::Metric)
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("the emitted metric is held and explorable");
+        assert_eq!(rec.payload, "ipam_pool_used_bytes 4096 @5");
+        assert_eq!(
+            rec.labels.get(METRIC_NAME_LABEL).map(String::as_str),
+            Some("ipam_pool_used_bytes")
+        );
+        assert_eq!(rec.labels.get("mtype").map(String::as_str), Some("gauge"));
+        assert_eq!(rec.labels.get("unit").map(String::as_str), Some("bytes"));
+        assert_eq!(
+            rec.labels.get("component").map(String::as_str),
+            Some("ipam")
+        );
+    }
+
+    /// Fail-closed: emitting an UNREGISTERED series writes nothing (no
+    /// fabricated-type metric ever reaches the store).
+    #[test]
+    fn unregistered_metric_is_rejected_and_writes_nothing() {
+        let mut sub = substrate();
+        let before = sub.count_of_kind(SignalKind::Metric);
+        assert!(sub
+            .emit_metric("never_registered", 1.0, &LabelSet::new(), 1)
+            .is_none());
+        assert_eq!(sub.count_of_kind(SignalKind::Metric), before);
+    }
+
+    /// A correlated log + span emitted under one `Cx` pivot together through
+    /// the correlation index (cross-kind correlation works for component
+    /// emissions, not just node self-signals).
+    #[test]
+    fn correlated_component_log_and_span_pivot_together() {
+        let mut sub = substrate();
+        let cx = Cx::new("req-7");
+        let log_id = sub
+            .emit_log(
+                LogLevel::Warn,
+                "slow allocate",
+                "ipam",
+                Some(&cx),
+                &LabelSet::new(),
+                3,
+            )
+            .expect("warn log captured at default info level");
+        let cx = cx.in_span("span-a");
+        let span_id = sub
+            .emit_span(&cx, "span-a", "allocate", "ipam", &LabelSet::new(), 3)
+            .expect("tracing enabled on the live substrate");
+        let pivot =
+            sub.pivot_by_correlation(&crate::correlation::CorrelationId("req-7".to_owned()));
+        assert!(pivot.contains(&log_id), "log is on the causal thread");
+        assert!(
+            pivot.contains(&span_id),
+            "span is on the same causal thread"
+        );
+    }
+
+    /// A parented span carries the parent-span edge and its `component` label.
+    #[test]
+    fn component_span_records_parent_edge() {
+        let mut sub = substrate();
+        let root = Cx::new("trace-1");
+        sub.emit_span(&root, "s1", "reconcile", "controller", &LabelSet::new(), 1);
+        let child = root.in_span("s1");
+        let child_id = sub
+            .emit_span(&child, "s2", "apply", "controller", &LabelSet::new(), 2)
+            .expect("child span recorded");
+        let rec = sub
+            .explore(SignalKind::TraceSpan)
+            .into_iter()
+            .find(|r| r.id == child_id)
+            .expect("child span held");
+        assert!(
+            rec.payload.contains("parent=s1"),
+            "parent edge: {}",
+            rec.payload
+        );
+        assert_eq!(
+            rec.labels.get("component").map(String::as_str),
+            Some("controller")
+        );
+    }
+
+    /// A component metadata observation writes a MetadataSample on FIRST
+    /// observation, dedups an unchanged snapshot (NoDoubleCount), and emits
+    /// again only when the labels genuinely change.
+    #[test]
+    fn component_metadata_observation_dedups_unchanged_snapshots() {
+        let mut sub = substrate();
+        let entity = EntityId("ipam-pool/default".to_owned());
+        let mut labels = LabelSet::new();
+        labels.insert("free".to_string(), "250".to_string());
+        assert!(sub
+            .observe_metadata(entity.clone(), labels.clone(), "ipam", 1)
+            .is_some());
+        // Same snapshot again -> deduped, no new signal.
+        assert!(sub
+            .observe_metadata(entity.clone(), labels.clone(), "ipam", 2)
+            .is_none());
+        // Changed snapshot -> a new observation is emitted.
+        labels.insert("free".to_string(), "249".to_string());
+        assert!(sub.observe_metadata(entity, labels, "ipam", 3).is_some());
+    }
+
+    /// The `ComponentProbe` facade emits through the shared substrate: a metric
+    /// registered and emitted via a probe is visible on the substrate.
+    #[test]
+    fn component_probe_emits_through_shared_substrate() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(substrate()));
+        let mut base = LabelSet::new();
+        base.insert("subsystem".to_string(), "allocator".to_string());
+        let probe = ComponentProbe::new("ipam", base, shared.clone());
+        assert!(probe.register_metric(MetricDescriptor::counter("ipam_allocations_total", "ipam")));
+        let id = probe
+            .metric("ipam_allocations_total", 1.0, 9)
+            .expect("probe emits the registered metric");
+        let sub = shared.lock().unwrap();
+        let rec = sub
+            .explore(SignalKind::Metric)
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("probe-emitted metric held on the shared substrate");
+        // The probe's base labels ride the signal.
+        assert_eq!(
+            rec.labels.get("subsystem").map(String::as_str),
+            Some("allocator")
+        );
+        assert_eq!(rec.labels.get("mtype").map(String::as_str), Some("counter"));
     }
 }
