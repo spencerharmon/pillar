@@ -123,6 +123,13 @@ pub struct Attestation {
 pub struct AuthChallenge {
     /// Base64url-encoded random challenge.
     pub challenge_b64: String,
+    /// The relying-party id the assertion is scoped to (needed by
+    /// `navigator.credentials.get()` so the browser can match the credential).
+    pub rp_id: String,
+    /// The user's enrolled credential id(s), base64url, for `allowCredentials`.
+    /// Without these a non-discoverable hardware credential cannot be located
+    /// and the ceremony fails as a NotAllowedError.
+    pub allow_credentials: Vec<String>,
 }
 
 /// The assertion an authentication ceremony's `get()` step produces,
@@ -201,13 +208,25 @@ pub fn authenticate_begin_body(token: &str) -> String {
     token.to_owned()
 }
 
-/// Parses a `/webauthn/authenticate/begin` response: `CHALLENGE <b64>`.
+/// Parses a `/webauthn/authenticate/begin` response:
+/// `CHALLENGE <b64> <rp_id> <allow-cred-csv>` (the rp_id/allow fields may be
+/// empty/absent for backward compatibility).
 pub fn parse_authenticate_begin(body: &str) -> Result<AuthChallenge, CeremonyError> {
-    let mut parts = body.trim().splitn(2, ' ');
-    match (parts.next(), parts.next()) {
-        (Some("CHALLENGE"), Some(challenge)) if !challenge.is_empty() => Ok(AuthChallenge {
-            challenge_b64: challenge.to_owned(),
-        }),
+    let mut parts = body.trim().splitn(4, ' ');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("CHALLENGE"), Some(challenge), rp_opt, allow_opt) if !challenge.is_empty() => {
+            let allow_credentials = allow_opt
+                .unwrap_or("")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Ok(AuthChallenge {
+                challenge_b64: challenge.to_owned(),
+                rp_id: rp_opt.unwrap_or("").to_owned(),
+                allow_credentials,
+            })
+        }
         _ => Err(CeremonyError::Protocol(format!(
             "malformed authenticate/begin response: {body:?}"
         ))),
@@ -373,7 +392,8 @@ mod browser {
     use web_sys::{
         AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, AuthenticatorResponse,
         CredentialCreationOptions, CredentialRequestOptions, CredentialsContainer,
-        PublicKeyCredential, PublicKeyCredentialCreationOptions, PublicKeyCredentialParameters,
+        PublicKeyCredential, PublicKeyCredentialCreationOptions, PublicKeyCredentialDescriptor,
+        PublicKeyCredentialParameters,
         PublicKeyCredentialRequestOptions, PublicKeyCredentialRpEntity,
         PublicKeyCredentialType, PublicKeyCredentialUserEntity,
     };
@@ -529,6 +549,28 @@ mod browser {
             let mut challenge_bytes = b64_decode(&challenge.challenge_b64)?;
             let pkc_options =
                 PublicKeyCredentialRequestOptions::new_with_u8_slice(&mut challenge_bytes);
+            // Scope the assertion to the RP so the browser matches the
+            // credential.
+            if !challenge.rp_id.is_empty() {
+                pkc_options.set_rp_id(&challenge.rp_id);
+            }
+            // Populate `allowCredentials` with the user's enrolled credential
+            // id(s): a non-discoverable hardware credential can ONLY be located
+            // by the authenticator when its id is offered here. Omitting this is
+            // what makes a real security key fail the ceremony as a
+            // NotAllowedError (surfaced as a "cancelled" prompt).
+            if !challenge.allow_credentials.is_empty() {
+                let allow = Array::new();
+                for id_b64 in &challenge.allow_credentials {
+                    let mut id_bytes = b64_decode(id_b64)?;
+                    let descriptor = PublicKeyCredentialDescriptor::new_with_u8_slice(
+                        &mut id_bytes,
+                        PublicKeyCredentialType::PublicKey,
+                    );
+                    allow.push(&descriptor);
+                }
+                pkc_options.set_allow_credentials(allow.as_ref());
+            }
             let options = CredentialRequestOptions::new();
             options.set_public_key(&pkc_options);
             let promise = creds.get_with_options(&options).map_err(js_err)?;

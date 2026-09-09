@@ -5073,7 +5073,7 @@ fn dispatch_webauthn_register_finish(
 
 /// `POST /webauthn/authenticate/begin` — mint a fresh, single-use, time-bounded
 /// assertion challenge bound to the caller's session/cell. Body:
-/// `<session-token>`. Returns `CHALLENGE <b64url>`.
+/// `<session-token>`. Returns `CHALLENGE <b64url> <rp_id> <allow-cred-csv>`.
 fn dispatch_webauthn_authenticate_begin(
     ctx: &mut WebAuthContext,
     request: &HttpRequest,
@@ -5088,7 +5088,24 @@ fn dispatch_webauthn_authenticate_begin(
         .webauthn_rp
         .begin(&session, &cell, now, WEBAUTHN_CHALLENGE_TTL);
     let b64 = pillar_crypto::webauthn::base64url_encode(&challenge);
-    text_response(200, "OK", format!("CHALLENGE {b64}"))
+    // Return the user's enrolled credential id(s) so the browser's
+    // navigator.credentials.get() can populate `allowCredentials`. WITHOUT this,
+    // a non-discoverable (non-resident) security-key credential — the default
+    // for a hardware key — cannot be located by the authenticator, and the
+    // ceremony fails as a NotAllowedError (surfaced to the user as a "cancelled"
+    // prompt). The credentials are filed under the session subject (`cell`).
+    let allow: Vec<String> = ctx
+        .webauthn_rp
+        .user_credential_ids(&cell)
+        .iter()
+        .map(|c| pillar_crypto::webauthn::base64url_encode(c))
+        .collect();
+    let allow_csv = allow.join(",");
+    text_response(
+        200,
+        "OK",
+        format!("CHALLENGE {b64} {} {allow_csv}", ctx.origin_rp_id()),
+    )
 }
 
 /// `POST /webauthn/authenticate/finish` — verify the assertion and derive the
@@ -6703,6 +6720,56 @@ mod tests {
             fin.status, 403,
             "a credential not owned by the logging-in user must be refused: {}",
             fin.body
+        );
+    }
+
+    #[test]
+    fn authenticate_begin_returns_rp_id_and_the_users_allow_credentials() {
+        // Regression: a non-discoverable hardware credential can only be located
+        // by the authenticator if authenticate/begin offers its id in the
+        // allow-list. Omitting it made a real security key fail get() as a
+        // NotAllowedError ("cancelled").
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let (att, _secret, _cose) = webauthn_authenticator("browser-auth", b"cred-web", 0);
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/webauthn/register/finish",
+                &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+            )
+            .status,
+            200
+        );
+        let nid = get(&mut ctx, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let ptoken = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"))
+            .session_token
+            .expect("pending token");
+        let begin = post(&mut ctx, "/webauthn/authenticate/begin", &ptoken);
+        assert_eq!(begin.status, 200, "{}", begin.body);
+        let parts: Vec<&str> = begin.body.split_whitespace().collect();
+        assert_eq!(parts[0], "CHALLENGE");
+        assert!(!parts[1].is_empty(), "challenge present: {}", begin.body);
+        assert!(
+            parts.len() >= 3 && !parts[2].is_empty(),
+            "rp_id present: {}",
+            begin.body
+        );
+        let want = pillar_crypto::webauthn::base64url_encode(b"cred-web");
+        assert!(
+            begin.body.contains(&want),
+            "allowCredentials must list the enrolled credential id: {}",
+            begin.body
         );
     }
 

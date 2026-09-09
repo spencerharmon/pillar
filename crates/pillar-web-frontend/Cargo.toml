@@ -101,6 +101,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "PublicKeyCredential",
     "PublicKeyCredentialCreationOptions",
     "PublicKeyCredentialRequestOptions",
+    "PublicKeyCredentialDescriptor",
     "PublicKeyCredentialRpEntity",
     "PublicKeyCredentialUserEntity",
     "PublicKeyCredentialParameters",
