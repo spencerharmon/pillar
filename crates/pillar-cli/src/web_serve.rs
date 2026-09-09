@@ -413,6 +413,20 @@ pub struct WebAuthContext {
     /// back into a fresh context on boot: suppresses [`WebAuthContext::record`]
     /// so replaying an op never re-appends it to the durable log.
     replaying: bool,
+    /// The next monotonic sequence number [`WebAuthContext::record`] stamps
+    /// onto a journaled op. The durable backend is CONTENT-addressed (its
+    /// `order()` is sorted by content address, NOT append order — see
+    /// `pillar_streamdb::persist`), so a replay that depended on that order
+    /// would apply ops in an effectively random sequence. Several
+    /// [`PortalOp`] variants (notably every resource/topology/trust act,
+    /// which requires the acting subject to already be admitted by an
+    /// earlier `BootstrapCellAndUser`/`AddMember`) are NOT order-independent,
+    /// so [`WebAuthContext::replay`] sorts by this stamped sequence to
+    /// reconstruct the ORIGINAL causal append order before applying anything.
+    /// Restarts continuing to append: seeded past the highest sequence seen
+    /// during replay, so a later session's new ops always sort after every
+    /// earlier session's.
+    next_op_seq: u64,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -480,6 +494,86 @@ enum PortalOp {
     StoreLayout {
         signer: String,
         content: String,
+    },
+    /// Resource-plane `apply` (declarative workload upsert) — the durable
+    /// counterpart of [`WebAuthContext::resource_apply`], so a restarted node
+    /// rehydrates every workload manifest the portal ever applied, not just
+    /// the login path.
+    ResourceApply {
+        actor: String,
+        name: String,
+        image: String,
+        replicas: i64,
+    },
+    /// Resource-plane `edit` (patch a workload's image) — durable counterpart
+    /// of [`WebAuthContext::resource_edit`].
+    ResourceEdit {
+        actor: String,
+        name: String,
+        new_image: String,
+    },
+    /// Resource-plane `scale` — durable counterpart of
+    /// [`WebAuthContext::resource_scale`].
+    ResourceScale {
+        actor: String,
+        name: String,
+        replicas: i64,
+    },
+    /// Resource-plane `rollout restart` — durable counterpart of
+    /// [`WebAuthContext::resource_rollout`].
+    ResourceRollout { actor: String, name: String },
+    /// Resource-plane `apply` for a scheduled (`CronJob`/`Job`) manifest —
+    /// durable counterpart of [`WebAuthContext::resource_apply_cronjob`] /
+    /// [`WebAuthContext::resource_apply_job`].
+    ResourceApplyScheduled {
+        actor: String,
+        kind: String,
+        name: String,
+        schedule_secs: f64,
+        command: String,
+    },
+    /// Resource-plane `delete` for a scheduled (`CronJob`/`Job`) manifest —
+    /// durable counterpart of [`WebAuthContext::resource_delete_cronjob`].
+    ResourceDeleteScheduled {
+        actor: String,
+        kind: String,
+        name: String,
+    },
+    /// The topology explorer's live node health/capacity registration —
+    /// durable counterpart of [`WebAuthContext::topology_register_node`].
+    TopologyRegisterNode {
+        node: String,
+        health: String,
+        capacity: u64,
+    },
+    /// A self-declared topology label set for a node — durable counterpart of
+    /// [`WebAuthContext::topology_declare`].
+    TopologyDeclare {
+        node: String,
+        labels: Vec<(String, String)>,
+    },
+    /// A signed trust attestation issued through the attestation builder —
+    /// durable counterpart of [`WebAuthContext::build_attestation`].
+    /// `capacity` is `("self", "")` for [`TrustCapacity::SelfCap`] or
+    /// `("role", "<role>@<scope>")` for [`TrustCapacity::Role`].
+    BuildAttestation {
+        issuer: String,
+        capacity_tag: String,
+        capacity_role: String,
+        capacity_scope: String,
+        authority: Option<String>,
+        subject: String,
+        action: String,
+        resource: String,
+        quota: Option<u64>,
+        scope: String,
+    },
+    /// A saved observability dashboard — durable counterpart of
+    /// [`WebAuthContext::save_observability_dashboard`].
+    SaveObservabilityDashboard {
+        signer: String,
+        name: String,
+        spec: String,
     },
 }
 
@@ -706,6 +800,7 @@ impl WebAuthContext {
             scheduler_runtime: None,
             journal: None,
             replaying: false,
+            next_op_seq: 0,
         }
     }
 
@@ -762,6 +857,9 @@ impl WebAuthContext {
             return;
         };
         let mut payload = PORTAL_OP_TAG.to_vec();
+        let seq = self.next_op_seq;
+        self.next_op_seq += 1;
+        payload.extend_from_slice(&seq.to_be_bytes());
         match serde_json::to_vec(op) {
             Ok(json) => payload.extend_from_slice(&json),
             Err(e) => {
@@ -783,18 +881,28 @@ impl WebAuthContext {
 
     /// Fold a persisted portal-op log back into this (freshly constructed)
     /// context on boot — the inverse of [`Self::record`]. `ops` is the durable
-    /// op-payload set in apply order (`stream.stream().log().order()` bytes);
-    /// non-portal ops (no [`PORTAL_OP_TAG`]) and any that fail to decode are
-    /// skipped, so a shared multi-node streaming DB carrying gossiped event-log
-    /// messages replays cleanly. Every applied op re-runs the SAME deterministic
-    /// mutator the live act used, with recording suppressed. Call BEFORE serving.
+    /// op-payload set (`stream.stream().log().order()` bytes) in whatever
+    /// order the CONTENT-addressed backend returns them — NOT necessarily
+    /// original append order (see [`Self::next_op_seq`]); non-portal ops (no
+    /// [`PORTAL_OP_TAG`]) and any that fail to decode are skipped, so a shared
+    /// multi-node streaming DB carrying gossiped event-log messages replays
+    /// cleanly. Every decoded op is sorted by its stamped sequence number and
+    /// THEN applied in that (original, causal) order, each re-running the SAME
+    /// deterministic mutator the live act used, with recording suppressed.
+    /// Call BEFORE serving.
     pub fn replay(&mut self, ops: &[Vec<u8>]) {
         self.replaying = true;
-        let mut applied = 0usize;
+        let mut decoded: Vec<(u64, PortalOp)> = Vec::new();
         for raw in ops {
-            let Some(json) = raw.strip_prefix(PORTAL_OP_TAG) else {
+            let Some(rest) = raw.strip_prefix(PORTAL_OP_TAG) else {
                 continue;
             };
+            if rest.len() < 8 {
+                tracing::warn!("portal journal: skipping op payload too short for a sequence stamp");
+                continue;
+            }
+            let (seq_bytes, json) = rest.split_at(8);
+            let seq = u64::from_be_bytes(seq_bytes.try_into().expect("exactly 8 bytes"));
             let op: PortalOp = match serde_json::from_slice(json) {
                 Ok(op) => op,
                 Err(e) => {
@@ -802,10 +910,18 @@ impl WebAuthContext {
                     continue;
                 }
             };
+            decoded.push((seq, op));
+        }
+        decoded.sort_by_key(|(seq, _)| *seq);
+        let applied = decoded.len();
+        let max_seq = decoded.last().map(|(seq, _)| *seq);
+        for (_, op) in decoded {
             self.apply_replayed(op);
-            applied += 1;
         }
         self.replaying = false;
+        if let Some(max_seq) = max_seq {
+            self.next_op_seq = max_seq + 1;
+        }
         if applied > 0 {
             tracing::info!(
                 applied,
@@ -870,6 +986,97 @@ impl WebAuthContext {
             PortalOp::StoreLayout { signer, content } => {
                 self.layouts
                     .append(format!("{signer}\n{content}").into_bytes());
+            }
+            PortalOp::ResourceApply {
+                actor,
+                name,
+                image,
+                replicas,
+            } => {
+                let _ = self.resource_apply(&NodeId::from(actor.as_str()), &name, &image, replicas);
+            }
+            PortalOp::ResourceEdit {
+                actor,
+                name,
+                new_image,
+            } => {
+                let _ = self.resource_edit(&NodeId::from(actor.as_str()), &name, &new_image);
+            }
+            PortalOp::ResourceScale {
+                actor,
+                name,
+                replicas,
+            } => {
+                let _ = self.resource_scale(&NodeId::from(actor.as_str()), &name, replicas);
+            }
+            PortalOp::ResourceRollout { actor, name } => {
+                let _ = self.resource_rollout(&NodeId::from(actor.as_str()), &name);
+            }
+            PortalOp::ResourceApplyScheduled {
+                actor,
+                kind,
+                name,
+                schedule_secs,
+                command,
+            } => {
+                let _ = self.resource_apply_scheduled(
+                    &NodeId::from(actor.as_str()),
+                    &kind,
+                    &name,
+                    schedule_secs,
+                    &command,
+                );
+            }
+            PortalOp::ResourceDeleteScheduled { actor, kind, name } => {
+                let _ = self.resource_delete_cronjob(&NodeId::from(actor.as_str()), &kind, &name);
+            }
+            PortalOp::TopologyRegisterNode {
+                node,
+                health,
+                capacity,
+            } => {
+                self.topology_register_node(&node, &health, capacity);
+            }
+            PortalOp::TopologyDeclare { node, labels } => {
+                let labels = labels
+                    .into_iter()
+                    .map(|(tier, value)| TopologyLabel::new(tier, value))
+                    .collect();
+                self.topology_declare(NodeId::from(node.as_str()), labels);
+            }
+            PortalOp::BuildAttestation {
+                issuer,
+                capacity_tag,
+                capacity_role,
+                capacity_scope,
+                authority,
+                subject,
+                action,
+                resource,
+                quota,
+                scope,
+            } => {
+                let capacity = if capacity_tag == "role" {
+                    TrustCapacity::Role {
+                        role: capacity_role,
+                        scope: capacity_scope,
+                    }
+                } else {
+                    TrustCapacity::SelfCap
+                };
+                let _ = self.build_attestation(
+                    NodeId::from(issuer.as_str()),
+                    capacity,
+                    authority.map(|a| TrustCid(a)),
+                    NodeId::from(subject.as_str()),
+                    &action,
+                    &resource,
+                    quota,
+                    &scope,
+                );
+            }
+            PortalOp::SaveObservabilityDashboard { signer, name, spec } => {
+                let _ = self.save_observability_dashboard(&signer, &name, &spec);
             }
         }
     }
@@ -1033,6 +1240,13 @@ impl WebAuthContext {
         // logs and skips scheduling rather than failing the already-recorded
         // signed manifest act — the manifest log is the source of truth).
         self.register_scheduler_job(name, schedule_secs, command);
+        self.record(&PortalOp::ResourceApplyScheduled {
+            actor: actor.to_string(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+            schedule_secs,
+            command: command.to_owned(),
+        });
         Ok(applied)
     }
 
@@ -1062,6 +1276,11 @@ impl WebAuthContext {
                 runtime.deregister(name);
             }
         }
+        self.record(&PortalOp::ResourceDeleteScheduled {
+            actor: actor.to_string(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        });
         Ok(applied)
     }
 
@@ -1629,7 +1848,26 @@ impl WebAuthContext {
         spec: &str,
     ) -> (OpId, pillar_streamdb::MerkleRoot) {
         let cid = self.observability.create_dashboard(signer, name, spec);
+        self.record(&PortalOp::SaveObservabilityDashboard {
+            signer: signer.to_owned(),
+            name: name.to_owned(),
+            spec: spec.to_owned(),
+        });
         (cid, self.observability.dashboard_tip())
+    }
+
+    /// Read back a saved observability dashboard by its content-addressed id
+    /// (the hex `OpId` [`Self::save_observability_dashboard`] returned) — the
+    /// dashboard builder's read half, so a client (and this task's restart
+    /// test) can confirm a saved dashboard is actually there, not just that
+    /// the save call returned 200.
+    #[must_use]
+    pub fn get_observability_dashboard(
+        &self,
+        dashboard_id_hex: &str,
+    ) -> Option<crate::observability_ui::DashboardView> {
+        let id = OpId::from_hex(dashboard_id_hex)?;
+        self.observability.get_dashboard(&id)
     }
 
     /// Read-only access to this session's global identity log — the
@@ -1832,6 +2070,14 @@ impl WebAuthContext {
         if let Some(q) = quota {
             predicate = predicate.with_quota(q);
         }
+        let (capacity_tag, capacity_role, capacity_scope) = match &capacity {
+            TrustCapacity::SelfCap => ("self".to_owned(), String::new(), String::new()),
+            TrustCapacity::Role { role, scope } => {
+                ("role".to_owned(), role.clone(), scope.clone())
+            }
+        };
+        let authority_for_record = authority.as_ref().map(|a| a.0.clone());
+        let subject_for_record = subject.to_string();
         let attest = Attest {
             issuer: issuer.clone(),
             capacity,
@@ -1851,6 +2097,18 @@ impl WebAuthContext {
             .map_err(|_| TrustError::CapacityNotHeld {
                 issuer: self.trust.genesis().clone(),
             })?;
+        self.record(&PortalOp::BuildAttestation {
+            issuer: issuer.to_string(),
+            capacity_tag,
+            capacity_role,
+            capacity_scope,
+            authority: authority_for_record,
+            subject: subject_for_record,
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+            quota,
+            scope: scope.to_owned(),
+        });
         Ok((cid, proof))
     }
 
@@ -1920,6 +2178,11 @@ impl WebAuthContext {
     pub fn topology_register_node(&mut self, node: &str, health: &str, capacity: u64) {
         self.topology_nodes
             .insert(node.to_owned(), (health.to_owned(), capacity));
+        self.record(&PortalOp::TopologyRegisterNode {
+            node: node.to_owned(),
+            health: health.to_owned(),
+            capacity,
+        });
     }
 
     /// Read-only access to the topology registry (hierarchy + resolved
@@ -1935,7 +2198,14 @@ impl WebAuthContext {
     /// basis for safety-critical placement (attested labels take
     /// precedence; see [`TopologyRegistry::placement`]).
     pub fn topology_declare(&mut self, node: NodeId, labels: Vec<TopologyLabel>) {
-        self.topology.declare(node, &labels);
+        self.topology.declare(node.clone(), &labels);
+        self.record(&PortalOp::TopologyDeclare {
+            node: node.to_string(),
+            labels: labels
+                .into_iter()
+                .map(|l| (l.tier, l.value))
+                .collect(),
+        });
     }
 
     /// Attest ONE topology label for `subject`, signed by `issuer` acting in
@@ -2443,6 +2713,12 @@ impl WebAuthContext {
         // Drive the real workload-runtime reconcile (fetch-by-CID + admit +
         // supervised spawn) toward the just-declared manifest state.
         self.drive_reconcile(name);
+        self.record(&PortalOp::ResourceApply {
+            actor: actor.to_string(),
+            name: name.to_owned(),
+            image: image.to_owned(),
+            replicas,
+        });
         Ok(applied)
     }
 
@@ -2464,6 +2740,14 @@ impl WebAuthContext {
                 CrdValue::String(new_image.to_owned()),
             )
             .map(|applied| format!("{}", applied.event.0))
+            .map(|applied| {
+                self.record(&PortalOp::ResourceEdit {
+                    actor: actor.to_string(),
+                    name: name.to_owned(),
+                    new_image: new_image.to_owned(),
+                });
+                applied
+            })
     }
 
     /// `scale --replicas N` (ACT): emit one signed scale event.
@@ -2483,6 +2767,11 @@ impl WebAuthContext {
             )
             .map(|applied| format!("{}", applied.event.0))?;
         self.drive_reconcile(name);
+        self.record(&PortalOp::ResourceScale {
+            actor: actor.to_string(),
+            name: name.to_owned(),
+            replicas,
+        });
         Ok(applied)
     }
 
@@ -2515,6 +2804,13 @@ impl WebAuthContext {
                 CrdValue::Integer(generation),
             )
             .map(|applied| format!("{}", applied.event.0))
+            .map(|applied| {
+                self.record(&PortalOp::ResourceRollout {
+                    actor: actor.to_string(),
+                    name: name.to_owned(),
+                });
+                applied
+            })
     }
 
     /// `logs`/`exec`/`port-forward` (VIEW-shaped runtime reach): these reach a
@@ -3756,6 +4052,11 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: PathMatch::Prefix("/portal/obs/dashboard/get"),
+        handler: |ctx, _peer, request| dispatch_obs_dashboard_get(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
         path: PathMatch::Prefix("/portal/swarm"),
         handler: |ctx, _peer, request| dispatch_swarm_view(ctx, request),
     },
@@ -4763,6 +5064,29 @@ fn dispatch_obs_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) -> Ht
     }
     let (cid, tip) = ctx.save_observability_dashboard(&session.subject.to_string(), name, spec);
     text_response(200, "OK", format!("OBS-DASHBOARD-CID {cid} TIP {tip}"))
+}
+
+/// Read back a saved dashboard: `GET /portal/obs/dashboard/get?token=<s>&id=<hex>`.
+/// Requires an admitted session. A pure view — signs nothing. 404 if no such
+/// dashboard exists (never created, or its latest event is a delete
+/// tombstone).
+fn dispatch_obs_dashboard_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let id = query_value(&request.path, "id").unwrap_or("");
+    match ctx.get_observability_dashboard(id) {
+        Some(view) => text_response(
+            200,
+            "OK",
+            format!(
+                "OBS-DASHBOARD-SIGNER {}\nOBS-DASHBOARD-NAME {}\nOBS-DASHBOARD-CONTENT {}\n",
+                view.signer, view.name, view.content
+            ),
+        ),
+        None => text_response(404, "Not Found", "NOT-FOUND".to_owned()),
+    }
 }
 
 /// Live-store per-kind counts: `GET /portal/obs/live/kinds?token=<s>`.
