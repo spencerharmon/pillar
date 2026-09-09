@@ -35,6 +35,8 @@
 //! This module holds only the dependency-free, host-tested *types*.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::correlation::CorrelationId;
 use crate::metadata::EntityId;
@@ -274,6 +276,134 @@ impl Cx {
     }
 }
 
+impl From<MetricType> for pillar_core::ObsMetricType {
+    fn from(t: MetricType) -> pillar_core::ObsMetricType {
+        match t {
+            MetricType::Counter => pillar_core::ObsMetricType::Counter,
+            MetricType::Gauge => pillar_core::ObsMetricType::Gauge,
+            MetricType::Histogram => pillar_core::ObsMetricType::Histogram,
+        }
+    }
+}
+
+impl From<pillar_core::ObsMetricType> for MetricType {
+    fn from(t: pillar_core::ObsMetricType) -> MetricType {
+        match t {
+            pillar_core::ObsMetricType::Counter => MetricType::Counter,
+            pillar_core::ObsMetricType::Gauge => MetricType::Gauge,
+            pillar_core::ObsMetricType::Histogram => MetricType::Histogram,
+        }
+    }
+}
+
+impl From<pillar_core::ObsLevel> for crate::LogLevel {
+    fn from(l: pillar_core::ObsLevel) -> crate::LogLevel {
+        match l {
+            pillar_core::ObsLevel::Trace => crate::LogLevel::Trace,
+            pillar_core::ObsLevel::Debug => crate::LogLevel::Debug,
+            pillar_core::ObsLevel::Info => crate::LogLevel::Info,
+            pillar_core::ObsLevel::Warn => crate::LogLevel::Warn,
+            pillar_core::ObsLevel::Error => crate::LogLevel::Error,
+        }
+    }
+}
+
+impl From<&pillar_core::ObsCx> for Cx {
+    fn from(c: &pillar_core::ObsCx) -> Cx {
+        Cx {
+            correlation: CorrelationId(c.correlation.clone()),
+            span: c.span.clone(),
+            entity: None,
+        }
+    }
+}
+
+/// A monotonically-advanced logical-tick cell shared between the node's tick
+/// loop and every [`ProbeObserver`], so a crate emitting through the inverted
+/// [`ObserverHook`](pillar_core::ObserverHook) seam is stamped with the current
+/// tick WITHOUT holding a clock itself. The composition root advances it once
+/// per node tick; observers read it on every emission.
+#[derive(Clone, Debug, Default)]
+pub struct TickClock(Arc<AtomicU64>);
+
+impl TickClock {
+    /// A clock starting at tick 0.
+    #[must_use]
+    pub fn new() -> TickClock {
+        TickClock(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Advance the shared clock to `tick` (the node's current logical tick).
+    /// Uses a max so an out-of-order caller never moves the clock backwards.
+    pub fn advance_to(&self, tick: u64) {
+        self.0.fetch_max(tick, Ordering::Relaxed);
+    }
+
+    /// The current logical tick.
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// The concrete [`ObserverHook`](pillar_core::ObserverHook) adapter that lets
+/// any low-level crate instrument itself without depending on
+/// `pillar-observability`.
+///
+/// It wraps a [`ComponentProbe`](crate::ComponentProbe) (the shared substrate +
+/// component name + base labels) and a [`TickClock`]; each trait call maps the
+/// dependency-free `pillar_core` value types to the observability types, reads
+/// the current tick from the clock, and forwards to the probe — so a crate's
+/// emission lands on the one shared store through the same proven, gated,
+/// retained path as a node self-signal.
+#[derive(Clone)]
+pub struct ProbeObserver {
+    probe: crate::ComponentProbe,
+    clock: TickClock,
+}
+
+impl ProbeObserver {
+    /// An observer forwarding to `probe`, stamping the tick from `clock`.
+    #[must_use]
+    pub fn new(probe: crate::ComponentProbe, clock: TickClock) -> ProbeObserver {
+        ProbeObserver { probe, clock }
+    }
+
+    /// The shared tick clock, so the composition root can advance it.
+    #[must_use]
+    pub fn clock(&self) -> &TickClock {
+        &self.clock
+    }
+}
+
+impl pillar_core::ObserverHook for ProbeObserver {
+    fn register_metric(
+        &self,
+        name: &str,
+        ty: pillar_core::ObsMetricType,
+        unit: &str,
+        component: &str,
+    ) {
+        self.probe
+            .register_metric(MetricDescriptor::new(name, ty.into(), unit, component));
+    }
+
+    fn metric(&self, name: &str, value: f64) {
+        self.probe.metric(name, value, self.clock.now());
+    }
+
+    fn log(&self, level: pillar_core::ObsLevel, message: &str, cx: Option<&pillar_core::ObsCx>) {
+        let cx: Option<Cx> = cx.map(Into::into);
+        self.probe
+            .log(level.into(), message, cx.as_ref(), self.clock.now());
+    }
+
+    fn span(&self, cx: &pillar_core::ObsCx, span_id: &str, operation: &str) {
+        let cx: Cx = cx.into();
+        self.probe.span(&cx, span_id, operation, self.clock.now());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +462,65 @@ mod tests {
         assert_eq!(child.span.as_deref(), Some("span-1"));
         // Entity is inherited by the child span.
         assert_eq!(child.entity, root.entity);
+    }
+
+    #[test]
+    fn probe_observer_forwards_a_crate_emission_to_the_shared_substrate() {
+        use crate::metadata::LabelSet;
+        use crate::{ComponentProbe, LiveObservabilitySubstrate, NodeCounters, NodeMetadataSource};
+        use pillar_core::{ObsLevel, ObserverHook};
+
+        let mut node_labels = LabelSet::new();
+        node_labels.insert("node".to_string(), "n-adapter".to_string());
+        let counters = NodeCounters::new();
+        let metadata_source = NodeMetadataSource::new(
+            "n-adapter",
+            Some("cell-adapter".to_string()),
+            std::iter::once("n-adapter".to_string()),
+            "0.0.0",
+            None,
+        );
+        let substrate = Arc::new(std::sync::Mutex::new(LiveObservabilitySubstrate::new(
+            node_labels,
+            counters,
+            metadata_source,
+            256,
+            100_000,
+        )));
+        let probe = ComponentProbe::new("streamdb", LabelSet::new(), substrate.clone());
+        let clock = TickClock::new();
+        clock.advance_to(11);
+        let observer = ProbeObserver::new(probe, clock.clone());
+
+        // A crate holds only `&dyn ObserverHook` — no observability types.
+        let obs: &dyn ObserverHook = &observer;
+        obs.register_metric(
+            "streamdb_ops_total",
+            pillar_core::ObsMetricType::Counter,
+            "1",
+            "streamdb",
+        );
+        obs.metric("streamdb_ops_total", 42.0);
+        obs.log(ObsLevel::Info, "compacted segment", None);
+
+        // The emission landed on the shared substrate at the clock's tick with
+        // the counter type label, through the same path as a node self-signal.
+        let sub = substrate.lock().unwrap();
+        let rec = sub
+            .explore(crate::SignalKind::Metric)
+            .into_iter()
+            .find(|r| r.payload.starts_with("streamdb_ops_total"))
+            .expect("crate metric forwarded to the substrate");
+        assert_eq!(rec.payload, "streamdb_ops_total 42 @11");
+        assert_eq!(rec.tick, 11);
+        assert_eq!(rec.labels.get("mtype").map(String::as_str), Some("counter"));
+        // An unregistered metric is dropped fail-closed even through the seam.
+        drop(sub);
+        obs.metric("never_registered", 1.0);
+        let sub = substrate.lock().unwrap();
+        assert!(sub
+            .explore(crate::SignalKind::Metric)
+            .into_iter()
+            .all(|r| !r.payload.starts_with("never_registered")));
     }
 }

@@ -66,8 +66,8 @@ pub use block::{Signal, SignalId, SignalKind, TimeseriesBlock, TimeseriesStore, 
 pub use correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
 pub use ingest::{MetricKind, MetricSource, MetricsProducer, NodeCounters, NodeMetricSource};
 pub use instrument::{
-    Cx, MetricDescriptor, MetricRegistry, MetricType, COMPONENT_LABEL, METRIC_TYPE_LABEL,
-    METRIC_UNIT_LABEL,
+    Cx, MetricDescriptor, MetricRegistry, MetricType, ProbeObserver, TickClock, COMPONENT_LABEL,
+    METRIC_TYPE_LABEL, METRIC_UNIT_LABEL,
 };
 pub use logs::{LogEvent, LogLevel, LogProducer};
 pub use live::{ComponentProbe, LiveObservabilitySubstrate, LiveRecord, DEFAULT_EVAL_TIER};
