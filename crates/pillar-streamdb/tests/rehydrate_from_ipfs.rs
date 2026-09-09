@@ -4,9 +4,10 @@
 //! from a local `ops/` directory.
 
 use pillar_core::SideEffect;
+use pillar_crypto::cell::group_key_from_seed;
 use pillar_crypto::seal::sealing_keypair_from_seed;
 use pillar_crypto::sign::signing_keypair_from_seed;
-use pillar_crypto::Seed;
+use pillar_crypto::{CellId, Seed};
 use pillar_streamdb::{Cid, IpfsPersistentStream, SignedSegment, Visibility};
 
 fn seed(label: &str) -> Seed {
@@ -25,11 +26,13 @@ fn source_from<'a>(
 #[test]
 fn fresh_node_rehydrates_from_ipfs_pinned_segments_not_local_disk() {
     let (owner_pk, owner_sk) = signing_keypair_from_seed(&seed("stream-owner")).expect("keygen");
+    let cell = CellId::from_bytes(b"rehydrate-from-ipfs-cell".to_vec());
+    let group = group_key_from_seed(&seed("stream-owner-cell")).expect("cell group key");
 
     // Node A: the original, continuously-writing node. Every append durably
     // pins a signed segment + advances the IPNS-format head — this IS the
     // "swarm" state (no local filesystem involved anywhere in this module).
-    let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
+    let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public, cell.clone(), group.clone());
     let ids = [
         node_a
             .append(b"alpha".to_vec(), SideEffect::Exclusive)
@@ -65,7 +68,7 @@ fn fresh_node_rehydrates_from_ipfs_pinned_segments_not_local_disk() {
     // it only reaches node A's pinned segments through the private-swarm
     // `SegmentSource` abstraction, exactly like a real backfill over libp2p.
     let source = source_from(node_a.store());
-    let node_b = IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &source)
+    let node_b = IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &source, cell, Some(group))
         .expect("rehydrate purely from IPFS-pinned segments");
 
     // Reconverges to EXACTLY the continuously-gossiped view: same op set,
@@ -100,8 +103,10 @@ fn fresh_node_rehydrates_from_ipfs_pinned_segments_not_local_disk() {
 fn restarting_node_recovers_write_capability_via_custody_key_and_sealed_ipfs_segment() {
     let (owner_pk, owner_sk) = signing_keypair_from_seed(&seed("cell-owner")).expect("keygen");
     let (node_pub, node_secret) = sealing_keypair_from_seed(&seed("node-custody")).expect("keygen");
+    let cell = CellId::from_bytes(b"rehydrate-from-ipfs-custody-cell".to_vec());
+    let group = group_key_from_seed(&seed("cell-owner-cell")).expect("cell group key");
 
-    let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
+    let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public, cell.clone(), group.clone());
     node_a
         .append(b"pre-restart-op".to_vec(), SideEffect::Exclusive)
         .unwrap();
@@ -125,7 +130,7 @@ fn restarting_node_recovers_write_capability_via_custody_key_and_sealed_ipfs_seg
     // Fresh node, empty disk: rehydrate read-only from IPFS...
     let source = source_from(node_a.store());
     let mut node_b =
-        IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &source).expect("rehydrate");
+        IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &source, cell, Some(group)).expect("rehydrate");
     assert!(
         node_b
             .append(b"should fail".to_vec(), SideEffect::Exclusive)
