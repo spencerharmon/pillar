@@ -1027,6 +1027,68 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         ),
     ));
 
+    // ------------------------------------------------------------------
+    // Per-component instrumentation (comprehensive-observability slice 2b).
+    //
+    // Until now a running node instrumented exactly ONE component — itself —
+    // through the seven closed node self-metrics. Here the composition root
+    // gives each component it can directly observe (streamdb, net, the
+    // controller, the scheduler) its own `ProbeObserver`, forwarding through
+    // the dependency-inverted `ObserverHook` seam to the ONE shared substrate.
+    // A shared `TickClock`, advanced once per self-metrics tick below, stamps
+    // every emission with the current logical tick, so a component never needs
+    // a clock of its own. The result is telemetry the console can filter by
+    // `component=<name>` and aggregate by type (`mtype=counter|gauge`).
+    let obs_clock = pillar_observability::TickClock::new();
+    let mk_component_observer = |component: &'static str| {
+        pillar_observability::ProbeObserver::new(
+            pillar_observability::ComponentProbe::new(
+                component,
+                pillar_observability::LabelSet::new(),
+                live_obs.clone(),
+            ),
+            obs_clock.clone(),
+        )
+    };
+    let streamdb_obs = mk_component_observer("streamdb");
+    let net_obs = mk_component_observer("net");
+    let controller_obs = mk_component_observer("controller");
+    let scheduler_obs = mk_component_observer("scheduler");
+    {
+        use pillar_core::{ObsMetricType, ObserverHook};
+        // Register each series once (idempotent); an unregistered series is
+        // dropped fail-closed at emit time.
+        streamdb_obs.register_metric(
+            "streamdb_oplog_entries",
+            ObsMetricType::Gauge,
+            "1",
+            "streamdb",
+        );
+        net_obs.register_metric("net_connected_peers", ObsMetricType::Gauge, "1", "net");
+        net_obs.register_metric("net_connections_total", ObsMetricType::Counter, "1", "net");
+        net_obs.register_metric("net_listen_addrs_total", ObsMetricType::Counter, "1", "net");
+        controller_obs.register_metric(
+            "controller_replica_restarts_total",
+            ObsMetricType::Counter,
+            "1",
+            "controller",
+        );
+        scheduler_obs.register_metric(
+            "scheduler_job_runs_total",
+            ObsMetricType::Counter,
+            "1",
+            "scheduler",
+        );
+    }
+    // Running totals for the counter series, advanced in the event arms below
+    // and emitted (as the current total) from the self-metrics arm. This is
+    // the same pull model the node self-counters use; the controller loop is a
+    // single task, so plain locals are sufficient (no atomics needed).
+    let mut net_connections_total: u64 = 0;
+    let mut net_listen_addrs_total: u64 = 0;
+    let mut controller_restarts_total: u64 = 0;
+    let mut scheduler_runs_total: u64 = 0;
+
     // Workload-runtime reconcile bridge (ROI "pillar-integration" workload
     // vertical): a real [`crate::workload_reconcile::WorkloadReconciler`] the
     // web plane drives on every authorized Workload apply/scale, bringing the
@@ -1290,6 +1352,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // process has died, on a fresh pid.
                 if let Ok(mut r) = restart_reconciler.lock() {
                     let restarted = r.reconcile_all_restarts();
+                    controller_restarts_total += restarted.len() as u64;
                     if !restarted.is_empty() {
                         tracing::info!(nodes = ?restarted, "pillar workload replicas restarted (RestartPolicy::Always)");
                     }
@@ -1303,6 +1366,35 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 node_counters.record_streamdb_ops(stream.lock().expect("streaming DB lock").stream().log().len() as u64);
                 node_counters.set_p2p_peers(swarm.connected_peers().count() as u64);
                 if metrics_enabled {
+                    // Per-component instrumentation: advance the shared tick
+                    // clock, then emit each component's real observed metrics
+                    // through the ObserverHook seam. Done BEFORE locking the
+                    // substrate below — each emit locks it internally and the
+                    // std::Mutex is non-reentrant, so holding `sub` across
+                    // these calls would deadlock.
+                    obs_clock.advance_to(self_metrics_tick);
+                    {
+                        use pillar_core::ObserverHook;
+                        let oplog_len = stream
+                            .lock()
+                            .expect("streaming DB lock")
+                            .stream()
+                            .log()
+                            .len() as f64;
+                        streamdb_obs.metric("streamdb_oplog_entries", oplog_len);
+                        net_obs.metric(
+                            "net_connected_peers",
+                            swarm.connected_peers().count() as f64,
+                        );
+                        net_obs.metric("net_connections_total", net_connections_total as f64);
+                        net_obs.metric("net_listen_addrs_total", net_listen_addrs_total as f64);
+                        controller_obs.metric(
+                            "controller_replica_restarts_total",
+                            controller_restarts_total as f64,
+                        );
+                        scheduler_obs
+                            .metric("scheduler_job_runs_total", scheduler_runs_total as f64);
+                    }
                     // Drive the periodic producers (metrics + profiles +
                     // metadata) once onto the SHARED live substrate the web
                     // surface serves; a real self-instrumentation span is also
@@ -1348,6 +1440,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 let mut scheduler_runtime = scheduler_runtime.lock().unwrap_or_else(|e| e.into_inner());
                 match scheduler_runtime.reap().await {
                     Ok(reaped) => {
+                        scheduler_runs_total += reaped.len() as u64;
                         for (job, _succeeded) in reaped {
                             if let Some(rec) = scheduler_runtime
                                 .run_history()
@@ -1366,6 +1459,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 }
                 match scheduler_runtime.tick(std::time::Instant::now()).await {
                     Ok(fired) => {
+                        scheduler_runs_total += fired.len() as u64;
                         for job in fired {
                             if let Some(rec) = scheduler_runtime
                                 .run_history()
@@ -1400,9 +1494,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             event = swarm.select_next_some() => {
                 match &event {
                     SwarmEvent::NewListenAddr { address, .. } => {
+                        net_listen_addrs_total += 1;
                         tracing::info!(%address, "pillar peer listening");
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        net_connections_total += 1;
                         tracing::info!(%peer_id, "pillar peer connection established");
                     }
                     // A peer we connected to (notably a dialed `/dnsaddr`
