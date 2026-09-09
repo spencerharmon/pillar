@@ -43,15 +43,31 @@ pub const COSE_ALG_EDDSA: i64 = -8;
 /// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256 over NIST P-256) — the
 /// default algorithm of essentially every FIDO2/CTAP2 authenticator.
 pub const COSE_ALG_ES256: i64 = -7;
+/// COSE algorithm identifier for ES384 (ECDSA w/ SHA-384 over NIST P-384).
+pub const COSE_ALG_ES384: i64 = -35;
+/// COSE algorithm identifier for ES512 (ECDSA w/ SHA-512 over NIST P-521).
+pub const COSE_ALG_ES512: i64 = -36;
+/// COSE algorithm identifier for RS256 (RSASSA-PKCS1-v1_5 w/ SHA-256) — what
+/// Windows Hello / older TPM-backed platform authenticators emit.
+pub const COSE_ALG_RS256: i64 = -257;
+/// COSE algorithm identifier for PS256 (RSASSA-PSS w/ SHA-256) — TPM 2.0
+/// platform authenticators.
+pub const COSE_ALG_PS256: i64 = -37;
 /// COSE key type `OKP` (Octet Key Pair — the Edwards-curve family).
 const COSE_KTY_OKP: i64 = 1;
 /// COSE key type `EC2` (two-coordinate elliptic-curve keys — the NIST-curve
 /// family, e.g. P-256 for ES256).
 const COSE_KTY_EC2: i64 = 2;
+/// COSE key type `RSA`.
+const COSE_KTY_RSA: i64 = 3;
 /// COSE curve identifier for `Ed25519`.
 const COSE_CRV_ED25519: i64 = 6;
 /// COSE curve identifier for NIST `P-256` (secp256r1 / prime256v1).
 const COSE_CRV_P256: i64 = 1;
+/// COSE curve identifier for NIST `P-384` (secp384r1).
+const COSE_CRV_P384: i64 = 2;
+/// COSE curve identifier for NIST `P-521` (secp521r1).
+const COSE_CRV_P521: i64 = 3;
 
 /// The minimum length of a WebAuthn `authenticatorData` structure: 32-byte
 /// rpIdHash + 1 flags byte + 4-byte big-endian sign counter.
@@ -214,7 +230,7 @@ pub fn cose_ed25519_public_key(cose: &[u8]) -> Result<SigningPublicKey> {
 
 /// The COSE `kty`/`alg` labels of a raw COSE public-key map, used to route an
 /// attested key to the correct algorithm-specific parser/verifier.
-fn cose_kty_alg(cose: &[u8]) -> Result<(i64, Option<i64>)> {
+fn cose_kty_alg_crv(cose: &[u8]) -> Result<(i64, Option<i64>, Option<i64>)> {
     use ciborium::value::Value;
     let value: Value = ciborium::from_reader(cose).map_err(|_| CryptoError::InvalidKey)?;
     let Value::Map(entries) = value else {
@@ -222,15 +238,64 @@ fn cose_kty_alg(cose: &[u8]) -> Result<(i64, Option<i64>)> {
     };
     let mut kty: Option<i64> = None;
     let mut alg: Option<i64> = None;
+    let mut crv: Option<i64> = None;
     for (k, v) in entries {
         let Value::Integer(label) = k else { continue };
         match i128::from(label) {
             1 => kty = v.as_integer().map(|i| i128::from(i) as i64),
             3 => alg = v.as_integer().map(|i| i128::from(i) as i64),
+            -1 => crv = v.as_integer().map(|i| i128::from(i) as i64),
             _ => {}
         }
     }
-    Ok((kty.ok_or(CryptoError::InvalidKey)?, alg))
+    Ok((kty.ok_or(CryptoError::InvalidKey)?, alg, crv))
+}
+
+/// Extract the `x`/`y` affine coordinates from a COSE EC2 key map, enforcing
+/// `kty = EC2`, the expected `crv`, an `alg` (when present) matching `want_alg`,
+/// and `coord_len`-byte coordinates. Returns the uncompressed SEC1 point
+/// (`0x04 || x || y`).
+fn cose_ec2_sec1_point(
+    cose: &[u8],
+    want_crv: i64,
+    want_alg: i64,
+    coord_len: usize,
+) -> Result<Vec<u8>> {
+    use ciborium::value::Value;
+    let value: Value = ciborium::from_reader(cose).map_err(|_| CryptoError::InvalidKey)?;
+    let Value::Map(entries) = value else {
+        return Err(CryptoError::InvalidKey);
+    };
+    let (mut kty, mut alg, mut crv, mut x, mut y) = (None, None, None, None, None);
+    for (k, v) in entries {
+        let Value::Integer(label) = k else { continue };
+        match i128::from(label) {
+            1 => kty = v.as_integer().map(|i| i128::from(i) as i64),
+            3 => alg = v.as_integer().map(|i| i128::from(i) as i64),
+            -1 => crv = v.as_integer().map(|i| i128::from(i) as i64),
+            -2 => x = v.as_bytes().cloned(),
+            -3 => y = v.as_bytes().cloned(),
+            _ => {}
+        }
+    }
+    if kty != Some(COSE_KTY_EC2) || crv != Some(want_crv) {
+        return Err(CryptoError::InvalidKey);
+    }
+    if let Some(alg) = alg {
+        if alg != want_alg {
+            return Err(CryptoError::InvalidKey);
+        }
+    }
+    let x = x.ok_or(CryptoError::InvalidKey)?;
+    let y = y.ok_or(CryptoError::InvalidKey)?;
+    if x.len() != coord_len || y.len() != coord_len {
+        return Err(CryptoError::InvalidKey);
+    }
+    let mut sec1 = Vec::with_capacity(1 + 2 * coord_len);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    Ok(sec1)
 }
 
 /// Extract an ES256 (ECDSA P-256) verifying key from a raw COSE-key CBOR map.
@@ -245,49 +310,70 @@ fn cose_kty_alg(cose: &[u8]) -> Result<(i64, Option<i64>)> {
 /// [`CryptoError::InvalidKey`] on a malformed map, an unexpected
 /// type/curve/algorithm/length, or a point that is not a valid P-256 point.
 pub fn cose_es256_public_key(cose: &[u8]) -> Result<p256::ecdsa::VerifyingKey> {
+    let sec1 = cose_ec2_sec1_point(cose, COSE_CRV_P256, COSE_ALG_ES256, 32)?;
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| CryptoError::InvalidKey)
+}
+
+/// Extract an ES384 (ECDSA P-384) verifying key from a raw COSE-key CBOR map.
+///
+/// # Errors
+///
+/// [`CryptoError::InvalidKey`] on an unexpected type/curve/algorithm/length or
+/// an off-curve point.
+pub fn cose_es384_public_key(cose: &[u8]) -> Result<p384::ecdsa::VerifyingKey> {
+    let sec1 = cose_ec2_sec1_point(cose, COSE_CRV_P384, COSE_ALG_ES384, 48)?;
+    p384::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| CryptoError::InvalidKey)
+}
+
+/// Extract an ES512 (ECDSA P-521) verifying key from a raw COSE-key CBOR map.
+///
+/// # Errors
+///
+/// [`CryptoError::InvalidKey`] on an unexpected type/curve/algorithm/length or
+/// an off-curve point.
+pub fn cose_es512_public_key(cose: &[u8]) -> Result<p521::ecdsa::VerifyingKey> {
+    // P-521 field elements are 66 bytes (521 bits, left-zero-padded).
+    let sec1 = cose_ec2_sec1_point(cose, COSE_CRV_P521, COSE_ALG_ES512, 66)?;
+    p521::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| CryptoError::InvalidKey)
+}
+
+/// Extract an RSA public key (`n`, `e`) from a raw COSE-key CBOR map, enforcing
+/// `kty = RSA` and, when present, `alg ∈ {RS256, PS256}`.
+///
+/// # Errors
+///
+/// [`CryptoError::InvalidKey`] on a malformed map, an unexpected type/algorithm,
+/// or modulus/exponent bytes that do not form a valid RSA public key.
+pub fn cose_rsa_public_key(cose: &[u8]) -> Result<rsa::RsaPublicKey> {
     use ciborium::value::Value;
     let value: Value = ciborium::from_reader(cose).map_err(|_| CryptoError::InvalidKey)?;
     let Value::Map(entries) = value else {
         return Err(CryptoError::InvalidKey);
     };
-    let mut kty: Option<i64> = None;
-    let mut alg: Option<i64> = None;
-    let mut crv: Option<i64> = None;
-    let mut x: Option<Vec<u8>> = None;
-    let mut y: Option<Vec<u8>> = None;
+    let (mut kty, mut alg, mut n, mut e) = (None, None, None, None);
     for (k, v) in entries {
         let Value::Integer(label) = k else { continue };
         match i128::from(label) {
             1 => kty = v.as_integer().map(|i| i128::from(i) as i64),
             3 => alg = v.as_integer().map(|i| i128::from(i) as i64),
-            -1 => crv = v.as_integer().map(|i| i128::from(i) as i64),
-            -2 => x = v.as_bytes().cloned(),
-            -3 => y = v.as_bytes().cloned(),
+            -1 => n = v.as_bytes().cloned(), // RSA modulus n
+            -2 => e = v.as_bytes().cloned(), // RSA public exponent e
             _ => {}
         }
     }
-    if kty != Some(COSE_KTY_EC2) {
+    if kty != Some(COSE_KTY_RSA) {
         return Err(CryptoError::InvalidKey);
     }
-    // `alg` is optional in an attested COSE key; when present it must be ES256.
     if let Some(alg) = alg {
-        if alg != COSE_ALG_ES256 {
+        if alg != COSE_ALG_RS256 && alg != COSE_ALG_PS256 {
             return Err(CryptoError::InvalidKey);
         }
     }
-    if crv != Some(COSE_CRV_P256) {
-        return Err(CryptoError::InvalidKey);
-    }
-    let x = x.ok_or(CryptoError::InvalidKey)?;
-    let y = y.ok_or(CryptoError::InvalidKey)?;
-    if x.len() != 32 || y.len() != 32 {
-        return Err(CryptoError::InvalidKey);
-    }
-    let mut sec1 = Vec::with_capacity(65);
-    sec1.push(0x04); // uncompressed point
-    sec1.extend_from_slice(&x);
-    sec1.extend_from_slice(&y);
-    p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| CryptoError::InvalidKey)
+    let n = n.ok_or(CryptoError::InvalidKey)?;
+    let e = e.ok_or(CryptoError::InvalidKey)?;
+    let modulus = rsa::BigUint::from_bytes_be(&n);
+    let exponent = rsa::BigUint::from_bytes_be(&e);
+    rsa::RsaPublicKey::new(modulus, exponent).map_err(|_| CryptoError::InvalidKey)
 }
 
 /// Encode an ES256 (P-256) verifying key as a COSE EC2 key CBOR map (the form a
@@ -364,6 +450,41 @@ pub fn ed25519_public_key_to_cose(public: &SigningPublicKey) -> Result<Vec<u8>> 
     Ok(out)
 }
 
+/// Validate that a raw attested COSE public key parses as one of the supported
+/// algorithms — Ed25519 (OKP), ES256/384/512 (EC2 over P-256/384/521), or
+/// RS256/PS256 (RSA) — without verifying any signature. Used at registration to
+/// reject a credential whose key pillar could never verify against.
+///
+/// # Errors
+///
+/// [`CryptoError::InvalidKey`] for any unsupported type/curve/algorithm or a
+/// malformed key.
+fn validate_attested_cose_key(cose: &[u8]) -> Result<()> {
+    let (kty, _alg, crv) = cose_kty_alg_crv(cose)?;
+    match kty {
+        COSE_KTY_OKP => {
+            let _ = cose_ed25519_public_key(cose)?;
+        }
+        COSE_KTY_EC2 => match crv {
+            Some(COSE_CRV_P256) => {
+                let _ = cose_es256_public_key(cose)?;
+            }
+            Some(COSE_CRV_P384) => {
+                let _ = cose_es384_public_key(cose)?;
+            }
+            Some(COSE_CRV_P521) => {
+                let _ = cose_es512_public_key(cose)?;
+            }
+            _ => return Err(CryptoError::InvalidKey),
+        },
+        COSE_KTY_RSA => {
+            let _ = cose_rsa_public_key(cose)?;
+        }
+        _ => return Err(CryptoError::InvalidKey),
+    }
+    Ok(())
+}
+
 /// Parse a WebAuthn attestation object (CBOR map `{fmt, attStmt, authData}`)
 /// from a registration ceremony and extract the shared credential record.
 ///
@@ -412,19 +533,10 @@ pub fn parse_attestation(attestation_object: &[u8]) -> Result<RegisteredCredenti
     }
     let credential_id = after_len[..cred_id_len].to_vec();
     let cose = &after_len[cred_id_len..];
-    // Validate the COSE key really parses as a supported algorithm — either an
-    // Ed25519/OKP key or an ES256/EC2 (P-256) key (the latter being what almost
-    // every real FIDO2 authenticator attests). Reject anything else.
-    let (kty, _alg) = cose_kty_alg(cose)?;
-    match kty {
-        COSE_KTY_OKP => {
-            let _ = cose_ed25519_public_key(cose)?;
-        }
-        COSE_KTY_EC2 => {
-            let _ = cose_es256_public_key(cose)?;
-        }
-        _ => return Err(CryptoError::InvalidKey),
-    }
+    // Validate the COSE key really parses as a supported algorithm before we
+    // store it: Ed25519 (OKP), ES256/384/512 (EC2 over P-256/384/521), or
+    // RS256/PS256 (RSA). Reject anything else.
+    validate_attested_cose_key(cose)?;
     Ok(RegisteredCredential {
         credential_id,
         cose_public_key: cose.to_vec(),
@@ -493,28 +605,75 @@ pub fn verify_assertion(
     let mut signed = Vec::with_capacity(authenticator_data.len() + 32);
     signed.extend_from_slice(authenticator_data);
     signed.extend_from_slice(&client_data_hash);
-    // Route to the algorithm the stored COSE key was attested with. Ed25519
-    // (OKP) and ES256 (EC2/P-256) are both supported; ES256 is what real FIDO2
-    // hardware overwhelmingly uses.
-    let (kty, _alg) = cose_kty_alg(cose_public_key)?;
+    // Route to the algorithm the stored COSE key was attested with:
+    //   * OKP           -> Ed25519 (EdDSA)
+    //   * EC2  + crv    -> ES256 / ES384 / ES512 (ECDSA; SHA-256/384/512)
+    //   * RSA  + alg    -> RS256 (PKCS#1v1.5) / PS256 (RSA-PSS), both SHA-256
+    // ES256 is what real FIDO2 hardware overwhelmingly uses; the RSA family is
+    // what Windows Hello / TPM-backed platform authenticators emit.
+    let (kty, alg, crv) = cose_kty_alg_crv(cose_public_key)?;
     match kty {
         COSE_KTY_OKP => {
             let public = cose_ed25519_public_key(cose_public_key)?;
             let sig = Signature::from_bytes(signature.to_vec());
             crate::sign::verify(&public, &signed, &sig)?;
         }
-        COSE_KTY_EC2 => {
-            use p256::ecdsa::signature::Verifier;
-            let vk = cose_es256_public_key(cose_public_key)?;
-            // WebAuthn ES256 assertion signatures are ASN.1 DER-encoded ECDSA
-            // (`SEQUENCE { r INTEGER, s INTEGER }`); accept a fixed-length
-            // 64-byte `r || s` encoding as a fallback for the rare authenticator
-            // that emits it. The verifier hashes `signed` with SHA-256 (ES256).
-            let sig = p256::ecdsa::Signature::from_der(signature)
-                .or_else(|_| p256::ecdsa::Signature::from_slice(signature))
-                .map_err(|_| CryptoError::VerificationFailed)?;
-            vk.verify(&signed, &sig)
-                .map_err(|_| CryptoError::VerificationFailed)?;
+        COSE_KTY_EC2 => match crv {
+            Some(COSE_CRV_P256) => {
+                use p256::ecdsa::signature::Verifier;
+                let vk = cose_es256_public_key(cose_public_key)?;
+                // WebAuthn ECDSA assertion signatures are ASN.1 DER-encoded
+                // (`SEQUENCE { r, s }`); accept a fixed-length `r || s` encoding
+                // as a fallback. The verifier hashes `signed` with the curve's
+                // digest (SHA-256 for P-256).
+                let sig = p256::ecdsa::Signature::from_der(signature)
+                    .or_else(|_| p256::ecdsa::Signature::from_slice(signature))
+                    .map_err(|_| CryptoError::VerificationFailed)?;
+                vk.verify(&signed, &sig)
+                    .map_err(|_| CryptoError::VerificationFailed)?;
+            }
+            Some(COSE_CRV_P384) => {
+                use p384::ecdsa::signature::Verifier;
+                let vk = cose_es384_public_key(cose_public_key)?;
+                let sig = p384::ecdsa::Signature::from_der(signature)
+                    .or_else(|_| p384::ecdsa::Signature::from_slice(signature))
+                    .map_err(|_| CryptoError::VerificationFailed)?;
+                vk.verify(&signed, &sig)
+                    .map_err(|_| CryptoError::VerificationFailed)?;
+            }
+            Some(COSE_CRV_P521) => {
+                use p521::ecdsa::signature::Verifier;
+                let vk = cose_es512_public_key(cose_public_key)?;
+                let sig = p521::ecdsa::Signature::from_der(signature)
+                    .or_else(|_| p521::ecdsa::Signature::from_slice(signature))
+                    .map_err(|_| CryptoError::VerificationFailed)?;
+                vk.verify(&signed, &sig)
+                    .map_err(|_| CryptoError::VerificationFailed)?;
+            }
+            _ => return Err(CryptoError::InvalidKey),
+        },
+        COSE_KTY_RSA => {
+            use rsa::signature::Verifier;
+            let pk = cose_rsa_public_key(cose_public_key)?;
+            match alg {
+                Some(COSE_ALG_RS256) => {
+                    let vk = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(pk);
+                    let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                        .map_err(|_| CryptoError::VerificationFailed)?;
+                    vk.verify(&signed, &sig)
+                        .map_err(|_| CryptoError::VerificationFailed)?;
+                }
+                Some(COSE_ALG_PS256) => {
+                    let vk = rsa::pss::VerifyingKey::<sha2::Sha256>::new(pk);
+                    let sig = rsa::pss::Signature::try_from(signature)
+                        .map_err(|_| CryptoError::VerificationFailed)?;
+                    vk.verify(&signed, &sig)
+                        .map_err(|_| CryptoError::VerificationFailed)?;
+                }
+                // An RSA key MUST name RS256 or PS256; a bare/other alg is
+                // ambiguous (the two padding schemes are not interchangeable).
+                _ => return Err(CryptoError::InvalidKey),
+            }
         }
         _ => return Err(CryptoError::InvalidKey),
     }
@@ -853,6 +1012,158 @@ mod tests {
             verify_assertion(&rec.cose_public_key, &ad, &cdj, &forged),
             Err(CryptoError::VerificationFailed),
             "an ES256 signature from another authenticator must be rejected"
+        );
+    }
+
+    /// Wrap a raw COSE key into a registration attestation object (AT flag set).
+    fn wrap_registration(cose: &[u8], credential_id: &[u8], sign_count: u32) -> Vec<u8> {
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&[0u8; 32]); // rpIdHash
+        auth_data.push(AUTH_FLAG_AT | 0x01); // AT + UP
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]); // aaguid
+        auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        auth_data.extend_from_slice(cose);
+        build_attestation_object("none", &auth_data)
+    }
+
+    /// The (authData, clientDataJSON, signed-message) triple for an assertion —
+    /// the caller signs `signed` with its algorithm and supplies the signature.
+    fn assertion_material(challenge: &str, sign_count: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use sha2::{Digest, Sha256};
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://pillar.local"}}"#,
+            base64url_encode(challenge.as_bytes())
+        )
+        .into_bytes();
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&[0u8; 32]);
+        auth_data.push(0x01); // UP
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data_json));
+        (auth_data, client_data_json, signed)
+    }
+
+    #[test]
+    fn an_es384_registration_and_assertion_verify_end_to_end() {
+        use p384::ecdsa::signature::Signer;
+        use sha2::{Digest, Sha384};
+        let scalar = Sha384::digest(b"es384-key");
+        let sk = p384::ecdsa::SigningKey::from_slice(&scalar).expect("P-384 scalar");
+        let point = sk.verifying_key().to_encoded_point(false);
+        let cose = {
+            use ciborium::value::{Integer, Value};
+            let map = Value::Map(vec![
+                (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(COSE_KTY_EC2))),
+                (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(COSE_ALG_ES384))),
+                (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(COSE_CRV_P384))),
+                (Value::Integer(Integer::from(-2)), Value::Bytes(point.x().unwrap().to_vec())),
+                (Value::Integer(Integer::from(-3)), Value::Bytes(point.y().unwrap().to_vec())),
+            ]);
+            let mut out = Vec::new();
+            ciborium::into_writer(&map, &mut out).unwrap();
+            out
+        };
+        let rec = parse_attestation(&wrap_registration(&cose, b"cred-es384", 0)).expect("parse");
+        let (ad, cdj, signed) = assertion_material("ch-es384", 4);
+        let sig: p384::ecdsa::Signature = sk.sign(&signed);
+        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, &sig.to_der().as_bytes())
+            .expect("ES384 assertion verifies");
+        assert_eq!(v.sign_count, 4);
+    }
+
+    #[test]
+    fn an_es512_registration_and_assertion_verify_end_to_end() {
+        use p521::ecdsa::signature::Signer;
+        use sha2::{Digest, Sha512};
+        // P-521 scalars are 66 bytes; left-pad a 64-byte SHA-512 with two zeros.
+        let mut scalar = vec![0u8, 0u8];
+        scalar.extend_from_slice(&Sha512::digest(b"es512-key"));
+        let sk = p521::ecdsa::SigningKey::from_slice(&scalar).expect("P-521 scalar");
+        let vk = p521::ecdsa::VerifyingKey::from(&sk);
+        let point = vk.to_encoded_point(false);
+        let cose = {
+            use ciborium::value::{Integer, Value};
+            let map = Value::Map(vec![
+                (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(COSE_KTY_EC2))),
+                (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(COSE_ALG_ES512))),
+                (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(COSE_CRV_P521))),
+                (Value::Integer(Integer::from(-2)), Value::Bytes(point.x().unwrap().to_vec())),
+                (Value::Integer(Integer::from(-3)), Value::Bytes(point.y().unwrap().to_vec())),
+            ]);
+            let mut out = Vec::new();
+            ciborium::into_writer(&map, &mut out).unwrap();
+            out
+        };
+        let rec = parse_attestation(&wrap_registration(&cose, b"cred-es512", 0)).expect("parse");
+        let (ad, cdj, signed) = assertion_material("ch-es512", 6);
+        let sig: p521::ecdsa::Signature = sk.sign(&signed);
+        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, &sig.to_der().as_bytes())
+            .expect("ES512 assertion verifies");
+        assert_eq!(v.sign_count, 6);
+    }
+
+    /// Encode an RSA public key as a COSE RSA key map for `alg`.
+    fn rsa_cose(public: &rsa::RsaPublicKey, alg: i64) -> Vec<u8> {
+        use ciborium::value::{Integer, Value};
+        use rsa::traits::PublicKeyParts;
+        let map = Value::Map(vec![
+            (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(COSE_KTY_RSA))),
+            (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(alg))),
+            (Value::Integer(Integer::from(-1)), Value::Bytes(public.n().to_bytes_be())),
+            (Value::Integer(Integer::from(-2)), Value::Bytes(public.e().to_bytes_be())),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&map, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn an_rs256_registration_and_assertion_verify_end_to_end() {
+        use rsa::signature::Signer;
+        let private = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let cose = rsa_cose(&private.to_public_key(), COSE_ALG_RS256);
+        let rec = parse_attestation(&wrap_registration(&cose, b"cred-rs256", 0)).expect("parse");
+        let (ad, cdj, signed) = assertion_material("ch-rs256", 2);
+        let sk = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(private);
+        let sig = sk.sign(&signed);
+        use rsa::signature::SignatureEncoding;
+        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, &sig.to_bytes())
+            .expect("RS256 assertion verifies (Windows Hello / TPM RSA path)");
+        assert_eq!(v.sign_count, 2);
+    }
+
+    #[test]
+    fn a_ps256_registration_and_assertion_verify_end_to_end() {
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        let private = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let cose = rsa_cose(&private.to_public_key(), COSE_ALG_PS256);
+        let rec = parse_attestation(&wrap_registration(&cose, b"cred-ps256", 0)).expect("parse");
+        let (ad, cdj, signed) = assertion_material("ch-ps256", 3);
+        let sk = rsa::pss::SigningKey::<sha2::Sha256>::new(private);
+        let sig = sk.sign_with_rng(&mut rand_core::OsRng, &signed);
+        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, &sig.to_bytes())
+            .expect("PS256 assertion verifies (TPM 2.0 RSA-PSS path)");
+        assert_eq!(v.sign_count, 3);
+    }
+
+    #[test]
+    fn a_forged_rsa_signature_is_rejected() {
+        use rsa::signature::{Signer, SignatureEncoding};
+        let real = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let cose = rsa_cose(&real.to_public_key(), COSE_ALG_RS256);
+        let rec = parse_attestation(&wrap_registration(&cose, b"cred-rs256", 0)).expect("parse");
+        let (ad, cdj, signed) = assertion_material("ch-rs256", 2);
+        // A DIFFERENT RSA key signs.
+        let mallory = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let sk = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(mallory);
+        let forged = sk.sign(&signed);
+        assert_eq!(
+            verify_assertion(&rec.cose_public_key, &ad, &cdj, &forged.to_bytes()),
+            Err(CryptoError::VerificationFailed),
+            "an RSA signature from another key must be rejected"
         );
     }
 

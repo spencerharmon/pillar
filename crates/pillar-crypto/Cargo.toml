@@ -16,6 +16,14 @@ ed25519-dalek = { version = "2", default-features = false, features = ["rand_cor
 # hardware WebAuthn credential verifies (Ed25519/OKP authenticators remain
 # supported too). `ecdsa` feature pulls the signing/verifying keys + DER sigs.
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# ES384 / ES512 (ECDSA P-384 / P-521) and RS256 / PS256 (RSA PKCS#1v1.5 /
+# RSA-PSS) round out the COSE signature algorithms a FIDO2/CTAP2 authenticator
+# can attest with: the RSA family is what Windows Hello / TPM-backed platform
+# authenticators emit, the larger ECDSA curves cover the rarer smartcard-style
+# devices. All pure-Rust RustCrypto, vendored from Cargo.lock like p256.
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p521 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "getrandom"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 sha2 = "0.10"
 hkdf = "0.12"

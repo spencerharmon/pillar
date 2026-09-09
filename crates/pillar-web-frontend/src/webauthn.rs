@@ -480,20 +480,21 @@ mod browser {
                 &user_id,
             );
             let params = Array::new();
-            // Offer BOTH algorithms `pillar_crypto::webauthn` verifies, in
-            // preference order. ES256 (-7, ECDSA P-256) is what essentially
-            // every FIDO2 security key / platform authenticator supports, so it
-            // is offered first; EdDSA (-8, Ed25519) is offered for the rarer
-            // authenticators that prefer or only support it. A device picks the
-            // first it can do.
-            params.push(&PublicKeyCredentialParameters::new(
-                -7,
-                PublicKeyCredentialType::PublicKey,
-            ));
-            params.push(&PublicKeyCredentialParameters::new(
-                -8,
-                PublicKeyCredentialType::PublicKey,
-            ));
+            // Offer every COSE algorithm `pillar_crypto::webauthn` verifies, in
+            // preference order, so ANY FIDO2/CTAP2 authenticator can enroll. A
+            // device picks the first it supports.
+            //   -7   ES256  (ECDSA P-256)   — ~all security keys / most platform
+            //   -8   EdDSA  (Ed25519)       — newer YubiKeys
+            //   -257 RS256  (RSA PKCS#1v1.5) — Windows Hello / TPM RSA
+            //   -37  PS256  (RSA-PSS)        — TPM 2.0
+            //   -35  ES384  (ECDSA P-384)   — rarer smartcard-style devices
+            //   -36  ES512  (ECDSA P-521)   — rarer still
+            for alg in [-7, -8, -257, -37, -35, -36] {
+                params.push(&PublicKeyCredentialParameters::new(
+                    alg,
+                    PublicKeyCredentialType::PublicKey,
+                ));
+            }
             let pkc_options = PublicKeyCredentialCreationOptions::new_with_u8_slice(
                 &mut challenge_bytes,
                 &params,
