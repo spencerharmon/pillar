@@ -480,9 +480,18 @@ mod browser {
                 &user_id,
             );
             let params = Array::new();
-            // ES256 (-7): the only algorithm `pillar_crypto::webauthn` verifies.
+            // Offer BOTH algorithms `pillar_crypto::webauthn` verifies, in
+            // preference order. ES256 (-7, ECDSA P-256) is what essentially
+            // every FIDO2 security key / platform authenticator supports, so it
+            // is offered first; EdDSA (-8, Ed25519) is offered for the rarer
+            // authenticators that prefer or only support it. A device picks the
+            // first it can do.
             params.push(&PublicKeyCredentialParameters::new(
                 -7,
+                PublicKeyCredentialType::PublicKey,
+            ));
+            params.push(&PublicKeyCredentialParameters::new(
+                -8,
                 PublicKeyCredentialType::PublicKey,
             ));
             let pkc_options = PublicKeyCredentialCreationOptions::new_with_u8_slice(

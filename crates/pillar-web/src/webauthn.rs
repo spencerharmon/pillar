@@ -8,7 +8,7 @@
 //! record, exactly as modelled by `specs/WebAuthnCustody.tla`.
 //!
 //! The heavy cryptographic lifting — COSE/CBOR parsing, COSE public-key
-//! extraction, Ed25519 assertion-signature verification over
+//! extraction, Ed25519/ES256 assertion-signature verification over
 //! `authData || SHA-256(clientDataJSON)`, and the HKDF PRF→unlock-secret
 //! derivation — lives in [`pillar_crypto::webauthn`]. This module owns the RP
 //! *protocol*: minting fresh, single-use, time-bounded challenges bound to the
@@ -65,7 +65,7 @@ struct OutstandingChallenge {
 pub struct CredentialRecord {
     /// Opaque credential id the authenticator minted.
     pub credential_id: Vec<u8>,
-    /// The attested COSE public key (raw CBOR), verified Ed25519 at register.
+    /// The attested COSE public key (raw CBOR); Ed25519 or ES256, verified at register.
     pub cose_public_key: Vec<u8>,
     /// The per-credential PRF salt (32 bytes) stored at registration.
     pub prf_salt: [u8; 32],
@@ -157,7 +157,7 @@ impl RelyingParty {
     }
 
     /// Finish a registration ceremony: consume the challenge, parse the
-    /// attestation object (extracting + validating the Ed25519 COSE key), and
+    /// attestation object (extracting + validating the Ed25519/ES256 COSE key), and
     /// persist the shared credential record. Returns the stored record.
     ///
     /// # Errors
