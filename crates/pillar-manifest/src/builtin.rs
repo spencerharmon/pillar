@@ -43,17 +43,20 @@ pub enum BuiltinKind {
     Job,
     /// A schedule-driven recurring job.
     CronJob,
+    /// A per-series telemetry retention + downsampling policy.
+    RetentionPolicy,
 }
 
 impl BuiltinKind {
     /// Every built-in kind, in a fixed order — the platform's complete list.
-    pub const ALL: [BuiltinKind; 6] = [
+    pub const ALL: [BuiltinKind; 7] = [
         BuiltinKind::Dashboard,
         BuiltinKind::RecordingRule,
         BuiltinKind::Alert,
         BuiltinKind::SignalConfig,
         BuiltinKind::Job,
         BuiltinKind::CronJob,
+        BuiltinKind::RetentionPolicy,
     ];
 
     /// The Kubernetes-CRD-compatible `kind` string this built-in declares
@@ -67,6 +70,7 @@ impl BuiltinKind {
             BuiltinKind::SignalConfig => "SignalConfig",
             BuiltinKind::Job => "Job",
             BuiltinKind::CronJob => "CronJob",
+            BuiltinKind::RetentionPolicy => "RetentionPolicy",
         }
     }
 
@@ -118,6 +122,16 @@ impl BuiltinKind {
                 .required("schedule", FieldType::String)
                 .required("command", FieldType::String)
                 .property("suspend", FieldType::Boolean),
+            // `signalKind` is the SignalKind name the policy governs; the
+            // selector is a flat, comma-separated `k=v,k=v` `matchLabels`
+            // string (the spec map holds only leaf types, so a nested object
+            // selector is encoded as a string and decoded by the controller);
+            // `window` / `downsampleInterval` are tick counts.
+            BuiltinKind::RetentionPolicy => base
+                .required("signalKind", FieldType::String)
+                .property("matchLabels", FieldType::String)
+                .property("window", FieldType::Integer)
+                .property("downsampleInterval", FieldType::Integer),
         }
     }
 }
@@ -242,10 +256,7 @@ impl ControllerRegistry {
     /// [`dispatch`]: ControllerRegistry::dispatch
     #[must_use]
     pub fn delete(&self, crd: &Crd) -> ReconcileOutcome {
-        match self
-            .hooks
-            .get(&(crd.api_version.clone(), crd.kind.clone()))
-        {
+        match self.hooks.get(&(crd.api_version.clone(), crd.kind.clone())) {
             Some(hook) => hook.delete(crd),
             None => ReconcileOutcome::Failed(format!(
                 "no controller registered to prune {}/{}",
@@ -259,8 +270,7 @@ impl ControllerRegistry {
 /// manifest names in its `source` field — the Rust-side mirror of
 /// `specs/ObsIngestionSubstrate.tla`'s `Kinds` constant
 /// (`{metrics, logs, traces, profiles, metadata}`).
-pub const SIGNAL_CONFIG_SOURCES: [&str; 5] =
-    ["metrics", "logs", "traces", "profiles", "metadata"];
+pub const SIGNAL_CONFIG_SOURCES: [&str; 5] = ["metrics", "logs", "traces", "profiles", "metadata"];
 
 /// Whether `source` is one of [`SIGNAL_CONFIG_SOURCES`] that defaults ON at
 /// cell creation — the Rust-side mirror of `specs/ObsIngestionSubstrate.tla`'s
@@ -338,6 +348,10 @@ mod tests {
             BuiltinKind::CronJob => crd
                 .with_spec("schedule", Value::String("*/5 * * * *".into()))
                 .with_spec("command", Value::String("echo hi".into())),
+            BuiltinKind::RetentionPolicy => crd
+                .with_spec("signalKind", Value::String("Metric".into()))
+                .with_spec("matchLabels", Value::String("app=web".into()))
+                .with_spec("window", Value::Integer(600)),
         }
     }
 

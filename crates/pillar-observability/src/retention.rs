@@ -241,6 +241,72 @@ pub fn signal_kind_from_str(s: &str) -> Option<SignalKind> {
     }
 }
 
+/// Decode a flat `matchLabels` selector string (`k=v,k=v`, whitespace around
+/// each pair trimmed) into a label map. An empty string is the empty selector
+/// (match everything). A malformed pair (no `=`, or an empty key) is rejected.
+fn parse_match_labels(s: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for pair in s.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("matchLabels entry {pair:?} is not k=v"))?;
+        let k = k.trim();
+        if k.is_empty() {
+            return Err(format!("matchLabels entry {pair:?} has an empty key"));
+        }
+        out.insert(k.to_string(), v.trim().to_string());
+    }
+    Ok(out)
+}
+
+/// Read an optional non-negative integer spec field (a tick count). A negative
+/// integer is rejected (a window/interval cannot be negative); an absent field
+/// is `None`; a present non-integer is rejected.
+fn u64_field(crd: &pillar_manifest::Crd, field: &str) -> Result<Option<u64>, String> {
+    match crd.spec.get(field) {
+        None => Ok(None),
+        Some(pillar_manifest::Value::Integer(n)) if *n >= 0 => Ok(Some(*n as u64)),
+        Some(pillar_manifest::Value::Integer(n)) => Err(format!(
+            "RetentionPolicy spec.{field} must be >= 0 (got {n})"
+        )),
+        Some(_) => Err(format!("RetentionPolicy spec.{field} must be an integer")),
+    }
+}
+
+impl RetentionPolicySpec {
+    /// Lower a validated `RetentionPolicy` manifest [`Crd`](pillar_manifest::Crd)
+    /// into a [`RetentionPolicySpec`]. The schema layer
+    /// ([`pillar_manifest::builtin`]) has already checked field presence/types;
+    /// this decodes the flat spec into the typed spec, in particular the
+    /// comma-separated `matchLabels` selector string into a label map.
+    ///
+    /// # Errors
+    /// A human-readable message when a field is missing/mistyped or the
+    /// `matchLabels` selector is malformed.
+    pub fn from_crd(crd: &pillar_manifest::Crd) -> Result<RetentionPolicySpec, String> {
+        let signal_kind = match crd.spec.get("signalKind") {
+            Some(pillar_manifest::Value::String(s)) => s.clone(),
+            Some(_) => return Err("RetentionPolicy spec.signalKind must be a string".to_string()),
+            None => return Err("RetentionPolicy spec.signalKind is required".to_string()),
+        };
+        let match_labels = match crd.spec.get("matchLabels") {
+            None => BTreeMap::new(),
+            Some(pillar_manifest::Value::String(s)) => parse_match_labels(s)?,
+            Some(_) => return Err("RetentionPolicy spec.matchLabels must be a string".to_string()),
+        };
+        Ok(RetentionPolicySpec {
+            signal_kind,
+            match_labels,
+            window: u64_field(crd, "window")?,
+            downsample_interval: u64_field(crd, "downsampleInterval")?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,7 +448,10 @@ mod tests {
                 .window,
             Some(100)
         );
-        assert_eq!(set.effective(SignalKind::Log, &LabelSet::new()).window, None);
+        assert_eq!(
+            set.effective(SignalKind::Log, &LabelSet::new()).window,
+            None
+        );
     }
 
     /// A downsample policy admits at most one representative per bucket for its
@@ -472,5 +541,93 @@ mod tests {
             downsample_interval: None,
         };
         assert!(RetentionPolicy::from_spec(&bad).is_none());
+    }
+
+    #[test]
+    fn from_crd_lowers_a_validated_manifest_including_the_selector_string() {
+        use pillar_manifest::builtin::BUILTIN_API_VERSION;
+        use pillar_manifest::{Crd, Metadata, Value};
+        let crd = Crd::new(
+            BUILTIN_API_VERSION,
+            RETENTION_POLICY_KIND,
+            Metadata::new("web-metrics"),
+        )
+        .with_spec("signalKind", Value::String("Metric".into()))
+        .with_spec(
+            "matchLabels",
+            Value::String("app=web, tier=frontend".into()),
+        )
+        .with_spec("window", Value::Integer(600))
+        .with_spec("downsampleInterval", Value::Integer(60));
+
+        let spec = RetentionPolicySpec::from_crd(&crd).expect("valid manifest lowers");
+        assert_eq!(spec.signal_kind, "Metric");
+        assert_eq!(
+            spec.match_labels.get("app").map(String::as_str),
+            Some("web")
+        );
+        assert_eq!(
+            spec.match_labels.get("tier").map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(spec.window, Some(600));
+        assert_eq!(spec.downsample_interval, Some(60));
+
+        // ...and it lowers further into a real policy matching the selector.
+        let policy = RetentionPolicy::from_spec(&spec).expect("kind is known");
+        assert!(policy.matches(
+            SignalKind::Metric,
+            &labels(&[("app", "web"), ("tier", "frontend")])
+        ));
+        assert!(!policy.matches(SignalKind::Metric, &labels(&[("app", "db")])));
+    }
+
+    #[test]
+    fn from_crd_defaults_optional_fields_and_matches_everything_without_a_selector() {
+        use pillar_manifest::builtin::BUILTIN_API_VERSION;
+        use pillar_manifest::{Crd, Metadata, Value};
+        let crd = Crd::new(
+            BUILTIN_API_VERSION,
+            RETENTION_POLICY_KIND,
+            Metadata::new("all-logs"),
+        )
+        .with_spec("signalKind", Value::String("Log".into()));
+        let spec = RetentionPolicySpec::from_crd(&crd).expect("minimal manifest lowers");
+        assert!(spec.match_labels.is_empty());
+        assert_eq!(spec.window, None);
+        assert_eq!(spec.downsample_interval, None);
+        let policy = RetentionPolicy::from_spec(&spec).unwrap();
+        // An empty selector matches every Log signal.
+        assert!(policy.matches(SignalKind::Log, &labels(&[("anything", "goes")])));
+    }
+
+    #[test]
+    fn from_crd_rejects_missing_kind_bad_selector_and_negative_window() {
+        use pillar_manifest::builtin::BUILTIN_API_VERSION;
+        use pillar_manifest::{Crd, Metadata, Value};
+        let no_kind = Crd::new(
+            BUILTIN_API_VERSION,
+            RETENTION_POLICY_KIND,
+            Metadata::new("x"),
+        );
+        assert!(RetentionPolicySpec::from_crd(&no_kind).is_err());
+
+        let bad_sel = Crd::new(
+            BUILTIN_API_VERSION,
+            RETENTION_POLICY_KIND,
+            Metadata::new("x"),
+        )
+        .with_spec("signalKind", Value::String("Metric".into()))
+        .with_spec("matchLabels", Value::String("no-equals-sign".into()));
+        assert!(RetentionPolicySpec::from_crd(&bad_sel).is_err());
+
+        let neg = Crd::new(
+            BUILTIN_API_VERSION,
+            RETENTION_POLICY_KIND,
+            Metadata::new("x"),
+        )
+        .with_spec("signalKind", Value::String("Metric".into()))
+        .with_spec("window", Value::Integer(-5));
+        assert!(RetentionPolicySpec::from_crd(&neg).is_err());
     }
 }
