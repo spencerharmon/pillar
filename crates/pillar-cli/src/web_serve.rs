@@ -208,6 +208,17 @@ pub use pillar_web_api::{NodeIdentitySnapshot, SessionSummary};
 /// offers), the shared WoT authority/actor login admission resolves through
 /// (never a parallel one), the one-shot bootstrap capability state, and the
 /// admitted portal sessions keyed by the bearer token handed to the client.
+/// A password-admitted login that is parked awaiting its mandatory WebAuthn
+/// second factor (see [`WebAuthContext::pending_2fa`]). Holds the admitted
+/// session AND the exact login IDENTIFIER the user typed — the identifier is
+/// the stable key the enrolled credential is filed under (a credential's
+/// `user_handle` == the login identifier), which is NOT the same as the
+/// session's greet `handle`.
+struct PendingLogin {
+    session: NodeCustodySession,
+    identifier: String,
+}
+
 pub struct WebAuthContext {
     verifier: NodeCustodyVerifier,
     authority: WotAuthority,
@@ -241,6 +252,17 @@ pub struct WebAuthContext {
     /// `pkcs11`), recorded at bootstrap so first-login enrollment requires/offers
     /// the matching WebAuthn/HSM/TPM registration.
     first_user_second_factor: HashMap<String, String>,
+    /// Admitted-but-not-yet-second-factor-verified logins. When a password
+    /// login succeeds for a user who has an ENROLLED WebAuthn credential, the
+    /// admitted [`NodeCustodySession`] is parked HERE under a `p<n>` pending
+    /// token instead of being turned into a live session — so a password ALONE
+    /// yields no usable session. The token is usable ONLY to drive the WebAuthn
+    /// assertion ceremony ([`webauthn_ceremony_scope`] resolves it); a
+    /// successful `authenticate/finish` promotes it into a real session
+    /// ([`store_session`]) and removes it here.
+    pending_2fa: HashMap<String, PendingLogin>,
+    /// Monotone counter minting distinct `p<n>` pending-2FA tokens.
+    next_pending: u64,
     next_session: u64,
     /// The node/user bootstrap-request queue for the cell this node serves.
     /// `None` until the cell is created (a request joins an EXISTING cell).
@@ -477,6 +499,21 @@ enum PortalOp {
         signer: String,
         content: String,
     },
+    /// A first/second-factor WebAuthn credential enrolled for a user. Journaled
+    /// on a successful `register/finish` and replayed on boot so the node
+    /// re-admits the SAME credential into its relying party — without this, a
+    /// restart would drop every enrolled authenticator and silently disable the
+    /// 2FA it was gating logins on. Carries exactly the persisted
+    /// [`pillar_web::webauthn::CredentialRecord`] fields (never any password or
+    /// live assertion material).
+    WebauthnEnroll {
+        handle: String,
+        cell: String,
+        credential_id: Vec<u8>,
+        cose_public_key: Vec<u8>,
+        prf_salt: Vec<u8>,
+        sign_count: u32,
+    },
 }
 
 /// The first user's operational subkey id — deterministic from the handle, so a
@@ -687,6 +724,8 @@ impl WebAuthContext {
             topology_nodes: BTreeMap::new(),
             observability: ObservabilityBuilders::new(),
             webauthn_rp: PillarRelyingParty::new(),
+            pending_2fa: HashMap::new(),
+            next_pending: 0,
             live_obs: None,
             workload_reconciler: None,
             scheduler_runtime: None,
@@ -856,6 +895,33 @@ impl WebAuthContext {
             PortalOp::StoreLayout { signer, content } => {
                 self.layouts
                     .append(format!("{signer}\n{content}").into_bytes());
+            }
+            PortalOp::WebauthnEnroll {
+                handle,
+                cell,
+                credential_id,
+                cose_public_key,
+                prf_salt,
+                sign_count,
+            } => {
+                let mut salt = [0u8; 32];
+                if prf_salt.len() == 32 {
+                    salt.copy_from_slice(&prf_salt);
+                    self.webauthn_rp
+                        .restore_credential(pillar_web::webauthn::CredentialRecord {
+                            credential_id,
+                            cose_public_key,
+                            prf_salt: salt,
+                            sign_count,
+                            user_handle: handle,
+                            cell,
+                        });
+                } else {
+                    tracing::warn!(
+                        len = prf_salt.len(),
+                        "portal journal: skipping WebauthnEnroll with non-32-byte prf_salt"
+                    );
+                }
             }
         }
     }
@@ -4875,14 +4941,23 @@ fn webauthn_ceremony_scope(
     ctx: &WebAuthContext,
     token: &str,
 ) -> Result<(String, String), HttpResponse> {
-    match ctx.login_sessions.get(token) {
-        Some(session) => Ok((token.to_owned(), session.subject.to_string())),
-        None => Err(text_response(
-            401,
-            "Unauthorized",
-            "DENIED not-authenticated".to_owned(),
-        )),
+    // A live session authorizes the ceremony (registration / step-up assertion).
+    if let Some(session) = ctx.login_sessions.get(token) {
+        return Ok((token.to_owned(), session.subject.to_string()));
     }
+    // A pending-2FA token (a password login awaiting its WebAuthn assertion) is
+    // ALSO a valid ceremony scope — it is the ONLY thing that token can do. It
+    // carries no live session, so it cannot perform any other authenticated
+    // action; completing the assertion promotes it (see
+    // `dispatch_webauthn_authenticate_finish`).
+    if let Some(session) = ctx.pending_2fa.get(token) {
+        return Ok((token.to_owned(), session.session.subject.to_string()));
+    }
+    Err(text_response(
+        401,
+        "Unauthorized",
+        "DENIED not-authenticated".to_owned(),
+    ))
 }
 
 /// Render an [`RpError`] as the portal's fail-closed text response.
@@ -4971,9 +5046,24 @@ fn dispatch_webauthn_register_finish(
         &challenge,
         &attestation,
         prf_salt,
-        user_handle,
+        // File the credential under the SESSION'S SUBJECT (the admitted
+        // operational subkey, `cell`), NOT the client-supplied handle: the
+        // subject is the stable per-user identity the login gate keys 2FA on,
+        // and a client must not be able to misfile a credential under another
+        // name. The browser-sent user_handle is only a display hint.
+        &cell,
     ) {
         Ok(record) => {
+            // Journal the enrollment so it survives a restart (else the node
+            // would drop the authenticator and silently disable 2FA).
+            ctx.record(&PortalOp::WebauthnEnroll {
+                handle: record.user_handle.clone(),
+                cell: record.cell.clone(),
+                credential_id: record.credential_id.clone(),
+                cose_public_key: record.cose_public_key.clone(),
+                prf_salt: record.prf_salt.to_vec(),
+                sign_count: record.sign_count,
+            });
             let cred_b64 = pillar_crypto::webauthn::base64url_encode(&record.credential_id);
             text_response(200, "OK", format!("REGISTERED {cred_b64}"))
         }
@@ -5037,11 +5127,45 @@ fn dispatch_webauthn_authenticate_finish(
         return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
     };
     let now = ctx.session_clock;
+    // If this token is a PENDING-2FA login (password already admitted, awaiting
+    // its assertion), the asserted credential MUST belong to that user — one
+    // user's authenticator can never satisfy another's 2FA gate. Check before
+    // consuming the challenge so a mismatch leaves the ceremony retryable. The
+    // credential is filed under the login IDENTIFIER (== its `user_handle`).
+    let pending_identifier = ctx.pending_2fa.get(token).map(|p| p.identifier.clone());
+    if let Some(identifier) = &pending_identifier {
+        let owns = ctx
+            .webauthn_rp
+            .user_credential_ids(identifier)
+            .into_iter()
+            .any(|id| id == cred);
+        if !owns {
+            return text_response(
+                403,
+                "Forbidden",
+                "DENIED credential-not-owned".to_owned(),
+            );
+        }
+    }
     match ctx.webauthn_rp.authenticate_finish(
         &session, &cell, now, &challenge, &cred, &ad, &cdj, &sig, &prf,
     ) {
         Ok(unlock) => {
             let b64 = pillar_crypto::webauthn::base64url_encode(&unlock);
+            // Promote a pending-2FA login into a real session now that the
+            // second factor is proven; return the promoted session token so the
+            // client can drop the pending token and use the live one.
+            if pending_identifier.is_some() {
+                if let Some(pending) = ctx.pending_2fa.remove(token) {
+                    let real = ctx.store_session(pending.session);
+                    return text_response(200, "OK", format!("UNLOCKED {b64} {real}"));
+                }
+            }
+            // An assertion on an already-live session is a step-up: refresh the
+            // token's step-up stamp with this strong (WebAuthn) proof.
+            if ctx.login_sessions.contains_key(token) {
+                ctx.step_up_at.insert(token.to_owned(), ctx.session_clock);
+            }
             text_response(200, "OK", format!("UNLOCKED {b64}"))
         }
         Err(e) => webauthn_rp_error(&e),
@@ -5075,6 +5199,34 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
     {
         Ok(session) => {
             let handle = session.handle.clone();
+            // 2FA ENFORCEMENT: if this user (keyed on the STABLE admitted
+            // subject, robust to which identifier form was typed) has an
+            // ENROLLED WebAuthn credential, a password alone is NOT enough. Park
+            // the admitted session under a pending `p<n>` token (no live session
+            // minted) and tell the client to complete a WebAuthn assertion; only
+            // `authenticate/finish` promotes it into a real session. A user with
+            // no enrolled credential logs in on the password alone (the
+            // pre-enrollment window used to register the first authenticator).
+            let subject = session.subject.to_string();
+            if ctx.webauthn_rp.user_has_credentials(&subject) {
+                let ptoken = format!("p{}", ctx.next_pending);
+                ctx.next_pending += 1;
+                ctx.pending_2fa.insert(
+                    ptoken.clone(),
+                    PendingLogin {
+                        session,
+                        identifier: subject,
+                    },
+                );
+                return HttpResponse {
+                    status: 200,
+                    reason: "OK",
+                    content_type: "text/plain; charset=utf-8",
+                    session_token: Some(ptoken),
+                    body: format!("NEEDS-2FA {handle}"),
+                    bytes: None,
+                };
+            }
             let token = ctx.store_session(session);
             HttpResponse {
                 status: 200,
@@ -6405,6 +6557,244 @@ mod tests {
         assert_eq!(
             resp.status, 401,
             "an unauthenticated ceremony must be refused"
+        );
+    }
+
+    #[test]
+    fn enrolled_credential_forces_2fa_on_password_login_and_assertion_promotes_a_working_session() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        // Pre-enrollment: a password login yields a live session directly.
+        let token = login_alice(&mut ctx);
+        let (att, secret, _cose) = webauthn_authenticator("browser-auth", b"cred-web", 0);
+
+        // Enroll a credential for alice (filed server-side under her subject).
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/webauthn/register/finish",
+                &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+            )
+            .status,
+            200
+        );
+
+        // Now a password login is NOT enough: it returns NEEDS-2FA + a PENDING
+        // token, never a live session.
+        let nid = get(&mut ctx, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let login = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"));
+        assert_eq!(login.status, 200, "{}", login.body);
+        assert!(
+            login.body.starts_with("NEEDS-2FA"),
+            "password alone must demand the second factor, got: {}",
+            login.body
+        );
+        let ptoken = login.session_token.clone().expect("pending token");
+
+        // The pending token CANNOT perform an authenticated act — it is not a
+        // live session, so a password ALONE grants nothing.
+        let refused = post(
+            &mut ctx,
+            "/portal/members/add",
+            &format!("{ptoken}\ncarol\nmember"),
+        );
+        assert_eq!(
+            refused.status, 403,
+            "a pending-2FA token must not authorize acts, got: {}",
+            refused.body
+        );
+
+        // Completing the assertion with the pending token promotes a real one.
+        let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &ptoken));
+        let (ad, cdj, sig) = webauthn_assertion(&secret, &ch2, 4);
+        let fin = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{ptoken}\n{}\n{}\n{}\n{}\n{}\n{}",
+                b64(&ch2),
+                b64(b"cred-web"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&sig),
+                b64(b"hardware-prf-output")
+            ),
+        );
+        assert_eq!(fin.status, 200, "{}", fin.body);
+        assert!(fin.body.starts_with("UNLOCKED"), "got: {}", fin.body);
+        let real = fin
+            .body
+            .split_whitespace()
+            .nth(2)
+            .expect("promoted session token in UNLOCKED <secret> <token>")
+            .to_owned();
+
+        // The promoted token DOES authorize an act.
+        let act = post(
+            &mut ctx,
+            "/portal/members/add",
+            &format!("{real}\ncarol\nmember"),
+        );
+        assert_eq!(
+            act.status, 200,
+            "the promoted session must authorize acts, got: {}",
+            act.body
+        );
+        assert!(act.body.contains("MEMBER carol ROLE member"));
+    }
+
+    #[test]
+    fn a_foreign_credential_cannot_satisfy_anothers_2fa_gate() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let (att, _secret, _cose) = webauthn_authenticator("browser-auth", b"cred-web", 0);
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/webauthn/register/finish",
+                &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+            )
+            .status,
+            200
+        );
+        // Pending 2FA login for alice.
+        let nid = get(&mut ctx, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let ptoken = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"))
+            .session_token
+            .expect("pending token");
+        // An assertion from a DIFFERENT (never-enrolled) credential id is
+        // refused before it can promote the session.
+        let (_a2, mallory, _c2) = webauthn_authenticator("mallory", b"cred-x", 0);
+        let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &ptoken));
+        let (ad, cdj, sig) = webauthn_assertion(&mallory, &ch2, 4);
+        let fin = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{ptoken}\n{}\n{}\n{}\n{}\n{}\n{}",
+                b64(&ch2),
+                b64(b"cred-x"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&sig),
+                b64(b"hardware-prf-output")
+            ),
+        );
+        assert_eq!(
+            fin.status, 403,
+            "a credential not owned by the logging-in user must be refused: {}",
+            fin.body
+        );
+    }
+
+    #[test]
+    fn webauthn_enrollment_is_journaled_and_survives_a_restart_keeping_2fa_enforced() {
+        // Node A: bootstrap + login + enroll a credential, with a durable
+        // journal wired in exactly as run.rs does.
+        let journal = test_journal();
+        let mut node_a = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        )
+        .with_persistent_journal(Arc::clone(&journal));
+        assert_eq!(
+            post(&mut node_a, "/bootstrap/create-cell", "cell-genesis").status,
+            200
+        );
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/bootstrap/create-user",
+                &format!("spencer\n{PASSWORD}")
+            )
+            .status,
+            200
+        );
+        let id: u64 = get(&mut node_a, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let token = post(&mut node_a, "/login", &format!("spencer\n{PASSWORD}\n{id}"))
+            .session_token
+            .expect("session token");
+        let (att, _secret, _cose) = webauthn_authenticator("tpm", b"cred-restart", 0);
+        let ch = challenge_of(&post(
+            &mut node_a,
+            "/webauthn/register/begin",
+            &format!("{token}\nspencer"),
+        ));
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/webauthn/register/finish",
+                &format!("{token}\nspencer\n{}\n{}", b64(&ch), b64(&att)),
+            )
+            .status,
+            200
+        );
+
+        // Capture what landed durably and replay it into a FRESH node (a pod
+        // restart on the same PVC).
+        let persisted_ops: Vec<Vec<u8>> = {
+            let stream = journal.lock().expect("journal lock");
+            stream
+                .stream()
+                .log()
+                .order()
+                .iter()
+                .map(|op| op.payload().to_vec())
+                .collect()
+        };
+        let mut node_b = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        node_b.replay(&persisted_ops);
+
+        // The restarted node STILL enforces 2FA for spencer: a password login
+        // returns NEEDS-2FA, never a live session — the enrolled authenticator
+        // was not silently dropped.
+        let id2: u64 = get(&mut node_b, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let login = post(&mut node_b, "/login", &format!("spencer\n{PASSWORD}\n{id2}"));
+        assert_eq!(login.status, 200, "{}", login.body);
+        assert!(
+            login.body.starts_with("NEEDS-2FA"),
+            "a restarted node must keep 2FA enforced (enrollment durable), got: {}",
+            login.body
         );
     }
 

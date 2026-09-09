@@ -232,11 +232,28 @@ pub fn authenticate_finish_body(
     )
 }
 
-/// Parses a `/webauthn/authenticate/finish` response: `UNLOCKED <b64>`.
-pub fn parse_authenticate_finish(body: &str) -> Result<String, CeremonyError> {
-    let mut parts = body.trim().splitn(2, ' ');
-    match (parts.next(), parts.next()) {
-        (Some("UNLOCKED"), Some(unlock)) if !unlock.is_empty() => Ok(unlock.to_owned()),
+/// The outcome of a completed `/webauthn/authenticate/finish`: the derived
+/// operational-unlock secret, plus — when the assertion completed a 2FA-gated
+/// LOGIN — the promoted live session token the server minted (absent for a
+/// step-up assertion on an already-live session).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthFinish {
+    /// The base64url operational-key-unlock secret.
+    pub unlock_secret: String,
+    /// The promoted full-session token, present iff this assertion upgraded a
+    /// pending-2FA login into a real session.
+    pub session_token: Option<String>,
+}
+
+/// Parses a `/webauthn/authenticate/finish` response: `UNLOCKED <secret-b64>`
+/// or, when a pending-2FA login was promoted, `UNLOCKED <secret-b64> <token>`.
+pub fn parse_authenticate_finish(body: &str) -> Result<AuthFinish, CeremonyError> {
+    let mut parts = body.trim().splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("UNLOCKED"), Some(unlock), token) if !unlock.is_empty() => Ok(AuthFinish {
+            unlock_secret: unlock.to_owned(),
+            session_token: token.filter(|t| !t.is_empty()).map(str::to_owned),
+        }),
         _ => Err(CeremonyError::Protocol(format!(
             "malformed authenticate/finish response: {body:?}"
         ))),
@@ -322,13 +339,13 @@ pub fn register(
 }
 
 /// Drives the full "sign in with a security key" ceremony: `begin` → `get()`
-/// → `finish`. Returns the unlock secret (base64url) on success. On a `get()`
-/// failure, `finish` is never posted.
+/// → `finish`. Returns the [`AuthFinish`] (unlock secret + any promoted session
+/// token) on success. On a `get()` failure, `finish` is never posted.
 pub fn authenticate(
     transport: &impl RpTransport,
     ceremony: &impl CredentialCeremony,
     token: &str,
-) -> Result<String, CeremonyError> {
+) -> Result<AuthFinish, CeremonyError> {
     let begin_resp = transport.post(Endpoint::AuthenticateBegin, &authenticate_begin_body(token))?;
     let challenge = parse_authenticate_begin(&begin_resp)?;
     let assertion = ceremony.get(&challenge)?;
@@ -568,9 +585,9 @@ mod browser {
 
     /// Runs the real "sign in with a security key" ceremony end to end in the
     /// browser: `POST /webauthn/authenticate/begin` → `navigator.credentials
-    /// .get()` → `POST /webauthn/authenticate/finish`. Returns the unlock
-    /// secret (base64url) on success.
-    pub async fn run_authenticate(token: &str) -> Result<String, CeremonyError> {
+    /// .get()` → `POST /webauthn/authenticate/finish`. Returns the
+    /// [`AuthFinish`] (unlock secret + any promoted session token) on success.
+    pub async fn run_authenticate(token: &str) -> Result<AuthFinish, CeremonyError> {
         let transport = BrowserTransport::new();
         let ceremony = BrowserCeremony;
         let begin_resp = transport
@@ -701,7 +718,13 @@ mod tests {
 
         let result = authenticate(&transport, &ceremony, "tok-1");
 
-        assert_eq!(result, Ok("dW5sb2Nr".to_owned()));
+        assert_eq!(
+            result,
+            Ok(AuthFinish {
+                unlock_secret: "dW5sb2Nr".to_owned(),
+                session_token: None,
+            })
+        );
         assert_eq!(
             *transport.steps.borrow(),
             vec![Endpoint::AuthenticateBegin, Endpoint::AuthenticateFinish],
@@ -816,6 +839,24 @@ mod tests {
             parse_authenticate_finish("NOPE"),
             Err(CeremonyError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn authenticate_finish_parses_secret_and_optional_promoted_token() {
+        assert_eq!(
+            parse_authenticate_finish("UNLOCKED sek"),
+            Ok(AuthFinish {
+                unlock_secret: "sek".to_owned(),
+                session_token: None,
+            })
+        );
+        assert_eq!(
+            parse_authenticate_finish("UNLOCKED sek s42"),
+            Ok(AuthFinish {
+                unlock_secret: "sek".to_owned(),
+                session_token: Some("s42".to_owned()),
+            })
+        );
     }
 
     #[test]

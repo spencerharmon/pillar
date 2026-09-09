@@ -24,6 +24,7 @@ mod yew_impl {
         interpret_name_check, login_wire, NameHint,
     };
     use crate::router::Route;
+    use crate::webauthn;
     use pillar_web_api::{BootstrapStatus, NonceResponse};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
@@ -82,18 +83,56 @@ mod yew_impl {
                         return;
                     };
                     // 2. POST exactly the two fields (+ the nonce id).
-                    message.set(Some("Signing in on the node\u{2026}".to_owned()));
+                    message.set(Some("Signing in on the node…".to_owned()));
                     match http("POST", "/login", Some(&login_wire(&id, &pw, nonce.id))).await {
-                        Ok(r) => match interpret_login(r.ok(), &r.body, &id) {
-                            Ok(handle) => {
-                                message.set(None);
-                                auth.dispatch(AuthAction::LoginSuccess {
-                                    user: handle,
-                                    token: r.session_token.unwrap_or_default(),
-                                });
+                        Ok(r) => {
+                            // A user with an enrolled WebAuthn credential gets a
+                            // `NEEDS-2FA <handle>` challenge instead of a live
+                            // session: the password admitted, but a second
+                            // factor is REQUIRED. Drive the assertion ceremony
+                            // with the returned pending token; only its success
+                            // promotes a real session.
+                            let body = r.body.trim().to_owned();
+                            if r.ok() && body.starts_with("NEEDS-2FA") {
+                                let handle = body
+                                    .strip_prefix("NEEDS-2FA")
+                                    .map(str::trim)
+                                    .filter(|h| !h.is_empty())
+                                    .unwrap_or(&id)
+                                    .to_owned();
+                                let ptoken = r.session_token.clone().unwrap_or_default();
+                                message.set(Some(
+                                    "Touch your security key / passkey to finish signing in…"
+                                        .to_owned(),
+                                ));
+                                match webauthn::run_authenticate(&ptoken).await {
+                                    Ok(fin) => match fin.session_token {
+                                        Some(real) if !real.is_empty() => {
+                                            message.set(None);
+                                            auth.dispatch(AuthAction::LoginSuccess {
+                                                user: handle,
+                                                token: real,
+                                            });
+                                        }
+                                        _ => message.set(Some(friendly_error(
+                                            "second factor did not complete",
+                                        ))),
+                                    },
+                                    Err(e) => message.set(Some(e.message())),
+                                }
+                            } else {
+                                match interpret_login(r.ok(), &r.body, &id) {
+                                    Ok(handle) => {
+                                        message.set(None);
+                                        auth.dispatch(AuthAction::LoginSuccess {
+                                            user: handle,
+                                            token: r.session_token.unwrap_or_default(),
+                                        });
+                                    }
+                                    Err(reason) => message.set(Some(friendly_error(&reason))),
+                                }
                             }
-                            Err(reason) => message.set(Some(friendly_error(&reason))),
-                        },
+                        }
                         Err(_) => message.set(Some(friendly_error("could not reach the node"))),
                     }
                     busy.set(false);
@@ -129,6 +168,10 @@ mod yew_impl {
         /// Called with the created first-user handle once the node is
         /// bootstrapped, so the entry flips to the login screen (prefilled).
         pub on_bootstrapped: Callback<String>,
+        /// Called when the first user chose a HARDWARE second factor: carries
+        /// `(session_token, handle, factor)` from the post-bootstrap auto-login
+        /// so the entry transitions to the WebAuthn enrollment panel.
+        pub on_enroll: Callback<(String, String, String)>,
     }
 
     /// The first-run bootstrap: create the cell AND first user in ONE atomic
@@ -197,6 +240,7 @@ mod yew_impl {
                 busy.clone(),
             );
             let on_bootstrapped = props.on_bootstrapped.clone();
+            let on_enroll = props.on_enroll.clone();
             Callback::from(move |e: SubmitEvent| {
                 e.prevent_default();
                 if *busy {
@@ -208,8 +252,12 @@ mod yew_impl {
                     (*factor).clone(),
                     (*second_factor).clone(),
                 );
-                let (message, busy, on_bootstrapped) =
-                    (message.clone(), busy.clone(), on_bootstrapped.clone());
+                let (message, busy, on_bootstrapped, on_enroll) = (
+                    message.clone(),
+                    busy.clone(),
+                    on_bootstrapped.clone(),
+                    on_enroll.clone(),
+                );
                 if cell_v.trim().is_empty() || handle_v.trim().is_empty() || factor_v.is_empty() {
                     message.set(Some((
                         "Enter a cell name, a handle, and an unlock factor.".to_owned(),
@@ -227,11 +275,60 @@ mod yew_impl {
                     match http("POST", "/bootstrap/create", Some(&body)).await {
                         Ok(r) => match interpret_bootstrap(r.ok(), &r.body) {
                             Ok(()) => {
-                                message.set(Some((
-                                    "Cell and first user created. This node is now bootstrapped \u{2014} sign in below.".to_owned(),
-                                    true,
-                                )));
-                                on_bootstrapped.emit(handle_v.trim().to_owned());
+                                if second_factor_v != "password" {
+                                    // A hardware second factor was chosen: sign
+                                    // in now (no credential enrolled yet, so the
+                                    // password alone yields a full session) to
+                                    // get a token, then hand off to the WebAuthn
+                                    // enrollment panel which prompts the device.
+                                    message.set(Some((
+                                        "Cell created. Signing in to enroll your security key…"
+                                            .to_owned(),
+                                        true,
+                                    )));
+                                    let nonce = match http("GET", "/nonce", None).await {
+                                        Ok(r) if r.ok() => NonceResponse::from_body(&r.body),
+                                        _ => None,
+                                    };
+                                    match nonce {
+                                        Some(n) => match http(
+                                            "POST",
+                                            "/login",
+                                            Some(&login_wire(handle_v.trim(), &factor_v, n.id)),
+                                        )
+                                        .await
+                                        {
+                                            Ok(r) if r.ok() => {
+                                                let token =
+                                                    r.session_token.unwrap_or_default();
+                                                on_enroll.emit((
+                                                    token,
+                                                    handle_v.trim().to_owned(),
+                                                    second_factor_v.clone(),
+                                                ));
+                                            }
+                                            _ => message.set(Some((
+                                                "Created the cell, but could not sign in to \
+                                                 enroll your key. Reload and sign in with your \
+                                                 password to try again."
+                                                    .to_owned(),
+                                                false,
+                                            ))),
+                                        },
+                                        None => message.set(Some((
+                                            "Created the cell, but could not reach the node to \
+                                             enroll your key."
+                                                .to_owned(),
+                                            false,
+                                        ))),
+                                    }
+                                } else {
+                                    message.set(Some((
+                                        "Cell and first user created. This node is now bootstrapped \u{2014} sign in below.".to_owned(),
+                                        true,
+                                    )));
+                                    on_bootstrapped.emit(handle_v.trim().to_owned());
+                                }
                             }
                             Err(reason) => message.set(Some((
                                 format!("Could not bootstrap the node: {reason}"),
@@ -300,11 +397,101 @@ mod yew_impl {
         }
     }
 
-    #[derive(Clone, Copy, PartialEq)]
+    /// Props for [`EnrollPanel`].
+    #[derive(Properties, PartialEq)]
+    pub struct EnrollPanelProps {
+        /// The live session token from the post-bootstrap auto-login.
+        pub token: String,
+        /// The first user's handle (the credential's user handle).
+        pub handle: String,
+        /// The chosen factor (`passkey`|`tpm`|`pkcs11`), for the prompt copy.
+        pub factor: String,
+    }
+
+    /// The WebAuthn/FIDO2 **enrollment** step shown right after a first-user
+    /// bootstrap that selected a hardware second factor. It drives the REAL
+    /// browser registration ceremony (`navigator.credentials.create()` →
+    /// `POST /webauthn/register/finish`) so the operator is actually prompted to
+    /// touch/unlock the device. On success the already-live session lands on the
+    /// console; from then on the authenticator is REQUIRED at every login.
+    #[function_component(EnrollPanel)]
+    pub fn enroll_panel(props: &EnrollPanelProps) -> Html {
+        let auth = use_auth();
+        let busy = use_state(|| true);
+        let error = use_state(|| None::<String>);
+        let attempt = use_state(|| 0u32);
+
+        {
+            let (auth, busy, error) = (auth.clone(), busy.clone(), error.clone());
+            let (token, handle) = (props.token.clone(), props.handle.clone());
+            use_effect_with(*attempt, move |_| {
+                let (auth, busy, error) = (auth.clone(), busy.clone(), error.clone());
+                let (token, handle) = (token.clone(), handle.clone());
+                busy.set(true);
+                error.set(None);
+                spawn_local(async move {
+                    match webauthn::run_register(&token, &handle).await {
+                        Ok(_cred) => {
+                            // Enrolled + journaled server-side. The session is
+                            // already live; land on the console. Every future
+                            // login now REQUIRES this device.
+                            auth.dispatch(AuthAction::LoginSuccess {
+                                user: handle,
+                                token,
+                            });
+                        }
+                        Err(e) => {
+                            error.set(Some(e.message()));
+                            busy.set(false);
+                        }
+                    }
+                });
+                || ()
+            });
+        }
+
+        let factor_label = match props.factor.as_str() {
+            "passkey" => "passkey / security key (WebAuthn)",
+            "tpm" => "TPM 2.0 authenticator",
+            "pkcs11" => "PKCS#11 HSM / smart card",
+            other => other,
+        };
+        let on_retry = {
+            let attempt = attempt.clone();
+            Callback::from(move |_: MouseEvent| attempt.set(*attempt + 1))
+        };
+
+        html! {
+            <div class="pillar-enroll">
+                <h2>{ "Enroll your second factor" }</h2>
+                <p>{ format!("Registering your {factor_label}. Follow your browser's prompt and touch or unlock the device.") }</p>
+                if *busy {
+                    <p class="pillar-enroll__status">{ "Waiting for your authenticator\u{2026}" }</p>
+                }
+                if let Some(err) = &*error {
+                    <>
+                        <p class="pillar-enroll__error" role="alert">{ err.clone() }</p>
+                        <button type="button" onclick={on_retry}>{ "Try again" }</button>
+                    </>
+                }
+            </div>
+        }
+    }
+
+    #[derive(Clone, PartialEq)]
     enum Phase {
         Loading,
         Fresh,
         Bootstrapped,
+        /// A first user was just created WITH a hardware second factor selected:
+        /// enroll the authenticator now (browser WebAuthn ceremony) before
+        /// landing on the console. Carries the freshly-minted session token (from
+        /// the post-bootstrap auto-login), the handle, and the chosen factor.
+        Enroll {
+            token: String,
+            handle: String,
+            factor: String,
+        },
     }
 
     /// The `/` entry surface: the authenticated portal when signed in, else the
@@ -347,11 +534,28 @@ mod yew_impl {
             let phase = phase.clone();
             Callback::from(move |_handle: String| phase.set(Phase::Bootstrapped))
         };
+        let on_enroll = {
+            let phase = phase.clone();
+            Callback::from(move |(token, handle, factor): (String, String, String)| {
+                phase.set(Phase::Enroll {
+                    token,
+                    handle,
+                    factor,
+                })
+            })
+        };
 
-        match *phase {
+        match (*phase).clone() {
             Phase::Loading => html! { <p class="pillar-loading">{ "Loading\u{2026}" }</p> },
-            Phase::Fresh => html! { <BootstrapForm on_bootstrapped={on_bootstrapped} /> },
+            Phase::Fresh => {
+                html! { <BootstrapForm on_bootstrapped={on_bootstrapped} on_enroll={on_enroll} /> }
+            }
             Phase::Bootstrapped => html! { <LoginForm /> },
+            Phase::Enroll {
+                token,
+                handle,
+                factor,
+            } => html! { <EnrollPanel token={token} handle={handle} factor={factor} /> },
         }
     }
 }

@@ -269,6 +269,40 @@ impl RelyingParty {
     pub fn record(&self, credential_id: &[u8]) -> Option<&CredentialRecord> {
         self.records.get(&hex(credential_id))
     }
+
+    /// Re-insert an already-verified credential record VERBATIM — the restart
+    /// replay path. Unlike [`register_finish`] this runs NO challenge or
+    /// attestation ceremony; it folds a record persisted at its original
+    /// registration back into the live store so WebAuthn 2FA enforcement
+    /// survives a node restart (a lost record would silently drop the second
+    /// factor). A revoked id is never revived (fail-closed).
+    pub fn restore_credential(&mut self, record: CredentialRecord) {
+        let key = hex(&record.credential_id);
+        if self.revoked.contains(&key) {
+            return;
+        }
+        self.records.insert(key, record);
+    }
+
+    /// Whether `user_handle` has at least one live (registered, non-revoked)
+    /// credential — the login-time "this user must complete a WebAuthn
+    /// assertion" predicate.
+    #[must_use]
+    pub fn user_has_credentials(&self, user_handle: &str) -> bool {
+        self.records.values().any(|r| r.user_handle == user_handle)
+    }
+
+    /// The credential ids registered to `user_handle` — used to confirm an
+    /// asserted credential actually belongs to the logging-in user (so one
+    /// user's authenticator can never satisfy another user's 2FA gate).
+    #[must_use]
+    pub fn user_credential_ids(&self, user_handle: &str) -> Vec<Vec<u8>> {
+        self.records
+            .values()
+            .filter(|r| r.user_handle == user_handle)
+            .map(|r| r.credential_id.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
