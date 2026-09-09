@@ -38,7 +38,8 @@ use pillar_cli::web_serve::{bind, serve, SharedLiveObs, WebAuthContext};
 use pillar_core::NodeId;
 use pillar_identity::NodeSubkey;
 use pillar_observability::{
-    LabelSet, LiveObservabilitySubstrate, LogLevel, NodeCounters, NodeMetadataSource, SignalKind,
+    ComponentProbe, LabelSet, LiveObservabilitySubstrate, LogLevel, NodeCounters,
+    NodeMetadataSource, ProbeObserver, SignalKind, TickClock,
 };
 use pillar_web::node_custody::Cid;
 
@@ -63,9 +64,7 @@ fn http(addr: &str, method: &str, path: &str, body: &str) -> HttpResponse {
         "{method} {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream
-        .write_all(request.as_bytes())
-        .expect("write request");
+    stream.write_all(request.as_bytes()).expect("write request");
     stream.flush().expect("flush");
 
     let mut raw = Vec::new();
@@ -118,29 +117,41 @@ fn live_substrate_with_real_workload() -> SharedLiveObs {
     counters.record_streamdb_ops(11);
     let metadata_source = NodeMetadataSource::new(
         "acceptance-node",
-        "cell-acceptance",
+        Some("cell-acceptance".to_string()),
         std::iter::once("acceptance-node".to_string()),
         env!("CARGO_PKG_VERSION"),
         None,
     );
-    let mut sub = LiveObservabilitySubstrate::new(node_labels, counters, metadata_source, 256, 100_000);
+    let mut sub =
+        LiveObservabilitySubstrate::new(node_labels, counters, metadata_source, 256, 100_000);
 
     // Drive several ticks of the real periodic producers + real per-event
     // logs/spans, so every one of the five kinds has genuinely-ingested data.
     for tick in 0..8u64 {
         sub.sample_periodic(tick);
-        sub.record_log(LogLevel::Info, format!("handled event tick={tick}"), tick);
+        sub.record_log(
+            LogLevel::Info,
+            format!("handled event tick={tick}"),
+            "workload",
+            tick,
+        );
         sub.record_span(
             format!("trace-{tick}"),
             format!("span-{tick}"),
             "handle_workload_op",
+            "workload",
             tick,
         );
     }
     // A single error-level log so an alert on log volume has a non-trivial
     // count to trip.
     for tick in 8..14u64 {
-        sub.record_log(LogLevel::Error, format!("workload error tick={tick}"), tick);
+        sub.record_log(
+            LogLevel::Error,
+            format!("workload error tick={tick}"),
+            "workload",
+            tick,
+        );
     }
 
     Arc::new(Mutex::new(sub))
@@ -150,8 +161,12 @@ fn live_substrate_with_real_workload() -> SharedLiveObs {
 /// substrate already fed a real workload emission, admit + provision a user so
 /// the black-box client can log in, and return `(addr, token)`.
 fn serve_and_login() -> (String, String) {
-    let live: SharedLiveObs = live_substrate_with_real_workload();
+    serve_and_login_with(live_substrate_with_real_workload())
+}
 
+/// As [`serve_and_login`], but stands the surface up over a caller-supplied
+/// live substrate (so a test can pre-populate it however it likes).
+fn serve_and_login_with(live: SharedLiveObs) -> (String, String) {
     let listener = bind(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0).expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
 
@@ -165,7 +180,14 @@ fn serve_and_login() -> (String, String) {
     )
     .with_live_observability(Arc::clone(&live));
     ctx.admit_subject(subkey.node_id(), 4);
-    ctx.provision_offer("alice@node", "Alice", Cid::from("cid-alice"), subkey, PASSWORD, SECRET);
+    ctx.provision_offer(
+        "alice@node",
+        "Alice",
+        Cid::from("cid-alice"),
+        subkey,
+        PASSWORD,
+        SECRET,
+    );
 
     std::thread::spawn(move || serve(listener, &mut ctx));
     // Give the accept loop a moment to start.
@@ -181,7 +203,12 @@ fn serve_and_login() -> (String, String) {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("nonce id");
-    let login = http(&addr, "POST", "/login", &format!("alice@node\n{PASSWORD}\n{id}"));
+    let login = http(
+        &addr,
+        "POST",
+        "/login",
+        &format!("alice@node\n{PASSWORD}\n{id}"),
+    );
     assert_eq!(login.status, 200, "login: {}", login.body);
     let token = login.session_token.expect("session token");
     (addr, token)
@@ -193,7 +220,12 @@ fn all_five_signal_kinds_are_live_and_independently_traceable() {
 
     // The kinds endpoint reports the per-kind counts of really-ingested
     // signals in the live store.
-    let kinds = http(&addr, "GET", &format!("/portal/obs/live/kinds?token={token}"), "");
+    let kinds = http(
+        &addr,
+        "GET",
+        &format!("/portal/obs/live/kinds?token={token}"),
+        "",
+    );
     assert_eq!(kinds.status, 200, "kinds: {}", kinds.body);
 
     for kind in ["metric", "log", "trace", "profile", "metadata"] {
@@ -208,7 +240,10 @@ fn all_five_signal_kinds_are_live_and_independently_traceable() {
             .rsplit_once("COUNT ")
             .and_then(|(_, n)| n.trim().parse().ok())
             .expect("count");
-        assert!(count > 0, "signal kind {kind} must be really ingested; got {count}");
+        assert!(
+            count > 0,
+            "signal kind {kind} must be really ingested; got {count}"
+        );
 
         // And its explore endpoint returns that many real records, each
         // rendered with a real payload — traceable to the workload emission.
@@ -219,7 +254,11 @@ fn all_five_signal_kinds_are_live_and_independently_traceable() {
             "",
         );
         assert_eq!(explore.status, 200, "explore {kind}: {}", explore.body);
-        let records = explore.body.lines().filter(|l| l.starts_with("SIGNAL ")).count();
+        let records = explore
+            .body
+            .lines()
+            .filter(|l| l.starts_with("SIGNAL "))
+            .count();
         assert_eq!(
             records, count,
             "explore for {kind} must surface exactly the ingested signals"
@@ -228,7 +267,10 @@ fn all_five_signal_kinds_are_live_and_independently_traceable() {
 
     // The auth gate holds on the live surface: no token -> 401.
     let unauth = http(&addr, "GET", "/portal/obs/live/kinds", "");
-    assert_eq!(unauth.status, 401, "live surface must require an admitted session");
+    assert_eq!(
+        unauth.status, 401,
+        "live surface must require an admitted session"
+    );
 }
 
 #[test]
@@ -243,8 +285,15 @@ fn psl_queries_return_only_really_ingested_signals() {
         &format!("{token}\nselect: metrics range: now-100000s"),
     );
     assert_eq!(q_metric.status, 200, "metric query: {}", q_metric.body);
-    let metric_hits = q_metric.body.lines().filter(|l| l.starts_with("SIGNAL ")).count();
-    assert!(metric_hits > 0, "a real metric was ingested; PSL must find it");
+    let metric_hits = q_metric
+        .body
+        .lines()
+        .filter(|l| l.starts_with("SIGNAL "))
+        .count();
+    assert!(
+        metric_hits > 0,
+        "a real metric was ingested; PSL must find it"
+    );
 
     // Every returned signal id must correspond to a really-held signal: the
     // explore endpoint (the ground truth of what is held) must contain each.
@@ -257,10 +306,18 @@ fn psl_queries_return_only_really_ingested_signals() {
     let held_ids: Vec<&str> = explore_metric
         .body
         .lines()
-        .filter_map(|l| l.strip_prefix("SIGNAL ").and_then(|r| r.split_whitespace().next()))
+        .filter_map(|l| {
+            l.strip_prefix("SIGNAL ")
+                .and_then(|r| r.split_whitespace().next())
+        })
         .collect();
     for line in q_metric.body.lines().filter(|l| l.starts_with("SIGNAL ")) {
-        let id = line.strip_prefix("SIGNAL ").unwrap().split_whitespace().next().unwrap();
+        let id = line
+            .strip_prefix("SIGNAL ")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
         assert!(
             held_ids.contains(&id),
             "PSL returned signal {id} that is NOT really held — phantom data (RED)"
@@ -288,11 +345,17 @@ fn psl_queries_return_only_really_ingested_signals() {
         &addr,
         "POST",
         "/portal/obs/live/query",
-        &format!("{token}\nselect: metrics where: metric = this-metric-never-emitted range: now-100000s"),
+        &format!(
+            "{token}\nselect: metrics where: metric = this-metric-never-emitted range: now-100000s"
+        ),
     );
     assert_eq!(q_none.status, 200, "empty query: {}", q_none.body);
     assert_eq!(
-        q_none.body.lines().filter(|l| l.starts_with("SIGNAL ")).count(),
+        q_none
+            .body
+            .lines()
+            .filter(|l| l.starts_with("SIGNAL "))
+            .count(),
         0,
         "a query with no matching real signal must return nothing (no fabrication)"
     );
@@ -400,3 +463,121 @@ fn dashboards_materialize_from_the_live_store() {
 // the module's domain (the black-box test names kinds as strings on the wire).
 #[allow(dead_code)]
 fn _kinds_domain(_k: SignalKind) {}
+
+/// Build a live substrate and emit the SAME per-component metrics the running
+/// node's composition root (`pillar node run`, obs slice 2b) emits: real
+/// [`ProbeObserver`]s over the shared substrate, stamped by a shared
+/// [`TickClock`], forwarding through the dependency-inverted `ObserverHook`
+/// seam. This is exactly the production wiring, exercised over the REAL public
+/// query path in the test below.
+fn substrate_with_component_metrics() -> SharedLiveObs {
+    let mut node_labels = LabelSet::new();
+    node_labels.insert("node".to_string(), "acceptance-node".to_string());
+    let counters = NodeCounters::new();
+    let metadata_source = NodeMetadataSource::new(
+        "acceptance-node",
+        Some("cell-acceptance".to_string()),
+        std::iter::once("acceptance-node".to_string()),
+        env!("CARGO_PKG_VERSION"),
+        None,
+    );
+    let live: SharedLiveObs = Arc::new(Mutex::new(LiveObservabilitySubstrate::new(
+        node_labels,
+        counters,
+        metadata_source,
+        256,
+        100_000,
+    )));
+
+    let clock = TickClock::new();
+    let mk = |component: &'static str| {
+        ProbeObserver::new(
+            ComponentProbe::new(component, LabelSet::new(), Arc::clone(&live)),
+            clock.clone(),
+        )
+    };
+    let net = mk("net");
+    let streamdb = mk("streamdb");
+    let controller = mk("controller");
+    {
+        use pillar_core::{ObsMetricType, ObserverHook};
+        net.register_metric("net_connected_peers", ObsMetricType::Gauge, "1", "net");
+        net.register_metric("net_connections_total", ObsMetricType::Counter, "1", "net");
+        streamdb.register_metric(
+            "streamdb_oplog_entries",
+            ObsMetricType::Gauge,
+            "1",
+            "streamdb",
+        );
+        controller.register_metric(
+            "controller_replica_restarts_total",
+            ObsMetricType::Counter,
+            "1",
+            "controller",
+        );
+        // Emit real readings across a few ticks, exactly as the self-metrics
+        // loop does (distinct payloads per tick => distinct content-addressed
+        // signal ids).
+        for tick in 0..5u64 {
+            clock.advance_to(tick);
+            net.metric("net_connected_peers", 2.0);
+            net.metric("net_connections_total", (tick + 1) as f64);
+            streamdb.metric("streamdb_oplog_entries", (10 + tick) as f64);
+            controller.metric("controller_replica_restarts_total", tick as f64);
+        }
+    }
+    live
+}
+
+/// The production per-component instrumentation (slice 2b) is queryable over
+/// the REAL public PSL surface: a `where: component = net` query returns the
+/// wired net series, typed (`mtype=`) and component-scoped (`component=net`),
+/// and the label filter genuinely excludes the other components' series. This
+/// is the end-to-end proof that does NOT need the operator's portal password.
+#[test]
+fn per_component_metrics_are_queryable_over_the_real_surface() {
+    let (addr, token) = serve_and_login_with(substrate_with_component_metrics());
+
+    let resp = http(
+        &addr,
+        "POST",
+        "/portal/obs/live/query",
+        &format!("{token}\nselect: metrics where: component = net range: now-100000s"),
+    );
+    assert_eq!(resp.status, 200, "query: {}", resp.body);
+
+    // The wired net series are present, component-scoped, and type-labeled.
+    assert!(
+        resp.body.contains("net_connected_peers"),
+        "net gauge present: {}",
+        resp.body
+    );
+    assert!(
+        resp.body.contains("net_connections_total"),
+        "net counter present: {}",
+        resp.body
+    );
+    assert!(
+        resp.body.contains("component=net"),
+        "signal labels carry the component: {}",
+        resp.body
+    );
+    assert!(
+        resp.body.contains("mtype=gauge") && resp.body.contains("mtype=counter"),
+        "signal labels carry the metric type: {}",
+        resp.body
+    );
+
+    // The component label-filter really scoped to net: the other components'
+    // series are excluded.
+    assert!(
+        !resp.body.contains("streamdb_oplog_entries"),
+        "component filter excludes streamdb: {}",
+        resp.body
+    );
+    assert!(
+        !resp.body.contains("controller_replica_restarts_total"),
+        "component filter excludes controller: {}",
+        resp.body
+    );
+}
