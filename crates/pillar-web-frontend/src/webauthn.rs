@@ -546,9 +546,17 @@ mod browser {
 
         async fn get_async(&self, challenge: &AuthChallenge) -> Result<Assertion, CeremonyError> {
             let creds = navigator_credentials()?;
-            let mut challenge_bytes = b64_decode(&challenge.challenge_b64)?;
+            // Decode every buffer into an OWNED js_sys::Uint8Array (a JS-heap
+            // copy) BEFORE attaching it to the options dict. A zero-copy
+            // `*_u8_slice` VIEW over wasm linear memory is DETACHED the instant
+            // a later `b64_decode` allocation grows wasm memory, which makes
+            // navigator.credentials.get() throw synchronously — surfaced here,
+            // wrongly, as "this browser does not support security keys". Copies
+            // are immune. (This path allocates per allow-credential, unlike the
+            // register path, so it is the one that trips the footgun.)
+            let challenge_buf = Uint8Array::from(b64_decode(&challenge.challenge_b64)?.as_slice());
             let pkc_options =
-                PublicKeyCredentialRequestOptions::new_with_u8_slice(&mut challenge_bytes);
+                PublicKeyCredentialRequestOptions::new(challenge_buf.unchecked_ref());
             // Scope the assertion to the RP so the browser matches the
             // credential.
             if !challenge.rp_id.is_empty() {
@@ -562,9 +570,9 @@ mod browser {
             if !challenge.allow_credentials.is_empty() {
                 let allow = Array::new();
                 for id_b64 in &challenge.allow_credentials {
-                    let mut id_bytes = b64_decode(id_b64)?;
-                    let descriptor = PublicKeyCredentialDescriptor::new_with_u8_slice(
-                        &mut id_bytes,
+                    let id_buf = Uint8Array::from(b64_decode(id_b64)?.as_slice());
+                    let descriptor = PublicKeyCredentialDescriptor::new(
+                        id_buf.unchecked_ref(),
                         PublicKeyCredentialType::PublicKey,
                     );
                     allow.push(&descriptor);
