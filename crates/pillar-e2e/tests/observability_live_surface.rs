@@ -464,6 +464,94 @@ fn dashboards_materialize_from_the_live_store() {
 #[allow(dead_code)]
 fn _kinds_domain(_k: SignalKind) {}
 
+/// Slice 3b: per-series retention policies install and read back over the REAL
+/// public surface. A PUT declaratively replaces the installed set; a GET reads
+/// it back in the same round-trip form; a malformed line is rejected. Proves
+/// the `/portal/obs/live/retention` GET+PUT routes + the substrate passthrough
+/// end to end (no operator password needed).
+#[test]
+fn retention_policies_install_and_read_back_over_the_real_surface() {
+    let (addr, token) = serve_and_login();
+
+    // Nothing installed initially.
+    let get0 = http(
+        &addr,
+        "GET",
+        &format!("/portal/obs/live/retention?token={token}"),
+        "",
+    );
+    assert_eq!(get0.status, 200, "get0: {}", get0.body);
+    assert_eq!(
+        get0.body.trim(),
+        "",
+        "no policies installed yet: {}",
+        get0.body
+    );
+
+    // Install two policies: Metric{app=web} 600t window / 60t downsample, and
+    // all Logs to a 100t window.
+    let put = http(
+        &addr,
+        "PUT",
+        "/portal/obs/live/retention",
+        &format!("{token}\nMetric|app=web|600|60\nLog||100|"),
+    );
+    assert_eq!(put.status, 200, "put: {}", put.body);
+    assert!(
+        put.body.contains("RETENTION INSTALLED 2"),
+        "put body: {}",
+        put.body
+    );
+
+    // Read them back in the round-trip form.
+    let get1 = http(
+        &addr,
+        "GET",
+        &format!("/portal/obs/live/retention?token={token}"),
+        "",
+    );
+    assert_eq!(get1.status, 200, "get1: {}", get1.body);
+    assert!(
+        get1.body.contains("Metric|app=web|600|60"),
+        "metric policy round-trips: {}",
+        get1.body
+    );
+    assert!(
+        get1.body.contains("Log||100|"),
+        "log policy round-trips: {}",
+        get1.body
+    );
+
+    // A PUT declaratively REPLACES: install just one, the other is gone.
+    let put2 = http(
+        &addr,
+        "PUT",
+        "/portal/obs/live/retention",
+        &format!("{token}\nMetric|app=web|600|60"),
+    );
+    assert_eq!(put2.status, 200, "put2: {}", put2.body);
+    let get2 = http(
+        &addr,
+        "GET",
+        &format!("/portal/obs/live/retention?token={token}"),
+        "",
+    );
+    assert!(
+        !get2.body.contains("Log|"),
+        "replace dropped the log policy: {}",
+        get2.body
+    );
+
+    // A malformed signalKind is rejected (fail-closed, 400).
+    let bad = http(
+        &addr,
+        "PUT",
+        "/portal/obs/live/retention",
+        &format!("{token}\nNonsense|app=web|1|"),
+    );
+    assert_eq!(bad.status, 400, "bad kind rejected: {}", bad.body);
+}
+
 /// Build a live substrate and emit the SAME per-component metrics the running
 /// node's composition root (`pillar node run`, obs slice 2b) emits: real
 /// [`ProbeObserver`]s over the shared substrate, stamped by a shared

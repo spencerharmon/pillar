@@ -1358,6 +1358,110 @@ impl WebAuthContext {
         let sub = live.lock().expect("live observability lock");
         Some(sub.metadata_index().label_values(key).join("\n"))
     }
+
+    /// The per-series retention policy set currently installed on the live
+    /// store, one policy per line as `<SignalKind>|<k=v,k=v>|<window>|
+    /// <downsample>` (empty selector = match all; empty window/downsample =
+    /// unset). `None` when no live substrate is attached. This is the read
+    /// side of the console's retention panel and the machine round-trip form
+    /// accepted by [`Self::live_obs_set_retention`].
+    pub fn live_obs_get_retention(&self) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut lines = Vec::new();
+        for p in sub.retention_policies().policies() {
+            let sel = p
+                .selector
+                .match_labels()
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let window = p.window.map(|w| w.to_string()).unwrap_or_default();
+            let downsample = p.downsample.map(|d| d.to_string()).unwrap_or_default();
+            lines.push(format!(
+                "{}|{}|{}|{}",
+                signal_kind_manifest_name(p.kind),
+                sel,
+                window,
+                downsample
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// Install a per-series retention policy set onto the live store,
+    /// declaratively REPLACING the current set. `body` is zero or more lines,
+    /// each `<SignalKind>|<k=v,k=v>|<window>|<downsample>` (the exact form
+    /// [`Self::live_obs_get_retention`] emits); a blank line is ignored. Per
+    /// the store + `specs/RetentionPolicy.tla` contract this affects only
+    /// FUTURE writes. Returns `RETENTION INSTALLED <n>` on success. `None`
+    /// when no live substrate is attached; `Err` on a malformed line.
+    pub fn live_obs_set_retention(&self, body: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let mut set = pillar_observability::RetentionPolicySet::empty();
+        for raw in body.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('|').collect();
+            let [kind_tok, sel_tok, window_tok, downsample_tok] = parts.as_slice() else {
+                return Some(Err(format!(
+                    "RETENTION-SPEC expected <SignalKind>|<matchLabels>|<window>|<downsample>, got {line:?}"
+                )));
+            };
+            let Some(kind) = pillar_observability::retention::signal_kind_from_str(kind_tok.trim())
+            else {
+                return Some(Err(format!(
+                    "RETENTION unknown signalKind {:?}",
+                    kind_tok.trim()
+                )));
+            };
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for entry in sel_tok.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                let Some((k, v)) = entry.split_once('=') else {
+                    return Some(Err(format!(
+                        "RETENTION matchLabels entry {entry:?} is not k=v"
+                    )));
+                };
+                if k.trim().is_empty() {
+                    return Some(Err(format!(
+                        "RETENTION matchLabels entry {entry:?} has empty key"
+                    )));
+                }
+                pairs.push((k.trim().to_string(), v.trim().to_string()));
+            }
+            let window = match window_tok.trim() {
+                "" => None,
+                n => match n.parse::<u64>() {
+                    Ok(w) => Some(w),
+                    Err(_) => return Some(Err(format!("RETENTION window {n:?} is not a u64"))),
+                },
+            };
+            let downsample = match downsample_tok.trim() {
+                "" => None,
+                n => match n.parse::<u64>() {
+                    Ok(d) => Some(d),
+                    Err(_) => return Some(Err(format!("RETENTION downsample {n:?} is not a u64"))),
+                },
+            };
+            set.add(pillar_observability::RetentionPolicy {
+                kind,
+                selector: pillar_observability::LabelSelector::matching(pairs),
+                window,
+                downsample,
+            });
+        }
+        let count = set.policies().len();
+        let mut sub = live.lock().expect("live observability lock");
+        sub.set_retention_policies(set);
+        Some(Ok(format!("RETENTION INSTALLED {count}")))
+    }
     /// (the black-box driver's "install this rule and fire it" action): parse
     /// `spec` as `<rule-id>|<kind>|<psl-query>|<emit-name>`, register it, then
     /// evaluate it now, returning `RULE <id> FIRED <bool> EMITTED <n>` plus the
@@ -3285,6 +3389,16 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: PathMatch::Exact("/portal/obs/live/retention"),
+        handler: |ctx, _peer, request| dispatch_obs_live_retention_get(ctx, request),
+    },
+    RouteSpec {
+        method: "PUT",
+        path: PathMatch::Exact("/portal/obs/live/retention"),
+        handler: |ctx, _peer, request| dispatch_obs_live_retention_set(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
         path: PathMatch::Prefix("/portal/obs/live/label-keys"),
         handler: |ctx, _peer, request| dispatch_obs_live_label_keys(ctx, request),
     },
@@ -3601,6 +3715,19 @@ fn signal_kind_tag(kind: SignalKind) -> &'static str {
         SignalKind::TraceSpan => "trace",
         SignalKind::ProfileSample => "profile",
         SignalKind::MetadataSample => "metadata",
+    }
+}
+
+/// The PascalCase `SignalKind` name a `RetentionPolicy` manifest's `signalKind`
+/// field uses (the inverse of `pillar_observability::retention::
+/// signal_kind_from_str`), so a policy round-trips through the retention route.
+fn signal_kind_manifest_name(kind: SignalKind) -> &'static str {
+    match kind {
+        SignalKind::Metric => "Metric",
+        SignalKind::Log => "Log",
+        SignalKind::TraceSpan => "TraceSpan",
+        SignalKind::ProfileSample => "ProfileSample",
+        SignalKind::MetadataSample => "MetadataSample",
     }
 }
 
@@ -4545,6 +4672,45 @@ fn dispatch_obs_live_metric_names(ctx: &mut WebAuthContext, request: &HttpReques
     }
     match ctx.live_obs_metric_names() {
         Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// View the installed per-series retention policies: `GET
+/// /portal/obs/live/retention?token=<s>` — one policy per line as
+/// `<SignalKind>|<matchLabels>|<window>|<downsample>`. Requires an admitted
+/// session + live substrate. A pure read.
+fn dispatch_obs_live_retention_get(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_get_retention() {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Install per-series retention policies: `PUT /portal/obs/live/retention`,
+/// body `<token>\n<policy-lines>` where each line is
+/// `<SignalKind>|<matchLabels>|<window>|<downsample>`. Declaratively REPLACES
+/// the installed set (an empty body clears it). Per the store +
+/// `specs/RetentionPolicy.tla` contract this affects only FUTURE writes.
+/// Requires an admitted session + live substrate.
+fn dispatch_obs_live_retention_set(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_set_retention(&rest) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
         None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
     }
 }
