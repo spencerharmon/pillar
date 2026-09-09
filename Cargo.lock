@@ -3258,6 +3258,7 @@ dependencies = [
  "pillar-swarm",
  "pillar-topology",
  "pillar-trust-artifacts",
+ "pillar-wire",
  "serde",
  "sha3",
  "tokio",

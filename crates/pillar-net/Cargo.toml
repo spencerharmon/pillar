@@ -25,6 +25,12 @@ acceptance = []
 
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
+# The `PillarMessage` envelope (version-stamped, cell-sealed, content-addressed)
+# every libp2p control payload is wrapped in before a pillar-UDP datagram is
+# sealed to the peer's WoT static X25519 key (handshakeless cutover, method #1
+# step (f)). pillar-wire depends only on pillar-crypto/pillar-core/pillar-ipfs,
+# never on pillar-net, so this edge is acyclic.
+pillar-wire = { path = "../pillar-wire" }
 libp2p = { version = "0.56", features = [
     "gossipsub",
     "kad",

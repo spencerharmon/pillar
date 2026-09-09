@@ -36,6 +36,13 @@ use libp2p::{
 
 pub mod pillar_udp;
 
+pub mod pillarmsg_udp;
+pub use pillarmsg_udp::{
+    handshakeless_pillar_udp_transport, negotiate_handshakeless_peer, open_datagram,
+    peer_sealing_keypair, seal_datagram_to_peer, unwrap_control, wrap_control, ControlProtocol,
+    HandshakelessError,
+};
+
 pub mod pillar_udp_posture;
 pub use pillar_udp_posture::{
     classify_reply_tier, select_preferred_transport, ClientConnectionSet, IngestNode,
