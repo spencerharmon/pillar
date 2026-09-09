@@ -6086,10 +6086,15 @@ mod tests {
         let seed = pillar_crypto::Seed::from_bytes(b"portal-journal-test-seed".to_vec());
         let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(&seed)
             .expect("ed25519 keygen from valid seed");
+        let cell = pillar_crypto::CellId::from_bytes(b"portal-journal-test-cell".to_vec());
+        let group = pillar_crypto::cell::group_key_from_seed(&seed)
+            .expect("cell group key from valid seed");
         let stream = pillar_streamdb::IpfsPersistentStream::genesis(
             public,
             secret,
             pillar_streamdb::Visibility::Cell,
+            cell,
+            group,
         );
         Arc::new(Mutex::new(stream))
     }

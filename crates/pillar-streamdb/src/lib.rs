@@ -70,6 +70,12 @@ pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, NativeIpfsBackend};
 mod ipfs_persist;
 pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};
 
+pub mod pillarmsg;
+pub use pillarmsg::{
+    decode_stream_op_segment_payload, encode_stream_op_segment_payload, open_stream_op,
+    seal_stream_op, StreamOpMessageError,
+};
+
 /// A durable op-log both persistent stream implementations satisfy, so
 /// transport-level sync ([`pillar_net::apply_op_sync`]) can drive EITHER the
 /// local-fs [`PersistentStream`] or the IPFS-backed [`IpfsPersistentStream`]

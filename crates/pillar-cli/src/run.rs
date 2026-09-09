@@ -804,6 +804,21 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 reason: format!("derive streamdb segment-signing key: {e}"),
             }
         })?;
+    // Method #1 step (d): every op is now sealed as a `PillarMessage::StreamOp`
+    // body to this node's cell. Solo-node interim: derive a single-member
+    // cell id + group key from the same identity seed material the segment-
+    // signing key comes from (mirrors that derivation) until real
+    // multi-member cell provisioning wires a shared group key in here.
+    let cell_id = pillar_crypto::CellId::from_bytes({
+        let mut m = b"pillar-streamdb/cell-id/v1:".to_vec();
+        m.extend_from_slice(identity_seed_material.as_bytes());
+        m
+    });
+    let cell_group_key = pillar_crypto::cell::group_key_from_seed(&identity_seed_material)
+        .map_err(|e| BootError::StreamDb {
+            path: streamdb_root.clone(),
+            reason: format!("derive streamdb cell group key: {e}"),
+        })?;
     let store =
         pillar_streamdb::ContentStore::open(&streamdb_root).map_err(|e| BootError::StreamDb {
             path: streamdb_root.clone(),
@@ -817,6 +832,8 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             // The node's own op stream is cell-visibility: its head travels the
             // private swarm's pubsub, never the public DHT.
             pillar_streamdb::Visibility::Cell,
+            cell_id,
+            cell_group_key,
         )
         .map_err(|e| BootError::StreamDb {
             path: streamdb_root.clone(),

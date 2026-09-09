@@ -232,12 +232,21 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
     let seed =
         |label: &str| Seed::from_bytes(format!("distributed-lb-acceptance::{label}").into_bytes());
     let (owner_pk, owner_sk) = signing_keypair_from_seed(&seed("lb-owner")).expect("keygen");
+    let cell_id = pillar_crypto::CellId::from_bytes(b"distributed-lb-acceptance-cell".to_vec());
+    let cell_group = pillar_crypto::cell::group_key_from_seed(&seed("lb-owner-cell"))
+        .expect("cell group key");
 
     // Node A: the continuously-running node backing the LB's streaming-DB
     // view. Every op it appends durably pins a signed segment + advances the
     // IPNS-format head -- this IS the swarm state; no local filesystem is
     // ever touched.
-    let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
+    let mut node_a = IpfsPersistentStream::genesis(
+        owner_pk.clone(),
+        owner_sk,
+        Visibility::Public,
+        cell_id.clone(),
+        cell_group.clone(),
+    );
 
     // The genesis identity that authorizes Route attachment, and the app
     // that attaches a pillar-native Route to a Frontend, gated by a REAL WoT
@@ -290,8 +299,14 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
     // `SegmentSource` abstraction, exactly like a real backfill over the
     // private libp2p/IPFS swarm.
     let source = source_from(node_a.store());
-    let node_b = IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &source)
-        .expect("rehydrate purely from IPFS-pinned segments");
+    let node_b = IpfsPersistentStream::rehydrate(
+        owner_pk.clone(),
+        &head,
+        &source,
+        cell_id,
+        Some(cell_group),
+    )
+    .expect("rehydrate purely from IPFS-pinned segments");
 
     assert!(
         node_b.stream().log().contains(&op_id),
@@ -418,7 +433,16 @@ fn distributed_lb_acceptance_end_to_end() {
     // --- durable persistence: the accepted routing decision survives a restart ---
     let seed = |label: &str| Seed::from_bytes(format!("e2e::{label}").into_bytes());
     let (owner_pk, owner_sk) = signing_keypair_from_seed(&seed("owner")).expect("keygen");
-    let mut node_a = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
+    let cell_id = pillar_crypto::CellId::from_bytes(b"e2e-cell".to_vec());
+    let cell_group =
+        pillar_crypto::cell::group_key_from_seed(&seed("owner-cell")).expect("cell group key");
+    let mut node_a = IpfsPersistentStream::genesis(
+        owner_pk.clone(),
+        owner_sk,
+        Visibility::Public,
+        cell_id.clone(),
+        cell_group.clone(),
+    );
     let op_id = node_a
         .append(
             b"e2e-route attached to e2e-frontend".to_vec(),
@@ -433,7 +457,7 @@ fn distributed_lb_acceptance_end_to_end() {
         .expect("head published");
 
     let source = source_from(node_a.store());
-    let node_b = IpfsPersistentStream::rehydrate(owner_pk, &head, &source)
+    let node_b = IpfsPersistentStream::rehydrate(owner_pk, &head, &source, cell_id, Some(cell_group))
         .expect("fresh node rehydrates purely from IPFS");
     assert!(node_b.stream().log().contains(&op_id));
     assert_eq!(
