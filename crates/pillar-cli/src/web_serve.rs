@@ -174,6 +174,10 @@ use pillar_wot_authority::{FencedActor, WotAuthority};
 
 use crate::observability_ui::ObservabilityBuilders;
 use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
+use crate::resourceset::{
+    build_graph, plan_reconcile, roll_up_health, MemberHealth, MemberRef, MemberStatus,
+    ResourceSetSpec,
+};
 use crate::Platform;
 use pillar_manifest::{
     Crd, FieldType, Metadata as CrdMetadata, Schema, SchemaRegistry, Value as CrdValue,
@@ -565,6 +569,16 @@ const RESOURCE_CAP: &str = "resource/act";
 /// A workload kind the resource UI drives (Deployment-like: a `replicas`
 /// spec `scale`/`rollout` act over).
 const WORKLOAD_KIND: &str = "Workload";
+/// The `ResourceSet` built-in kind's `kind` string (pillar's ArgoCD-Application
+/// analog), reused verbatim from
+/// [`pillar_manifest::builtin::BuiltinKind::ResourceSet`].
+const RESOURCE_SET_KIND: &str = "ResourceSet";
+/// The well-known Default ResourceSet name; it implicitly owns every
+/// RetentionPolicy resource.
+const DEFAULT_RESOURCE_SET: &str = "default";
+/// The ownership tracking label an explicit ResourceSet stamps on the
+/// resources it owns (ArgoCD-tracking-label analog).
+const RESOURCE_SET_LABEL: &str = "pillar.dev/resource-set";
 /// An identity-object kind the SAME verb surface is polymorphic over.
 const IDENTITY_KIND: &str = "User";
 /// The `CronJob` built-in kind's `kind` string — reused verbatim from
@@ -2205,6 +2219,197 @@ impl WebAuthContext {
             .describe(&self.resource_api, kind, name)
     }
 
+    /// Every ResourceSet the resource plane knows, one status line each:
+    /// `SET <name> HEALTH <h> SYNC <s> MEMBERS <n> ADOPT <n> PRUNE <n>`. The
+    /// well-known Default ResourceSet is synthesized when it is not explicitly
+    /// declared, and IMPLICITLY owns every RetentionPolicy resource ("default
+    /// RetentionPolicies belong to the Default ResourceSet"). Health/sync are
+    /// computed live from the folded resource view; signs nothing.
+    #[must_use]
+    pub fn resourcesets_list(&self) -> String {
+        let view = self.resource_platform.view();
+        let sets = self.collect_resourcesets(&view);
+        let mut lines = Vec::new();
+        for spec in &sets {
+            let statuses = self.member_statuses(&view, spec);
+            let healths: Vec<MemberHealth> = statuses.iter().map(|s| s.health).collect();
+            let health = roll_up_health(&healths);
+            let owned = self.owned_live(&view, spec);
+            let plan = plan_reconcile(&spec.members, &owned);
+            lines.push(format!(
+                "SET {} HEALTH {} SYNC {} MEMBERS {} ADOPT {} PRUNE {}",
+                spec.name,
+                health.as_str(),
+                plan.sync_status().as_str(),
+                spec.members.len(),
+                plan.to_adopt.len(),
+                plan.to_prune.len()
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// One ResourceSet's full detail: a `SET`/`DESC` header, one `MEMBER
+    /// <Kind/name> HEALTH <h>` line per declared member, the reconcile `PLAN`
+    /// (`ADOPT`/`PRUNE` refs), the rolled-up `HEALTH`/`SYNC`, and the resource
+    /// GRAPH the console renders (`NODE <i> <label>` + `EDGE <from> <to>
+    /// <label>`). `None` when the named set is neither declared nor the
+    /// synthesizable Default set. Signs nothing.
+    #[must_use]
+    pub fn resourceset_detail(&self, name: &str) -> Option<String> {
+        let view = self.resource_platform.view();
+        let spec = self
+            .collect_resourcesets(&view)
+            .into_iter()
+            .find(|s| s.name == name)?;
+        let statuses = self.member_statuses(&view, &spec);
+        let healths: Vec<MemberHealth> = statuses.iter().map(|s| s.health).collect();
+        let health = roll_up_health(&healths);
+        let owned = self.owned_live(&view, &spec);
+        let plan = plan_reconcile(&spec.members, &owned);
+        let graph = build_graph(&spec.name, &statuses);
+
+        let mut out = Vec::new();
+        out.push(format!("SET {}", spec.name));
+        out.push(format!(
+            "DESC {}",
+            spec.description.as_deref().unwrap_or("")
+        ));
+        for s in &statuses {
+            out.push(format!(
+                "MEMBER {} HEALTH {}",
+                s.reference,
+                s.health.as_str()
+            ));
+        }
+        out.push(format!(
+            "PLAN ADOPT {}",
+            plan.to_adopt
+                .iter()
+                .map(MemberRef::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        out.push(format!(
+            "PLAN PRUNE {}",
+            plan.to_prune
+                .iter()
+                .map(MemberRef::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        out.push(format!("HEALTH {}", health.as_str()));
+        out.push(format!("SYNC {}", plan.sync_status().as_str()));
+        for (i, label) in graph.nodes.iter().enumerate() {
+            out.push(format!("NODE {i} {label}"));
+        }
+        for (from, to, label) in &graph.edges {
+            out.push(format!("EDGE {from} {to} {label}"));
+        }
+        Some(out.join("\n"))
+    }
+
+    /// Collect the declared ResourceSets from the view, plus the synthesized
+    /// Default set (declaring every RetentionPolicy resource) when no explicit
+    /// `default` ResourceSet has been applied.
+    fn collect_resourcesets(
+        &self,
+        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
+    ) -> Vec<ResourceSetSpec> {
+        let mut sets: Vec<ResourceSetSpec> = Vec::new();
+        let mut have_default = false;
+        for (key, env) in view {
+            if key.kind != RESOURCE_SET_KIND {
+                continue;
+            }
+            if let Ok(spec) = ResourceSetSpec::from_crd(&env.render()) {
+                if spec.name == DEFAULT_RESOURCE_SET {
+                    have_default = true;
+                }
+                sets.push(spec);
+            }
+        }
+        if !have_default {
+            sets.insert(
+                0,
+                ResourceSetSpec {
+                    name: DEFAULT_RESOURCE_SET.to_owned(),
+                    description: Some("default retention policies".to_owned()),
+                    members: self.all_retention_policy_refs(view),
+                },
+            );
+        }
+        sets
+    }
+
+    /// Every `RetentionPolicy/<name>` resource currently in the view — the
+    /// implicit membership of the Default ResourceSet.
+    fn all_retention_policy_refs(
+        &self,
+        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
+    ) -> Vec<MemberRef> {
+        view.keys()
+            .filter(|k| k.kind == "RetentionPolicy")
+            .map(|k| MemberRef::new("RetentionPolicy", &k.name))
+            .collect()
+    }
+
+    /// The declared members of `spec` with their live health: a member present
+    /// in the view is `Healthy`, an absent one is `Missing`. (Richer per-kind
+    /// health probes are a follow-up; presence is the honest baseline.)
+    fn member_statuses(
+        &self,
+        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
+        spec: &ResourceSetSpec,
+    ) -> Vec<MemberStatus> {
+        spec.members
+            .iter()
+            .map(|m| {
+                let present = view.keys().any(|k| k.kind == m.kind && k.name == m.name);
+                MemberStatus {
+                    reference: m.clone(),
+                    health: if present {
+                        MemberHealth::Healthy
+                    } else {
+                        MemberHealth::Missing
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// The members `spec` currently OWNS on the live plane. The Default set
+    /// IMPLICITLY owns every RetentionPolicy that exists; an explicit set owns
+    /// the resources carrying its ownership label
+    /// (`pillar.dev/resource-set=<name>`).
+    fn owned_live(
+        &self,
+        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
+        spec: &ResourceSetSpec,
+    ) -> Vec<MemberRef> {
+        if spec.name == DEFAULT_RESOURCE_SET {
+            // Implicit ownership: every existing RetentionPolicy that the set
+            // declares (all of them, by construction of the synthesized set).
+            return spec
+                .members
+                .iter()
+                .filter(|m| view.keys().any(|k| k.kind == m.kind && k.name == m.name))
+                .cloned()
+                .collect();
+        }
+        view.iter()
+            .filter(|(_, env)| {
+                env.body()
+                    .metadata
+                    .labels
+                    .get(RESOURCE_SET_LABEL)
+                    .map(|owner| owner == &spec.name)
+                    .unwrap_or(false)
+            })
+            .map(|(k, _)| MemberRef::new(&k.kind, &k.name))
+            .collect()
+    }
+
     /// The `--dry-run`-style preview of an act: the decider's ALLOW/DENY for
     /// `actor` WITHOUT signing or appending anything, returned as the PREDICTED
     /// decision. The enforced act (below) runs the SAME decider, so a UI can
@@ -3396,6 +3601,16 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "PUT",
         path: PathMatch::Exact("/portal/obs/live/retention"),
         handler: |ctx, _peer, request| dispatch_obs_live_retention_set(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/resource/sets"),
+        handler: |ctx, _peer, request| dispatch_resourcesets_list(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/set"),
+        handler: |ctx, _peer, request| dispatch_resourceset_detail(ctx, request),
     },
     RouteSpec {
         method: "GET",
@@ -4715,6 +4930,36 @@ fn dispatch_obs_live_retention_set(
     }
 }
 
+/// List every ResourceSet with its live health/sync roll-up: `GET
+/// /portal/resource/sets?token=<s>` — one `SET <name> HEALTH <h> SYNC <s>
+/// MEMBERS <n> ADOPT <n> PRUNE <n>` line each (the synthesized Default set
+/// included). Requires an admitted session. A pure read.
+fn dispatch_resourcesets_list(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    text_response(200, "OK", ctx.resourcesets_list())
+}
+
+/// One ResourceSet's full detail + resource graph: `GET
+/// /portal/resource/set?token=<s>&name=<set>` — the `SET`/`DESC` header,
+/// per-member health, the reconcile `PLAN`, the rolled-up `HEALTH`/`SYNC`, and
+/// the `NODE`/`EDGE` graph the console renders. 404 when the named set is
+/// neither declared nor the synthesizable Default set. Requires an admitted
+/// session. A pure read.
+fn dispatch_resourceset_detail(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let name = percent_decode(query_value(&request.path, "name").unwrap_or(""));
+    match ctx.resourceset_detail(&name) {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(404, "Not Found", format!("NO-SUCH-RESOURCESET {name}")),
+    }
+}
+
 /// Label-key typeahead: `GET /portal/obs/live/label-keys?token=<s>` — the real
 /// live-store label keys, one per line, for the Explore `where:` autofill.
 /// Requires an admitted session + live substrate.
@@ -5532,6 +5777,72 @@ mod tests {
                 api_version: None,
             },
         )
+    }
+
+    // ResourceSet status over the REAL resource plane: the Default set is
+    // synthesized (owning every RetentionPolicy resource), reflects an applied
+    // RetentionPolicy CRD as a healthy synced member, and renders a graph.
+    #[test]
+    fn resourcesets_synthesize_default_and_reflect_applied_retention_policies() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        let actor = ctx.identity_actor_for_test();
+
+        // Empty plane: the Default set is synthesized, empty + synced.
+        let list0 = ctx.resourcesets_list();
+        assert!(
+            list0.contains("SET default HEALTH Empty SYNC Synced MEMBERS 0"),
+            "synthesized empty default: {list0}"
+        );
+
+        // Apply a RetentionPolicy CRD through the real signed resource-plane path.
+        let rp = Crd::new(
+            &ctx.resource_api,
+            "RetentionPolicy",
+            CrdMetadata::new("web-metrics"),
+        )
+        .with_spec("signalKind", CrdValue::String("Metric".into()))
+        .with_spec("window", CrdValue::Integer(600));
+        {
+            let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
+            plane
+                .apply(&actor, RESOURCE_CAP, rp)
+                .expect("owner applies retention policy");
+        }
+
+        // The Default set now owns it: 1 member, Healthy, Synced (implicit).
+        let list1 = ctx.resourcesets_list();
+        assert!(
+            list1.contains("SET default HEALTH Healthy SYNC Synced MEMBERS 1 ADOPT 0 PRUNE 0"),
+            "default owns the retention policy: {list1}"
+        );
+
+        // Detail renders the member + a graph edge from the set to it.
+        let detail = ctx
+            .resourceset_detail("default")
+            .expect("default set exists");
+        assert!(
+            detail.contains("MEMBER RetentionPolicy/web-metrics HEALTH Healthy"),
+            "member line: {detail}"
+        );
+        assert!(
+            detail.contains("NODE 0 ResourceSet/default"),
+            "root node: {detail}"
+        );
+        assert!(
+            detail.contains("NODE 1 RetentionPolicy/web-metrics"),
+            "member node: {detail}"
+        );
+        assert!(detail.contains("EDGE 0 1 Healthy"), "edge: {detail}");
+        assert!(detail.contains("SYNC Synced"), "sync: {detail}");
+
+        // An unknown set is a clean miss.
+        assert!(ctx.resourceset_detail("nope").is_none());
     }
 
     // A GET carrying an explicit `X-Pillar-Api-Version` assertion.

@@ -39,6 +39,7 @@ pub mod observability_ui;
 pub mod onboard;
 pub mod polish;
 pub mod resource;
+pub mod resourceset;
 pub mod run;
 pub mod secrets_audit_rotation_mfa;
 pub mod session_cli;

@@ -45,11 +45,16 @@ pub enum BuiltinKind {
     CronJob,
     /// A per-series telemetry retention + downsampling policy.
     RetentionPolicy,
+    /// A declarative grouping that OWNS a set of member resources and
+    /// reconciles the live world toward its declared membership — pillar's
+    /// ArgoCD-Application analog. The Default ResourceSet owns the default
+    /// RetentionPolicies.
+    ResourceSet,
 }
 
 impl BuiltinKind {
     /// Every built-in kind, in a fixed order — the platform's complete list.
-    pub const ALL: [BuiltinKind; 7] = [
+    pub const ALL: [BuiltinKind; 8] = [
         BuiltinKind::Dashboard,
         BuiltinKind::RecordingRule,
         BuiltinKind::Alert,
@@ -57,6 +62,7 @@ impl BuiltinKind {
         BuiltinKind::Job,
         BuiltinKind::CronJob,
         BuiltinKind::RetentionPolicy,
+        BuiltinKind::ResourceSet,
     ];
 
     /// The Kubernetes-CRD-compatible `kind` string this built-in declares
@@ -71,6 +77,7 @@ impl BuiltinKind {
             BuiltinKind::Job => "Job",
             BuiltinKind::CronJob => "CronJob",
             BuiltinKind::RetentionPolicy => "RetentionPolicy",
+            BuiltinKind::ResourceSet => "ResourceSet",
         }
     }
 
@@ -132,6 +139,13 @@ impl BuiltinKind {
                 .property("matchLabels", FieldType::String)
                 .property("window", FieldType::Integer)
                 .property("downsampleInterval", FieldType::Integer),
+            // `members` is a flat, comma-separated list of `Kind/name` member
+            // references (the spec map holds only leaf types, so the member
+            // list is encoded as a string and decoded by the controller);
+            // `description` is an optional human label for the set.
+            BuiltinKind::ResourceSet => base
+                .required("members", FieldType::String)
+                .property("description", FieldType::String),
         }
     }
 }
@@ -352,6 +366,12 @@ mod tests {
                 .with_spec("signalKind", Value::String("Metric".into()))
                 .with_spec("matchLabels", Value::String("app=web".into()))
                 .with_spec("window", Value::Integer(600)),
+            BuiltinKind::ResourceSet => crd
+                .with_spec(
+                    "members",
+                    Value::String("RetentionPolicy/web-metrics".into()),
+                )
+                .with_spec("description", Value::String("the default set".into())),
         }
     }
 
