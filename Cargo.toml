@@ -10,6 +10,7 @@ members = [
     "crates/pillar-manifest",
     "crates/pillar-identity",
     "crates/pillar-net",
+    "crates/pillar-wire",
     "crates/pillar-streamdb",
     "crates/pillar-ipfs",
     "crates/pillar-swarm",

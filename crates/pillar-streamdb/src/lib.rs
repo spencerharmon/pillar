@@ -43,12 +43,26 @@ pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::Sur
 mod persist;
 pub use persist::{PersistError, PersistentStream};
 
-pub mod store;
+// SignedSegment/Cid/HeadRecord/Visibility/ContentStore/IpfsBackend moved DOWN
+// to `pillar-wire` (the shared wire/persistence substrate every one of
+// pillar-streamdb/pillar-observability/pillar-net rides) per
+// `docs/papers/pillar-message-format.md` §3. Re-exported here, under the
+// SAME module paths (`crate::store::*`, `crate::ipfs_backend::*`) so every
+// existing internal (`crate::store::Cid`) and external (`pillar_streamdb::
+// store::Cid`) call site keeps working unchanged — no behavior change.
+pub mod store {
+    //! Re-export of [`pillar_wire::store`] — see the `pillar-wire` crate docs.
+    pub use pillar_wire::store::*;
+}
 pub use store::{
     Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, StoreError, Visibility,
 };
 
-pub mod ipfs_backend;
+pub mod ipfs_backend {
+    //! Re-export of [`pillar_wire::ipfs_backend`] — see the `pillar-wire`
+    //! crate docs.
+    pub use pillar_wire::ipfs_backend::*;
+}
 pub use ipfs_backend::IpfsBackend;
 #[cfg(feature = "ipfs")]
 pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, NativeIpfsBackend};
