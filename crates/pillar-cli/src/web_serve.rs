@@ -882,17 +882,43 @@ impl WebAuthContext {
     /// Call BEFORE serving.
     pub fn replay(&mut self, ops: &[Vec<u8>]) {
         self.replaying = true;
-        let mut decoded: Vec<(u64, PortalOp)> = Vec::new();
+        // Two on-disk journal layouts coexist, and BOTH must replay:
+        //   v1 (pre-sequence-stamp): PORTAL_OP_TAG ++ serde_json(op)
+        //   v2 (current):            PORTAL_OP_TAG ++ seq:[u8;8] ++ serde_json(op)
+        // A serialized `PortalOp` is always a JSON object, so the first byte
+        // after the tag is `{` (0x7b) for v1; a v2 sequence stamp is a
+        // big-endian u64 whose leading byte is its high byte (0x00 for every
+        // sequence a node will ever reach), never 0x7b. That single byte
+        // disambiguates the layouts with no version flag, so a journal written
+        // before the stamp existed still rehydrates instead of being silently
+        // dropped (which stranded a node's whole bootstrap on upgrade). The
+        // sort key is (layout_rank, seq): every v1 op (which predates the
+        // stamp, hence is causally earlier) sorts ahead of every v2 op, and
+        // within a layout the ops sort by their own sequence — v1 by the
+        // synthetic encounter order the content-addressed log yields (already
+        // causal), v2 by its recorded stamp.
+        let mut decoded: Vec<((u8, u64), PortalOp)> = Vec::new();
+        let mut v1_seq: u64 = 0;
+        let mut max_v2_seq: Option<u64> = None;
         for raw in ops {
             let Some(rest) = raw.strip_prefix(PORTAL_OP_TAG) else {
                 continue;
             };
-            if rest.len() < 8 {
-                tracing::warn!("portal journal: skipping op payload too short for a sequence stamp");
+            let (rank, seq, json): (u8, u64, &[u8]) = if rest.first() == Some(&b'{') {
+                let s = v1_seq;
+                v1_seq += 1;
+                (0, s, rest)
+            } else if rest.len() >= 8 {
+                let (seq_bytes, json) = rest.split_at(8);
+                let s = u64::from_be_bytes(seq_bytes.try_into().expect("exactly 8 bytes"));
+                max_v2_seq = Some(max_v2_seq.map_or(s, |m| m.max(s)));
+                (1, s, json)
+            } else {
+                tracing::warn!(
+                    "portal journal: skipping op payload too short for a sequence stamp"
+                );
                 continue;
-            }
-            let (seq_bytes, json) = rest.split_at(8);
-            let seq = u64::from_be_bytes(seq_bytes.try_into().expect("exactly 8 bytes"));
+            };
             let op: PortalOp = match serde_json::from_slice(json) {
                 Ok(op) => op,
                 Err(e) => {
@@ -900,17 +926,18 @@ impl WebAuthContext {
                     continue;
                 }
             };
-            decoded.push((seq, op));
+            decoded.push(((rank, seq), op));
         }
-        decoded.sort_by_key(|(seq, _)| *seq);
+        decoded.sort_by_key(|(key, _)| *key);
         let applied = decoded.len();
-        let max_seq = decoded.last().map(|(seq, _)| *seq);
         for (_, op) in decoded {
             self.apply_replayed(op);
         }
         self.replaying = false;
-        if let Some(max_seq) = max_seq {
-            self.next_op_seq = max_seq + 1;
+        // New ops must stamp a sequence strictly above any v2 op already on
+        // disk; v1 ops carry no stamp and never constrain it.
+        if let Some(max_v2_seq) = max_v2_seq {
+            self.next_op_seq = max_v2_seq + 1;
         }
         if applied > 0 {
             tracing::info!(
@@ -6845,6 +6872,118 @@ mod tests {
         node_c.replay(&persisted_ops);
         node_c.replay(&persisted_ops);
         assert_eq!(node_c.bootstrap().initial_user(), Some("spencer"));
+    }
+
+    #[test]
+    fn replay_rehydrates_a_pre_sequence_stamp_v1_journal() {
+        // Regression: a journal written BEFORE the 8-byte sequence stamp was
+        // introduced is laid out `PORTAL_OP_TAG ++ serde_json(op)` with NO
+        // stamp. The stamped replay path must still decode it (it previously
+        // ate the first 8 JSON bytes as a bogus sequence and dropped every op,
+        // stranding a live node's entire bootstrap on upgrade). These bytes are
+        // byte-for-byte the layout of the on-disk blocks a v1 node persisted.
+        let v1 = |op: &PortalOp| -> Vec<u8> {
+            let mut p = PORTAL_OP_TAG.to_vec();
+            p.extend_from_slice(&serde_json::to_vec(op).expect("serialize PortalOp"));
+            p
+        };
+        let ops = vec![
+            v1(&PortalOp::CreateCell {
+                cell: "pillar".into(),
+            }),
+            v1(&PortalOp::BootstrapCellAndUser {
+                cell: "pillar".into(),
+                handle: "spencer".into(),
+                bootstrap_offer_sealed: vec![1, 2, 3, 4],
+            }),
+            v1(&PortalOp::AddMember {
+                handle: "test".into(),
+                role: "member".into(),
+            }),
+        ];
+
+        let mut node = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        assert!(node.bootstrap().initial_user().is_none());
+        node.replay(&ops);
+
+        // The pre-stamp bootstrap is fully rehydrated — the node presents as
+        // bootstrapped and the post-bootstrap member act is restored.
+        assert_eq!(node.bootstrap().initial_user(), Some("spencer"));
+        assert_eq!(
+            node.members().get("test").map(String::as_str),
+            Some("member")
+        );
+
+        // A subsequent live mutation stamps a v2 sequence starting at 0 (v1 ops
+        // carry none) and, on the next replay, still sorts AFTER the v1 ops
+        // because v1 outranks v2 in the sort key.
+        node.add_member("charlie", "operator");
+        assert_eq!(
+            node.members().get("charlie").map(String::as_str),
+            Some("operator")
+        );
+    }
+
+    #[test]
+    fn replay_orders_v1_before_v2_and_preserves_both() {
+        // A node upgraded across the stamp boundary can carry BOTH layouts:
+        // pre-stamp v1 ops (no sequence) written first, then post-upgrade v2 ops
+        // (stamped). Every v1 op must sort ahead of every v2 op regardless of
+        // the numeric stamp, and none may be dropped.
+        let v1 = |op: &PortalOp| -> Vec<u8> {
+            let mut p = PORTAL_OP_TAG.to_vec();
+            p.extend_from_slice(&serde_json::to_vec(op).expect("serialize"));
+            p
+        };
+        let v2 = |seq: u64, op: &PortalOp| -> Vec<u8> {
+            let mut p = PORTAL_OP_TAG.to_vec();
+            p.extend_from_slice(&seq.to_be_bytes());
+            p.extend_from_slice(&serde_json::to_vec(op).expect("serialize"));
+            p
+        };
+        let ops = vec![
+            v1(&PortalOp::CreateCell {
+                cell: "pillar".into(),
+            }),
+            v1(&PortalOp::BootstrapCellAndUser {
+                cell: "pillar".into(),
+                handle: "spencer".into(),
+                bootstrap_offer_sealed: vec![9],
+            }),
+            // v2 op with a LOW stamp (0) must still land after the v1 ops.
+            v2(
+                0,
+                &PortalOp::AddMember {
+                    handle: "late".into(),
+                    role: "operator".into(),
+                },
+            ),
+        ];
+        let mut node = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        node.replay(&ops);
+        assert_eq!(node.bootstrap().initial_user(), Some("spencer"));
+        assert_eq!(
+            node.members().get("late").map(String::as_str),
+            Some("operator")
+        );
+        // next_op_seq advanced past the highest v2 stamp (0) → 1.
+        node.add_member("newest", "member");
+        assert_eq!(
+            node.members().get("newest").map(String::as_str),
+            Some("member")
+        );
     }
 
     #[test]
