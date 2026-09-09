@@ -12,10 +12,31 @@
 //! membership equals its declared membership. The health roll-up and graph are
 //! pure derivations (no protocol, hence no TLA+ per pillar-method).
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use pillar_manifest::{Crd, Value};
+use pillar_manifest::{Crd, Envelope, Value};
+use pillar_observability::RetentionPolicySpec;
+
+use crate::defaults::{self, DefaultAdvisory};
+use crate::ResourceKey;
+
+/// The `ResourceSet` kind string (matches
+/// [`pillar_manifest::builtin::BuiltinKind::ResourceSet`]).
+pub const RESOURCE_SET_KIND: &str = "ResourceSet";
+/// The well-known Default ResourceSet name; it implicitly owns every
+/// RetentionPolicy resource on the cell.
+pub const DEFAULT_RESOURCE_SET: &str = "default";
+/// The ownership-tracking label an explicit ResourceSet stamps on the resources
+/// it owns (ArgoCD tracking-label analog).
+pub const RESOURCE_SET_LABEL: &str = "pillar.dev/resource-set";
+/// The RetentionPolicy kind string — the Default set's implicit membership.
+pub const RETENTION_POLICY_KIND: &str = "RetentionPolicy";
+
+/// The resource-plane materialized view both the web plane and the CLI read:
+/// every applied resource keyed by `(apiVersion, kind, name)`.
+pub type ResourceView = BTreeMap<ResourceKey, Envelope>;
 
 /// A reference to a member resource, rendered `<Kind>/<name>` — the same
 /// `kind`/`name` pair a resource is applied and listed under on the resource
@@ -270,6 +291,189 @@ pub fn build_graph(set_name: &str, members: &[MemberStatus]) -> ResourceGraph {
         edges.push((0, i + 1, m.health.as_str().to_string()));
     }
     ResourceGraph { nodes, edges }
+}
+
+// ---------------------------------------------------------------------------
+// Resource-plane synthesis (SHARED by the web plane and the CLI).
+//
+// These were previously private methods on the web `WebAuthContext`; pushed
+// down here as pure functions over the materialized view so `pillar get/
+// describe`, the portal routes, and the console all derive an IDENTICAL model
+// (the operator's "surface the semantic in both UI and CLI" requirement).
+// ---------------------------------------------------------------------------
+
+/// Every `RetentionPolicy/<name>` resource in the view — the implicit
+/// membership of the synthesized Default ResourceSet.
+#[must_use]
+pub fn all_retention_policy_refs(view: &ResourceView) -> Vec<MemberRef> {
+    view.keys()
+        .filter(|k| k.kind == RETENTION_POLICY_KIND)
+        .map(|k| MemberRef::new(RETENTION_POLICY_KIND, &k.name))
+        .collect()
+}
+
+/// Collect the declared ResourceSets from the view, plus the synthesized
+/// Default set (declaring every RetentionPolicy resource) when no explicit
+/// `default` ResourceSet has been applied.
+#[must_use]
+pub fn collect_resourcesets(view: &ResourceView) -> Vec<ResourceSetSpec> {
+    let mut sets: Vec<ResourceSetSpec> = Vec::new();
+    let mut have_default = false;
+    for (key, env) in view {
+        if key.kind != RESOURCE_SET_KIND {
+            continue;
+        }
+        if let Ok(spec) = ResourceSetSpec::from_crd(&env.render()) {
+            if spec.name == DEFAULT_RESOURCE_SET {
+                have_default = true;
+            }
+            sets.push(spec);
+        }
+    }
+    if !have_default {
+        sets.insert(
+            0,
+            ResourceSetSpec {
+                name: DEFAULT_RESOURCE_SET.to_owned(),
+                description: Some("default retention policies".to_owned()),
+                members: all_retention_policy_refs(view),
+            },
+        );
+    }
+    sets
+}
+
+/// The live members a set currently OWNS. The Default set implicitly owns every
+/// RetentionPolicy it declares; an explicit set owns the resources carrying its
+/// `pillar.dev/resource-set` ownership label.
+#[must_use]
+pub fn owned_live(view: &ResourceView, spec: &ResourceSetSpec) -> Vec<MemberRef> {
+    if spec.name == DEFAULT_RESOURCE_SET {
+        return spec
+            .members
+            .iter()
+            .filter(|m| view.keys().any(|k| k.kind == m.kind && k.name == m.name))
+            .cloned()
+            .collect();
+    }
+    view.iter()
+        .filter(|(_, env)| {
+            env.body()
+                .metadata
+                .labels
+                .get(RESOURCE_SET_LABEL)
+                .map(|owner| owner == &spec.name)
+                .unwrap_or(false)
+        })
+        .map(|(k, _)| MemberRef::new(&k.kind, &k.name))
+        .collect()
+}
+
+/// Each declared member's live status: present (Healthy) or absent (Missing).
+#[must_use]
+pub fn member_statuses(view: &ResourceView, spec: &ResourceSetSpec) -> Vec<MemberStatus> {
+    spec.members
+        .iter()
+        .map(|m| {
+            let present = view.keys().any(|k| k.kind == m.kind && k.name == m.name);
+            MemberStatus {
+                reference: m.clone(),
+                health: if present {
+                    MemberHealth::Healthy
+                } else {
+                    MemberHealth::Missing
+                },
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Defaults provenance + advisory (SHARED). The binary-shipped default bundle is
+// a seed/offer, not a reconcile target (see `crate::defaults` +
+// `specs/Defaults.tla`). These derive the two-axis model: SYNC stays declared<->
+// live (above); the defaults advisory is a SEPARATE additive signal.
+// ---------------------------------------------------------------------------
+
+/// The provenance of a live member resource, read from its applied labels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberOrigin {
+    /// Seeded from the defaults bundle at the given version stamp.
+    Defaults(String),
+    /// Operator-authored (or provenance-stripped).
+    Operator,
+}
+
+impl MemberOrigin {
+    /// A compact tag for the CLI/console: `defaults@<v>` or `operator`.
+    #[must_use]
+    pub fn as_tag(&self) -> String {
+        match self {
+            MemberOrigin::Defaults(v) if v.is_empty() => "defaults".to_string(),
+            MemberOrigin::Defaults(v) => format!("defaults@{v}"),
+            MemberOrigin::Operator => "operator".to_string(),
+        }
+    }
+}
+
+/// Read a member's provenance from its applied labels: `defaults@<v>` when it
+/// carries the defaults `managed-by` label, else `operator`.
+#[must_use]
+pub fn member_origin(view: &ResourceView, member: &MemberRef) -> MemberOrigin {
+    for (k, env) in view {
+        if k.kind == member.kind && k.name == member.name {
+            let labels = &env.body().metadata.labels;
+            if labels
+                .get(defaults::DEFAULTS_MANAGED_BY_LABEL)
+                .map(String::as_str)
+                == Some(defaults::DEFAULTS_MANAGED_BY_VALUE)
+            {
+                let v = labels
+                    .get(defaults::DEFAULT_BUNDLE_LABEL)
+                    .cloned()
+                    .unwrap_or_default();
+                return MemberOrigin::Defaults(v);
+            }
+            return MemberOrigin::Operator;
+        }
+    }
+    MemberOrigin::Operator
+}
+
+/// Compute the shipped-defaults advisory against the live view: classify each
+/// shipped default as Present / Available / Edited / Tombstoned. `present` and
+/// `edited` are read from the view (a `RetentionPolicy/<name>` exists; its
+/// applied spec differs from the shipped spec by content); `tombstoned` is the
+/// operator's recorded deletions (durable-deletion tracking is the follow-up
+/// slice — callers pass the known set, empty when none).
+#[must_use]
+pub fn defaults_advisory_for_view(
+    view: &ResourceView,
+    tombstoned: &BTreeSet<String>,
+) -> Vec<DefaultAdvisory> {
+    let bundle = defaults::shipped_default_bundle();
+    let mut present: BTreeSet<String> = BTreeSet::new();
+    let mut edited: BTreeSet<String> = BTreeSet::new();
+    for p in &bundle.policies {
+        let applied = view
+            .iter()
+            .find(|(k, _)| k.kind == RETENTION_POLICY_KIND && k.name == p.name)
+            .map(|(_, env)| env.render());
+        if let Some(applied_crd) = applied {
+            present.insert(p.name.to_string());
+            // Content divergence: lower BOTH through the SAME manifest lowering
+            // and compare the typed specs (ignores version/provenance labels).
+            if let (Ok(a), Ok(s)) = (
+                RetentionPolicySpec::from_crd(&applied_crd),
+                RetentionPolicySpec::from_crd(&p.to_crd(bundle.version)),
+            ) {
+                if a != s {
+                    edited.insert(p.name.to_string());
+                }
+            }
+        }
+    }
+    defaults::defaults_advisory(&bundle, &present, &edited, tombstoned)
 }
 
 #[cfg(test)]

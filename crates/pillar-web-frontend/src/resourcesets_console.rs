@@ -21,11 +21,14 @@ pub struct ResourceSetRow {
     pub members: usize,
     pub adopt: usize,
     pub prune: usize,
+    /// Net-new shipped defaults available to adopt (additive advisory, NOT
+    /// drift). Only meaningful for the Default set.
+    pub defaults_available: usize,
 }
 
 /// Parse the `GET /portal/resource/sets` body: one
-/// `SET <name> HEALTH <h> SYNC <s> MEMBERS <n> ADOPT <n> PRUNE <n>` line per
-/// set. A line missing a field falls back to sensible defaults for that field.
+/// `SET <name> HEALTH <h> SYNC <s> MEMBERS <n> ADOPT <n> PRUNE <n> DEFAULTS <n>`
+/// line per set. A line missing a field falls back to sensible defaults.
 #[must_use]
 pub fn parse_set_list(body: &str) -> Vec<ResourceSetRow> {
     let mut out = Vec::new();
@@ -48,6 +51,7 @@ pub fn parse_set_list(body: &str) -> Vec<ResourceSetRow> {
                 "MEMBERS" => row.members = val.parse().unwrap_or(0),
                 "ADOPT" => row.adopt = val.parse().unwrap_or(0),
                 "PRUNE" => row.prune = val.parse().unwrap_or(0),
+                "DEFAULTS" => row.defaults_available = val.parse().unwrap_or(0),
                 _ => {}
             }
             i += 2;
@@ -57,12 +61,13 @@ pub fn parse_set_list(body: &str) -> Vec<ResourceSetRow> {
     out
 }
 
-/// One member row of a ResourceSet detail: the `Kind/name` reference and its
-/// observed health.
+/// One member row of a ResourceSet detail: the `Kind/name` reference, its
+/// observed health, and its provenance (`defaults@<v>` or `operator`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemberRow {
     pub reference: String,
     pub health: String,
+    pub origin: String,
 }
 
 /// A ResourceSet's full detail, parsed from `GET /portal/resource/set`.
@@ -79,6 +84,14 @@ pub struct ResourceSetDetail {
     pub nodes: Vec<String>,
     /// Graph edges as `(from_index, to_index, label)`.
     pub edges: Vec<(usize, usize, String)>,
+    /// Shipped-defaults advisory (Default set only) — a SEPARATE axis from sync.
+    pub bundle_version: String,
+    /// Net-new shipped defaults available to adopt.
+    pub defaults_available: Vec<String>,
+    /// Present defaults the operator has diverged from ship.
+    pub defaults_edited: Vec<String>,
+    /// Operator-deleted defaults (never resurrected).
+    pub defaults_tombstoned: Vec<String>,
 }
 
 fn split_csv(raw: &str) -> Vec<String> {
@@ -105,17 +118,30 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
         } else if line == "DESC" {
             d.description.clear();
         } else if let Some(rest) = line.strip_prefix("MEMBER ") {
-            // `<ref> HEALTH <h>`
-            if let Some((reference, health)) = rest.split_once(" HEALTH ") {
+            // `<ref> HEALTH <h> [ORIGIN <origin>]`
+            if let Some((reference, tail)) = rest.split_once(" HEALTH ") {
+                let (health, origin) = match tail.split_once(" ORIGIN ") {
+                    Some((h, o)) => (h.trim().to_string(), o.trim().to_string()),
+                    None => (tail.trim().to_string(), String::new()),
+                };
                 d.members.push(MemberRow {
                     reference: reference.trim().to_string(),
-                    health: health.trim().to_string(),
+                    health,
+                    origin,
                 });
             }
         } else if let Some(rest) = line.strip_prefix("PLAN ADOPT ") {
             d.adopt = split_csv(rest);
         } else if let Some(rest) = line.strip_prefix("PLAN PRUNE ") {
             d.prune = split_csv(rest);
+        } else if let Some(rest) = line.strip_prefix("DEFAULT-BUNDLE ") {
+            d.bundle_version = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("DEFAULT-AVAILABLE ") {
+            d.defaults_available = split_csv(rest);
+        } else if let Some(rest) = line.strip_prefix("DEFAULT-EDITED ") {
+            d.defaults_edited = split_csv(rest);
+        } else if let Some(rest) = line.strip_prefix("DEFAULT-TOMBSTONED ") {
+            d.defaults_tombstoned = split_csv(rest);
         } else if let Some(rest) = line.strip_prefix("HEALTH ") {
             d.health = rest.trim().to_string();
         } else if let Some(rest) = line.strip_prefix("SYNC ") {
@@ -221,6 +247,11 @@ mod yew_impl {
                 if is_active {
                     class.push("is-active");
                 }
+                let defaults_cell = if s.defaults_available > 0 {
+                    html! { <Badge label={format!("{} available", s.defaults_available)} tone={Tone::Info} /> }
+                } else {
+                    html! { <span class="ds-muted">{ "—" }</span> }
+                };
                 html! {
                     <tr class={class} onclick={select} style="cursor:pointer">
                         <td class="mono">{ name }</td>
@@ -229,6 +260,7 @@ mod yew_impl {
                         <td>{ s.members }</td>
                         <td>{ s.adopt }</td>
                         <td>{ s.prune }</td>
+                        <td>{ defaults_cell }</td>
                     </tr>
                 }
             })
@@ -252,10 +284,16 @@ mod yew_impl {
                     .members
                     .iter()
                     .map(|m| {
+                        let origin = if m.origin.is_empty() {
+                            html! {}
+                        } else {
+                            html! { <span class="ds-muted">{ m.origin.clone() }</span> }
+                        };
                         html! {
                             <tr>
                                 <td class="mono">{ m.reference.clone() }</td>
                                 <td><Badge label={m.health.clone()} /></td>
+                                <td>{ origin }</td>
                             </tr>
                         }
                     })
@@ -268,6 +306,51 @@ mod yew_impl {
                             { for d.adopt.iter().map(|r| html!{ <li>{ format!("adopt {r}") }</li> }) }
                             { for d.prune.iter().map(|r| html!{ <li>{ format!("prune {r}") }</li> }) }
                         </ul>
+                    }
+                };
+                // Shipped-defaults advisory: a SEPARATE axis from sync. Net-new
+                // defaults are an additive offer (adopt via `pillar render
+                // defaults/<name>` then apply); operator edits/deletions are
+                // first-class and never flagged as drift.
+                let defaults_advisory = {
+                    let has_any = !d.defaults_available.is_empty()
+                        || !d.defaults_edited.is_empty()
+                        || !d.defaults_tombstoned.is_empty();
+                    if !has_any {
+                        html! {}
+                    } else {
+                        html! {
+                            <>
+                                <h4>
+                                    { "Shipped defaults" }
+                                    if !d.bundle_version.is_empty() {
+                                        <span class="ds-muted">{ format!(" (bundle v{})", d.bundle_version) }</span>
+                                    }
+                                </h4>
+                                if !d.defaults_available.is_empty() {
+                                    <p class="ds-muted">
+                                        { "Available to adopt (″pillar render defaults/<name>″ then apply):" }
+                                    </p>
+                                    <ul class="ds-list">
+                                        { for d.defaults_available.iter().map(|n| html!{
+                                            <li><span class="mono">{ n.clone() }</span>{ " " }<Badge label={"available"} tone={Tone::Info} /></li>
+                                        }) }
+                                    </ul>
+                                }
+                                if !d.defaults_edited.is_empty() {
+                                    <p class="ds-muted">{ "Edited (diverged from ship — kept, not reverted):" }</p>
+                                    <ul class="ds-list">
+                                        { for d.defaults_edited.iter().map(|n| html!{ <li class="mono">{ n.clone() }</li> }) }
+                                    </ul>
+                                }
+                                if !d.defaults_tombstoned.is_empty() {
+                                    <p class="ds-muted">{ "Deleted (tombstoned — will not be resurrected):" }</p>
+                                    <ul class="ds-list">
+                                        { for d.defaults_tombstoned.iter().map(|n| html!{ <li class="mono">{ n.clone() }</li> }) }
+                                    </ul>
+                                }
+                            </>
+                        }
                     }
                 };
                 html! {
@@ -285,11 +368,12 @@ mod yew_impl {
                         <Graph nodes={d.nodes.clone()} edges={graph_edges} />
                         <h4>{ "Members" }</h4>
                         <table class="ds-table">
-                            <thead><tr><th>{ "Resource" }</th><th>{ "Health" }</th></tr></thead>
+                            <thead><tr><th>{ "Resource" }</th><th>{ "Health" }</th><th>{ "Origin" }</th></tr></thead>
                             <tbody>{ member_rows }</tbody>
                         </table>
                         <h4>{ "Reconcile plan" }</h4>
                         { plan }
+                        { defaults_advisory }
                     </section>
                 }
             }
@@ -306,6 +390,7 @@ mod yew_impl {
                         <tr>
                             <th>{ "Name" }</th><th>{ "Health" }</th><th>{ "Sync" }</th>
                             <th>{ "Members" }</th><th>{ "Adopt" }</th><th>{ "Prune" }</th>
+                            <th>{ "Defaults" }</th>
                         </tr>
                     </thead>
                     <tbody>{ rows }</tbody>
@@ -322,8 +407,8 @@ mod tests {
 
     #[test]
     fn parses_the_set_list_lines() {
-        let body = "SET default HEALTH Healthy SYNC Synced MEMBERS 2 ADOPT 0 PRUNE 0\n\
-                    SET web HEALTH Degraded SYNC OutOfSync MEMBERS 3 ADOPT 1 PRUNE 2\n\
+        let body = "SET default HEALTH Healthy SYNC Synced MEMBERS 2 ADOPT 0 PRUNE 0 DEFAULTS 3\n\
+                    SET web HEALTH Degraded SYNC OutOfSync MEMBERS 3 ADOPT 1 PRUNE 2 DEFAULTS 0\n\
                     garbage line";
         let rows = parse_set_list(body);
         assert_eq!(rows.len(), 2);
@@ -336,19 +421,21 @@ mod tests {
                 members: 2,
                 adopt: 0,
                 prune: 0,
+                defaults_available: 3,
             }
         );
         assert_eq!(rows[1].name, "web");
         assert_eq!(rows[1].adopt, 1);
         assert_eq!(rows[1].prune, 2);
         assert_eq!(rows[1].sync, "OutOfSync");
+        assert_eq!(rows[1].defaults_available, 0);
     }
 
     #[test]
     fn parses_the_detail_header_members_plan_and_graph() {
         let body = "SET default\n\
                     DESC default retention policies\n\
-                    MEMBER RetentionPolicy/web-metrics HEALTH Healthy\n\
+                    MEMBER RetentionPolicy/web-metrics HEALTH Healthy ORIGIN operator\n\
                     MEMBER Job/nightly HEALTH Missing\n\
                     PLAN ADOPT Job/nightly\n\
                     PLAN PRUNE \n\
@@ -365,7 +452,9 @@ mod tests {
         assert_eq!(d.members.len(), 2);
         assert_eq!(d.members[0].reference, "RetentionPolicy/web-metrics");
         assert_eq!(d.members[0].health, "Healthy");
+        assert_eq!(d.members[0].origin, "operator");
         assert_eq!(d.members[1].health, "Missing");
+        assert_eq!(d.members[1].origin, "");
         assert_eq!(d.adopt, vec!["Job/nightly".to_string()]);
         assert!(d.prune.is_empty());
         assert_eq!(d.health, "Degraded");
@@ -393,5 +482,30 @@ mod tests {
         assert_eq!(d.nodes, vec!["ResourceSet/default".to_string()]);
         assert!(d.edges.is_empty());
         assert!(d.members.is_empty());
+    }
+
+    #[test]
+    fn parses_the_shipped_defaults_advisory_and_member_origin() {
+        let body = "SET default\n\
+                    MEMBER RetentionPolicy/metrics-default HEALTH Healthy ORIGIN defaults@1\n\
+                    HEALTH Healthy\n\
+                    SYNC Synced\n\
+                    DEFAULT-BUNDLE 1\n\
+                    DEFAULT-AVAILABLE logs-default,traces-default\n\
+                    DEFAULT-EDITED \n\
+                    DEFAULT-TOMBSTONED old-default\n\
+                    NODE 0 ResourceSet/default";
+        let d = parse_set_detail(body);
+        assert_eq!(d.members[0].origin, "defaults@1");
+        assert_eq!(d.bundle_version, "1");
+        assert_eq!(
+            d.defaults_available,
+            vec!["logs-default".to_string(), "traces-default".to_string()]
+        );
+        assert!(d.defaults_edited.is_empty());
+        assert_eq!(d.defaults_tombstoned, vec!["old-default".to_string()]);
+        // The advisory is a SEPARATE axis: the set is still Synced/Healthy.
+        assert_eq!(d.sync, "Synced");
+        assert_eq!(d.health, "Healthy");
     }
 }

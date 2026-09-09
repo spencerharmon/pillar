@@ -650,10 +650,68 @@ fn web(args: &[String]) -> ExitCode {
 fn render(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("helm") => render_helm(&args[1..]),
+        Some("defaults") => render_defaults(&args[1..]),
         _ => {
             eprintln!("usage: pillar render helm <template-file> [key=value ...]");
+            eprintln!("       pillar render defaults [<name>]");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `pillar render defaults [<name>]`: emit the binary-shipped default
+/// RetentionPolicy manifest(s) as applyable text (the exact format
+/// [`crate::parse_crd`] consumes), provenance-labeled. With a `<name>` it emits
+/// just that default (pipe straight into an apply); with no name it lists every
+/// shipped default, each as its own document separated by a `# ---` comment for
+/// review. This is the host-side half of "deploy new defaults after the fact":
+/// the bundle is a seed, decoupled from the node image (see specs/Defaults.tla).
+fn render_defaults(args: &[String]) -> ExitCode {
+    match defaults_manifest_output(args.first().map(String::as_str)) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Produce the shipped-defaults manifest text: with `Some(name)` just that
+/// default (applyable as-is), with `None` every shipped default as its own
+/// `# ---`-separated document. `Err` names the unknown default + the available
+/// set. Pure (no I/O) so the verb is unit-tested.
+fn defaults_manifest_output(name: Option<&str>) -> Result<String, String> {
+    let bundle = crate::defaults::shipped_default_bundle();
+    match name {
+        None => {
+            let mut out = String::new();
+            for (i, p) in bundle.policies.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "# --- {} (bundle v{}) ---\n",
+                    p.name, bundle.version
+                ));
+                out.push_str(&p.to_manifest(bundle.version));
+            }
+            Ok(out)
+        }
+        Some(name) => bundle
+            .policies
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.to_manifest(bundle.version))
+            .ok_or_else(|| {
+                let names: Vec<&str> = bundle.policies.iter().map(|p| p.name).collect();
+                format!(
+                    "no shipped default named {name:?}; available: {}",
+                    names.join(", ")
+                )
+            }),
     }
 }
 
@@ -692,5 +750,34 @@ fn render_helm(args: &[String]) -> ExitCode {
             eprintln!("render failed: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod defaults_render_tests {
+    use super::defaults_manifest_output;
+    use crate::parse_crd;
+
+    #[test]
+    fn render_one_default_emits_applyable_manifest_text() {
+        let text = defaults_manifest_output(Some("metrics-default")).expect("known default");
+        let crd = parse_crd(&text).expect("rendered default must parse as a manifest");
+        assert_eq!(crd.kind, "RetentionPolicy");
+        assert_eq!(crd.metadata.name, "metrics-default");
+    }
+
+    #[test]
+    fn render_all_defaults_lists_every_shipped_policy() {
+        let text = defaults_manifest_output(None).expect("all defaults");
+        for name in ["metrics-default", "logs-default", "traces-default"] {
+            assert!(text.contains(name), "listing must include {name}");
+        }
+    }
+
+    #[test]
+    fn render_unknown_default_is_an_error_naming_the_available_set() {
+        let err = defaults_manifest_output(Some("nope")).expect_err("unknown default");
+        assert!(err.contains("nope"));
+        assert!(err.contains("metrics-default"));
     }
 }

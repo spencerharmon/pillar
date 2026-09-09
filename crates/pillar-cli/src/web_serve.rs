@@ -175,8 +175,8 @@ use pillar_wot_authority::{FencedActor, WotAuthority};
 use crate::observability_ui::ObservabilityBuilders;
 use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
 use crate::resourceset::{
-    build_graph, plan_reconcile, roll_up_health, MemberHealth, MemberRef, MemberStatus,
-    ResourceSetSpec,
+    build_graph, collect_resourcesets, defaults_advisory_for_view, member_origin, member_statuses,
+    owned_live, plan_reconcile, roll_up_health, MemberHealth, MemberRef, DEFAULT_RESOURCE_SET,
 };
 use crate::Platform;
 use pillar_manifest::{
@@ -663,16 +663,6 @@ const RESOURCE_CAP: &str = "resource/act";
 /// A workload kind the resource UI drives (Deployment-like: a `replicas`
 /// spec `scale`/`rollout` act over).
 const WORKLOAD_KIND: &str = "Workload";
-/// The `ResourceSet` built-in kind's `kind` string (pillar's ArgoCD-Application
-/// analog), reused verbatim from
-/// [`pillar_manifest::builtin::BuiltinKind::ResourceSet`].
-const RESOURCE_SET_KIND: &str = "ResourceSet";
-/// The well-known Default ResourceSet name; it implicitly owns every
-/// RetentionPolicy resource.
-const DEFAULT_RESOURCE_SET: &str = "default";
-/// The ownership tracking label an explicit ResourceSet stamps on the
-/// resources it owns (ArgoCD-tracking-label analog).
-const RESOURCE_SET_LABEL: &str = "pillar.dev/resource-set";
 /// An identity-object kind the SAME verb surface is polymorphic over.
 const IDENTITY_KIND: &str = "User";
 /// The `CronJob` built-in kind's `kind` string — reused verbatim from
@@ -2498,44 +2488,62 @@ impl WebAuthContext {
     #[must_use]
     pub fn resourcesets_list(&self) -> String {
         let view = self.resource_platform.view();
-        let sets = self.collect_resourcesets(&view);
+        let sets = collect_resourcesets(&view);
+        let advisory = defaults_advisory_for_view(&view, &self.default_tombstones());
+        let available = crate::defaults::available_count(&advisory);
         let mut lines = Vec::new();
         for spec in &sets {
-            let statuses = self.member_statuses(&view, spec);
+            let statuses = member_statuses(&view, spec);
             let healths: Vec<MemberHealth> = statuses.iter().map(|s| s.health).collect();
             let health = roll_up_health(&healths);
-            let owned = self.owned_live(&view, spec);
+            let owned = owned_live(&view, spec);
             let plan = plan_reconcile(&spec.members, &owned);
+            // The defaults advisory is a property of the Default set only; other
+            // sets report 0 (their membership is not seeded from the bundle).
+            let defaults_avail = if spec.name == DEFAULT_RESOURCE_SET {
+                available
+            } else {
+                0
+            };
             lines.push(format!(
-                "SET {} HEALTH {} SYNC {} MEMBERS {} ADOPT {} PRUNE {}",
+                "SET {} HEALTH {} SYNC {} MEMBERS {} ADOPT {} PRUNE {} DEFAULTS {}",
                 spec.name,
                 health.as_str(),
                 plan.sync_status().as_str(),
                 spec.members.len(),
                 plan.to_adopt.len(),
-                plan.to_prune.len()
+                plan.to_prune.len(),
+                defaults_avail,
             ));
         }
         lines.join("\n")
     }
 
+    /// The operator-recorded default deletions (tombstones) for the Default set.
+    /// Durable deletion tracking is the follow-up slice; today no deletions are
+    /// journaled, so this is empty — the advisory is exact for every cell that
+    /// has not yet deleted a seeded default (which is every cell today).
+    fn default_tombstones(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
     /// One ResourceSet's full detail: a `SET`/`DESC` header, one `MEMBER
-    /// <Kind/name> HEALTH <h>` line per declared member, the reconcile `PLAN`
-    /// (`ADOPT`/`PRUNE` refs), the rolled-up `HEALTH`/`SYNC`, and the resource
-    /// GRAPH the console renders (`NODE <i> <label>` + `EDGE <from> <to>
-    /// <label>`). `None` when the named set is neither declared nor the
-    /// synthesizable Default set. Signs nothing.
+    /// <Kind/name> HEALTH <h> ORIGIN <origin>` line per declared member, the
+    /// reconcile `PLAN` (`ADOPT`/`PRUNE` refs), the rolled-up `HEALTH`/`SYNC`,
+    /// the shipped-defaults advisory (`DEFAULT-AVAILABLE`/`DEFAULT-TOMBSTONED`,
+    /// a SEPARATE axis from `SYNC`), and the resource GRAPH the console renders
+    /// (`NODE <i> <label>` + `EDGE <from> <to> <label>`). `None` when the named
+    /// set is neither declared nor the synthesizable Default set. Signs nothing.
     #[must_use]
     pub fn resourceset_detail(&self, name: &str) -> Option<String> {
         let view = self.resource_platform.view();
-        let spec = self
-            .collect_resourcesets(&view)
+        let spec = collect_resourcesets(&view)
             .into_iter()
             .find(|s| s.name == name)?;
-        let statuses = self.member_statuses(&view, &spec);
+        let statuses = member_statuses(&view, &spec);
         let healths: Vec<MemberHealth> = statuses.iter().map(|s| s.health).collect();
         let health = roll_up_health(&healths);
-        let owned = self.owned_live(&view, &spec);
+        let owned = owned_live(&view, &spec);
         let plan = plan_reconcile(&spec.members, &owned);
         let graph = build_graph(&spec.name, &statuses);
 
@@ -2546,10 +2554,15 @@ impl WebAuthContext {
             spec.description.as_deref().unwrap_or("")
         ));
         for s in &statuses {
+            // Provenance is a SEPARATE axis from health: a member seeded from
+            // the defaults bundle is tagged `defaults@<v>`, an operator-authored
+            // one `operator`. This never affects HEALTH/SYNC.
+            let origin = member_origin(&view, &s.reference);
             out.push(format!(
-                "MEMBER {} HEALTH {}",
+                "MEMBER {} HEALTH {} ORIGIN {}",
                 s.reference,
-                s.health.as_str()
+                s.health.as_str(),
+                origin.as_tag(),
             ));
         }
         out.push(format!(
@@ -2570,6 +2583,34 @@ impl WebAuthContext {
         ));
         out.push(format!("HEALTH {}", health.as_str()));
         out.push(format!("SYNC {}", plan.sync_status().as_str()));
+        // Shipped-defaults advisory (Default set only): an ADDITIVE signal, not
+        // drift. `DEFAULT-AVAILABLE` = net-new adoptable; `DEFAULT-TOMBSTONED` =
+        // operator-deleted (never resurrected). Never folded into SYNC/HEALTH.
+        if spec.name == DEFAULT_RESOURCE_SET {
+            let advisory = defaults_advisory_for_view(&view, &self.default_tombstones());
+            let avail: Vec<&str> = advisory
+                .iter()
+                .filter(|a| a.status == crate::defaults::DefaultStatus::Available)
+                .map(|a| a.name.as_str())
+                .collect();
+            let tombs: Vec<&str> = advisory
+                .iter()
+                .filter(|a| a.status == crate::defaults::DefaultStatus::Tombstoned)
+                .map(|a| a.name.as_str())
+                .collect();
+            let edited: Vec<&str> = advisory
+                .iter()
+                .filter(|a| a.status == crate::defaults::DefaultStatus::Edited)
+                .map(|a| a.name.as_str())
+                .collect();
+            out.push(format!(
+                "DEFAULT-BUNDLE {}",
+                crate::defaults::DEFAULT_BUNDLE_VERSION
+            ));
+            out.push(format!("DEFAULT-AVAILABLE {}", avail.join(",")));
+            out.push(format!("DEFAULT-EDITED {}", edited.join(",")));
+            out.push(format!("DEFAULT-TOMBSTONED {}", tombs.join(",")));
+        }
         for (i, label) in graph.nodes.iter().enumerate() {
             out.push(format!("NODE {i} {label}"));
         }
@@ -2577,107 +2618,6 @@ impl WebAuthContext {
             out.push(format!("EDGE {from} {to} {label}"));
         }
         Some(out.join("\n"))
-    }
-
-    /// Collect the declared ResourceSets from the view, plus the synthesized
-    /// Default set (declaring every RetentionPolicy resource) when no explicit
-    /// `default` ResourceSet has been applied.
-    fn collect_resourcesets(
-        &self,
-        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
-    ) -> Vec<ResourceSetSpec> {
-        let mut sets: Vec<ResourceSetSpec> = Vec::new();
-        let mut have_default = false;
-        for (key, env) in view {
-            if key.kind != RESOURCE_SET_KIND {
-                continue;
-            }
-            if let Ok(spec) = ResourceSetSpec::from_crd(&env.render()) {
-                if spec.name == DEFAULT_RESOURCE_SET {
-                    have_default = true;
-                }
-                sets.push(spec);
-            }
-        }
-        if !have_default {
-            sets.insert(
-                0,
-                ResourceSetSpec {
-                    name: DEFAULT_RESOURCE_SET.to_owned(),
-                    description: Some("default retention policies".to_owned()),
-                    members: self.all_retention_policy_refs(view),
-                },
-            );
-        }
-        sets
-    }
-
-    /// Every `RetentionPolicy/<name>` resource currently in the view — the
-    /// implicit membership of the Default ResourceSet.
-    fn all_retention_policy_refs(
-        &self,
-        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
-    ) -> Vec<MemberRef> {
-        view.keys()
-            .filter(|k| k.kind == "RetentionPolicy")
-            .map(|k| MemberRef::new("RetentionPolicy", &k.name))
-            .collect()
-    }
-
-    /// The declared members of `spec` with their live health: a member present
-    /// in the view is `Healthy`, an absent one is `Missing`. (Richer per-kind
-    /// health probes are a follow-up; presence is the honest baseline.)
-    fn member_statuses(
-        &self,
-        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
-        spec: &ResourceSetSpec,
-    ) -> Vec<MemberStatus> {
-        spec.members
-            .iter()
-            .map(|m| {
-                let present = view.keys().any(|k| k.kind == m.kind && k.name == m.name);
-                MemberStatus {
-                    reference: m.clone(),
-                    health: if present {
-                        MemberHealth::Healthy
-                    } else {
-                        MemberHealth::Missing
-                    },
-                }
-            })
-            .collect()
-    }
-
-    /// The members `spec` currently OWNS on the live plane. The Default set
-    /// IMPLICITLY owns every RetentionPolicy that exists; an explicit set owns
-    /// the resources carrying its ownership label
-    /// (`pillar.dev/resource-set=<name>`).
-    fn owned_live(
-        &self,
-        view: &std::collections::BTreeMap<crate::ResourceKey, pillar_manifest::Envelope>,
-        spec: &ResourceSetSpec,
-    ) -> Vec<MemberRef> {
-        if spec.name == DEFAULT_RESOURCE_SET {
-            // Implicit ownership: every existing RetentionPolicy that the set
-            // declares (all of them, by construction of the synthesized set).
-            return spec
-                .members
-                .iter()
-                .filter(|m| view.keys().any(|k| k.kind == m.kind && k.name == m.name))
-                .cloned()
-                .collect();
-        }
-        view.iter()
-            .filter(|(_, env)| {
-                env.body()
-                    .metadata
-                    .labels
-                    .get(RESOURCE_SET_LABEL)
-                    .map(|owner| owner == &spec.name)
-                    .unwrap_or(false)
-            })
-            .map(|(k, _)| MemberRef::new(&k.kind, &k.name))
-            .collect()
     }
 
     /// The `--dry-run`-style preview of an act: the decider's ALLOW/DENY for
@@ -6164,6 +6104,65 @@ mod tests {
         );
         assert!(detail.contains("EDGE 0 1 Healthy"), "edge: {detail}");
         assert!(detail.contains("SYNC Synced"), "sync: {detail}");
+
+        // Two-axis model: the operator-authored policy is tagged `operator`,
+        // and the shipped-defaults advisory is SEPARATE from SYNC — all three
+        // shipped defaults are net-new Available, none tombstoned.
+        assert!(
+            list1.contains("MEMBERS 1 ADOPT 0 PRUNE 0 DEFAULTS 3"),
+            "defaults advisory column (3 net-new available): {list1}"
+        );
+        assert!(
+            detail.contains("MEMBER RetentionPolicy/web-metrics HEALTH Healthy ORIGIN operator"),
+            "operator provenance tag: {detail}"
+        );
+        assert!(
+            detail.contains("DEFAULT-BUNDLE 1"),
+            "bundle version: {detail}"
+        );
+        assert!(
+            detail.contains("DEFAULT-AVAILABLE metrics-default,logs-default,traces-default"),
+            "net-new available advisory (additive, not drift): {detail}"
+        );
+        assert!(
+            detail.contains("DEFAULT-TOMBSTONED "),
+            "tombstoned line present (empty): {detail}"
+        );
+
+        // Adopt a shipped default WITH provenance labels + the shipped spec: it
+        // becomes Present (tagged `defaults@1`, dropping it from Available) and
+        // is NOT flagged as drift.
+        let seeded = Crd::new(
+            &ctx.resource_api,
+            "RetentionPolicy",
+            CrdMetadata::new("metrics-default")
+                .with_label("pillar.dev/managed-by", "defaults")
+                .with_label("pillar.dev/default-bundle", "1"),
+        )
+        .with_spec("signalKind", CrdValue::String("Metric".into()))
+        .with_spec("window", CrdValue::Integer(2_592_000));
+        {
+            let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
+            plane
+                .apply(&actor, RESOURCE_CAP, seeded)
+                .expect("owner adopts a shipped default");
+        }
+        let list2 = ctx.resourcesets_list();
+        assert!(
+            list2.contains("MEMBERS 2 ADOPT 0 PRUNE 0 DEFAULTS 2"),
+            "one default adopted -> 2 net-new remain: {list2}"
+        );
+        let detail2 = ctx.resourceset_detail("default").expect("default set");
+        assert!(
+            detail2.contains(
+                "MEMBER RetentionPolicy/metrics-default HEALTH Healthy ORIGIN defaults@1"
+            ),
+            "defaults provenance tag: {detail2}"
+        );
+        assert!(
+            detail2.contains("DEFAULT-AVAILABLE logs-default,traces-default"),
+            "adopted default drops out of Available: {detail2}"
+        );
 
         // An unknown set is a clean miss.
         assert!(ctx.resourceset_detail("nope").is_none());

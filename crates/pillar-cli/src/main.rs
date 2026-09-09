@@ -47,6 +47,7 @@ fn usage() -> &'static str {
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar secrets-audit-rotation-mfa          seal/read a secret, signed-audit + forged-key rejection, key rotation, step-up MFA\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\
+     \x20 pillar render defaults [<name>]           print shipped default RetentionPolicy manifest(s) to apply\n\
      \x20 pillar render kustomize <base.txt>        (see library API for overlay construction)\n\
      \x20 pillar --web [--port N]                  serve the localhost-only bootstrap/web UI\n\
      \x20 pillar obs <family> <verb> [args]         per-signal observability views (see below)\n\
