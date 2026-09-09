@@ -1878,8 +1878,8 @@ mod yew_impl {
                                 <span class="mono">{ s.name.clone() }</span>
                                 <span class="query-metric-last">{ format!("last {last}") }</span>
                             </div>
-                            <crate::components::chart::Chart values={vals}
-                                kind={crate::components::chart::ChartKind::Line} />
+                            <crate::primitives::Chart values={vals}
+                                kind={crate::primitives::ChartKind::Line} />
                         </div>
                     }
                 }) }
