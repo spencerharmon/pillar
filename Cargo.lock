@@ -3271,9 +3271,10 @@ name = "pillar-observability"
 version = "0.1.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-manifest",
- "pillar-streamdb",
  "pillar-topology",
+ "pillar-wire",
  "pillar-wot-authority",
  "sha2",
 ]

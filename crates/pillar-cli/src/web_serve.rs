@@ -1195,7 +1195,7 @@ impl WebAuthContext {
         for r in self.observability.explore(kind) {
             body.push_str(&format!(
                 "SIGNAL {} KIND {} PAYLOAD {}\n",
-                r.id.0,
+                r.id,
                 signal_kind_tag(kind),
                 r.payload
             ));
@@ -1239,7 +1239,7 @@ impl WebAuthContext {
                 for r in records {
                     body.push_str(&format!(
                         "SIGNAL {} KIND {} PAYLOAD {}\n",
-                        r.id.0,
+                        r.id,
                         signal_kind_tag(kind),
                         r.payload
                     ));
@@ -1267,7 +1267,7 @@ impl WebAuthContext {
         for r in sub.explore(kind) {
             body.push_str(&format!(
                 "SIGNAL {} KIND {} PAYLOAD {}\n",
-                r.id.0,
+                r.id,
                 signal_kind_tag(r.kind),
                 r.payload
             ));
@@ -1325,7 +1325,7 @@ impl WebAuthContext {
                 .join(";");
             body.push_str(&format!(
                 "SIGNAL {} KIND {} TICK {} TS {} LABELS {} PAYLOAD {}\n",
-                r.id.0,
+                r.id,
                 signal_kind_tag(r.kind),
                 r.tick,
                 r.unix_millis.map(|m| m.to_string()).unwrap_or_default(),
@@ -1339,7 +1339,7 @@ impl WebAuthContext {
                 .map(|m| m.to_hex())
                 .collect::<Vec<_>>()
                 .join(",");
-            body.push_str(&format!("GROUP {} MEMBERS {}\n", anchor.0, ids));
+            body.push_str(&format!("GROUP {} MEMBERS {}\n", anchor, ids));
         }
         Some(Ok(body))
     }
@@ -1609,7 +1609,7 @@ impl WebAuthContext {
             for r in records {
                 body.push_str(&format!(
                     "SIGNAL {} KIND {} PAYLOAD {}\n",
-                    r.id.0,
+                    r.id,
                     signal_kind_tag(r.kind),
                     r.payload
                 ));
