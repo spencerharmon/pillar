@@ -26,7 +26,14 @@ loss/bandwidth scaling.
 `pillar-message-format.md` — *The Pillar Message Format*. The single sealed,
 content-addressed, version-stamped `PillarMessage` envelope that carries every
 byte Pillar persists or transmits — streamdb ops, observability signals, and all
-libp2p control traffic — the convergent cell-seal that keeps the `Cid` stable
-under encryption, and the handshakeless (WoT-keyed) pillar-udp datagram seal that
-replaces the libp2p Noise upgrade. Design of record for the `pillar-wire` crate;
-implementation is TLA+-gated (method #1).
+libp2p control traffic — and the convergent cell-seal that keeps the `Cid` stable
+under encryption (transport-agnostic). Design of record for the `pillar-wire`
+crate; implementation is TLA+-gated (method #1).
+
+`pillar-udp-encryption.md` — *pillar-udp Encryption: the portable cell-minted
+session key*. How a **pillar-udp** datagram is encrypted on the wire, replacing the
+libp2p Noise upgrade: a cell-as-KDC scheme distributing a deterministically-derived,
+**portable** session key over streamdb (any cell node can serve the session), with
+anonymous sessions handled by policy (not a separate crypto scheme) and forward
+secrecy deliberately bounded to cell-key security for cross-node portability. QUIC/TCP
+fallbacks use their own TLS instead. TLA+-gated by `../../specs/PillarUdpEncryption.tla`.

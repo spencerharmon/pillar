@@ -44,8 +44,12 @@ variants of it. It is:
    is stable across nodes despite encryption;
 3. **version-stamped** — an independently-incrementable surface version, per the
    ROI versioning spine;
-4. **the payload of a pillar-udp datagram** (fallback QUIC, then TCP+TLS), where
-   pillar-udp — *not* a libp2p Noise handshake — supplies the transport encryption.
+4. **the payload of a pillar-udp datagram** (fallback QUIC, then TCP+TLS). On
+   pillar-udp the datagram is encrypted under a **portable, cell-minted session key**
+   (not a libp2p Noise handshake, and not a per-pair session); the full scheme is its
+   own design-of-record — see the companion paper **`pillar-udp-encryption.md`**. On
+   QUIC/TCP the transport's own TLS supplies session encryption and this scheme does
+   not apply. The content seal (point 2) is transport-agnostic and applies either way.
 
 ---
 
@@ -68,11 +72,13 @@ variants of it. It is:
 │ ContentStore → IpfsBackend   │  │ pillar-net: one PillarMessage per       │
 │  (embedded IPFS, pin/provide)│  │  request/response/gossip payload        │
 │  Cid ⇔ IPFS CIDv1 raw block  │  └───────────────┬───────────────────────┘
-└──────────────────────────────┘          per-hop │ seal to peer (handshakeless)
+└──────────────────────────────┘   transport │ frame seal (pillar-udp ONLY)
                                    ┌───────────────▼───────────────────────┐
-                                   │ pillar-udp datagram  (fallback QUIC,   │
-                                   │   then TCP+TLS)  — pillar-crypto seals, │
-                                   │   NOT libp2p Noise                      │
+                                   │ pillar-udp datagram — sealed under a   │
+                                   │   portable cell-minted SESSION KEY     │
+                                   │   (see pillar-udp-encryption.md).      │
+                                   │ fallback QUIC / TCP+TLS: transport TLS │
+                                   │   supplies the frame seal instead.     │
                                    └────────────────────────────────────────┘
 ```
 
@@ -81,13 +87,16 @@ Two distinct seals, deliberately, because they protect different things:
 | Seal | Layer | Recipient | Key | Nonce | Purpose |
 |------|-------|-----------|-----|-------|---------|
 | **content seal** | `PillarMessage.body` | the **cell** | cell group key (symmetric) | **deterministic** (convergent) | confidentiality at rest + stable `Cid` + dedup |
-| **hop seal** | pillar-udp datagram | the **peer** (next hop) | peer X25519 sealing key (WoT) | random (ephemeral) | confidentiality on the wire, handshakeless |
+| **transport frame seal** | pillar-udp datagram | the **cell** (any member) | portable cell-minted **session key** `K_s` | **collision-free** (convergent / sender-partitioned) | confidentiality of transport framing on the wire |
 
 The content seal travels *with* the record — an IPFS block on disk is already sealed;
 a peer that backfills it over bitswap still cannot read it without the cell key. The
-hop seal is per-datagram and protects the transport metadata/framing to the specific
-next hop. A datagram to a cell member therefore carries a cell-sealed body inside a
-peer-sealed datagram — double-sealed, each layer independent.
+transport frame seal is **pillar-udp-specific** and protects the on-wire framing; it
+is keyed by a session key that is *portable across every cell node* (established via
+the cell-as-KDC scheme in **`pillar-udp-encryption.md`**), so any ingress/relay node
+can carry the session. On QUIC/TCP the transport's native TLS plays this role instead.
+A pillar-udp datagram to a cell therefore carries a cell-sealed body inside a
+session-key-sealed datagram — double-sealed, each layer independent.
 
 ---
 
@@ -219,56 +228,36 @@ gets its own TLA+ obligations (`ConvergentDeterministic`, `ConvergentConfidentia
 
 ---
 
-## 6. Transport: pillar-udp supplies the cryptography
+## 6. Transport: how the envelope is encrypted on the wire
 
-Decision #1: pillar-udp itself supplies transport cryptography **via pillar-crypto**,
-because non-anonymous sessions are **handshakeless** — the distributed Web of Trust
-already yields each peer's static X25519 `SealingPublicKey`, so there is no need for a
-Noise DH handshake round-trip to establish a session key. **All libp2p messages ride
-inside the `PillarMessage` envelope**, exactly like streamdb ops and tsdb signals.
-pillar-udp sits **beneath** IPFS in the stack.
+The envelope's on-wire encryption depends on the transport, and there are exactly two
+cases:
 
-### 6.1 Non-anonymous datagram (handshakeless)
+- **pillar-udp** (a bare datagram substrate) supplies its **own** frame encryption,
+  keyed by a **portable, cell-minted session key** — established by a *cell-as-KDC*
+  scheme distributed over streamdb, with a deterministic session key derived from the
+  client's ephemeral key against the cell static key. This replaces the libp2p Noise
+  upgrade. It is **not** handshakeless-per-peer and it is **not** a per-pair Noise
+  session: the session key is portable across every cell node so any ingress/relay can
+  carry it. The complete scheme — packet flow, key derivation, anonymous handling,
+  revocation/GC, and the forward-secrecy tradeoff — is its **own design-of-record**,
+  the companion paper **`pillar-udp-encryption.md`**, TLA+-gated by
+  `specs/PillarUdpEncryption.tla`.
 
-```
-datagram_payload = seal_to_recipients( canonical_cbor(PillarMessage),
-                                        [ peer_sealing_pubkey ] )     // X25519 sealed-box
-```
+- **QUIC / TCP** (the fallback transports) bring their **own TLS 1.3 session
+  encryption**; the pillar-udp session-key scheme does **not** apply there. pillar-udp
+  → QUIC → TCP+TLS is the selection order; the *payload of every one of them* is a
+  `PillarMessage`, and because the body is *already* cell-sealed (§5), even the
+  fallback transports never see plaintext application content.
 
-`seal_to_recipients` (`pillar-crypto::seal`) is an ephemeral-static ECDH sealed-box:
-the sender mints an ephemeral X25519 key per datagram, derives a shared secret against
-the peer's WoT-published static key, and AEAD-seals — **no handshake, no round-trip,
-no session state.** The peer opens with `unseal(secret)`. This is what "handshakeless
-due to the distributed WoT" means concretely: the WoT *is* the key-distribution that a
-handshake would otherwise perform.
+**All libp2p control messages ride inside the `PillarMessage` envelope**, exactly like
+streamdb ops and observability signals; pillar-udp sits **beneath** IPFS in the stack.
 
-### 6.2 Anonymous sessions
-
-An anonymous session has no WoT identity for the peer, so §6.1 has no recipient key.
-Anonymous datagrams are therefore **out of scope for per-hop confidentiality** and are
-specified separately (candidate: ephemeral-ephemeral with an out-of-band-verified
-short-auth-string, or cleartext-authenticated-only for public gossip). The TLA+ spec
-resolves the anonymous path; the non-anonymous path above is the default and the one
-the initial implementation lands. *(Open design point flagged to the operator.)*
-
-### 6.3 Fallback chain
-
-Transport selection is unchanged in ordering — pillar-udp → QUIC → TCP+TLS — but the
-**payload of every one of them is a `PillarMessage`**. QUIC and TCP+TLS retain their
-own transport-native encryption (QUIC-TLS, TLS); pillar-udp is the case that needed an
-explicit cryptographic story because it is a bare datagram substrate. Because the
-envelope body is *already* cell-sealed (§5), even the fallback transports never see
-plaintext application content.
-
-### 6.4 Relationship to Noise
-
-Removing the libp2p Noise upgrade from the pillar-udp transport is a deliberate,
-**breaking** transport-protocol change. It is safe only behind the versioning spine:
-the pillar-UDP protocol version and the pillar-message version both bump, and
-compatibility negotiation (ROI versioning section) refuses a Noise-era peer cleanly
-rather than mis-framing. Non-negotiable method #1 (TLA+ first) governs the cutover —
-`NegotiationRefusesIncompatible` and `RollingCoexistence` must cover a mixed
-Noise/pillar-crypto swarm during rollout.
+Removing the libp2p Noise upgrade from pillar-udp is a deliberate, **breaking**
+transport-protocol change, safe only behind the versioning spine: the pillar-UDP
+protocol version bumps and compatibility negotiation refuses a Noise-era peer cleanly
+rather than mis-framing. `NegotiationRefusesIncompatible` and `RollingCoexistence`
+(§9) cover a mixed legacy-Noise / session-key swarm during rollout.
 
 ---
 
@@ -279,7 +268,8 @@ Per the ROI versioning spine (independent per-surface version stamps, N-1 window
 - **envelope version** — `PillarMessage.version`. `v1` = the legacy streamdb
   `SignedSegment` length-prefixed form (read-compat); `v2` = this canonical-CBOR,
   cell-sealed, convergent envelope.
-- **pillar-UDP protocol version** — bumped for the Noise→pillar-crypto cutover.
+- **pillar-UDP protocol version** — bumped for the Noise→session-key cutover
+  (see `pillar-udp-encryption.md`).
 - **sealed-artifact/key envelope version** — the convergent-seal algorithm tag
   (reuses `pillar-crypto`'s self-describing AEAD tag; the convergent KDF gets its own
   `"…/v1"` info string so a future scheme coexists).
@@ -306,8 +296,9 @@ coexist by construction).
   `TimeseriesStore` hot tip persists each signal as a sealed, content-addressed IPFS
   block via `ContentStore`; cross-node backfill rides the same substrate as streamdb.
 - **`pillar-net`** — every request/response/gossip payload is a `PillarMessage`; the
-  pillar-udp transport drops the Noise upgrade and seals datagrams with
-  `seal_to_recipients` (§6). The per-protocol CBOR types become `ControlBody` variants.
+  pillar-udp transport drops the Noise upgrade and seals datagrams under the portable
+  cell-minted session key (§6, `pillar-udp-encryption.md`). The per-protocol CBOR
+  types become `ControlBody` variants.
 
 ## 9. Invariants (TLA+ obligations, before any Rust)
 
@@ -320,20 +311,30 @@ Refines/extends the existing `versioning-compat-migration-spec` and
 - `DedupUnderEncryption` — identical sealed records collapse to one `Cid`/one block.
 - `CellConfidential` — only a cell-key holder recovers `Body`; a non-member/bitswap
   peer gets ciphertext only.
-- `HandshakelessAuth` — a non-anonymous datagram is sealed to and openable by exactly
-  the intended WoT peer, with no handshake state.
-- `NoNonceReuseAcrossDistinctPlaintext` — convergent nonces collide only for identical
-  plaintext.
+- `NoNonceReuseAcrossDistinctPlaintext` — convergent content nonces collide only for
+  identical plaintext.
+
+The transport-frame encryption obligations (portable session-key convergence,
+cell-signed session records, anonymous-as-unattested-principal policy gating, replay
+via dedup, revoked-key erasure) are proven separately in
+`specs/PillarUdpEncryption.tla` — see `pillar-udp-encryption.md` §Invariants.
 - `IndependentVersioning` / `NegotiationRefusesIncompatible` / `RollingCoexistence` —
   the envelope, pillar-UDP, and seal versions bump independently and a mixed-version
   (incl. Noise-era) swarm never mis-frames or partitions.
 
-## 10. Open points for the operator
+## 10. Resolved design points
 
-1. **Anonymous-session transport crypto (§6.2)** — no WoT key exists; needs an
-   explicit scheme (ephemeral-ephemeral + SAS, or authenticated-cleartext for public
-   gossip). Default proposed: non-anonymous handshakeless first; anonymous resolved in
-   the spec.
-2. **Convergent-encryption equality leak (§5)** — accepted as the mechanism of dedup,
+1. **Anonymous-session transport crypto** — *resolved.* Anonymous clients use the
+   *exact same* pillar-udp session-key scheme; anonymity is a **policy** property, not
+   a crypto scheme. An anonymous key is cryptographically equivalent to a user/node
+   key and is subject to the same WoT/RBAC checks; lacking role attestations, the cell
+   withholds sensitive data and privileged operations by default-deny. See
+   `pillar-udp-encryption.md` §Anonymous.
+2. **Transport forward secrecy** — *accepted tradeoff.* The portable session key is
+   derivable under the cell static key, so transport forward secrecy bounds to
+   cell-key security plus erase-on-revoke — the same price the content seal already
+   pays. Per-session ephemeral FS is deliberately traded for cross-node portability.
+   Detailed in `pillar-udp-encryption.md`.
+3. **Convergent-encryption equality leak (§5)** — accepted as the mechanism of dedup,
    scoped to the cell boundary. Flagged so it is an explicit, reviewed acceptance, not
    an accident.

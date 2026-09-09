@@ -2,11 +2,16 @@
 (***************************************************************************)
 (* ROI P1 "The unified Pillar Message Format" (operator-directed, 2026-09-09), *)
 (* method #1 TLA+-FIRST, DESIGN-GATED. This spec is step (a): it MUST be     *)
-(* green under TLC before ANY Rust lands for the envelope, the convergent    *)
-(* seal, or the pillar-udp cutover (pillar-wire-crate-impl,                   *)
-(* cell-seal-convergent-impl, streamdb-pillarmsg-migration,                  *)
-(* obs-signal-pillarmsg-ipfs, pillar-net-pillarmsg-handshakeless-udp all      *)
-(* depend on it). Design of record: docs/papers/pillar-message-format.md.    *)
+(* green under TLC before ANY Rust lands for the envelope or the convergent   *)
+(* content seal (pillar-wire-crate-impl, cell-seal-convergent-impl,           *)
+(* streamdb-pillarmsg-migration, obs-signal-pillarmsg-ipfs all depend on it).  *)
+(* Design of record: docs/papers/pillar-message-format.md.                    *)
+(*                                                                          *)
+(* SCOPE: this spec is TRANSPORT-AGNOSTIC -- envelope + convergent CONTENT     *)
+(* seal (holds on pillar-udp, QUIC, TCP alike) + format/protocol version      *)
+(* negotiation. The pillar-udp TRANSPORT-FRAME encryption (the portable       *)
+(* cell-minted session key) is proven separately in PillarUdpEncryption.tla / *)
+(* docs/papers/pillar-udp-encryption.md -- NOT modelled here.                  *)
 (*                                                                          *)
 (* It extends the version-negotiation discipline of VersioningCompat.tla     *)
 (* (the pillar-UDP protocol version is one of that spec's abstract           *)
@@ -27,19 +32,15 @@
 (* DISTINCT plaintexts never share a nonce (AEAD-safe) while two IDENTICAL    *)
 (* plaintexts collapse to one Cid (the intended dedup).                       *)
 (*                                                                          *)
-(* Transport (pillar-udp) is HANDSHAKELESS: a datagram is sealed to the       *)
-(* recipient peer's STATIC sealing key (published by the WoT), so it is       *)
-(* openable by EXACTLY that peer with NO session/handshake state -- the        *)
-(* model has no handshake variable at all; that absence IS the property.      *)
 (* The legacy libp2p Noise upgrade is gone: the message-format/pillar-UDP     *)
 (* version bumps and a mixed-version swarm negotiates or is cleanly refused.  *)
 (*                                                                          *)
 (* Proven by TLC:                                                            *)
 (*   Safety   : TypeOK, OneRecordFormat, ContentAddressStable,               *)
-(*              DedupUnderEncryption, CellConfidential, HandshakelessAuth,    *)
+(*              DedupUnderEncryption, CellConfidential,                       *)
 (*              NoNonceReuseAcrossDistinctPlaintext,                          *)
 (*              NegotiationRefusesIncompatible                               *)
-(*   Liveness : RollingCoexistence (mixed Noise/pillar-crypto era reachable) *)
+(*   Liveness : RollingCoexistence (mixed Noise/session-key era reachable)   *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -88,25 +89,18 @@ VARIABLES
                \*   (a SET, so identical Cids collapse -- dedup by construction)
     opened,    \* [Nodes -> SUBSET (Cells \X Bodies)] : the <<cell, body>> pairs a
                \*   node has actually DECRYPTED (only ever for a cell it holds)
-    hop,       \* the single in-flight pillar-udp datagram slot (scalar, like
-               \*   VersioningCompat's negOutcome): [phase, to, sealedTo, by, env]
     protoVer,  \* [Nodes -> 0..MaxV] : each node's running pillar-UDP/message
                \*   version (0 = legacy Noise era, >=1 = sealed-envelope era)
     released,  \* 0..MaxV : swarm-wide released pillar-UDP/message version
     neg        \* last negotiation outcome: [kind: {"none","linked","refused"}, p, q]
 
-vars == <<stored, opened, hop, protoVer, released, neg>>
+vars == <<stored, opened, protoVer, released, neg>>
 
 NoNode == CHOOSE n \in Nodes : TRUE
-AnyBody == CHOOSE b \in Bodies : TRUE
-
-HopIdle == [phase |-> "idle", to |-> NoNode, sealedTo |-> NoNode,
-            by |-> NoNode, env |-> MkEnv("cA", AnyBody)]
 
 Init ==
     /\ stored   = [n \in Nodes |-> {}]
     /\ opened   = [n \in Nodes |-> {}]
-    /\ hop      = HopIdle
     /\ protoVer = [n \in Nodes |-> 0]
     /\ released = 0
     /\ neg      = [kind |-> "none", p |-> NoNode, q |-> NoNode]
@@ -120,37 +114,18 @@ Produce(n, b) ==
     LET c == CellOf(n) IN
     /\ stored' = [stored EXCEPT ![n] = @ \cup {MkEnv(c, b)}]
     /\ opened' = [opened EXCEPT ![n] = @ \cup {<<c, b>>}]
-    /\ UNCHANGED <<hop, protoVer, released, neg>>
+    /\ UNCHANGED <<protoVer, released, neg>>
 
 \* Content-addressed backfill: m fetches an envelope from n's store (bitswap).
 \* m stores the (sealed) block unconditionally; it recovers the PLAINTEXT only
 \* if it holds the sealing cell's key -- a non-member keeps ciphertext only.
+\* Transport-agnostic: same whether the block arrives over pillar-udp/QUIC/TCP.
 Replicate(n, m) ==
     /\ n # m
     /\ \E e \in stored[n] :
          /\ stored' = [stored EXCEPT ![m] = @ \cup {e}]
          /\ opened' = [opened EXCEPT ![m] =
                           IF Holds(m, e.cell) THEN @ \cup {<<e.cell, e.body>>} ELSE @]
-    /\ UNCHANGED <<hop, protoVer, released, neg>>
-
-\* n transmits an envelope as a pillar-udp datagram sealed to m's STATIC sealing
-\* key (from the WoT). No handshake precedes this -- there is no session state.
-Send(n, m) ==
-    /\ n # m
-    /\ \E e \in stored[n] :
-         hop' = [phase |-> "sent", to |-> m, sealedTo |-> m, by |-> NoNode, env |-> e]
-    /\ UNCHANGED <<stored, opened, protoVer, released, neg>>
-
-\* Only the addressed peer can open the datagram (its static key unseals it).
-\* Delivery then feeds the envelope into m's store exactly like backfill.
-HopOpen(m) ==
-    /\ hop.phase = "sent"
-    /\ hop.sealedTo = m
-    /\ hop' = [hop EXCEPT !.phase = "opened", !.by = m]
-    /\ stored' = [stored EXCEPT ![m] = @ \cup {hop.env}]
-    /\ opened' = [opened EXCEPT ![m] =
-                     IF Holds(m, hop.env.cell)
-                        THEN @ \cup {<<hop.env.cell, hop.env.body>>} ELSE @]
     /\ UNCHANGED <<protoVer, released, neg>>
 
 \* A new pillar-UDP/message version is released; guarded to never strand a peer
@@ -159,28 +134,26 @@ Release ==
     /\ released < MaxV
     /\ \A n \in Nodes : released - protoVer[n] < N
     /\ released' = released + 1
-    /\ UNCHANGED <<stored, opened, hop, protoVer, neg>>
+    /\ UNCHANGED <<stored, opened, protoVer, neg>>
 
 \* A node rolls forward one version at a time (never a stop-the-world jump), so
-\* a mixed Noise/sealed-envelope swarm is the reachable norm during cutover.
+\* a mixed Noise/session-key swarm is the reachable norm during cutover.
 Upgrade(n) ==
     /\ protoVer[n] < released
     /\ protoVer' = [protoVer EXCEPT ![n] = @ + 1]
-    /\ UNCHANGED <<stored, opened, hop, released, neg>>
+    /\ UNCHANGED <<stored, opened, released, neg>>
 
 \* Two peers exchange + compare versions: within the window => linked; else
-\* cleanly REFUSED (never silently mis-framed across the Noise/sealed boundary).
+\* cleanly REFUSED (never silently mis-framed across the Noise/session boundary).
 Negotiate(p, q) ==
     /\ p # q
     /\ neg' = [kind |-> IF Diff(protoVer[p], protoVer[q]) <= N THEN "linked" ELSE "refused",
                p |-> p, q |-> q]
-    /\ UNCHANGED <<stored, opened, hop, protoVer, released>>
+    /\ UNCHANGED <<stored, opened, protoVer, released>>
 
 Next ==
     \/ \E n \in Nodes, b \in Bodies : Produce(n, b)
     \/ \E n, m \in Nodes : Replicate(n, m)
-    \/ \E n, m \in Nodes : Send(n, m)
-    \/ \E m \in Nodes : HopOpen(m)
     \/ Release
     \/ \E n \in Nodes : Upgrade(n)
     \/ \E p, q \in Nodes : Negotiate(p, q)
@@ -200,18 +173,15 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 TypeOK ==
     /\ stored   \in [Nodes -> SUBSET Env]
     /\ opened   \in [Nodes -> SUBSET (Cells \X Bodies)]
-    /\ hop      \in [phase: {"idle", "sent", "opened"}, to: Nodes,
-                     sealedTo: Nodes, by: Nodes, env: Env]
     /\ protoVer \in [Nodes -> 0..MaxV]
     /\ released \in 0..MaxV
     /\ neg      \in [kind: {"none", "linked", "refused"}, p: Nodes, q: Nodes]
 
-\* Every persisted and every in-flight item is a PillarMessage envelope -- there
-\* is NO non-envelope byte path anywhere in the system (the whole point of the
-\* unification: one record format for streamdb ops, obs signals, and control).
+\* Every persisted item is a PillarMessage envelope -- there is NO non-envelope
+\* byte path anywhere in the system (the whole point of the unification: one
+\* record format for streamdb ops, obs signals, and control).
 OneRecordFormat ==
-    /\ \A n \in Nodes : \A e \in stored[n] : e \in Env
-    /\ (hop.phase # "idle" => hop.env \in Env)
+    \A n \in Nodes : \A e \in stored[n] : e \in Env
 
 \* The content address of a record is identical on every node that holds it,
 \* DESPITE the body being encrypted -- convergent sealing preserves the stable,
@@ -230,17 +200,10 @@ DedupUnderEncryption ==
 
 \* Only a cell-key holder ever recovers a body sealed to that cell: a node's
 \* set of decrypted <<cell, body>> pairs contains only cells it holds. A peer
-\* outside the cell may STORE the ciphertext (backfill / a mis-addressed hop)
-\* but never obtains the plaintext.
+\* outside the cell may STORE the ciphertext (backfill over any transport) but
+\* never obtains the plaintext.
 CellConfidential ==
     \A n \in Nodes : \A pair \in opened[n] : Holds(n, pair[1])
-
-\* The pillar-udp datagram is opened by EXACTLY the peer it was sealed to, and
-\* the opener is the addressee -- no third party, and (structurally) no prior
-\* handshake: the model carries no session state, so an open depends only on the
-\* recipient's static sealing identity.
-HandshakelessAuth ==
-    hop.phase = "opened" => (hop.by = hop.to /\ hop.by = hop.sealedTo)
 
 \* The convergent nonce never repeats for two DISTINCT plaintexts under the same
 \* cell key -- the AEAD nonce-reuse safety condition the convergent scheme must
@@ -256,7 +219,7 @@ ASSUME NonceInjective == NoNonceReuseAcrossDistinctPlaintext
 
 \* A negotiation's recorded outcome is always correct w.r.t. the window: a
 \* "linked" pair truly is within N (never a silent link across an incompatible
-\* Noise/sealed-envelope boundary); a "refused" pair truly is beyond N.
+\* Noise/session-key boundary); a "refused" pair truly is beyond N.
 NegotiationRefusesIncompatible ==
     /\ (neg.kind = "linked"  => Diff(protoVer[neg.p], protoVer[neg.q]) <= N)
     /\ (neg.kind = "refused" => Diff(protoVer[neg.p], protoVer[neg.q]) > N)
@@ -264,8 +227,8 @@ NegotiationRefusesIncompatible ==
 ------------------------------------------------------------------------------
 (* LIVENESS *)
 
-\* A mixed-version swarm (some nodes on the legacy Noise era, some on the sealed
-\* -envelope era) is REACHABLE, not merely tolerated -- the rolling cutover
+\* A mixed-version swarm (some nodes on the legacy Noise era, some on the
+\* session-key era) is REACHABLE, not merely tolerated -- the rolling cutover
 \* passes through a state where two nodes run different versions.
 RollingCoexistence == <>(\E p, q \in Nodes : protoVer[p] # protoVer[q])
 
