@@ -90,6 +90,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "RequestMode",
     "Response",
     "Window",
+    "console",
     "Navigator",
     "HtmlInputElement",
     "HtmlSelectElement",
