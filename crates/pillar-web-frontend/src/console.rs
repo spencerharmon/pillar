@@ -62,6 +62,9 @@ pub enum Section {
     Overview,
     /// Workload / resource inventory + lifecycle (get/apply/scale/rollout).
     Resources,
+    /// Declarative resource groups (ArgoCD-Application analog): ResourceSets +
+    /// their health/sync + interconnected resource graph.
+    ResourceSets,
     /// The five-signal observability console.
     Observability,
     /// Failure-domain / topology explorer.
@@ -83,10 +86,11 @@ pub enum Section {
 impl Section {
     /// Every section in canonical (sidebar) order.
     #[must_use]
-    pub const fn all() -> [Section; 10] {
+    pub const fn all() -> [Section; 11] {
         [
             Section::Overview,
             Section::Resources,
+            Section::ResourceSets,
             Section::Observability,
             Section::Topology,
             Section::Identity,
@@ -106,6 +110,7 @@ impl Section {
         match self {
             Section::Overview => "/overview",
             Section::Resources => "/resources",
+            Section::ResourceSets => "/resource-sets",
             Section::Observability => "/observability",
             Section::Topology => "/topology",
             Section::Identity => "/identity",
@@ -123,6 +128,7 @@ impl Section {
         match self {
             Section::Overview => "Overview",
             Section::Resources => "Resources",
+            Section::ResourceSets => "Resource Sets",
             Section::Observability => "Observability",
             Section::Topology => "Topology",
             Section::Identity => "Identity",
@@ -141,6 +147,7 @@ impl Section {
         match self {
             Section::Overview => "◎",
             Section::Resources => "▣",
+            Section::ResourceSets => "❖",
             Section::Observability => "∿",
             Section::Topology => "⧉",
             Section::Identity => "⬡",
@@ -157,6 +164,7 @@ impl Section {
     pub const fn group(self) -> NavGroup {
         match self {
             Section::Overview | Section::Resources => NavGroup::Compute,
+            Section::ResourceSets => NavGroup::Compute,
             Section::Observability => NavGroup::Observability,
             Section::Topology => NavGroup::Topology,
             Section::Identity | Section::Members | Section::Sessions | Section::Trust => {
@@ -182,6 +190,7 @@ mod yew_impl {
     use crate::overview::OverviewConsole;
     use crate::portal::{IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile};
     use crate::resources_console::ResourcesConsole;
+    use crate::resourcesets_console::ResourceSetsConsole;
     use crate::router::Route;
     use crate::topology_console::{TopologyConsole, TrustGraphConsole};
     use yew::prelude::*;
@@ -279,6 +288,7 @@ mod yew_impl {
         match section {
             Section::Overview => html! { <OverviewConsole /> },
             Section::Resources => html! { <ResourcesConsole /> },
+            Section::ResourceSets => html! { <ResourceSetsConsole /> },
             Section::Observability => html! { <ObservabilityConsole /> },
             Section::Topology => html! { <TopologyConsole /> },
             Section::Identity => html! { <IdentityTile /> },
@@ -304,6 +314,7 @@ mod yew_impl {
         match section {
             Section::Overview => Route::Overview,
             Section::Resources => Route::Resources,
+            Section::ResourceSets => Route::ResourceSets,
             Section::Observability => Route::Observability,
             Section::Topology => Route::Topology,
             Section::Identity => Route::Identity,

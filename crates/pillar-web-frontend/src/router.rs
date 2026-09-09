@@ -47,6 +47,9 @@ pub enum Route {
     /// Workload / resource inventory + lifecycle.
     #[cfg_attr(feature = "yew", at("/resources"))]
     Resources,
+    /// Declarative resource groups (ArgoCD-Application analog).
+    #[cfg_attr(feature = "yew", at("/resource-sets"))]
+    ResourceSets,
     /// The per-resource detail page (Overview/Manifest/Logs/Exec/Events tabs
     /// over `crate::resources_console::ResourceDetailPage`) — a real,
     /// deep-linkable route distinct from the inventory grid's drawer.
@@ -100,6 +103,7 @@ impl Route {
             self,
             Route::Overview
                 | Route::Resources
+                | Route::ResourceSets
                 | Route::ResourceDetail { .. }
                 | Route::Observability
                 | Route::Topology
@@ -122,6 +126,7 @@ impl Route {
         Some(match self {
             Route::Overview | Route::Dashboard => Section::Overview,
             Route::Resources => Section::Resources,
+            Route::ResourceSets => Section::ResourceSets,
             Route::Observability => Section::Observability,
             Route::Topology => Section::Topology,
             Route::Identity => Section::Identity,
