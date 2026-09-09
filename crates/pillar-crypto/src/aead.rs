@@ -129,6 +129,96 @@ pub fn seal_symmetric_with(
     }
 }
 
+/// Encrypt `plaintext` under `key` and `algorithm` using an EXPLICIT,
+/// caller-supplied nonce rather than drawing one from the OS RNG. Exists so a
+/// convergent seal ([`crate::cell::cell_seal_convergent`]) can supply a
+/// deterministic nonce (derived via HKDF, never random) while reusing this
+/// module's cipher plumbing and self-describing tag/envelope layout.
+///
+/// # Errors
+/// Returns [`CryptoError::InvalidLength`] if `nonce` is not exactly the
+/// algorithm's required width; propagates any AEAD failure otherwise.
+///
+/// Ordinary callers needing confidentiality-only (non-convergent) sealing
+/// should use [`seal_symmetric`], which draws a fresh random nonce per call —
+/// reusing a nonce with the same key for DISTINCT plaintexts breaks AEAD
+/// security, so this function must only ever be driven by a nonce-derivation
+/// scheme (like the convergent one) that provably never repeats a nonce
+/// across distinct plaintexts under the same key.
+pub fn seal_symmetric_with_nonce(
+    algorithm: AeadAlgorithm,
+    key: &SymmetricKey,
+    nonce: &[u8],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Ciphertext> {
+    match algorithm {
+        AeadAlgorithm::ChaCha20Poly1305V1 => {
+            use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+            use chacha20poly1305::ChaCha20Poly1305;
+
+            if nonce.len() != CHACHA20_NONCE_LEN {
+                return Err(CryptoError::InvalidLength);
+            }
+            let key32 = cipher_key32(b"pillar-crypto/aead/chacha20poly1305/key-v1", key);
+            let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key32));
+            let nonce = chacha20poly1305::Nonce::from_slice(nonce);
+
+            let ct = cipher
+                .encrypt(
+                    nonce,
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
+                .map_err(|_| CryptoError::DecryptionFailed)?;
+
+            let mut out = Vec::with_capacity(1 + CHACHA20_NONCE_LEN + ct.len());
+            out.push(algorithm.tag());
+            out.extend_from_slice(nonce.as_slice());
+            out.extend_from_slice(&ct);
+            Ok(Ciphertext::from_bytes(out))
+        }
+        AeadAlgorithm::XChaCha20Poly1305V1 => {
+            use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+            use chacha20poly1305::XChaCha20Poly1305;
+
+            if nonce.len() != XCHACHA20_NONCE_LEN {
+                return Err(CryptoError::InvalidLength);
+            }
+            let key32 = cipher_key32(b"pillar-crypto/aead/xchacha20poly1305/key-v1", key);
+            let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key32));
+            let nonce = chacha20poly1305::XNonce::from_slice(nonce);
+
+            let ct = cipher
+                .encrypt(
+                    nonce,
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
+                .map_err(|_| CryptoError::DecryptionFailed)?;
+
+            let mut out = Vec::with_capacity(1 + XCHACHA20_NONCE_LEN + ct.len());
+            out.push(algorithm.tag());
+            out.extend_from_slice(nonce.as_slice());
+            out.extend_from_slice(&ct);
+            Ok(Ciphertext::from_bytes(out))
+        }
+    }
+}
+
+/// The nonce width, in bytes, `algorithm` requires — so a caller deriving a
+/// deterministic nonce (e.g. via HKDF) knows how many bytes to expand.
+pub fn nonce_len(algorithm: AeadAlgorithm) -> usize {
+    match algorithm {
+        AeadAlgorithm::ChaCha20Poly1305V1 => CHACHA20_NONCE_LEN,
+        AeadAlgorithm::XChaCha20Poly1305V1 => XCHACHA20_NONCE_LEN,
+    }
+}
+
 /// Decrypt and authenticate `ciphertext` under `key` and `aad`.
 ///
 /// Reads the producing algorithm off the ciphertext's own inline tag (see the
