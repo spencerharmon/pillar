@@ -3320,7 +3320,7 @@ version = "0.1.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
- "pillar-ipfs",
+ "pillar-wire",
  "sha2",
  "tracing",
 ]
@@ -3416,6 +3416,19 @@ dependencies = [
  "web-sys",
  "yew",
  "yew-router",
+]
+
+[[package]]
+name = "pillar-wire"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "pillar-core",
+ "pillar-crypto",
+ "pillar-ipfs",
+ "serde",
+ "sha2",
+ "tracing",
 ]
 
 [[package]]
