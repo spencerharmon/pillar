@@ -55,7 +55,9 @@ pub struct DefaultPolicy {
 /// The shipped default bundle: a monotonic version + its policies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefaultBundle {
+    /// The bundle's monotonic version (`DEFAULT_BUNDLE_VERSION`).
     pub version: u32,
+    /// The shipped default policies.
     pub policies: Vec<DefaultPolicy>,
 }
 
