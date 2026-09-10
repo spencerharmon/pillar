@@ -85,10 +85,14 @@ fn token_from(parsed: &Args<'_>) -> Result<String, String> {
 
 fn usage() -> &'static str {
     "usage:\n\
-     \x20 pillar webauthn register --user <handle> [--domain D] [--token T] [--rp-id R] [--origin O]\n\
-     \x20 pillar webauthn login [--domain D] [--token T] [--rp-id R] [--origin O]\n\
-     Drives the real registration/assertion ceremony over ctap-hid against a\n\
-     locally attached hardware authenticator (requires the `passkey` feature)."
+     \x20 pillar webauthn register --user <handle> [--label L] [--domain D] [--token T] [--rp-id R] [--origin O]\n\
+     \x20 pillar webauthn login [--credential-id C] [--domain D] [--token T] [--rp-id R] [--origin O]\n\
+     \x20 pillar webauthn list [--domain D] [--token T]\n\
+     \x20 pillar webauthn revoke --credential-id <b64url> [--domain D] [--token T]\n\
+     register/login drive the real ceremony over ctap-hid against a locally\n\
+     attached hardware authenticator (requires the `passkey` feature); pass\n\
+     --rp-id <domain> to register a PORTABLE passkey bound to that domain.\n\
+     list/revoke manage the credential set over HTTP (no hardware needed)."
 }
 
 /// Dispatch `pillar webauthn <sub> …`.
@@ -100,6 +104,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("register") => register(&args[1..]),
         Some("login") => login(&args[1..]),
+        Some("list") => list(&args[1..]),
+        Some("revoke") => revoke(&args[1..]),
         _ => Err(usage().to_owned()),
     }
 }
@@ -143,7 +149,16 @@ fn register(args: &[String]) -> Result<String, String> {
     let challenge_b64 = fields
         .next()
         .ok_or_else(|| format!("malformed register/begin reply: {}", begin.body))?;
-    let rp_id = fields.next().unwrap_or(DEFAULT_RP_ID);
+    // The credential's rpId: an explicit --rp-id (a PORTABLE passkey bound to a
+    // chosen domain / the cell IPNS name) wins; otherwise the server-echoed
+    // rp_id; otherwise the fixture default. This same value is sent to the node
+    // as the credential's bound-scope metadata for the management surface.
+    let server_rp_id = fields.next();
+    let rp_id = parsed
+        .get("rp-id")
+        .or(server_rp_id)
+        .unwrap_or(DEFAULT_RP_ID);
+    let label = parsed.get("label").unwrap_or("");
 
     #[cfg(feature = "passkey")]
     {
@@ -160,7 +175,7 @@ fn register(args: &[String]) -> Result<String, String> {
             &authority,
             "POST",
             "/webauthn/register/finish",
-            &format!("{token}\n{user_handle}\n{challenge_b64}\n{attestation_b64}"),
+            &format!("{token}\n{user_handle}\n{challenge_b64}\n{attestation_b64}\n{label}\n{rp_id}"),
         )?;
         if finish.status != 200 {
             return Err(format!(
@@ -173,13 +188,65 @@ fn register(args: &[String]) -> Result<String, String> {
     }
     #[cfg(not(feature = "passkey"))]
     {
-        let _ = (challenge_b64, rp_id, origin, token, authority);
+        let _ = (challenge_b64, rp_id, origin, token, authority, label);
         Err(
             "hardware WebAuthn ceremonies require the `passkey` build feature \
              (the deployed node's `hsm` feature set includes it)"
                 .to_owned(),
         )
     }
+}
+
+/// `pillar webauthn list`: print the caller's credential set over HTTP (no
+/// hardware needed). One line per live credential:
+/// `<id-b64url>  <label>  <rp_id>  created=<unix>  last_used=<unix|->  signs=<n>`.
+fn list(args: &[String]) -> Result<String, String> {
+    let parsed = Args::parse(args)?;
+    let (authority, _host) = domain_from(&parsed)?;
+    let token = token_from(&parsed)?;
+    let resp = http(&authority, "POST", "/webauthn/credentials/list", &token)?;
+    if resp.status != 200 {
+        return Err(format!("credentials/list refused: {} {}", resp.status, resp.body));
+    }
+    if resp.body.trim().is_empty() {
+        return Ok("no credentials enrolled".to_owned());
+    }
+    let mut out = String::new();
+    for line in resp.body.lines() {
+        // `CRED <id> <label> <rp_id> <created> <last|-> <signs>`
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() == 7 && f[0] == "CRED" {
+            out.push_str(&format!(
+                "{}  {}  {}  created={}  last_used={}  signs={}\n",
+                f[1], f[2], f[3], f[4], f[5], f[6]
+            ));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+/// `pillar webauthn revoke --credential-id <b64url>`: permanently revoke one
+/// credential from the caller's set over HTTP (no hardware needed).
+fn revoke(args: &[String]) -> Result<String, String> {
+    let parsed = Args::parse(args)?;
+    let credential_id_b64 = parsed
+        .get("credential-id")
+        .ok_or("webauthn revoke requires --credential-id <b64url> (from `webauthn list`)")?;
+    let (authority, _host) = domain_from(&parsed)?;
+    let token = token_from(&parsed)?;
+    let resp = http(
+        &authority,
+        "POST",
+        "/webauthn/credentials/revoke",
+        &format!("{token}\n{credential_id_b64}"),
+    )?;
+    if resp.status != 200 {
+        return Err(format!("credentials/revoke refused: {} {}", resp.status, resp.body));
+    }
+    Ok(resp.body)
 }
 
 /// `pillar webauthn login`: authenticate with an already-registered hardware

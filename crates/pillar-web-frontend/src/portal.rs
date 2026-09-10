@@ -404,6 +404,43 @@ pub fn parse_identity(text: &str) -> IdentityView {
     view
 }
 
+/// A parsed credential row from `/webauthn/credentials/list`
+/// (`CRED <id> <label> <rp_id> <created> <last|-> <signs>`; `label`/`rp_id`
+/// arrive as `-` when empty).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CredentialRow {
+    /// The base64url credential id.
+    pub id: String,
+    /// The user-chosen label (empty when none).
+    pub label: String,
+    /// The rpId / domain the credential is bound to (empty when unknown).
+    pub rp_id: String,
+    /// Registration time (unix seconds, as text).
+    pub created_at: String,
+    /// Last-used time (unix seconds, or `-` when never used).
+    pub last_used: String,
+    /// The authenticator sign-count.
+    pub sign_count: String,
+}
+
+/// Parse one `/webauthn/credentials/list` line; `None` if it does not match.
+#[must_use]
+pub fn parse_credential_line(line: &str) -> Option<CredentialRow> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() != 7 || f[0] != "CRED" {
+        return None;
+    }
+    let undash = |s: &str| if s == "-" { String::new() } else { s.to_owned() };
+    Some(CredentialRow {
+        id: f[1].to_owned(),
+        label: undash(f[2]),
+        rp_id: undash(f[3]),
+        created_at: f[4].to_owned(),
+        last_used: f[5].to_owned(),
+        sign_count: f[6].to_owned(),
+    })
+}
+
 /// A parsed active-session row (`SESSION <id> NODE <n> ISSUED <t> EXPIRY <t>
 /// CURRENT <yes|no>`).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1348,6 +1385,140 @@ mod yew_impl {
         }
     }
 
+    /// The user's WebAuthn credentials (security keys / passkeys): list each
+    /// with its label, bound domain, created / last-used / sign-count; enroll
+    /// another; and revoke individually. Register more than one so a lost key
+    /// is a revoke, not a lockout.
+    #[function_component(CredentialsTile)]
+    pub(crate) fn credentials_tile() -> Html {
+        let auth = use_auth();
+        let rows = use_state(Vec::<CredentialRow>::new);
+        let label = use_state(String::new);
+        let msg = use_state(|| None::<(String, bool)>);
+        let busy = use_state(|| false);
+
+        let refresh = {
+            let (auth, rows) = (auth.clone(), rows.clone());
+            Callback::from(move |_: ()| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let rows = rows.clone();
+                spawn_local(async move {
+                    if let Ok(r) = http("POST", "/webauthn/credentials/list", Some(&token)).await {
+                        if r.ok() {
+                            rows.set(
+                                r.body.lines().filter_map(parse_credential_line).collect(),
+                            );
+                        }
+                    }
+                });
+            })
+        };
+        {
+            let refresh = refresh.clone();
+            use_effect_with(auth.token.clone(), move |_| {
+                refresh.emit(());
+                || ()
+            });
+        }
+
+        let on_label = {
+            let label = label.clone();
+            Callback::from(move |e: InputEvent| label.set(input_value(&e)))
+        };
+
+        let enroll = {
+            let (auth, busy, msg, refresh, label) = (
+                auth.clone(),
+                busy.clone(),
+                msg.clone(),
+                refresh.clone(),
+                label.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                if *busy {
+                    return;
+                }
+                let token = auth.token.clone().unwrap_or_default();
+                let user = auth.user.clone().unwrap_or_default();
+                let label_v = (*label).clone();
+                let (busy, msg, refresh, label) =
+                    (busy.clone(), msg.clone(), refresh.clone(), label.clone());
+                busy.set(true);
+                msg.set(Some(("Touch your security key to enroll it…".to_owned(), true)));
+                spawn_local(async move {
+                    match crate::webauthn::run_register(&token, &user, &label_v).await {
+                        Ok(_) => {
+                            msg.set(Some(("Security key enrolled.".to_owned(), true)));
+                            label.set(String::new());
+                            refresh.emit(());
+                        }
+                        Err(e) => msg.set(Some((e.message(), false))),
+                    }
+                    busy.set(false);
+                });
+            })
+        };
+
+        let revoke = {
+            let (auth, busy, msg, refresh) =
+                (auth.clone(), busy.clone(), msg.clone(), refresh.clone());
+            move |id: String| {
+                let (auth, busy, msg, refresh) =
+                    (auth.clone(), busy.clone(), msg.clone(), refresh.clone());
+                Callback::from(move |_: MouseEvent| {
+                    if *busy {
+                        return;
+                    }
+                    let token = auth.token.clone().unwrap_or_default();
+                    let body = body_lines(&[&token, &id]);
+                    let (busy, msg, refresh) = (busy.clone(), msg.clone(), refresh.clone());
+                    busy.set(true);
+                    spawn_local(async move {
+                        if let Ok(r) =
+                            http("POST", "/webauthn/credentials/revoke", Some(&body)).await
+                        {
+                            msg.set(Some((r.body.trim().to_owned(), r.ok())));
+                            if r.ok() {
+                                refresh.emit(());
+                            }
+                        }
+                        busy.set(false);
+                    });
+                })
+            }
+        };
+
+        html! {
+            <div class="tile" id="credentials-tile">
+                <h3>{ "Security keys" }</h3>
+                <p>{ "Your WebAuthn passkeys / security keys. Register more than one so a lost key is a revoke, not a lockout." }</p>
+                <div id="credential-list">
+                    { for rows.iter().map(|c| {
+                        let rev = revoke(c.id.clone());
+                        let last = if c.last_used == "-" { "never".to_owned() } else { c.last_used.clone() };
+                        let bound = if c.rp_id.is_empty() { "(unknown)".to_owned() } else { c.rp_id.clone() };
+                        let name = if c.label.is_empty() { "(unlabeled)".to_owned() } else { c.label.clone() };
+                        html! {
+                            <div class="tile credential-row" data-credential-id={c.id.clone()}>
+                                <p><strong>{ name }</strong></p>
+                                <p>{ format!("Bound domain: {bound}") }</p>
+                                <p>{ format!("Created: {}  ·  Last used: {last}  ·  Signs: {}", c.created_at, c.sign_count) }</p>
+                                <p class="credential-id">{ c.id.clone() }</p>
+                                <PendingButton label="Revoke" busy={*busy} onclick={rev} />
+                            </div>
+                        }
+                    }) }
+                </div>
+                <label for="credential-label">{ "Label for a new key" }</label>
+                <input id="credential-label" type="text" value={(*label).clone()} placeholder="e.g. yubikey-blue" oninput={on_label} />
+                <PendingButton id="enroll-credential-btn" label="Add a security key" busy={*busy} onclick={enroll} />
+                { message_line("credential-msg", &msg) }
+            </div>
+        }
+    }
+
     /// Trust graph + attestation builder + key/offer custody actions.
     #[function_component(TrustTile)]
     pub(crate) fn trust_tile() -> Html {
@@ -2061,6 +2232,7 @@ mod yew_impl {
                 <IdentityTile />
                 <MembersTile />
                 <SessionsTile />
+                <CredentialsTile />
                 <TrustTile />
                 <ResourceTile />
                 <ObservabilityTile />
@@ -2302,6 +2474,25 @@ mod tests {
                 .current
         );
         assert!(parse_session_line("garbage").is_none());
+    }
+
+    #[test]
+    fn credential_line_parsing() {
+        let c = parse_credential_line("CRED aWQ yubikey-blue deleteme.example.com 100 250 7")
+            .unwrap();
+        assert_eq!(c.id, "aWQ");
+        assert_eq!(c.label, "yubikey-blue");
+        assert_eq!(c.rp_id, "deleteme.example.com");
+        assert_eq!(c.created_at, "100");
+        assert_eq!(c.last_used, "250");
+        assert_eq!(c.sign_count, "7");
+        // `-` sentinels for an unlabeled, never-used credential decode to empty.
+        let c2 = parse_credential_line("CRED aWQ - - 100 - 0").unwrap();
+        assert_eq!(c2.label, "");
+        assert_eq!(c2.rp_id, "");
+        assert_eq!(c2.last_used, "-");
+        assert!(parse_credential_line("SESSION x").is_none());
+        assert!(parse_credential_line("CRED too few").is_none());
     }
 
     #[test]
