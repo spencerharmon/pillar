@@ -39,6 +39,7 @@ pub mod apply;
 pub mod bgp_lb;
 pub mod builtin;
 pub mod gitops;
+pub mod hop_min;
 pub mod ingress;
 pub mod network_policy;
 pub mod scheduler;
