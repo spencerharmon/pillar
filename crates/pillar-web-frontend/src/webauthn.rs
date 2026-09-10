@@ -420,19 +420,10 @@ mod browser {
     }
 
     fn js_err(e: JsValue) -> CeremonyError {
-        // DEBUG: dump the raw browser error (name, message, full stack) so a
-        // real device failure can be diagnosed from the devtools console.
-        web_sys::console::error_2(&JsValue::from_str("[pillar webauthn] ceremony JS error:"), &e);
         let name = Reflect::get(&e, &JsValue::from_str("name"))
             .ok()
             .and_then(|v| v.as_string());
-        let message = Reflect::get(&e, &JsValue::from_str("message"))
-            .ok()
-            .and_then(|v| v.as_string());
-        web_sys::console::log_1(&JsValue::from_str(&format!(
-            "[pillar webauthn] error name={:?} message={:?}",
-            name, message
-        )));
+        let _ = Reflect::get(&e, &JsValue::from_str("message"));
         // `DOMException.name` distinguishes user-cancel/no-authenticator from
         // any other browser-side failure; anything unrecognized is folded
         // into `Unsupported` since the caller has no better fallback.
@@ -558,11 +549,6 @@ mod browser {
 
         async fn get_async(&self, challenge: &AuthChallenge) -> Result<Assertion, CeremonyError> {
             let creds = navigator_credentials()?;
-            web_sys::console::log_1(&JsValue::from_str(&format!(
-                "[pillar webauthn] get_async: challenge_len={} allow_credentials={}",
-                challenge.challenge_b64.len(),
-                challenge.allow_credentials.len()
-            )));
             // Decode every buffer into an OWNED js_sys::Uint8Array (a JS-heap
             // copy) BEFORE attaching it to the options dict. A zero-copy
             // `*_u8_slice` VIEW over wasm linear memory is DETACHED the instant
@@ -599,23 +585,9 @@ mod browser {
             }
             let options = CredentialRequestOptions::new();
             options.set_public_key(&pkc_options);
-            web_sys::console::log_1(&JsValue::from_str(
-                "[pillar webauthn] calling navigator.credentials.get()",
-            ));
             let promise = creds.get_with_options(&options).map_err(js_err)?;
             let cred = JsFuture::from(promise).await.map_err(js_err)?;
-            web_sys::console::log_1(&JsValue::from_str(
-                "[pillar webauthn] get() resolved; inspecting credential",
-            ));
-            let cred: PublicKeyCredential = cred.dyn_into().map_err(|v| {
-                web_sys::console::error_2(
-                    &JsValue::from_str(
-                        "[pillar webauthn] get() result is not a PublicKeyCredential:",
-                    ),
-                    &v,
-                );
-                CeremonyError::Unsupported
-            })?;
+            let cred: PublicKeyCredential = cred.dyn_into().map_err(|_| CeremonyError::Unsupported)?;
             let credential_id_b64 = Reflect::get(&cred, &JsValue::from_str("id"))
                 .ok()
                 .and_then(|v| v.as_string())
@@ -696,9 +668,6 @@ mod browser {
         let begin_resp = transport
             .post_async(Endpoint::AuthenticateBegin, authenticate_begin_body(token))
             .await?;
-        web_sys::console::log_1(&JsValue::from_str(&format!(
-            "[pillar webauthn] authenticate/begin response: {begin_resp:?}"
-        )));
         let challenge = parse_authenticate_begin(&begin_resp)?;
         let assertion = ceremony.get_async(&challenge).await?;
         let finish_resp = transport
