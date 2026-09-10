@@ -141,6 +141,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, args| crate::swarm_cli::run(args),
     },
     VerbSpec {
+        name: "portal",
+        handler: |_v, args| crate::portal_cli::run(args),
+    },
+    VerbSpec {
         name: "render",
         handler: |_v, args| render(args),
     },
