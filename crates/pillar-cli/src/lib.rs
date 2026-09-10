@@ -39,6 +39,7 @@ pub mod ingress_lb_udp;
 pub mod observability_ui;
 pub mod onboard;
 pub mod polish;
+pub mod portal_cli;
 pub mod resource;
 pub mod resourceset;
 pub mod run;
