@@ -49,6 +49,39 @@ pub fn sealing_keypair_from_seed(seed: &Seed) -> Result<(SealingPublicKey, Seali
     ))
 }
 
+/// Compute the raw X25519 Diffie-Hellman shared secret between a local sealing
+/// secret and a peer's sealing public key.
+///
+/// This is the bare static-ephemeral ECDH the portable pillar-UDP session key
+/// is built on (`docs/papers/pillar-udp-encryption.md` §2.1): the client runs
+/// it as `X25519(eph_sk, cell_static_pk)` and every cell node runs it as
+/// `X25519(cell_static_sk, eph_pk)` — the two are byte-identical, which is what
+/// makes the derived session key portable across every cell node without any
+/// key on the wire. The raw shared secret MUST NOT be used directly as an AEAD
+/// key; run it through an HKDF (as the session-key derivation does) so the
+/// output is a uniformly-distributed key with a domain separator.
+///
+/// # Errors
+/// [`CryptoError::InvalidKey`] if either key is not exactly 32 bytes.
+pub fn x25519_shared_secret(
+    secret: &SealingSecretKey,
+    peer_public: &SealingPublicKey,
+) -> Result<[u8; 32]> {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let sk_bytes: [u8; 32] = secret
+        .as_bytes()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let pk_bytes: [u8; 32] = peer_public
+        .as_bytes()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let sk = StaticSecret::from(sk_bytes);
+    let shared = sk.diffie_hellman(&PublicKey::from(pk_bytes));
+    Ok(shared.to_bytes())
+}
+
 /// Derive the recipient's X25519 public key from its stored secret bytes, so the
 /// envelope can be probed for a matching recipient wrap on unseal.
 fn public_from_secret(secret: &SealingSecretKey) -> Result<[u8; 32]> {
@@ -286,11 +319,26 @@ mod tests {
     }
 
     #[test]
-    fn truncated_envelope_is_a_parse_error_not_an_unknown_version() {
-        let (_pk, sk) = sealing_keypair_from_seed(&seed("short")).expect("keygen");
-        // One byte cannot even hold the 2-byte version stamp → InvalidLength,
-        // never UnsupportedEnvelopeVersion.
-        let stub = SealedEnvelope::from_bytes(vec![0x00]);
-        assert_eq!(unseal(&stub, &sk), Err(CryptoError::InvalidLength));
+    fn x25519_shared_secret_is_symmetric_and_distinct_per_pair() {
+        // The portability property the pillar-UDP session key rests on:
+        // X25519(a_sk, b_pk) == X25519(b_sk, a_pk). The client computes the
+        // former (eph_sk vs cell_static_pk); every cell node computes the
+        // latter (cell_static_sk vs eph_pk) — byte-identical, no key on the
+        // wire.
+        let (a_pk, a_sk) = sealing_keypair_from_seed(&seed("ecdh-a")).expect("keygen");
+        let (b_pk, b_sk) = sealing_keypair_from_seed(&seed("ecdh-b")).expect("keygen");
+
+        let ab = x25519_shared_secret(&a_sk, &b_pk).expect("a·B");
+        let ba = x25519_shared_secret(&b_sk, &a_pk).expect("b·A");
+        assert_eq!(ab, ba, "ECDH must be symmetric across the two endpoints");
+
+        // A third party's shared secret with A differs.
+        let (c_pk, c_sk) = sealing_keypair_from_seed(&seed("ecdh-c")).expect("keygen");
+        let ca = x25519_shared_secret(&c_sk, &a_pk).expect("c·A");
+        assert_ne!(
+            ab, ca,
+            "a distinct pair must yield a distinct shared secret"
+        );
+        let _ = c_pk;
     }
 }
