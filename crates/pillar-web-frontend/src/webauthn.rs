@@ -123,9 +123,6 @@ pub struct Attestation {
 pub struct AuthChallenge {
     /// Base64url-encoded random challenge.
     pub challenge_b64: String,
-    /// The relying-party id the assertion is scoped to (needed by
-    /// `navigator.credentials.get()` so the browser can match the credential).
-    pub rp_id: String,
     /// The user's enrolled credential id(s), base64url, for `allowCredentials`.
     /// Without these a non-discoverable hardware credential cannot be located
     /// and the ceremony fails as a NotAllowedError.
@@ -209,12 +206,11 @@ pub fn authenticate_begin_body(token: &str) -> String {
 }
 
 /// Parses a `/webauthn/authenticate/begin` response:
-/// `CHALLENGE <b64> <rp_id> <allow-cred-csv>` (the rp_id/allow fields may be
-/// empty/absent for backward compatibility).
+/// `CHALLENGE <b64> <allow-cred-csv>` (the allow field may be empty/absent).
 pub fn parse_authenticate_begin(body: &str) -> Result<AuthChallenge, CeremonyError> {
-    let mut parts = body.trim().splitn(4, ' ');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("CHALLENGE"), Some(challenge), rp_opt, allow_opt) if !challenge.is_empty() => {
+    let mut parts = body.trim().splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("CHALLENGE"), Some(challenge), allow_opt) if !challenge.is_empty() => {
             let allow_credentials = allow_opt
                 .unwrap_or("")
                 .split(',')
@@ -223,7 +219,6 @@ pub fn parse_authenticate_begin(body: &str) -> Result<AuthChallenge, CeremonyErr
                 .collect();
             Ok(AuthChallenge {
                 challenge_b64: challenge.to_owned(),
-                rp_id: rp_opt.unwrap_or("").to_owned(),
                 allow_credentials,
             })
         }
@@ -557,8 +552,7 @@ mod browser {
         async fn get_async(&self, challenge: &AuthChallenge) -> Result<Assertion, CeremonyError> {
             let creds = navigator_credentials()?;
             web_sys::console::log_1(&JsValue::from_str(&format!(
-                "[pillar webauthn] get_async: rp_id={:?} challenge_len={} allow_credentials={}",
-                challenge.rp_id,
+                "[pillar webauthn] get_async: challenge_len={} allow_credentials={}",
                 challenge.challenge_b64.len(),
                 challenge.allow_credentials.len()
             )));
@@ -573,11 +567,12 @@ mod browser {
             let challenge_buf = Uint8Array::from(b64_decode(&challenge.challenge_b64)?.as_slice());
             let pkc_options =
                 PublicKeyCredentialRequestOptions::new(challenge_buf.unchecked_ref());
-            // Scope the assertion to the RP so the browser matches the
-            // credential.
-            if !challenge.rp_id.is_empty() {
-                pkc_options.set_rp_id(&challenge.rp_id);
-            }
+            // NOTE: rpId is deliberately NOT set. The browser defaults it to the
+            // serving origin's effective domain — exactly what registration used
+            // (create() only set rp.name, never rp.id, so the credential is
+            // bound to the origin domain). Setting it to anything that is not a
+            // registrable-domain suffix of the origin (e.g. the node peer id)
+            // makes the browser reject get() with a SecurityError.
             // Populate `allowCredentials` with the user's enrolled credential
             // id(s): a non-discoverable hardware credential can ONLY be located
             // by the authenticator when its id is offered here. Omitting this is

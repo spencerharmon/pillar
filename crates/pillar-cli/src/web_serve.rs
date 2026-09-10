@@ -1181,6 +1181,11 @@ impl WebAuthContext {
     /// from this node's identity peer id (the portal's stable origin host); a
     /// browser client scopes `navigator.credentials.{create,get}` to it.
     #[must_use]
+    /// The WebAuthn relying-party NAME shown in the browser prompt, taken from
+    /// this node's identity peer id. This is a cosmetic label only — it is NOT
+    /// the rpId: the browser derives the rpId from the serving origin's domain
+    /// (the ceremony never sets `rp.id`), so no deployment domain is embedded in
+    /// source and the node adapts to whatever host fronts it.
     fn origin_rp_id(&self) -> String {
         if self.identity.peer_id.is_empty() {
             "pillar.local".to_owned()
@@ -5073,7 +5078,7 @@ fn dispatch_webauthn_register_finish(
 
 /// `POST /webauthn/authenticate/begin` — mint a fresh, single-use, time-bounded
 /// assertion challenge bound to the caller's session/cell. Body:
-/// `<session-token>`. Returns `CHALLENGE <b64url> <rp_id> <allow-cred-csv>`.
+/// `<session-token>`. Returns `CHALLENGE <b64url> <allow-cred-csv>`.
 fn dispatch_webauthn_authenticate_begin(
     ctx: &mut WebAuthContext,
     request: &HttpRequest,
@@ -5104,7 +5109,7 @@ fn dispatch_webauthn_authenticate_begin(
     text_response(
         200,
         "OK",
-        format!("CHALLENGE {b64} {} {allow_csv}", ctx.origin_rp_id()),
+        format!("CHALLENGE {b64} {allow_csv}"),
     )
 }
 
@@ -6724,7 +6729,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_begin_returns_rp_id_and_the_users_allow_credentials() {
+    fn authenticate_begin_returns_the_users_allow_credentials() {
         // Regression: a non-discoverable hardware credential can only be located
         // by the authenticator if authenticate/begin offers its id in the
         // allow-list. Omitting it made a real security key fail get() as a
@@ -6757,14 +6762,10 @@ mod tests {
             .expect("pending token");
         let begin = post(&mut ctx, "/webauthn/authenticate/begin", &ptoken);
         assert_eq!(begin.status, 200, "{}", begin.body);
+        // Body: CHALLENGE <b64> <allow-cred-csv>
         let parts: Vec<&str> = begin.body.split_whitespace().collect();
         assert_eq!(parts[0], "CHALLENGE");
         assert!(!parts[1].is_empty(), "challenge present: {}", begin.body);
-        assert!(
-            parts.len() >= 3 && !parts[2].is_empty(),
-            "rp_id present: {}",
-            begin.body
-        );
         let want = pillar_crypto::webauthn::base64url_encode(b"cred-web");
         assert!(
             begin.body.contains(&want),
