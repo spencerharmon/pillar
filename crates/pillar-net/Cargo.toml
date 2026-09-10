@@ -59,6 +59,13 @@ pillar-ipam = { path = "../pillar-ipam" }
 # manifest's own decision, not a parallel one. pillar-manifest does not depend
 # on pillar-net, so this is acyclic.
 pillar-manifest = { path = "../pillar-manifest" }
+# Hop-cost observability (`hop_metric`): the terminal destination emits
+# `pillar_message_hops` labeled by ATTESTED ingest/destination topology tiers,
+# written onto the SAME shared observability substrate every other signal
+# rides (no parallel store). pillar-observability/pillar-topology never
+# depend on pillar-net, so this edge is acyclic.
+pillar-observability = { path = "../pillar-observability" }
+pillar-topology = { path = "../pillar-topology" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -74,9 +81,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # which is exactly the "overlay never a bootstrap dep of the substrate"
 # invariant this task requires.
 pillar-streamdb = { path = "../pillar-streamdb" }
-# Dev-only: builds a TopologyScopedIpam fixture for the pillar-UDP reply-set
-# determinism test. Not a runtime dep (pillar-ipam is; topology comes through it).
-pillar-topology = { path = "../pillar-topology" }
+# pillar-topology is now a runtime dependency (see [dependencies] above, for
+# `hop_metric`), so no separate dev-dependency entry is needed here.
 # Dev-only: the distributed-lb-acceptance test composes the ingress/LB
 # manifest model (Route/Frontend/derive_routing_table) and the WoT trust
 # artifacts gating Route attachment. (pillar-manifest is now a runtime dep of
