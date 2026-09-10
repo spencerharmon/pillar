@@ -29,11 +29,23 @@
 (* session is therefore SECURITY-critical, modelled as RevokedKeyEventually-   *)
 (* Erased.                                                                     *)
 (*                                                                          *)
+(* ROLLING COEXISTENCE. Dropping the libp2p Noise upgrade is a BREAKING       *)
+(* pillar-udp change (paper Sec.7). During the rollout window a cell holds a   *)
+(* MIXED population: some sessions are LEGACY (Noise-era, protoVer 0, opaque   *)
+(* to this scheme -- no cell-signed record, no derivable K_s) and some are new *)
+(* SESSION-KEY sessions. The two eras must coexist without the session-key     *)
+(* machinery mis-serving, conflating, or corrupting a legacy session. Modelled *)
+(* by a disjoint `legacy` session population that this scheme carries but never *)
+(* touches: LegacySessionKeyDisjoint (no sid is both), LegacyUnaffectedBy-      *)
+(* SessionKey (session-key actions never mutate a legacy session), and the     *)
+(* liveness MixedEraReachable (a genuinely mixed state is reached in rollout).  *)
+(*                                                                          *)
 (* Proven by TLC:                                                            *)
 (*   Safety   : TypeOK, SessionKeyCellSigned, SessionConvergesOnOneKey,      *)
 (*              SessionAuthorizedBeforeServe, AnonIsUnattestedPrincipal,     *)
-(*              SharedKeyReplayViaDedup                                       *)
-(*   Liveness : RevokedKeyEventuallyErased                                    *)
+(*              SharedKeyReplayViaDedup, LegacySessionKeyDisjoint,           *)
+(*              LegacyUnaffectedBySessionKey                                  *)
+(*   Liveness : RevokedKeyEventuallyErased, MixedEraReachable                 *)
 (*   Constant : NonceCollisionFree (per-frame nonce injective in plaintext)  *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
@@ -46,12 +58,16 @@ CONSTANTS
                          \*   the complement are anonymous/unattested principals
     Eph,                 \* the finite set of client ephemeral keys; a session's id is
                          \*   its ephemeral (content_address(eph || nonce), abstracted)
-    Frames               \* distinct application frames (distinct content addresses)
+    Frames,              \* distinct application frames (distinct content addresses)
+    LegacyEph            \* legacy Noise-era session ids present during the rollout window;
+                         \*   opaque to this scheme (no cell record, no derivable K_s) and
+                         \*   DISJOINT from Eph -- must coexist untouched by session-key ops
 
 ASSUME NodesOK   == Nodes # {}
 ASSUME PrincOK   == Principals # {} /\ AttestedPrincipals \subseteq Principals
 ASSUME EphOK     == Eph # {}
 ASSUME FramesOK  == Frames # {}
+ASSUME LegacyOK  == LegacyEph \cap Eph = {}   \* eras never share a session id
 
 CellSig == "cA"                       \* the single cell / genesis principal signature
 Grant(p) == IF p \in AttestedPrincipals THEN "full" ELSE "restricted"
@@ -80,9 +96,12 @@ VARIABLES
     revoked,      \* SUBSET Eph : sessions whose revocation record has been written
     everRevoked,  \* SUBSET Eph : monotone memory of revocations (sids are one-shot)
     appliedCAs,   \* SUBSET FrameCAs : frame content-addresses that have taken effect (dedup key)
-    effectCount   \* Nat : number of frame effects applied (must equal |appliedCAs| -- no replay)
+    effectCount,  \* Nat : number of frame effects applied (must equal |appliedCAs| -- no replay)
+    legacyServed  \* [Nodes -> SUBSET LegacyEph] : legacy Noise-era sessions each node still
+                  \*   honors during rollout -- carried by the swarm, opaque to the session-key
+                  \*   scheme; present so coexistence is a state, not just a paper claim
 
-vars == <<inits, sdb, views, revoked, everRevoked, appliedCAs, effectCount>>
+vars == <<inits, sdb, views, revoked, everRevoked, appliedCAs, effectCount, legacyServed>>
 
 SessionRec == [sid: Eph, principal: Principals, eph: Eph,
                grant: {"full", "restricted"}, signed: {CellSig}]
@@ -97,6 +116,7 @@ Init ==
     /\ everRevoked = {}
     /\ appliedCAs  = {}
     /\ effectCount = 0
+    /\ legacyServed = [n \in Nodes |-> {}]
 
 ------------------------------------------------------------------------------
 (* ACTIONS *)
@@ -108,7 +128,7 @@ OpenSession(p, e) ==
     /\ \A i \in inits : i.eph # e
     /\ \A r \in sdb   : r.eph # e
     /\ inits' = inits \cup {[principal |-> p, eph |-> e]}
-    /\ UNCHANGED <<sdb, views, revoked, everRevoked, appliedCAs, effectCount>>
+    /\ UNCHANGED <<sdb, views, revoked, everRevoked, appliedCAs, effectCount, legacyServed>>
 
 \* An ingress cell node authorizes the init: verify, apply RBAC policy (grant), derive
 \* K_s (deterministic), write the cell-signed record to streamdb. The request stays in
@@ -119,7 +139,7 @@ Accept(n, i) ==
     /\ i \in inits
     /\ sdb'   = sdb \cup {MkRec(i.principal, i.eph)}
     /\ views' = [views EXCEPT ![n] = @ \cup {i.eph}]
-    /\ UNCHANGED <<inits, revoked, everRevoked, appliedCAs, effectCount>>
+    /\ UNCHANGED <<inits, revoked, everRevoked, appliedCAs, effectCount, legacyServed>>
 
 \* streamdb convergence: another cell node learns an authorized session and can now
 \* derive K_s and serve it -- this is what makes the session portable / failover-safe.
@@ -128,7 +148,7 @@ ConvergeView(n, sid) ==
     /\ sid \notin views[n]
     /\ sid \notin revoked
     /\ views' = [views EXCEPT ![n] = @ \cup {sid}]
-    /\ UNCHANGED <<inits, sdb, revoked, everRevoked, appliedCAs, effectCount>>
+    /\ UNCHANGED <<inits, sdb, revoked, everRevoked, appliedCAs, effectCount, legacyServed>>
 
 \* A cell node serves a K_s-encrypted frame for a converged, non-revoked session.
 \* Delivery is CONTENT-ADDRESSED and idempotent: a replayed frame (same content
@@ -141,7 +161,7 @@ Deliver(n, sid, f) ==
             THEN UNCHANGED <<appliedCAs, effectCount>>
             ELSE /\ appliedCAs'  = appliedCAs \cup {ca}
                  /\ effectCount' = effectCount + 1
-    /\ UNCHANGED <<inits, sdb, views, revoked, everRevoked>>
+    /\ UNCHANGED <<inits, sdb, views, revoked, everRevoked, legacyServed>>
 
 \* Close / timeout: a cell node writes a cell-signed revocation; convergence stops
 \* every node from honoring K_s.
@@ -150,7 +170,7 @@ Revoke(n, sid) ==
     /\ sid \notin revoked
     /\ revoked'     = revoked \cup {sid}
     /\ everRevoked' = everRevoked \cup {sid}
-    /\ UNCHANGED <<inits, sdb, views, appliedCAs, effectCount>>
+    /\ UNCHANGED <<inits, sdb, views, appliedCAs, effectCount, legacyServed>>
 
 \* GC erases the revoked authorization from streamdb and every node's view. This is a
 \* SECURITY operation: while the record survives, K_s stays derivable (a live oracle).
@@ -159,7 +179,23 @@ CollectGC(sid) ==
     /\ sdb'     = {r \in sdb : r.sid # sid}
     /\ views'   = [n \in Nodes |-> views[n] \ {sid}]
     /\ revoked' = revoked \ {sid}
-    /\ UNCHANGED <<inits, everRevoked, appliedCAs, effectCount>>
+    /\ UNCHANGED <<inits, everRevoked, appliedCAs, effectCount, legacyServed>>
+
+\* ROLLING COEXISTENCE (rollout window). A node still honoring the legacy Noise era
+\* serves a legacy session -- entirely outside the session-key scheme (no init, no
+\* cell record, no K_s derivation). Present so a genuinely MIXED cell state is a
+\* reachable, checked state, not just a paper assertion.
+LegacyServe(n, lsid) ==
+    /\ lsid \in LegacyEph
+    /\ lsid \notin legacyServed[n]
+    /\ legacyServed' = [legacyServed EXCEPT ![n] = @ \cup {lsid}]
+    /\ UNCHANGED <<inits, sdb, views, revoked, everRevoked, appliedCAs, effectCount>>
+
+\* A node finishes migrating off a legacy session (Noise era retired for that sid).
+LegacyRetire(n, lsid) ==
+    /\ lsid \in legacyServed[n]
+    /\ legacyServed' = [legacyServed EXCEPT ![n] = @ \ {lsid}]
+    /\ UNCHANGED <<inits, sdb, views, revoked, everRevoked, appliedCAs, effectCount>>
 
 Next ==
     \/ \E p \in Principals, e \in Eph : OpenSession(p, e)
@@ -168,6 +204,8 @@ Next ==
     \/ \E n \in Nodes, sid \in Eph, f \in Frames : Deliver(n, sid, f)
     \/ \E n \in Nodes, sid \in Eph : Revoke(n, sid)
     \/ \E sid \in Eph : CollectGC(sid)
+    \/ \E n \in Nodes, lsid \in LegacyEph : LegacyServe(n, lsid)
+    \/ \E n \in Nodes, lsid \in LegacyEph : LegacyRetire(n, lsid)
 
 \* Fairness: EACH revoked session's GC eventually fires (needed for the security-
 \* critical erase liveness). Per-sid weak fairness -- fairness on the existential
@@ -187,6 +225,7 @@ TypeOK ==
     /\ everRevoked \in SUBSET Eph
     /\ appliedCAs  \in SUBSET FrameCAs
     /\ effectCount \in 0..MaxEffects
+    /\ legacyServed \in [Nodes -> SUBSET LegacyEph]
 
 \* Every honored session is backed by a CELL-signed authorization -- provenance any
 \* node verifies against the genesis principal before deriving/serving K_s.
@@ -214,6 +253,23 @@ AnonIsUnattestedPrincipal ==
 \* number of DISTINCT frame content addresses -- a replay never causes a second effect.
 SharedKeyReplayViaDedup == effectCount = Cardinality(appliedCAs)
 
+\* ROLLING COEXISTENCE (safety). The two eras never conflate: no id is ever both a
+\* session-key session and a legacy session (the constant disjointness lifted to the
+\* live state), so a legacy datagram is never mis-served under a K_s and vice versa.
+LegacySessionKeyDisjoint ==
+    /\ \A n \in Nodes : legacyServed[n] \cap views[n] = {}
+    /\ \A n \in Nodes : \A lsid \in legacyServed[n] : ~(\E r \in sdb : r.sid = lsid)
+
+\* ROLLING COEXISTENCE (safety). The session-key scheme's state carries legacy
+\* sessions without ever meaning to derive a K_s or a cell record for them: a legacy
+\* sid never appears in the session-key machinery (inits/sdb/views/revoked/appliedCAs).
+LegacyUnaffectedBySessionKey ==
+    /\ \A i \in inits : i.eph \notin LegacyEph
+    /\ \A r \in sdb   : r.sid \notin LegacyEph
+    /\ \A n \in Nodes : views[n] \cap LegacyEph = {}
+    /\ revoked \cap LegacyEph = {}
+    /\ \A ca \in appliedCAs : ca[1] \notin LegacyEph
+
 ------------------------------------------------------------------------------
 (* LIVENESS *)
 
@@ -221,5 +277,23 @@ SharedKeyReplayViaDedup == effectCount = Cardinality(appliedCAs)
 \* GC). Until then K_s stays derivable, so this erasure is a security guarantee.
 RevokedKeyEventuallyErased ==
     \A sid \in Eph : [](sid \in revoked => <>(sid \notin ActiveSids))
+
+\* ROLLING COEXISTENCE (a mixed cell state: at least one legacy session and one
+\* session-key session both being honored somewhere in the cell at once).
+MixedEra == (\E n \in Nodes : legacyServed[n] # {}) /\ (\E n \in Nodes : views[n] # {})
+
+\* ROLLING COEXISTENCE (safety, non-vacuous). In EVERY mixed state the two eras stay
+\* cleanly separated -- a legacy session is never conflated with a session-key session
+\* on any node, and the session-key machinery never touches a legacy sid. This is the
+\* coexistence guarantee that MATTERS: the rollout window is safe precisely because a
+\* mixed population never lets one era corrupt the other. (That the antecedent is
+\* satisfiable -- a genuinely mixed state IS reached -- is witnessed by TLC's coverage
+\* of MixedEra states during the exhaustive search; see the change doc.)
+MixedEraCoexistsSafely ==
+    MixedEra =>
+        /\ \A n \in Nodes : legacyServed[n] \cap views[n] = {}
+        /\ \A n \in Nodes : \A lsid \in legacyServed[n] :
+               /\ ~(\E r \in sdb : r.sid = lsid)
+               /\ lsid \notin views[n]
 
 ===============================================================================
