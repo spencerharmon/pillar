@@ -28,7 +28,14 @@ content-addressed, version-stamped `PillarMessage` envelope that carries every
 byte Pillar persists or transmits — streamdb ops, observability signals, and all
 libp2p control traffic — and the convergent cell-seal that keeps the `Cid` stable
 under encryption (transport-agnostic). Design of record for the `pillar-wire`
-crate; implementation is TLA+-gated (method #1).
+crate; implementation is TLA+-gated (method #1). Rendered as a formal LaTeX paper
+with a layering diagram and the two-seal / invariant tables in
+`pillar-message-format.tex` (the `.md` is the design-of-record prose). Build the
+PDF (needs a TeX install with tikz + pgfplots):
+
+```
+pdflatex pillar-message-format.tex && pdflatex pillar-message-format.tex
+```
 
 `pillar-udp-encryption.md` — *pillar-udp Encryption: the portable cell-minted
 session key*. How a **pillar-udp** datagram is encrypted on the wire, replacing the

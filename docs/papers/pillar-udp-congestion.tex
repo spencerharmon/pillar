@@ -10,6 +10,7 @@
 \pgfplotsset{compat=1.16}
 \usetikzlibrary{arrows.meta,positioning,shapes.geometric,backgrounds,fit,calc}
 \usepackage[hidelinks]{hyperref}
+\usepackage{pifont}
 \usepackage{caption}
 \captionsetup{font=small,labelfont=bf}
 
@@ -239,6 +240,64 @@ completes over the other three pairs, aggregating their bandwidth instead of
 bottlenecking on one connection. Modeled in \code{PillarUdpMesh.tla}.}
 \label{fig:manytomany}
 \end{figure}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  part/.style={rectangle,rounded corners=1pt,draw=pnode,thick,fill=white,
+               font=\scriptsize\bfseries,minimum height=5.5mm,minimum width=15mm,
+               align=center,inner sep=2pt},
+  life/.style={pgray,densely dashed,semithick},
+  msg/.style={-{Stealth[length=2mm]},thick,pgood},
+  lossy/.style={-{Stealth[length=2mm]},thick,pbad,dash pattern=on 1.4pt off 1.4pt},
+  ret/.style={-{Stealth[length=2mm]},thick,pgood,densely dashed},
+  gray/.style={-{Stealth[length=1.8mm]},semithick,pgray},
+  lbl/.style={midway,above,font=\tiny,fill=white,inner sep=1pt},
+  lblb/.style={midway,below,font=\tiny,fill=white,inner sep=1pt},
+  note/.style={rectangle,rounded corners=1.5pt,draw=pnode,fill=pcell,
+               font=\tiny,align=center,inner sep=2.5pt}]
+  \def\xC{0} \def\xA{3.4} \def\xB{6.8} \def\xE{10.2} \def\xD{13.6}
+  \def\ybot{-9.6}
+  \foreach \x in {\xC,\xA,\xB,\xE,\xD}
+     \draw[life] (\x,-0.45) -- (\x,\ybot);
+  \node[part] at (\xC,0) {client};
+  \node[part] at (\xA,0) {ingest n1};
+  \node[part] at (\xB,0) {ingest n2};
+  \node[part] at (\xE,0) {ingest n3};
+  \node[part,shape=cylinder,shape border rotate=90,aspect=0.3,fill=pcell] at (\xD,0) {streamDB};
+  % client setup
+  \node[note,anchor=north,text width=44mm] at (\xC,-0.85)
+     {join cell $\to$ receive node list; open\\ redundant client-initiated conns\\ (each opens its own NAT return path)};
+  % spray, allowance-bounded; n2 path lossy
+  \draw[msg]   (\xC,-2.5) -- node[lbl]{spray (CID, allowance $W$, TTL)} (\xA,-2.5);
+  \draw[lossy] (\xC,-3.05) -- node[lblb]{\textcolor{pbad}{$\times$ lossy path}} (\xB,-3.05);
+  \draw[msg]   (\xC,-3.6) -- node[lblb]{redundant copy (dispersed IP)} (\xE,-3.6);
+  % dedup at DB
+  \draw[msg]  (\xA,-4.3) -- node[lbl]{inject (first copy anywhere)} (\xD,-4.3);
+  \draw[gray] (\xE,-4.85) -- node[lblb]{later copy: same CID $\Rightarrow$ dedup} (\xD,-4.85);
+  \node[note,anchor=north,text width=60mm] at ($(\xA,-5.35)!0.5!(\xE,-5.35)$)
+     {\code{ExactlyOnce}: injected $\le 1$ (safety) \quad\textbullet\quad
+      \code{SprayWidthBounded}: round $\le$ allowance (safety)};
+  % reply from a different node than ingested
+  \draw[gray] (\xD,-6.55) -- node[lbl]{best path} (\xE,-6.55);
+  \draw[ret]  (\xE,-7.1) -- node[lblb]{reply: \emph{any} well-placed node, WoT-signed (not the ingester)} (\xC,-7.1);
+  \node[note,anchor=north,draw=pgood,text width=70mm] at ($(\xC,-7.65)!0.5!(\xD,-7.65)$)
+     {adversary may flip \emph{any} links lossy, provided $\ge 1$ dispersed path stays good
+      $\Rightarrow$ \code{Delivered} (liveness); coverage accumulates monotonically across retransmit rounds};
+\end{tikzpicture}
+\caption{\textbf{One-to-many, in time.} The temporal view of
+Fig.~\ref{fig:onetomany}. The client dials a dispersed set of ingest nodes
+(client-initiated, so each connection opens its own return path through NAT),
+then sprays an allowance-bounded set of CID-signed copies. The path to
+\code{n2} is lossy and its copy is dropped, but copies reach \code{n1} and
+\code{n3}; the first to arrive injects the message and the later one deduplicates
+by CID (\code{ExactlyOnce}), while no round exceeds the redundancy allowance
+(\code{SprayWidthBounded}). The reply returns from whichever well-placed node has
+the best path---not necessarily the one that ingested---and as long as at least
+one dispersed path stays good the message is eventually delivered
+(\code{Delivered}). Modeled in \code{PillarUdpClient.tla}.}
+\label{fig:onetomany-seq}
+\end{figure*}
 
 \section{Automatic geographic load balancing}
 Neither model contains a load balancer, a scheduler, or a route table. Delivery
