@@ -48,3 +48,9 @@ pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, NativeIpfsBackend};
 pub mod seal;
 pub mod envelope;
 pub use envelope::{Body, PillarMessage, PILLAR_MESSAGE_MAX_SUPPORTED, PILLAR_MESSAGE_MIN_SUPPORTED};
+
+pub mod psl_message;
+pub use psl_message::{
+    decode_request, decode_response, encode_request, encode_response, PslCorrelateGroup,
+    PslMessageCodecError, PslQueryRequest, PslQueryResponse, PslQueryResult, PslSignalRow,
+};
