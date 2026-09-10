@@ -37,3 +37,10 @@ libp2p Noise upgrade: a cell-as-KDC scheme distributing a deterministically-deri
 anonymous sessions handled by policy (not a separate crypto scheme) and forward
 secrecy deliberately bounded to cell-key security for cross-node portability. QUIC/TCP
 fallbacks use their own TLS instead. TLA+-gated by `../../specs/PillarUdpEncryption.tla`.
+Rendered as a formal LaTeX paper with a packet-flow diagram in
+`pillar-udp-encryption.tex` (companion to the congestion paper; the `.md` is the
+design-of-record prose). Build the PDF (needs a TeX install with tikz + pgfplots):
+
+```
+pdflatex pillar-udp-encryption.tex && pdflatex pillar-udp-encryption.tex
+```
