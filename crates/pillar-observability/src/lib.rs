@@ -47,6 +47,7 @@ pub mod alerting;
 pub use alerting::{Alert, AlertEngine, AlertError, AlertPredicate, Notification, Notifier, RecordingNotifier};
 pub mod block;
 pub mod correlation;
+pub mod hop_metric;
 pub mod ingest;
 pub mod instrument;
 pub mod live;

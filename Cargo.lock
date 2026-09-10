@@ -3333,6 +3333,7 @@ dependencies = [
  "pillar-ipam",
  "pillar-ipfs",
  "pillar-manifest",
+ "pillar-observability",
  "pillar-streamdb",
  "pillar-swarm",
  "pillar-topology",
