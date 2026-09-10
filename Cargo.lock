@@ -3326,6 +3326,7 @@ name = "pillar-net"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hkdf",
  "libp2p",
  "pillar-core",
  "pillar-crypto",
@@ -3339,6 +3340,7 @@ dependencies = [
  "pillar-trust-artifacts",
  "pillar-wire",
  "serde",
+ "sha2",
  "sha3",
  "tokio",
  "tracing",

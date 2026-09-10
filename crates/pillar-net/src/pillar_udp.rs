@@ -41,14 +41,27 @@ use pillar_streamdb::content_address;
 /// version space is independent of every other stamped surface (the message
 /// format's [`crate::MESSAGE_VERSION`], the event envelope, the manifest
 /// schema, …): they advance separately.
-pub const PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+///
+/// **Bumped to 2 for the portable cell-minted session-key cutover**
+/// (`docs/papers/pillar-udp-encryption.md`): dropping the legacy
+/// Noise / seal-to-recipients pillar-UDP transport crypto in favor of the
+/// portable session key ([`crate::pillarmsg_session`]) is a BREAKING wire
+/// change, so the protocol version advances and
+/// [`crate::pillarmsg_session::negotiate_session_key_peer`] refuses a legacy
+/// (version-1) peer cleanly while a mixed rolling swarm coexists.
+pub const PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(2);
 
 /// The OLDEST pillar-UDP protocol wire version this build can still decode.
 /// A decoded stamp outside `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` is a
 /// [`ShardError::UnsupportedProtocolVersion`] — distinct from a malformed
 /// (truncated / garbage) buffer, so the future compatibility layer can treat a
 /// newer peer as negotiable rather than as corruption.
-pub const MIN_PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(1);
+///
+/// Raised to 2 alongside [`PROTOCOL_VERSION`]: the session-key cutover removed
+/// the legacy version-1 transport-crypto path, so a version-1 (Noise-era) peer
+/// is outside this build's decodable window and is refused as a clean
+/// negotiation refusal rather than mis-framed.
+pub const MIN_PROTOCOL_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::SurfaceVersion(2);
 
 /// The pillar-UDP N-1+ backward-compat window (ROI P1 "Compatibility
 /// contract: check, negotiate, N-1+"): the max tolerated absolute difference

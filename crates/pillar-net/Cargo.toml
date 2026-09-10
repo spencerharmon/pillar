@@ -21,6 +21,14 @@ description = "libp2p transport substrate for Pillar: gossipsub event log, Kadem
 # stands up real libp2p swarms over real sockets to prove the corrected
 # transport posture (pillar-UDP preferred; QUIC/TCP fallback) end to end. Both
 # acceptance-tier tests share this single off-by-default gate.
+#
+# It further gates `tests/pillar_udp_session_key.rs`, the acceptance proof of
+# the portable cell-minted pillar-UDP session-key scheme
+# (`docs/papers/pillar-udp-encryption.md`): over real UDP sockets and a real
+# libp2p swarm it proves K_s portability across ingress nodes,
+# authorize-before-serve, CID-dedup replay defense, ed25519 sender identity,
+# revocation + GC-erase, anonymous-as-policy, and clean legacy-peer negotiation
+# refusal.
 acceptance = []
 
 [dependencies]
@@ -64,6 +72,11 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
 sha3 = "0.10.9"
+# The portable cell-minted pillar-UDP session key (pillarmsg_session) derives
+# K_s via HKDF-SHA256 over an X25519 ECDH shared secret and a convergent
+# transport-frame nonce, matching pillar-crypto's own HKDF-SHA256 derivations.
+sha2 = "0.10"
+hkdf = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

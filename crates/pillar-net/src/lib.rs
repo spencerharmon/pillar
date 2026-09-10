@@ -43,6 +43,13 @@ pub use pillarmsg_udp::{
     HandshakelessError,
 };
 
+pub mod pillarmsg_session;
+pub use pillarmsg_session::{
+    cell_node_session_key, client_session_key, derive_session_key, frame_sender, grants_for,
+    negotiate_session_key_peer, open_frame, seal_frame, unwrap_frame_body, wrap_frame_body,
+    CellKeys, Grant, PolicySet, SessionError, SessionInit, SessionRecord, SessionStore,
+};
+
 pub mod pillar_udp_posture;
 pub use pillar_udp_posture::{
     classify_reply_tier, select_preferred_transport, ClientConnectionSet, IngestNode,
