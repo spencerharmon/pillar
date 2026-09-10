@@ -222,7 +222,9 @@ pub fn interpret_login(ok: bool, body: &str, submitted: &str) -> Result<String, 
 
 /// The atomic `POST /bootstrap/create` body
 /// (`<cell>\n<handle>\n<factor>\n<second_factor>`). `second_factor` is the
-/// first user's 2FA method (`password`|`passkey`|`tpm`|`pkcs11`).
+/// first user's 2FA method (`password`|`passkey`). A browser second factor is
+/// always a WebAuthn passkey; TPM/PKCS#11 are node-key custody, not user
+/// credentials, and are not offered here.
 #[must_use]
 pub fn bootstrap_wire(cell: &str, handle: &str, factor: &str, second_factor: &str) -> String {
     body_lines(&[cell, handle, factor, second_factor])

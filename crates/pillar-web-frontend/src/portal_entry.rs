@@ -356,13 +356,6 @@ mod yew_impl {
                 <label for="cell-id">{ "Cell name" }</label>
                 <input id="cell-id" type="text" value={(*cell).clone()} placeholder="your cell name" oninput={on_cell} />
                 <div id="cell-name-hint" class={hint_cls}>{ hint_text }</div>
-                <label for="custody">{ "Cell key custody" }</label>
-                <select id="custody">
-                    <option value="tpm">{ "TPM (hardware-bound)" }</option>
-                    <option value="passkey">{ "Passkey / WebAuthn" }</option>
-                    <option value="password">{ "Password" }</option>
-                    <option value="keyring">{ "OS keyring" }</option>
-                </select>
                 <label for="first-handle">{ "First user handle" }</label>
                 <input id="first-handle" type="text" value={(*handle).clone()} placeholder="choose a handle" oninput={on_handle} />
                 <label for="first-factor">{ "Unlock factor" }</label>
@@ -371,8 +364,6 @@ mod yew_impl {
                 <select id="first-2fa" onchange={on_second_factor}>
                     <option value="password" selected={*second_factor == "password"}>{ "None (password only)" }</option>
                     <option value="passkey" selected={*second_factor == "passkey"}>{ "Passkey / WebAuthn (FIDO2)" }</option>
-                    <option value="tpm" selected={*second_factor == "tpm"}>{ "TPM 2.0" }</option>
-                    <option value="pkcs11" selected={*second_factor == "pkcs11"}>{ "PKCS#11 HSM / smart card" }</option>
                 </select>
                 <button id="bootstrap-submit" type="submit" disabled={*busy}>{ "Create cell & first user" }</button>
                 <div class="explainer" id="bootstrap-explainer">
@@ -404,7 +395,7 @@ mod yew_impl {
         pub token: String,
         /// The first user's handle (the credential's user handle).
         pub handle: String,
-        /// The chosen factor (`passkey`|`tpm`|`pkcs11`), for the prompt copy.
+        /// The chosen factor (`passkey`), for the prompt copy.
         pub factor: String,
     }
 
@@ -452,8 +443,6 @@ mod yew_impl {
 
         let factor_label = match props.factor.as_str() {
             "passkey" => "passkey / security key (WebAuthn)",
-            "tpm" => "TPM 2.0 authenticator",
-            "pkcs11" => "PKCS#11 HSM / smart card",
             other => other,
         };
         let on_retry = {

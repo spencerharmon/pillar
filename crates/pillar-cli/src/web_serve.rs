@@ -248,9 +248,10 @@ pub struct WebAuthContext {
     /// token last authenticated). The key-export gate consumes it as the fresh
     /// WebAuthn step-up proof; a token with no fresh stamp cannot export a secret.
     step_up_at: HashMap<String, u64>,
-    /// The first user's required second factor (`password`|`passkey`|`tpm`|
-    /// `pkcs11`), recorded at bootstrap so first-login enrollment requires/offers
-    /// the matching WebAuthn/HSM/TPM registration.
+    /// The first user's required second factor (`password`|`passkey`),
+    /// recorded at bootstrap so first-login enrollment requires/offers the
+    /// matching WebAuthn passkey registration. (TPM/PKCS#11 are node-key
+    /// custody, not user credentials — a browser cannot drive them.)
     first_user_second_factor: HashMap<String, String>,
     /// Admitted-but-not-yet-second-factor-verified logins. When a password
     /// login succeeds for a user who has an ENROLLED WebAuthn credential, the
@@ -1823,7 +1824,7 @@ impl WebAuthContext {
     }
 
     /// Record the first user's chosen second factor (2FA) so first-login
-    /// enrollment requires/offers the matching WebAuthn/HSM/TPM registration.
+    /// enrollment requires/offers the matching WebAuthn passkey registration.
     pub fn note_first_user_second_factor(&mut self, handle: &str, method: &str) {
         self.first_user_second_factor
             .insert(handle.to_owned(), method.to_owned());
@@ -3098,7 +3099,7 @@ fn dispatch_bootstrap_create(
     match ctx.bootstrap_cell_and_first_user(NodeId::from(cell_id.as_str()), &handle, &password) {
         Ok(()) => {
             // Record the first user's required second factor so the enrollment
-            // (WebAuthn/HSM/TPM registration) is required/offered at first
+            // (WebAuthn passkey registration) is required/offered at first
             // login; "password" means no hardware second factor.
             ctx.note_first_user_second_factor(&handle, &second_factor);
             let hint = if second_factor == "password" {
