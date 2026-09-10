@@ -1580,6 +1580,46 @@ impl WebAuthContext {
         Some(Ok(body))
     }
 
+    /// The ONE `psl-message-api` `PillarMessage` contract (`psl-message-api`,
+    /// 2026-09-09 ROI HEAD): runs `query_text` against the SAME live query
+    /// engine [`Self::live_obs_psl`] rides (`pillar_observability::parse_psl`
+    /// + `psl_query`/`psl_correlate`), but returns the typed
+    /// [`pillar_wire::PslQueryResponse`] every transport tier (pillar-UDP,
+    /// QUIC, HTTPS) serves verbatim as canonical CBOR — never the ad hoc text
+    /// line-protocol `live_obs_psl` renders. `None` when no live substrate is
+    /// attached (the caller maps this to a transport-appropriate "service
+    /// unavailable").
+    pub fn live_obs_psl_message(&self, query_text: &str) -> Option<pillar_wire::PslQueryResponse> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let query = match pillar_observability::parse_psl(query_text) {
+            Ok(q) => q,
+            Err(e) => return Some(pillar_wire::PslQueryResponse::Error(format!("PSL-PARSE {}", e.0))),
+        };
+        let now = sub.latest_tick();
+        let rows: Vec<pillar_wire::PslSignalRow> = sub
+            .psl_query(&query, now)
+            .into_iter()
+            .map(|r| pillar_wire::PslSignalRow {
+                id: r.id.to_hex(),
+                kind: signal_kind_tag(r.kind).to_owned(),
+                tick: r.tick,
+                unix_millis: r.unix_millis,
+                labels: r.labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                payload: r.payload.clone(),
+            })
+            .collect();
+        let groups: Vec<pillar_wire::PslCorrelateGroup> = sub
+            .psl_correlate(&query, now)
+            .into_iter()
+            .map(|(anchor, members)| pillar_wire::PslCorrelateGroup {
+                anchor: anchor.to_hex(),
+                members: members.iter().map(|m| m.to_hex()).collect(),
+            })
+            .collect();
+        Some(pillar_wire::PslQueryResponse::Ok(pillar_wire::PslQueryResult { rows, groups }))
+    }
+
     /// The metric-name typeahead for the Explore `select:` builders, one name
     /// per line, read from the LIVE store's real [`pillar_observability::
     /// MetadataIndex`] projection — never a fabricated catalog. `None` when no
@@ -3102,7 +3142,12 @@ impl WebAuthContext {
         token
     }
 
-    fn login_session_for(&self, token: &str) -> Option<&LoginSession> {
+    /// Look up an admitted session by its bearer token. `pub(crate)` (rather
+    /// than private) so the `psl-message-api` pillar-UDP/QUIC tiers
+    /// ([`crate::psl_udp_server`], [`crate::psl_quic_server`]) authenticate
+    /// against the SAME session registry the HTTPS `/login` path admits
+    /// into — never a duplicated/desynced notion of "admitted".
+    pub(crate) fn login_session_for(&self, token: &str) -> Option<&LoginSession> {
         self.login_sessions.get(token)
     }
 
@@ -3193,6 +3238,20 @@ pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
     }
 }
 
+/// Serve HTTP/1.1 on `listener` against a SHARED, mutex-guarded
+/// [`WebAuthContext`] — the same context instance the `psl-message-api`
+/// pillar-UDP and QUIC tiers also read/authenticate against, so a session
+/// token admitted over one tier (e.g. the HTTPS `/login`) is honored by
+/// every other tier serving the SAME running node. Blocking — run on a
+/// dedicated thread.
+pub fn serve_shared(listener: TcpListener, ctx: std::sync::Arc<std::sync::Mutex<WebAuthContext>>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let mut guard = ctx.lock().expect("shared web auth context lock");
+        handle_connection(stream, &mut guard);
+    }
+}
+
 /// The graphical portal UI served at `GET /` — a real login page (two fields:
 /// user identifier + unlock factor, NO CID), whose embedded script drives the
 /// `GET /nonce` → `POST /login` handshake as hidden plumbing and, on success,
@@ -3275,6 +3334,11 @@ struct HttpRequest {
     method: String,
     path: String,
     body: String,
+    /// The raw request body bytes, preserved verbatim (unlike `body`, which
+    /// is a lossy UTF-8 decode) — the ONLY body a binary route (e.g. the
+    /// canonical-CBOR `psl-message-api` contract) may read, so a non-UTF-8
+    /// CBOR payload is never corrupted by the text path's lossy conversion.
+    body_bytes: Vec<u8>,
     /// The raw `X-Pillar-Api-Version` header value the client sent, if any.
     /// `None` means the request asserted no version — served backward-
     /// compatibly at [`API_VERSION`]. `Some` is validated by
@@ -3322,10 +3386,12 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
     }
 
     let mut body = String::new();
+    let mut raw = Vec::new();
     if content_length > 0 {
         let mut buf = vec![0u8; content_length];
         if reader.read_exact(&mut buf).is_ok() {
             body = String::from_utf8_lossy(&buf).into_owned();
+            raw = buf;
         }
     }
 
@@ -3333,6 +3399,7 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
         method,
         path,
         body,
+        body_bytes: raw,
         api_version,
     })
 }
@@ -3831,6 +3898,10 @@ pub static ROUTES: &[RouteSpec] = &[
         handler: |ctx, _peer, request| dispatch_obs_live_query(ctx, request),
     },
     RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/obs/query/message"),
+        handler: |ctx, _peer, request| dispatch_obs_query_message(ctx, request),
+    },    RouteSpec {
         method: "POST",
         path: PathMatch::Exact("/portal/obs/live/recording"),
         handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request),
@@ -5101,6 +5172,44 @@ fn dispatch_obs_live_query(ctx: &mut WebAuthContext, request: &HttpRequest) -> H
     }
 }
 
+/// The `psl-message-api` HTTPS tier: `POST /portal/obs/query/message`, body =
+/// canonical-CBOR [`pillar_wire::PslQueryRequest`] bytes (never text-framed —
+/// this is the ONE typed contract the Yew UI and the CLI's HTTPS fallback
+/// tier both ride). Responds with a canonical-CBOR
+/// [`pillar_wire::PslQueryResponse`] body regardless of outcome (including an
+/// unauthorized/no-substrate case), so a caller never has to branch on HTTP
+/// status to learn what happened — decode the body.
+fn dispatch_obs_query_message(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let req = match pillar_wire::decode_request(&request.body_bytes) {
+        Ok(req) => req,
+        Err(e) => {
+            let bytes = pillar_wire::encode_response(&pillar_wire::PslQueryResponse::Error(
+                format!("BAD-CBOR {e}"),
+            ))
+            .unwrap_or_default();
+            return cbor_response(400, "Bad Request", bytes);
+        }
+    };
+    if ctx.login_session_for(&req.token).is_none() {
+        let bytes = pillar_wire::encode_response(&pillar_wire::PslQueryResponse::Unauthorized)
+            .unwrap_or_default();
+        return cbor_response(401, "Unauthorized", bytes);
+    }
+    match ctx.live_obs_psl_message(&req.query_text) {
+        Some(resp) => {
+            let bytes = pillar_wire::encode_response(&resp).unwrap_or_default();
+            cbor_response(200, "OK", bytes)
+        }
+        None => {
+            let bytes = pillar_wire::encode_response(&pillar_wire::PslQueryResponse::Error(
+                "NO-LIVE-SUBSTRATE".to_owned(),
+            ))
+            .unwrap_or_default();
+            cbor_response(503, "Service Unavailable", bytes)
+        }
+    }
+}
+
 /// Live-store recording-rule register+evaluate: `POST
 /// /portal/obs/live/recording`, body `<token>\n<id>|<kind>|<psl>|<emit>`.
 /// Evaluates the rule on the node's real scheduler engine over the live store,
@@ -5985,6 +6094,20 @@ fn text_response(status: u16, reason: &'static str, mut body: String) -> HttpRes
     }
 }
 
+/// A binary response carrying canonical-CBOR bytes — the ONE response shape
+/// the `psl-message-api` HTTPS tier uses, matching the same
+/// [`pillar_wire::PslQueryResponse`] the pillar-UDP and QUIC tiers serve.
+fn cbor_response(status: u16, reason: &'static str, bytes: Vec<u8>) -> HttpResponse {
+    HttpResponse {
+        status,
+        reason,
+        content_type: "application/cbor",
+        session_token: None,
+        body: String::new(),
+        bytes: Some(bytes),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6052,6 +6175,7 @@ mod tests {
                 method: "GET".into(),
                 path: path.into(),
                 body: String::new(),
+                body_bytes: Vec::new(),
                 api_version: None,
             },
         )
@@ -6065,6 +6189,7 @@ mod tests {
                 method: "POST".into(),
                 path: path.into(),
                 body: body.into(),
+                body_bytes: body.as_bytes().to_vec(),
                 api_version: None,
             },
         )
@@ -6204,6 +6329,7 @@ mod tests {
                 method: "GET".into(),
                 path: path.into(),
                 body: String::new(),
+                body_bytes: Vec::new(),
                 api_version: Some(version.into()),
             },
         )

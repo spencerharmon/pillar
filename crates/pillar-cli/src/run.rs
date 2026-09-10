@@ -1270,7 +1270,37 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 };
                 ctx.replay(&persisted_ops);
 
-                std::thread::spawn(move || crate::web_serve::serve(listener, &mut ctx));
+                let ctx = std::sync::Arc::new(std::sync::Mutex::new(ctx));
+
+                // The `psl-message-api` pillar-UDP and QUIC tiers
+                // (`psl-message-api`, 2026-09-09 ROI HEAD): opt-in,
+                // integration-rig-only additional listeners serving the SAME
+                // `PillarMessage` PSL query contract the HTTPS
+                // `/portal/obs/query/message` route above serves, against
+                // the SAME shared, mutex-guarded `WebAuthContext` — so a
+                // session admitted over one tier is honored by every tier.
+                // Unset in production; a deployed node relies on HTTPS +
+                // the swarm-level pillar-UDP/QUIC transport instead of this
+                // narrow RPC-of-convenience surface (see
+                // `crate::psl_udp_server`/`crate::psl_quic_server`).
+                if let Ok(bind) = std::env::var("PILLAR_PSL_UDP_BIND") {
+                    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
+                        match crate::psl_udp_server::spawn(addr, std::sync::Arc::clone(&ctx)) {
+                            Ok(bound) => tracing::info!(%bound, "psl-message-api pillar-UDP tier listening"),
+                            Err(e) => tracing::warn!(error = %e, %addr, "psl-message-api pillar-UDP tier failed to bind"),
+                        }
+                    }
+                }
+                if let Ok(bind) = std::env::var("PILLAR_PSL_QUIC_BIND") {
+                    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
+                        match crate::psl_quic_server::spawn(addr, std::sync::Arc::clone(&ctx)) {
+                            Ok(bound) => tracing::info!(%bound, "psl-message-api QUIC tier listening"),
+                            Err(e) => tracing::warn!(error = %e, %addr, "psl-message-api QUIC tier failed to bind"),
+                        }
+                    }
+                }
+
+                std::thread::spawn(move || crate::web_serve::serve_shared(listener, ctx));
             }
             Err(e) => {
                 tracing::warn!(error = %e, %web_bind, port = config.web_port, "pillar web UI failed to bind; continuing without it");
