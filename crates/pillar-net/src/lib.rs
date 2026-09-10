@@ -37,8 +37,6 @@ use libp2p::{
 pub mod pillar_udp;
 pub mod hop_metric;
 
-pub mod hop_metric;
-
 pub mod pillarmsg_udp;
 pub use pillarmsg_udp::{
     handshakeless_pillar_udp_transport, negotiate_handshakeless_peer, open_datagram,
