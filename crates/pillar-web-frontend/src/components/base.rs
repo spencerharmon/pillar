@@ -277,7 +277,7 @@ pub fn login_panel() -> Html {
             let error = error.clone();
             busy.set(true);
             spawn_local(async move {
-                match webauthn::run_register(&token, &user_handle).await {
+                match webauthn::run_register(&token, &user_handle, "").await {
                     Ok(_credential_id) => error.set(None),
                     Err(e) => error.set(Some(e)),
                 }

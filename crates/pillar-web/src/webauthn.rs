@@ -75,6 +75,18 @@ pub struct CredentialRecord {
     pub user_handle: String,
     /// The cell this record is scoped to.
     pub cell: String,
+    /// User-chosen human label for the management surface (`""` if none).
+    pub label: String,
+    /// The rpId / domain this credential is bound to (the serving origin for a
+    /// browser passkey, the cell IPNS name or an operator-chosen domain for a
+    /// portable passkey). `""` when unknown — e.g. a record restored from a
+    /// journal written before rpId capture.
+    pub rp_id: String,
+    /// Unix seconds the credential was registered.
+    pub created_at: u64,
+    /// Unix seconds of the most recent successful assertion; `None` until the
+    /// credential is first used to log in.
+    pub last_used_at: Option<u64>,
 }
 
 /// The pillar WebAuthn relying party: the challenge protocol plus the shared
@@ -175,6 +187,8 @@ impl RelyingParty {
         attestation_object: &[u8],
         prf_salt: [u8; 32],
         user_handle: &str,
+        label: &str,
+        rp_id: &str,
     ) -> Result<CredentialRecord, RpError> {
         self.consume_challenge(challenge, session, cell, now)?;
         let RegisteredCredential {
@@ -195,6 +209,10 @@ impl RelyingParty {
             sign_count,
             user_handle: user_handle.to_owned(),
             cell: cell.to_owned(),
+            label: label.to_owned(),
+            rp_id: rp_id.to_owned(),
+            created_at: now,
+            last_used_at: None,
         };
         self.records.insert(key, record.clone());
         Ok(record)
@@ -264,6 +282,8 @@ impl RelyingParty {
         if verified.sign_count != 0 {
             record.sign_count = verified.sign_count;
         }
+        // Stamp the credential's most-recent-use for the management surface.
+        record.last_used_at = Some(now);
         Ok(unlock)
     }
 
@@ -296,6 +316,24 @@ impl RelyingParty {
         self.records.insert(key, record);
     }
 
+    /// Replay a journaled successful assertion: advance a live credential's
+    /// stored sign-count and last-used stamp. No-op for an unknown or revoked
+    /// credential (fail-closed). This is the restart-replay counterpart to the
+    /// in-session mutation [`authenticate_finish`] performs, so clone-detection
+    /// state and the management surface's "last used" survive a node restart.
+    pub fn touch_credential(&mut self, credential_id: &[u8], sign_count: u32, last_used_at: u64) {
+        let key = hex(credential_id);
+        if let Some(record) = self.records.get_mut(&key) {
+            if sign_count > record.sign_count {
+                record.sign_count = sign_count;
+            }
+            record.last_used_at = Some(match record.last_used_at {
+                Some(prev) => prev.max(last_used_at),
+                None => last_used_at,
+            });
+        }
+    }
+
     /// Whether `user_handle` has at least one live (registered, non-revoked)
     /// credential — the login-time "this user must complete a WebAuthn
     /// assertion" predicate.
@@ -314,6 +352,35 @@ impl RelyingParty {
             .filter(|r| r.user_handle == user_handle)
             .map(|r| r.credential_id.clone())
             .collect()
+    }
+
+    /// Every live (registered, non-revoked) credential belonging to
+    /// `user_handle`, oldest-first, for the management surface (list). Returns
+    /// the full records so the caller can render label / rpId / created /
+    /// last-used / sign-count / id.
+    #[must_use]
+    pub fn user_credentials(&self, user_handle: &str) -> Vec<&CredentialRecord> {
+        let mut creds: Vec<&CredentialRecord> = self
+            .records
+            .values()
+            .filter(|r| r.user_handle == user_handle)
+            .collect();
+        creds.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.credential_id.cmp(&b.credential_id))
+        });
+        creds
+    }
+
+    /// Whether `credential_id` is a live credential owned by `user_handle` — the
+    /// authorization predicate for a user-initiated revoke (a user may revoke
+    /// only their own credentials).
+    #[must_use]
+    pub fn user_owns_credential(&self, user_handle: &str, credential_id: &[u8]) -> bool {
+        self.records
+            .get(&hex(credential_id))
+            .is_some_and(|r| r.user_handle == user_handle)
     }
 }
 
@@ -384,6 +451,8 @@ mod tests {
             &attestation(cose, cred, sc),
             [7u8; 32],
             "alice",
+            "test-key",
+            "pillar.local",
         )
         .expect("register");
     }

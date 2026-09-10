@@ -514,6 +514,32 @@ enum PortalOp {
         cose_public_key: Vec<u8>,
         prf_salt: Vec<u8>,
         sign_count: u32,
+        /// User-chosen label; `#[serde(default)]` so a journal written before
+        /// management metadata (an already-enrolled credential) still replays.
+        #[serde(default)]
+        label: String,
+        /// The rpId/domain the credential is bound to; empty for a legacy
+        /// record enrolled before rpId capture.
+        #[serde(default)]
+        rp_id: String,
+        /// Unix seconds of registration; 0 for a legacy record.
+        #[serde(default)]
+        created_at: u64,
+    },
+    /// A successful WebAuthn assertion: re-stamps a credential's advancing
+    /// sign-count and its last-used time on replay, so clone-detection state
+    /// and the management surface's "last used" survive a node restart (a
+    /// registration alone would restore only the enrolled-time counter).
+    WebauthnAssertion {
+        credential_id: Vec<u8>,
+        sign_count: u32,
+        last_used_at: u64,
+    },
+    /// A user-initiated credential revocation: fail-closed and permanent. On
+    /// replay the credential is removed and blocklisted so it never re-admits
+    /// or revives (RevokedKeyNeverAdmits / RevokedStaysDead).
+    WebauthnRevoke {
+        credential_id: Vec<u8>,
     },
 }
 
@@ -904,6 +930,9 @@ impl WebAuthContext {
                 cose_public_key,
                 prf_salt,
                 sign_count,
+                label,
+                rp_id,
+                created_at,
             } => {
                 let mut salt = [0u8; 32];
                 if prf_salt.len() == 32 {
@@ -916,6 +945,10 @@ impl WebAuthContext {
                             sign_count,
                             user_handle: handle,
                             cell,
+                            label,
+                            rp_id,
+                            created_at,
+                            last_used_at: None,
                         });
                 } else {
                     tracing::warn!(
@@ -923,6 +956,17 @@ impl WebAuthContext {
                         "portal journal: skipping WebauthnEnroll with non-32-byte prf_salt"
                     );
                 }
+            }
+            PortalOp::WebauthnAssertion {
+                credential_id,
+                sign_count,
+                last_used_at,
+            } => {
+                self.webauthn_rp
+                    .touch_credential(&credential_id, sign_count, last_used_at);
+            }
+            PortalOp::WebauthnRevoke { credential_id } => {
+                self.webauthn_rp.revoke(&credential_id);
             }
         }
     }
@@ -3207,6 +3251,16 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/webauthn/credentials/list"),
+        handler: |ctx, _peer, request| dispatch_webauthn_credentials_list(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/webauthn/credentials/revoke"),
+        handler: |ctx, _peer, request| dispatch_webauthn_credentials_revoke(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/bootstrap/request/node"),
         handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, true),
     },
@@ -5020,6 +5074,13 @@ fn dispatch_webauthn_register_finish(
     let user_handle = lines.next().unwrap_or("").trim();
     let challenge_b64 = lines.next().unwrap_or("").trim();
     let attestation_b64 = lines.next().unwrap_or("").trim();
+    // Optional trailing management metadata (older clients omit them):
+    //   <label>  user-chosen human name for the credential
+    //   <rp_id>  the rpId/domain the browser bound the credential to (the
+    //            frontend sends window.location.hostname; native CTAP2 sends
+    //            its chosen --rp-id/--domain).
+    let label = lines.next().unwrap_or("").trim();
+    let rp_id = lines.next().unwrap_or("").trim();
     if user_handle.is_empty() || challenge_b64.is_empty() || attestation_b64.is_empty() {
         return text_response(
             400,
@@ -5058,6 +5119,8 @@ fn dispatch_webauthn_register_finish(
         // and a client must not be able to misfile a credential under another
         // name. The browser-sent user_handle is only a display hint.
         &cell,
+        label,
+        rp_id,
     ) {
         Ok(record) => {
             // Journal the enrollment so it survives a restart (else the node
@@ -5069,12 +5132,96 @@ fn dispatch_webauthn_register_finish(
                 cose_public_key: record.cose_public_key.clone(),
                 prf_salt: record.prf_salt.to_vec(),
                 sign_count: record.sign_count,
+                label: record.label.clone(),
+                rp_id: record.rp_id.clone(),
+                created_at: record.created_at,
             });
             let cred_b64 = pillar_crypto::webauthn::base64url_encode(&record.credential_id);
             text_response(200, "OK", format!("REGISTERED {cred_b64}"))
         }
         Err(e) => webauthn_rp_error(&e),
     }
+}
+
+/// `POST /webauthn/credentials/list` — the management surface's read. Body:
+/// `<session-token>`. Requires a LIVE session (not a pending-2FA token). Emits
+/// one `CRED` line per live credential the caller owns, oldest-first:
+/// `CRED <id-b64url> <label> <rp_id> <created_at> <last_used|-> <sign_count>`.
+/// `label`/`rp_id` are `-` when empty (kept single-token so the line splits on
+/// spaces). An empty set yields a `200 OK` with an empty body.
+fn dispatch_webauthn_credentials_list(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = request.body.lines().next().unwrap_or("").trim();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let subject = session.subject.to_string();
+    let dash = |s: &str| if s.is_empty() { "-".to_owned() } else { s.to_owned() };
+    let lines: Vec<String> = ctx
+        .webauthn_rp
+        .user_credentials(&subject)
+        .into_iter()
+        .map(|r| {
+            let id = pillar_crypto::webauthn::base64url_encode(&r.credential_id);
+            let last = r
+                .last_used_at
+                .map_or_else(|| "-".to_owned(), |t| t.to_string());
+            format!(
+                "CRED {id} {} {} {} {last} {}",
+                dash(&r.label),
+                dash(&r.rp_id),
+                r.created_at,
+                r.sign_count,
+            )
+        })
+        .collect();
+    text_response(200, "OK", lines.join("\n"))
+}
+
+/// `POST /webauthn/credentials/revoke` — the management surface's revoke. Body:
+/// `<session-token>\n<credential-id-b64url>`. Requires a LIVE session and that
+/// the credential belong to the caller (a user may revoke only their own).
+/// Fail-closed and permanent (journaled `WebauthnRevoke`); the credential never
+/// admits again. Returns `REVOKED <id-b64url>`.
+fn dispatch_webauthn_credentials_revoke(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let cred_b64 = lines.next().unwrap_or("").trim();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let subject = session.subject.to_string();
+    let Ok(cred) = pillar_crypto::webauthn::base64url_decode(cred_b64) else {
+        return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
+    };
+    // A user may revoke ONLY their own credential; refuse (404, not 403, so an
+    // attacker cannot probe another user's credential ids) otherwise.
+    if !ctx.webauthn_rp.user_owns_credential(&subject, &cred) {
+        return text_response(404, "Not Found", "DENIED unknown-credential".to_owned());
+    }
+    // Refuse to revoke the caller's LAST credential if that would silently drop
+    // an enforced second factor, leaving a weaker login than the user set up.
+    // The user must keep at least one, or disable 2FA through the dedicated
+    // path. (Enforcement keys on "user has >=1 live credential".)
+    let remaining = ctx.webauthn_rp.user_credentials(&subject).len();
+    if remaining <= 1 {
+        return text_response(
+            409,
+            "Conflict",
+            "DENIED last-credential-would-disable-2fa".to_owned(),
+        );
+    }
+    ctx.record(&PortalOp::WebauthnRevoke {
+        credential_id: cred.clone(),
+    });
+    ctx.webauthn_rp.revoke(&cred);
+    let id = pillar_crypto::webauthn::base64url_encode(&cred);
+    text_response(200, "OK", format!("REVOKED {id}"))
 }
 
 /// `POST /webauthn/authenticate/begin` — mint a fresh, single-use, time-bounded
@@ -5181,6 +5328,19 @@ fn dispatch_webauthn_authenticate_finish(
                 Some(secret) => pillar_crypto::webauthn::base64url_encode(secret),
                 None => "-".to_owned(),
             };
+            // Persist the advanced sign-count + last-used stamp so clone-
+            // detection state and the management surface's "last used" survive a
+            // node restart (a registration alone restores only enrolled-time
+            // state). authenticate_finish already advanced the in-memory record.
+            if let Some(rec) = ctx.webauthn_rp.record(&cred) {
+                let (sign_count, last_used_at) =
+                    (rec.sign_count, rec.last_used_at.unwrap_or(now));
+                ctx.record(&PortalOp::WebauthnAssertion {
+                    credential_id: cred.clone(),
+                    sign_count,
+                    last_used_at,
+                });
+            }
             // Promote a pending-2FA login into a real session now that the
             // second factor is proven; return the promoted session token so the
             // client can drop the pending token and use the live one.
@@ -6679,6 +6839,109 @@ mod tests {
             act.body
         );
         assert!(act.body.contains("MEMBER carol ROLE member"));
+    }
+
+    #[test]
+    fn credentials_list_and_revoke_manage_a_users_multiple_authenticators() {
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Enroll TWO authenticators for alice, each with its own label + rpId,
+        // via the extended register/finish wire (…\n<label>\n<rp_id>).
+        let enroll = |ctx: &mut WebAuthContext, cred: &[u8], label: &str, rp_id: &str| {
+            let (att, secret, _cose) = webauthn_authenticator(label, cred, 0);
+            let ch = challenge_of(&post(
+                ctx,
+                "/webauthn/register/begin",
+                &format!("{token}\nalice@pillar"),
+            ));
+            let r = post(
+                ctx,
+                "/webauthn/register/finish",
+                &format!(
+                    "{token}\nalice@pillar\n{}\n{}\n{label}\n{rp_id}",
+                    b64(&ch),
+                    b64(&att)
+                ),
+            );
+            assert_eq!(r.status, 200, "{}", r.body);
+            secret
+        };
+        let _s1 = enroll(&mut ctx, b"cred-blue", "yubikey-blue", "deleteme.example.com");
+        let _s2 = enroll(&mut ctx, b"cred-green", "laptop-green", "pillar.example.net");
+
+        // LIST returns both, oldest-first, with the metadata we enrolled.
+        let list = post(&mut ctx, "/webauthn/credentials/list", &token);
+        assert_eq!(list.status, 200, "{}", list.body);
+        let rows: Vec<&str> = list.body.lines().collect();
+        assert_eq!(rows.len(), 2, "two credentials listed: {}", list.body);
+        assert!(rows[0].starts_with("CRED "), "{}", rows[0]);
+        assert!(
+            rows[0].contains("yubikey-blue") && rows[0].contains("deleteme.example.com"),
+            "row0 carries label+rpId: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("laptop-green") && rows[1].contains("pillar.example.net"),
+            "row1 carries label+rpId: {}",
+            rows[1]
+        );
+        // Neither has been used to log in yet -> last-used is `-`.
+        assert!(rows[0].contains(" - "), "unused credential shows -: {}", rows[0]);
+
+        // A credential the caller does NOT own -> 404 (never 403, no probing).
+        let bogus = post(
+            &mut ctx,
+            "/webauthn/credentials/revoke",
+            &format!("{token}\n{}", b64(b"not-a-real-cred")),
+        );
+        assert_eq!(bogus.status, 404, "{}", bogus.body);
+
+        // Revoke the first credential: allowed (a second remains).
+        let rev = post(
+            &mut ctx,
+            "/webauthn/credentials/revoke",
+            &format!("{token}\n{}", b64(b"cred-blue")),
+        );
+        assert_eq!(rev.status, 200, "{}", rev.body);
+        assert!(rev.body.starts_with("REVOKED"), "{}", rev.body);
+
+        // LIST now shows only the survivor.
+        let list2 = post(&mut ctx, "/webauthn/credentials/list", &token);
+        let rows2: Vec<&str> = list2.body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(rows2.len(), 1, "one credential remains: {}", list2.body);
+        assert!(rows2[0].contains("laptop-green"), "{}", rows2[0]);
+
+        // Revoking the LAST credential is refused (would silently disable 2FA).
+        let last = post(
+            &mut ctx,
+            "/webauthn/credentials/revoke",
+            &format!("{token}\n{}", b64(b"cred-green")),
+        );
+        assert_eq!(last.status, 409, "last-credential revoke refused: {}", last.body);
+
+        // A revoked credential can never re-admit: a fresh assertion with the
+        // revoked credential is refused even with a valid signature.
+        let ch = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &token));
+        let (ad, cdj, sig) = webauthn_assertion(&_s1, &ch, 9);
+        let asrt = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{token}\n{}\n{}\n{}\n{}\n{}\n",
+                b64(&ch),
+                b64(b"cred-blue"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&sig),
+            ),
+        );
+        assert!(
+            asrt.status == 403 || asrt.status == 404,
+            "revoked credential must not admit, got {} {}",
+            asrt.status,
+            asrt.body
+        );
     }
 
     #[test]

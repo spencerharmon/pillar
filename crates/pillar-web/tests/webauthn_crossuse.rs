@@ -87,8 +87,18 @@ fn assertion(secret: &SigningSecretKey, challenge: &[u8], sign_count: u32) -> (V
 /// code path (`register_finish`) is IDENTICAL either way.
 fn register_on(rp: &mut RelyingParty, session: &str, now: u64, cose: &[u8], cred: &[u8]) {
     let ch = rp.begin(session, CELL, now, TTL);
-    rp.register_finish(session, CELL, now, &ch, &attestation(cose, cred, 0), [9u8; 32], "alice")
-        .expect("registration must succeed");
+    rp.register_finish(
+        session,
+        CELL,
+        now,
+        &ch,
+        &attestation(cose, cred, 0),
+        [9u8; 32],
+        "alice",
+        "cross-key",
+        "pillar.local",
+    )
+    .expect("registration must succeed");
 }
 
 /// Log in against `rp`, simulating whichever surface `session` names — the RP

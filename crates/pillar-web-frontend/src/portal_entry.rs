@@ -421,7 +421,7 @@ mod yew_impl {
                 busy.set(true);
                 error.set(None);
                 spawn_local(async move {
-                    match webauthn::run_register(&token, &handle).await {
+                    match webauthn::run_register(&token, &handle, "").await {
                         Ok(_cred) => {
                             // Enrolled + journaled server-side. The session is
                             // already live; land on the console. Every future

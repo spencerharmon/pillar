@@ -182,9 +182,11 @@ pub fn register_finish_body(
     user_handle: &str,
     challenge_b64: &str,
     attestation: &Attestation,
+    label: &str,
+    rp_id: &str,
 ) -> String {
     format!(
-        "{token}\n{user_handle}\n{challenge_b64}\n{}",
+        "{token}\n{user_handle}\n{challenge_b64}\n{}\n{label}\n{rp_id}",
         attestation.attestation_object_b64
     )
 }
@@ -344,13 +346,15 @@ pub fn register(
     ceremony: &impl CredentialCeremony,
     token: &str,
     user_handle: &str,
+    label: &str,
+    rp_id: &str,
 ) -> Result<String, CeremonyError> {
     let begin_resp = transport.post(Endpoint::RegisterBegin, &register_begin_body(token, user_handle))?;
     let challenge = parse_register_begin(&begin_resp)?;
     let attestation = ceremony.create(&challenge)?;
     let finish_resp = transport.post(
         Endpoint::RegisterFinish,
-        &register_finish_body(token, user_handle, &challenge.challenge_b64, &attestation),
+        &register_finish_body(token, user_handle, &challenge.challenge_b64, &attestation, label, rp_id),
     )?;
     parse_register_finish(&finish_resp)
 }
@@ -654,9 +658,20 @@ mod browser {
     /// browser: `POST /webauthn/register/begin` → `navigator.credentials
     /// .create()` → `POST /webauthn/register/finish`. Returns the new
     /// credential id (base64url) on success.
-    pub async fn run_register(token: &str, user_handle: &str) -> Result<String, CeremonyError> {
+    pub async fn run_register(
+        token: &str,
+        user_handle: &str,
+        label: &str,
+    ) -> Result<String, CeremonyError> {
         let transport = BrowserTransport::new();
         let ceremony = BrowserCeremony;
+        // The browser binds the credential's rpId to the serving origin (it
+        // refuses any rpId that is not a registrable suffix of the origin), so
+        // the effective rpId is this page's hostname. Record it for the
+        // management surface so the credential's bound domain is visible.
+        let rp_id = web_sys::window()
+            .and_then(|w| w.location().hostname().ok())
+            .unwrap_or_default();
         let begin_resp = transport
             .post_async(Endpoint::RegisterBegin, register_begin_body(token, user_handle))
             .await?;
@@ -665,7 +680,7 @@ mod browser {
         let finish_resp = transport
             .post_async(
                 Endpoint::RegisterFinish,
-                register_finish_body(token, user_handle, &challenge.challenge_b64, &attestation),
+                register_finish_body(token, user_handle, &challenge.challenge_b64, &attestation, label, &rp_id),
             )
             .await?;
         parse_register_finish(&finish_resp)
@@ -787,7 +802,7 @@ mod tests {
         ]);
         let ceremony = MockCeremony::ok();
 
-        let result = register(&transport, &ceremony, "tok-1", "alice");
+        let result = register(&transport, &ceremony, "tok-1", "alice", "test-key", "example.com");
 
         assert_eq!(result, Ok("Y3JlZC0x".to_owned()));
         assert_eq!(
@@ -833,7 +848,7 @@ mod tests {
         )]);
         let ceremony = MockCeremony::failing(CeremonyError::UserCancelled);
 
-        let err = register(&transport, &ceremony, "tok-1", "alice").unwrap_err();
+        let err = register(&transport, &ceremony, "tok-1", "alice", "test-key", "example.com").unwrap_err();
 
         assert_eq!(err, CeremonyError::UserCancelled);
         assert!(err.message().contains("cancelled"));
@@ -868,7 +883,7 @@ mod tests {
         )]);
         let ceremony = MockCeremony::failing(CeremonyError::Unsupported);
 
-        let err = register(&transport, &ceremony, "tok-1", "alice").unwrap_err();
+        let err = register(&transport, &ceremony, "tok-1", "alice", "test-key", "example.com").unwrap_err();
 
         assert_eq!(err, CeremonyError::Unsupported);
         assert!(err.message().to_lowercase().contains("does not support"));
@@ -960,8 +975,8 @@ mod tests {
             attestation_object_b64: "att".into(),
         };
         assert_eq!(
-            register_finish_body("tok", "alice", "chal", &attestation),
-            "tok\nalice\nchal\natt"
+            register_finish_body("tok", "alice", "chal", &attestation, "my-key", "example.com"),
+            "tok\nalice\nchal\natt\nmy-key\nexample.com"
         );
         // authenticate/begin: "<token>"
         assert_eq!(authenticate_begin_body("tok"), "tok");
