@@ -335,6 +335,41 @@ impl ForwardGate {
         }
         Some(ttl - 1)
     }
+
+    /// Decide the delivery outcome for a copy of `cid` arriving with `ttl`
+    /// hops remaining — the distinction [`Self::forward`] deliberately
+    /// collapses (it answers only "keep forwarding or not"), needed by the
+    /// `pillar-message-hop-metric` terminal-processing metric: a message
+    /// whose TTL is legitimately exhausted ON ARRIVAL at its addressed
+    /// destination is a real, single terminal delivery (worth a metric
+    /// sample), never conflated with a duplicate/looped arrival (which is
+    /// not a distinct delivery at all and must never double-emit).
+    pub fn arrive(&mut self, cid: &Cid, ttl: u32) -> Delivery {
+        if !self.seen.insert(cid.clone()) {
+            return Delivery::Loop;
+        }
+        if ttl == 0 {
+            Delivery::Terminal
+        } else {
+            Delivery::Forward(ttl - 1)
+        }
+    }
+}
+
+/// The outcome of [`ForwardGate::arrive`] for one message copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Forward the message onward, decrementing the TTL to the carried
+    /// value.
+    Forward(u32),
+    /// This node is the addressed destination (TTL exhausted on a
+    /// first-seen arrival): the terminal-processing point the
+    /// `pillar_message_hops` metric is emitted from.
+    Terminal,
+    /// A duplicate arrival of an already-seen CID: drop silently. Not a
+    /// real distinct delivery — never forward, never emit a terminal
+    /// metric for it.
+    Loop,
 }
 
 /// Return-routability + anti-amplification gate for redundant replies.

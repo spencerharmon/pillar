@@ -41,7 +41,14 @@ use crate::store::{Cid, Visibility};
 pub const PILLAR_MESSAGE_MIN_SUPPORTED: SurfaceVersion = SurfaceVersion(1);
 
 /// The highest [`PillarMessage::version`] this build understands.
-pub const PILLAR_MESSAGE_MAX_SUPPORTED: SurfaceVersion = SurfaceVersion(2);
+///
+/// `v3` adds [`PillarMessage::hops`] (the ingress->current hop counter the
+/// `pillar-message-hop-metric` task's terminal-processing metric is derived
+/// from). It is additive-only: a `v1`/`v2` wire encoding simply lacks the
+/// field, and `WireEnvelope::hops` defaults to `0` on decode
+/// (`#[serde(default)]`), so old bytes remain readable and a message that
+/// never passed through a hop-counting relay is legitimately "0 hops".
+pub const PILLAR_MESSAGE_MAX_SUPPORTED: SurfaceVersion = SurfaceVersion(3);
 
 /// The canonical-CBOR envelope version this crate produces for a NEW message.
 /// (`v1` is read-compat only — see [`PILLAR_MESSAGE_MIN_SUPPORTED`].)
@@ -77,6 +84,11 @@ struct WireEnvelope {
     visibility: u8,
     cell: Vec<u8>,
     body_sealed: Vec<u8>,
+    /// See [`PillarMessage::hops`]. `#[serde(default)]` so a `v1`/`v2`
+    /// encoding (which never wrote this field) decodes as `0` hops rather
+    /// than failing to parse.
+    #[serde(default)]
+    hops: u32,
 }
 
 /// A fault decoding a [`PillarMessage`] from canonical-CBOR bytes.
@@ -133,6 +145,13 @@ pub struct PillarMessage {
     /// The [`crate::seal::ContentSeal`]-sealed, canonical-CBOR-encoded
     /// [`Body`]. Never plaintext on disk or wire.
     pub body_sealed: Ciphertext,
+    /// Ingest->current forwarding-hop counter. `0` for a message that has
+    /// not yet been relayed past its ingest node; a relay increments it by
+    /// exactly one per forward (see `pillar_net::pillar_udp::ForwardGate`).
+    /// NOT covered by [`Self::signing_material`] (only `body_sealed` is
+    /// signed) — a hop count is routing metadata the author cannot predict
+    /// at signing time, mirroring `version`'s own unsigned-header status.
+    pub hops: u32,
 }
 
 /// What the sealed body decodes to once a cell node opens it (design paper
@@ -196,7 +215,20 @@ impl PillarMessage {
             visibility,
             cell,
             body_sealed,
+            hops: 0,
         }
+    }
+
+    /// Return a copy of this envelope with [`Self::hops`] incremented by
+    /// one — the exact step a relay takes when it forwards (rather than
+    /// terminally delivers) the message onward. Saturating: a `u32` hop
+    /// counter realistically never wraps, but this keeps the operation
+    /// total rather than panicking on an adversarial/corrupt input.
+    #[must_use]
+    pub fn incremented_hop(&self) -> Self {
+        let mut next = self.clone();
+        next.hops = next.hops.saturating_add(1);
+        next
     }
 
     /// The associated data a [`crate::seal::ContentSeal`] must bind when
@@ -251,6 +283,7 @@ impl PillarMessage {
             visibility: vis_to_u8(self.visibility),
             cell: self.cell.as_bytes().to_vec(),
             body_sealed: self.body_sealed.as_bytes().to_vec(),
+            hops: self.hops,
         };
         let mut out = Vec::new();
         ciborium::into_writer(&wire, &mut out).map_err(|_| EnvelopeError::Malformed)?;
@@ -285,6 +318,7 @@ impl PillarMessage {
             visibility,
             cell: CellId::from_bytes(wire.cell),
             body_sealed: Ciphertext::from_bytes(wire.body_sealed),
+            hops: wire.hops,
         })
     }
 
@@ -418,6 +452,7 @@ mod tests {
             visibility: vis_to_u8(msg.visibility),
             cell: msg.cell.as_bytes().to_vec(),
             body_sealed: msg.body_sealed.as_bytes().to_vec(),
+            hops: msg.hops,
         };
         encoded.clear();
         ciborium::into_writer(&wire, &mut encoded).expect("encode future version");
