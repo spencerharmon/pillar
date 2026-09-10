@@ -17,7 +17,8 @@ trusted. Each document below links to the specification that proves its claims.
 | [architecture.md](architecture.md) | System layers, the state model, how components fit together |
 | [consistency-model.md](consistency-model.md) | The CP/AP per-view split and the coordination core (`specs/CoordinationCore.tla`) |
 | [identity.md](identity.md) | The OpenPGP key hierarchy and node-admission handshake (`specs/Registration.tla`) |
-| [credentials.md](credentials.md) | The multi-credential model: kinds (browser/portable passkey, TPM, PKCS#11), rpId/domain binding rules, PRF/`hmac-secret`, and list/create/revoke management (`specs/WebAuthnCustody.tla`, `specs/CredentialRegistry.tla`) |
+| [credentials.md](credentials.md) | User credentials: WebAuthn passkeys (browser + portable/CLI), rpId/domain binding, and list/create/revoke management (`specs/WebAuthnCustody.tla`) |
+| [node-custody.md](node-custody.md) | How a *node* holds its own sealing secret in hardware — TPM / PKCS#11 / passkey custody backends (`specs/NodeCustodyLogin.tla`) |
 | [plugin-surface.md](plugin-surface.md) | The complete out-of-tree plugin surface and each plugin's interface contract |
 | [cli-surface.md](cli-surface.md) | The single coherent `pillar` CLI: views-vs-acts split, `kind/name` addressing, and the kubectl-parity resource plane |
 | [observability.md](observability.md) | Built-in distributed observability: signal event schema, retention/sampling policy, and RBAC-decider read authority (`specs/Observability.tla`) |
