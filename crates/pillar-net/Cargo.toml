@@ -65,8 +65,7 @@ pillar-manifest = { path = "../pillar-manifest" }
 # substrate's shared correlation spine — both are now real runtime deps of
 # the substrate, not merely dev-deps of its tests.
 pillar-topology = { path = "../pillar-topology" }
-pillar-observability = { path = "../pillar-observability" }
-serde = { version = "1", features = ["derive"] }
+pillar-observability = { path = "../pillar-observability" }serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
@@ -82,8 +81,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # invariant this task requires.
 pillar-streamdb = { path = "../pillar-streamdb" }
 # (pillar-topology is now a runtime dep, above — used to build a
-# TopologyScopedIpam fixture here too, so no separate dev-dep entry.)
-# Dev-only: the distributed-lb-acceptance test composes the ingress/LB
+# TopologyScopedIpam fixture here too, so no separate dev-dep entry.)# Dev-only: the distributed-lb-acceptance test composes the ingress/LB
 # manifest model (Route/Frontend/derive_routing_table) and the WoT trust
 # artifacts gating Route attachment. (pillar-manifest is now a runtime dep of
 # this crate for the UDP dataplane, above.)
