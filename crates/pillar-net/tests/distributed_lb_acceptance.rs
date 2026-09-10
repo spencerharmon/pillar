@@ -233,8 +233,8 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
         |label: &str| Seed::from_bytes(format!("distributed-lb-acceptance::{label}").into_bytes());
     let (owner_pk, owner_sk) = signing_keypair_from_seed(&seed("lb-owner")).expect("keygen");
     let cell_id = pillar_crypto::CellId::from_bytes(b"distributed-lb-acceptance-cell".to_vec());
-    let cell_group = pillar_crypto::cell::group_key_from_seed(&seed("lb-owner-cell"))
-        .expect("cell group key");
+    let cell_group =
+        pillar_crypto::cell::group_key_from_seed(&seed("lb-owner-cell")).expect("cell group key");
 
     // Node A: the continuously-running node backing the LB's streaming-DB
     // view. Every op it appends durably pins a signed segment + advances the
@@ -457,8 +457,9 @@ fn distributed_lb_acceptance_end_to_end() {
         .expect("head published");
 
     let source = source_from(node_a.store());
-    let node_b = IpfsPersistentStream::rehydrate(owner_pk, &head, &source, cell_id, Some(cell_group))
-        .expect("fresh node rehydrates purely from IPFS");
+    let node_b =
+        IpfsPersistentStream::rehydrate(owner_pk, &head, &source, cell_id, Some(cell_group))
+            .expect("fresh node rehydrates purely from IPFS");
     assert!(node_b.stream().log().contains(&op_id));
     assert_eq!(
         node_b.stream().log().root(),
