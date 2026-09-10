@@ -5173,7 +5173,13 @@ fn dispatch_webauthn_authenticate_finish(
         &session, &cell, now, &challenge, &cred, &ad, &cdj, &sig, &prf,
     ) {
         Ok(unlock) => {
-            let b64 = pillar_crypto::webauthn::base64url_encode(&unlock);
+            // The operational-key-unlock secret is present only when the
+            // authenticator produced a PRF output; absent it, the second factor
+            // still succeeded. A `-` sentinel means "no operational unlock".
+            let b64 = match &unlock {
+                Some(secret) => pillar_crypto::webauthn::base64url_encode(secret),
+                None => "-".to_owned(),
+            };
             // Promote a pending-2FA login into a real session now that the
             // second factor is proven; return the promoted session token so the
             // client can drop the pending token and use the live one.
@@ -6671,6 +6677,70 @@ mod tests {
             "the promoted session must authorize acts, got: {}",
             act.body
         );
+        assert!(act.body.contains("MEMBER carol ROLE member"));
+    }
+
+    #[test]
+    fn a_password_login_completes_2fa_with_an_authenticator_that_has_no_prf_output() {
+        // Regression: real FIDO2 keys / browsers that omit the WebAuthn `prf`
+        // extension send an EMPTY prf output. The second factor (the verified
+        // assertion) must still promote a live session — the operational-unlock
+        // secret is just absent (`UNLOCKED - <token>`), never a 401.
+        let (mut ctx, _sk) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let (att, secret, _cose) = webauthn_authenticator("no-prf-auth", b"cred-noprf", 0);
+        let ch = challenge_of(&post(
+            &mut ctx,
+            "/webauthn/register/begin",
+            &format!("{token}\nalice@pillar"),
+        ));
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/webauthn/register/finish",
+                &format!("{token}\nalice@pillar\n{}\n{}", b64(&ch), b64(&att)),
+            )
+            .status,
+            200
+        );
+        let nid = get(&mut ctx, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let login = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"));
+        let ptoken = login.session_token.clone().expect("pending token");
+        let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &ptoken));
+        let (ad, cdj, sig) = webauthn_assertion(&secret, &ch2, 4);
+        // NOTE the EMPTY final field: no prf output.
+        let fin = post(
+            &mut ctx,
+            "/webauthn/authenticate/finish",
+            &format!(
+                "{ptoken}\n{}\n{}\n{}\n{}\n{}\n",
+                b64(&ch2),
+                b64(b"cred-noprf"),
+                b64(&ad),
+                b64(&cdj),
+                b64(&sig),
+            ),
+        );
+        assert_eq!(fin.status, 200, "empty prf must still verify: {}", fin.body);
+        assert!(fin.body.starts_with("UNLOCKED"), "got: {}", fin.body);
+        let parts: Vec<&str> = fin.body.split_whitespace().collect();
+        assert_eq!(parts[1], "-", "no prf => `-` unlock sentinel: {}", fin.body);
+        let real = parts
+            .get(2)
+            .expect("promoted session token in UNLOCKED - <token>")
+            .to_string();
+        // The promoted token authorizes an act — login truly succeeded.
+        let act = post(
+            &mut ctx,
+            "/portal/members/add",
+            &format!("{real}\ncarol\nmember"),
+        );
+        assert_eq!(act.status, 200, "{}", act.body);
         assert!(act.body.contains("MEMBER carol ROLE member"));
     }
 

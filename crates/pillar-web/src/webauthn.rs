@@ -224,7 +224,7 @@ impl RelyingParty {
         client_data_json: &[u8],
         signature: &[u8],
         prf_output: &[u8],
-    ) -> Result<[u8; 32], RpError> {
+    ) -> Result<Option<[u8; 32]>, RpError> {
         self.consume_challenge(challenge, session, cell, now)?;
         let key = hex(credential_id);
         if self.revoked.contains(&key) {
@@ -244,7 +244,19 @@ impl RelyingParty {
         if verified.sign_count != 0 && verified.sign_count <= record.sign_count {
             return Err(RpError::SignCountRegression);
         }
-        let unlock = webauthn::derive_unlock_secret(prf_output, credential_id)?;
+        // The SECOND FACTOR is the verified assertion above (possession of the
+        // owning authenticator). The PRF-derived operational-key-unlock secret
+        // is a SEPARATE, OPTIONAL capability: it exists only for authenticators
+        // (and browsers) that implement the WebAuthn `prf` / CTAP2 `hmac-secret`
+        // extension. A key that produced no PRF output still proves the second
+        // factor perfectly well, so an empty PRF output yields `None` (no
+        // operational unlock) rather than failing the login — coupling the two
+        // would break 2FA for the majority of authenticators that omit PRF.
+        let unlock = if prf_output.is_empty() {
+            None
+        } else {
+            Some(webauthn::derive_unlock_secret(prf_output, credential_id)?)
+        };
         let record = self
             .records
             .get_mut(&key)
@@ -396,7 +408,8 @@ mod tests {
                 &sig,
                 b"prf-out-hardware",
             )
-            .expect("authenticate");
+            .expect("authenticate")
+            .expect("non-empty prf output yields an unlock secret");
         assert_ne!(
             unlock, [0u8; 32],
             "unlock secret is real, not a placeholder"
@@ -410,6 +423,31 @@ mod tests {
         );
         // sign_count advanced.
         assert_eq!(rp.record(b"cred-1").unwrap().sign_count, 5);
+    }
+
+    #[test]
+    fn an_authenticator_without_prf_still_satisfies_the_second_factor() {
+        // Most FIDO2 authenticators (and many browsers) do not implement the
+        // WebAuthn `prf` / CTAP2 `hmac-secret` extension, so they return an
+        // EMPTY prf output. That must NOT fail the second factor: the verified
+        // assertion is the proof of possession. The operational-key-unlock
+        // secret is simply absent (None) for such a credential.
+        let (sk, cose) = authenticator("no-prf");
+        let mut rp = RelyingParty::new();
+        register(&mut rp, &cose, b"cred-noprf", 0);
+        let ch = rp.begin("sess-1", "cell-A", 2000, TTL);
+        let (ad, cdj, sig) = assertion(&sk, &ch, 5);
+        let unlock = rp
+            .authenticate_finish(
+                "sess-1", "cell-A", 2000, &ch, b"cred-noprf", &ad, &cdj, &sig, b"",
+            )
+            .expect("assertion verifies with no prf output");
+        assert_eq!(
+            unlock, None,
+            "no prf output => no operational unlock secret, but 2FA still passed"
+        );
+        // The verified assertion still advanced the stored sign-count.
+        assert_eq!(rp.record(b"cred-noprf").unwrap().sign_count, 5);
     }
 
     #[test]

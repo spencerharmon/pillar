@@ -104,6 +104,7 @@ fn login_on(
     let ch = rp.begin(session, CELL, now, TTL);
     let (ad, cdj, sig) = assertion(secret, &ch, sign_count);
     rp.authenticate_finish(session, CELL, now, &ch, cred, &ad, &cdj, &sig, b"prf-out")
+        .map(|u| u.expect("non-empty prf output yields an unlock secret"))
 }
 
 #[test]

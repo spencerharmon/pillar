@@ -265,7 +265,10 @@ pub fn parse_authenticate_finish(body: &str) -> Result<AuthFinish, CeremonyError
     let mut parts = body.trim().splitn(3, ' ');
     match (parts.next(), parts.next(), parts.next()) {
         (Some("UNLOCKED"), Some(unlock), token) if !unlock.is_empty() => Ok(AuthFinish {
-            unlock_secret: unlock.to_owned(),
+            // `-` sentinel = the authenticator produced no PRF output, so there
+            // is no operational-key-unlock secret (the second factor still
+            // succeeded). Login promotion uses `session_token`, not this.
+            unlock_secret: if unlock == "-" { String::new() } else { unlock.to_owned() },
             session_token: token.filter(|t| !t.is_empty()).map(str::to_owned),
         }),
         _ => Err(CeremonyError::Protocol(format!(
