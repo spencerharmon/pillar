@@ -55,11 +55,16 @@ stories, three security postures---and observability gets none of the durability
 content-addressing, or replication streamdb already has. We unify them behind a
 single record: the \textbf{\code{PillarMessage}}, a version-stamped envelope whose
 payload is AEAD-sealed to the owning \emph{cell} and addressed by the SHA2-256
-multihash of its canonical CBOR encoding. The crux is a \emph{convergent} content
-seal: the nonce is derived (HKDF) from the cell key and the content address of the
-plaintext, so identical bodies produce identical ciphertext and hence an identical
-\Cid{} on every node---dedup, IPFS convergence, and Merkle roots all survive
-encryption---while distinct plaintexts never share a nonce (AEAD-safe). streamdb
+multihash of its canonical CBOR encoding. A body's seal is chosen by \emph{how many
+parties must unseal it}: the transport-frame seal (a datagram fans out to many ingest
+nodes) and the \code{PillarMessage} content seal (a message reaches every cell node)
+are both \emph{convergent}---the key is portable and the nonce is derived (HKDF) from
+the cell key and the content address of the plaintext, so identical bodies produce an
+identical \Cid{} on every node and redundant sprayed datagrams and duplicate blocks
+dedupe, while distinct plaintexts never share a nonce (AEAD-safe). The \emph{contents}
+of a direct-message Op reach one recipient, so they are instead \emph{random}-sealed
+(unique per message, \emph{not} content-deduped) and referenced by \Cid{} from a
+cell-sealed wrapper; some control bodies ride unencrypted. streamdb
 ops, observability signals, and every control message become body variants of the
 one envelope, owned by a new shared crate \code{pillar-wire} onto which streamdb,
 observability, and net all depend \emph{down}. On the wire the envelope rides a
@@ -68,8 +73,10 @@ paper), or a QUIC/TCP connection under the transport's own TLS; the content seal
 is transport-agnostic and holds either way, so no transport ever sees plaintext.
 Per Pillar's method \#1, this is the design of record and the implementation is
 TLA\textsuperscript{+}-gated: \code{OneRecordFormat}, \code{ContentAddressStable},
-\code{DedupUnderEncryption}, \code{CellConfidential}, and
-\code{NoNonceReuseAcrossDistinctPlaintext} must be green under TLC before any Rust.
+\code{DedupUnderEncryption}, \code{CellConfidential},
+\code{NoNonceReuseAcrossDistinctPlaintext} (envelope), and
+\code{Convergent\-CellDedup}, \code{RcptRandomDistinctByEntropy},
+\code{RcptOpaqueToNonHolder} (body treatments) must be green under TLC before any Rust.
 \end{abstract}
 
 \section{Motivation}
@@ -144,31 +151,40 @@ independent.}
 \label{fig:layering}
 \end{figure*}
 
-\section{Two seals, deliberately}
-The design has two distinct seals because they protect different things
-(Table~\ref{tab:seals}). The \textbf{content seal} is on \code{PillarMessage.body},
-keyed by the cell group key with a \emph{deterministic} (convergent) nonce; it
-gives confidentiality at rest, a stable \Cid{}, and dedup. The \textbf{transport
-frame seal} is on the pillar-UDP datagram, keyed by a portable cell-minted session
-key with a collision-free nonce; it protects on-wire framing. On QUIC/TCP the
-transport's native TLS plays the second role instead.
+\section{Three seal treatments}
+A body's seal is decided by \emph{how many parties must unseal it}
+(Table~\ref{tab:seals}). The \textbf{transport frame seal} (a datagram fanned out to
+many ingest nodes) and the \textbf{content seal} on \code{PillarMessage.body} (a
+message reaching every cell node) each require \emph{many} recipients to unseal, so
+both are \emph{convergent}: a portable key and a deterministic nonce make identical
+content byte-identical, which is what lets redundant sprayed datagrams and duplicate
+blocks dedupe. The \textbf{application-content seal} on the \emph{contents} of a
+direct-message Op reaches \emph{one} recipient, so it may draw a \emph{random}
+per-message nonce---the message is unique and canonical for itself, so same-text
+messages at different times stay distinct and are not content-deduped. On QUIC/TCP
+the transport's native TLS plays the frame-seal role; a control body may ride
+unencrypted.
 
 \begin{table}[t]
 \footnotesize
-\setlength{\tabcolsep}{3.5pt}
-\begin{tabular}{@{}p{0.15\columnwidth}p{0.36\columnwidth}p{0.40\columnwidth}@{}}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}p{0.12\columnwidth}p{0.235\columnwidth}p{0.225\columnwidth}p{0.24\columnwidth}@{}}
 \toprule
- & \textbf{content seal} & \textbf{transport frame seal} \\
+ & \textbf{transport frame} & \textbf{content seal} & \textbf{app-content} \\
 \midrule
-layer     & \code{PillarMessage.body} & pillar-UDP datagram \\
-recipient & the cell & the cell (any member) \\
-key       & cell group key (symmetric) & portable cell-minted session key $K_s$ \\
-nonce     & \textbf{deterministic} (convergent) & collision-free (convergent / sender-partitioned) \\
-purpose   & confidentiality at rest $+$ stable \Cid{} $+$ dedup & confidentiality of transport framing \\
+layer     & pillar-UDP datagram & \code{PillarMessage} body & Op contents \\
+unseal    & many (ingest nodes) & many (cell nodes) & \textbf{one} (recipient) \\
+key       & session key $K_s$ & cell group key & recipient sealed-box \\
+nonce     & \textbf{convergent} & \textbf{convergent} & \textbf{random} \\
+dedup     & redundant datagrams & identical blocks & none (unique) \\
 \bottomrule
 \end{tabular}
-\caption{The two seals protect different things and compose. The content seal is
-transport-agnostic and travels with the record; the transport frame seal is
+\caption{The seal is chosen by recipient count. The two multi-node layers are
+convergent (so redundant/duplicate copies dedupe); the single-recipient
+application-content seal is random (so each direct message is a distinct record—
+exactly-once is an application-layer concern, not the wire format). A control body
+may be unencrypted. The content seal is transport-agnostic and travels with the record;
+the transport frame seal is
 pillar-UDP-specific (its portable session key is the subject of the companion
 paper \code{pillar-udp-encryption}). On QUIC/TCP the transport's TLS supplies the
 frame seal instead.}
@@ -205,12 +221,14 @@ struct PillarMessage \{\\
 \hspace*{1.2em}signature\ \ \ : Signature\ // over body\_sealed\\
 \hspace*{1.2em}visibility\ \ : Visibility\ // DHT reach\\
 \hspace*{1.2em}cell\ \ \ \ \ \ \ \ : CellId\ // which group key opens it\\
-\hspace*{1.2em}body\_sealed : Ciphertext\ // convergent AEAD\\
+\hspace*{1.2em}body\_sealed : Ciphertext\ // per treatment (\S5)\\
 \}\\[3pt]
 enum Body \{\ // what body\_sealed decodes to\\
-\hspace*{1.2em}StreamOp(StreamOpBody),\ // CRDT op-log\\
+\hspace*{1.2em}StreamOp(StreamOpBody),\ // op-log; also typed\\
+\hspace*{3.0em}// UserMessage/NodeMessage/KeyOffer:\\
+\hspace*{3.0em}// \{recipient, sealed\_cid\} (\S5b)\\
 \hspace*{1.2em}Signal(SignalBody),\ \ \ // one of 5 kinds\\
-\hspace*{1.2em}Control(ControlBody),\ \ // opsync/AE/blob/gossip\\
+\hspace*{1.2em}Control(ControlBody),\ \ // may be plaintext (\S5c)\\
 \}
 \end{quote}
 
@@ -231,10 +249,12 @@ and observability already share, and the same multihash inside an IPFS CIDv1
 signature verification needs no cell key, decryption needs the cell key, and both
 are independent of the \Cid{}.
 
-\section{Convergent content seal (the crux)}\label{sec:seal}
-The promise is: \emph{the encryption recipient is the cell; any cell node can
-decrypt; the \Cid{} is the same across nodes; we deliver BOTH dedup AND
-encryption.} Na\"ively this is impossible---\code{pillar-crypto::seal\_symmetric}
+\section{Seal treatments}\label{sec:seal}
+\textbf{(a) Convergent, where many must unseal.} A \code{PillarMessage} reaches every
+node in its cell and they must \emph{all} decrypt, so the content seal is
+\emph{convergent}: \emph{the recipient is the cell; any cell node decrypts; the \Cid{}
+is the same across nodes; we deliver BOTH dedup AND encryption.} Na\"ively this is
+impossible---\code{pillar-crypto::seal\_symmetric}
 draws a \emph{random} nonce, so the same signal sealed on two nodes yields
 different ciphertext, a different \Cid{}, and no dedup. We therefore add a
 \emph{convergent} seal:
@@ -259,9 +279,28 @@ $\mathrm{content\_address}(\mathit{plaintext})$; and an \textbf{equality leak},
 accepted and documented---convergent encryption reveals that two sealed records are
 byte-identical (that is \emph{how} dedup works), a property scoped to the cell
 confidentiality boundary, with the \code{domain} input separating record classes
-so equality never leaks across classes. This is the one genuinely new
-cryptographic primitive the refactor introduces, and it earns its own TLC
-obligations and \code{pillar-crypto} contract tests.
+so equality never leaks across classes. This convergent seal is what a StreamOp, an
+obs signal, and a direct message's cell \emph{wrapper} get; it is exactly what a
+random nonce would break, and why the two multi-node layers (content seal and
+transport frame) are convergent (proven in \code{PillarMessageFormat.tla}).
+
+\textbf{(b) Random, where one recipient unseals.} The \emph{contents} of a
+direct-message Op---a typed \code{UserMessage}/\code{NodeMessage}/\code{KeyOffer}---are
+sealed to \emph{one} recipient (X25519 sealed-box) and referenced by \Cid{} from a
+cell-sealed wrapper. The cell sees the op and the reference but never the plaintext
+(it coordinates delivery without reading it). Because only one party unseals, the
+seal draws a \emph{random} per-message nonce, and should: the message is unique and
+canonical for itself, so two same-text messages at different times are \emph{distinct}
+records with distinct \Cid{}s---\emph{not} content-deduped. The only dedup here is the
+byte-identity of truly redundant copies (one message sprayed to many nodes).
+\emph{Exactly-once coordination is an application-layer concern (a CP-variant streamdb
+or other primitive), not the wire format.}
+
+\textbf{(c) Unencrypted, for one-shot non-addressed control.} Some bodies---typically
+libp2p control messages---are sealed once by the transport and not content-addressed,
+so they ride as plaintext inside the envelope; any holder reads them. Treatments (b)
+and (c) are proven in \code{PillarBodySeals.tla} (\code{RcptOpaqueToNonHolder},
+\code{RcptRandomDistinctByEntropy}, \code{DedupByCid}, \code{PlainReadableWithoutKey}).
 
 \section{Transport}\label{sec:transport}
 The envelope's on-wire encryption depends on the transport, and there are exactly
@@ -313,8 +352,10 @@ key, and turns the per-protocol CBOR types into \code{ControlBody} variants.
 \section{Invariants (before any Rust)}
 The design is TLA\textsuperscript{+}-gated (method \#1). It refines/extends the
 existing \code{versioning-compat-migration-spec} and \code{ObsIngestionSubstrate};
-Table~\ref{tab:inv} lists the envelope/content obligations, all green under TLC in
-\code{specs/PillarMessageFormat.tla}. The transport-frame obligations (portable
+Table~\ref{tab:inv} lists the envelope/content and per-body-treatment obligations,
+all green under TLC in \code{specs/PillarMessageFormat.tla} (convergent envelope $+$
+version negotiation) and \code{specs/PillarBodySeals.tla} (the three seal
+treatments). The transport-frame obligations (portable
 session-key convergence, cell-signed session records, anonymous-as-unattested
 policy, replay-via-dedup, revoked-key erasure) are proven separately in
 \code{specs/PillarUdpEncryption.tla}.
@@ -326,16 +367,24 @@ policy, replay-via-dedup, revoked-key erasure) are proven separately in
 \toprule
 \textbf{Invariant} & \textbf{Guarantee} \\
 \midrule
+\multicolumn{2}{@{}l}{\emph{envelope $+$ convergent content seal (\code{PillarMessageFormat.tla})}}\\
 \code{OneRecordFormat} & every persisted/transmitted byte is a \code{PillarMessage} \\
 \code{ContentAddress\-Stable} & \Cid{} is a deterministic function of the logical record, equal across nodes despite sealing \\
 \code{DedupUnder\-Encryption} & identical sealed records collapse to one \Cid{}/one block \\
 \code{CellConfidential} & only a cell-key holder recovers \code{Body}; a non-member/bitswap peer gets ciphertext only \\
 \code{NoNonceReuseAcross\-DistinctPlaintext} & convergent content nonces collide only for identical plaintext \\
 \code{Negotiation\-Refuses\-Incompatible}, \code{Rolling\-Coexistence} & envelope, pillar-UDP, and seal versions bump independently; a mixed-version (incl.\ Noise-era) swarm never mis-frames or partitions \\
+\midrule
+\multicolumn{2}{@{}l}{\emph{per-body seal treatments (\code{PillarBodySeals.tla})}}\\
+\code{Convergent\-CellDedup} & a cell-sealed body's \Cid{} is a pure function of (cell, content); identical content collapses, distinct never collides \\
+\code{RcptRandom\-DistinctByEntropy} & a random single-recipient seal binds per-message entropy; same-content direct messages at different times stay distinct (not deduped) \\
+\code{RcptOpaque\-ToNonHolder} & a recipient-sealed Op body opens only for the recipient's key-holder; the cell holds only the referenced \Cid{} \\
+\code{DedupBy\-Cid}, \code{Plain\-Readable\-WithoutKey} & redundant/duplicate copies collapse by \Cid{}; an unencrypted control body is readable with no key \\
 \bottomrule
 \end{tabular}
-\caption{TLA\textsuperscript{+} obligations of \code{PillarMessageFormat.tla} (the
-transport-agnostic envelope $+$ convergent content seal $+$ version negotiation).}
+\caption{TLA\textsuperscript{+} obligations across the two envelope specs: the
+convergent envelope $+$ version negotiation (\code{PillarMessageFormat.tla}) and the
+three per-body seal treatments (\code{PillarBodySeals.tla}).}
 \label{tab:inv}
 \end{table}
 

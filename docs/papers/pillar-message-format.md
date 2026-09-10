@@ -39,9 +39,13 @@ variants of it. It is:
 
 1. **content-addressed** — its `Cid` is the SHA2-256 multihash of its canonical
    encoding, identical on every node (dedup, IPFS convergence, Merkle roots);
-2. **sealed to the cell** — the payload is AEAD-encrypted under the cell group key
+2. **sealed to the cell** — the body is AEAD-encrypted under the cell group key
    so any cell node (and only a cell node) can decrypt, *convergently* so the `Cid`
-   is stable across nodes despite encryption;
+   is stable across nodes despite encryption. This convergent cell seal is the
+   treatment of a streamdb op, an obs signal, and the cell *wrapper* of a direct
+   message; the *contents* of a direct-message Op are instead random-sealed to one
+   recipient (unique per message), and some control bodies ride unencrypted — see
+   §5;
 3. **version-stamped** — an independently-incrementable surface version, per the
    ROI versioning spine;
 4. **the payload of a pillar-udp datagram** (fallback QUIC, then TCP+TLS). On
@@ -82,21 +86,30 @@ variants of it. It is:
                                    └────────────────────────────────────────┘
 ```
 
-Two distinct seals, deliberately, because they protect different things:
+Two convergent multi-node seals, plus an inner application-content treatment,
+because they protect different things:
 
 | Seal | Layer | Recipient | Key | Nonce | Purpose |
 |------|-------|-----------|-----|-------|---------|
-| **content seal** | `PillarMessage.body` | the **cell** | cell group key (symmetric) | **deterministic** (convergent) | confidentiality at rest + stable `Cid` + dedup |
-| **transport frame seal** | pillar-udp datagram | the **cell** (any member) | portable cell-minted **session key** `K_s` | **collision-free** (convergent / sender-partitioned) | confidentiality of transport framing on the wire |
+| **transport frame seal** | pillar-udp datagram | the **cell** (any member) | portable cell-minted **session key** `K_s` | **convergent** / sender-partitioned | confidentiality of transport framing on the wire |
+| **content seal** | `PillarMessage.body` | the **cell** | cell group key (symmetric) | **convergent** (deterministic) | confidentiality at rest + stable `Cid` + dedup |
+| **application-content seal** *(inside an Op)* | e.g. `UserMessage` contents | one **recipient** principal | recipient key (X25519 sealed-box) | **random** (per-message) | direct-message confidentiality; each message unique, *not* content-deduped |
 
-The content seal travels *with* the record — an IPFS block on disk is already sealed;
-a peer that backfills it over bitswap still cannot read it without the cell key. The
-transport frame seal is **pillar-udp-specific** and protects the on-wire framing; it
-is keyed by a session key that is *portable across every cell node* (established via
-the cell-as-KDC scheme in **`pillar-udp-encryption.md`**), so any ingress/relay node
-can carry the session. On QUIC/TCP the transport's native TLS plays this role instead.
-A pillar-udp datagram to a cell therefore carries a cell-sealed body inside a
-session-key-sealed datagram — double-sealed, each layer independent.
+The first two layers each fan a record out to **multiple nodes that must all
+unseal**, so their key is portable/convergent and identical content is byte-identical
+(that is what lets redundant sprayed datagrams and duplicate blocks dedupe). The
+inner application-content seal reaches **one recipient**, so it may draw a random
+per-message nonce: the message is unique and canonical for itself, and two same-text
+direct messages sent at different times are *distinct* messages, not deduped. A
+control body may even ride **unencrypted** (§4, §5). The content seal travels *with*
+the record — an IPFS block on disk is already sealed; a peer that backfills it over
+bitswap still cannot read it without the cell key. The transport frame seal is
+**pillar-udp-specific** and is keyed by a session key *portable across every cell
+node* (the cell-as-KDC scheme in **`pillar-udp-encryption.md`**), so any
+ingress/relay node can carry the session; on QUIC/TCP the transport's native TLS
+plays this role instead. A pillar-udp datagram to a cell therefore carries a
+cell-sealed body inside a session-key-sealed datagram — double-sealed, each layer
+independent.
 
 ---
 
@@ -145,18 +158,25 @@ pub struct PillarMessage {
     pub visibility: Visibility,
     /// The cell this record's body is sealed to (which group key opens it).
     pub cell: CellId,
-    /// AEAD ciphertext of the canonical-CBOR-encoded `Body`, sealed CONVERGENTLY
-    /// under the cell group key (see §5). Never plaintext on disk or wire.
+    /// The body, encoded and sealed per its treatment (see §5): a StreamOp /
+    /// Signal (and a direct-message Op's cell wrapper) is CONVERGENTLY cell-sealed;
+    /// a control body MAY be unencrypted. Never the application plaintext of a
+    /// direct message — that is random-sealed to its recipient and referenced by
+    /// `Cid` from inside a StreamOp (see `UserMessage` below).
     pub body_sealed: Ciphertext,
 }
 
 /// What the sealed body decodes to once a cell node opens it.
 pub enum Body {
-    /// A streamdb operation (the CRDT op-log payload).
+    /// A streamdb operation (the CRDT op-log payload). Direct messages are typed
+    /// StreamOps whose contents are a recipient-sealed blob referenced by `Cid`:
+    ///   UserMessage / NodeMessage / KeyOffer { recipient, sealed_cid, .. }
+    /// The cell sees the op and the `Cid`; only the recipient opens the blob (§5).
     StreamOp(StreamOpBody),
     /// An observability signal — one of the five kinds.
     Signal(SignalBody),          // { kind, payload, labels, expiry, correlation }
-    /// A libp2p control message, wrapped so it too rides the envelope.
+    /// A libp2p control message, wrapped so it too rides the envelope. MAY be
+    /// unencrypted (transport-sealed once, not content-addressed) — see §5.
     Control(ControlBody),        // { protocol, bytes }  — opsync/antientropy/blob/gossip
 }
 ```
@@ -185,15 +205,23 @@ the `Cid`.
 
 ---
 
-## 5. Convergent content seal (the crux)
+## 5. Seal treatments: convergent where many must unseal, random where one does
 
-Decision #2: **encryption recipient is the cell; any cell node can decrypt; the `Cid`
-is the same across nodes; we promise BOTH dedup AND encryption.**
+There are three seal treatments, and which one a body gets is decided by **how many
+parties must unseal it**, not by taste.
 
-Naïve AEAD breaks this: `pillar-crypto::seal_symmetric` draws a **random** nonce
-(`OsRng`), so the same signal sealed on two nodes yields different ciphertext →
-different `Cid` → no dedup, no IPFS convergence. We therefore add a **convergent**
-seal to `pillar-crypto`:
+**(a) Convergent, at the two multi-node layers.** A pillar-udp *datagram* fans out to
+multiple ingest nodes and a *PillarMessage* reaches every node in its cell; in both
+cases **all of them must be able to unseal**. So both the transport frame seal
+(`pillar-udp-encryption.md`) and the PillarMessage **content seal** are *convergent*:
+the key is portable across the recipients and the ciphertext — hence the `Cid` — is a
+deterministic function of the plaintext, so identical content is byte-identical on
+every node. That determinism is exactly what makes **redundant sprayed datagrams and
+duplicate blocks dedupe** (a message is sealed once and sprayed; every copy has the
+same `Cid`; the store and the ingest nodes collapse them). Naïve AEAD would break
+this — `pillar-crypto::seal_symmetric` draws a **random** nonce, so the same op sealed
+on two nodes would get a different `Cid` and fail to converge — so the content seal
+uses a **convergent** derivation:
 
 ```
 nonce = HKDF(key = cell_group_key,
@@ -202,29 +230,49 @@ nonce = HKDF(key = cell_group_key,
 ciphertext = AEAD_seal(cell_group_key, nonce, plaintext_body, aad = envelope_header)
 ```
 
-Properties:
+- **Deterministic** — nonce is a pure function of (cell key, plaintext); same body +
+  same cell key ⇒ identical ciphertext ⇒ identical `Cid` on every cell node.
+- **Confidential** — recovered only with the cell group key (sealed to each member via
+  the existing `distribute_group_key` X25519 sealed-box). A non-member, or a bitswap
+  peer outside the cell, holds only ciphertext.
+- **Nonce-safe** — nonce reuse across *distinct* plaintexts would break AEAD; here
+  reuse happens only for identical plaintext (which yields identical ciphertext anyway
+  — the intended dedup), never for distinct plaintext, because the nonce binds
+  `content_address(plaintext)`.
+- **Equality leak (accepted, cell-scoped):** convergent encryption reveals that two
+  sealed records are byte-identical — that is *how* dedup works. The cell boundary is
+  the confidentiality boundary; the `domain` input separates record classes so
+  equality never leaks across classes.
 
-- **Deterministic** — nonce is a pure function of (cell key, plaintext). Same body +
-  same cell key ⇒ identical ciphertext ⇒ identical `Cid` on every cell node ⇒ dedup and
-  IPFS convergence preserved (exactly the streamdb CRDT idempotence guarantee, now for
-  sealed content).
-- **Confidential** — recovered only with the cell group key, which is sealed to each
-  member via the existing `distribute_group_key` (X25519 sealed-box). A non-member,
-  or a bitswap peer outside the cell, holds only ciphertext.
-- **Nonce-safe** — nonce reuse across *distinct* plaintexts under one key would break
-  AEAD; here reuse happens **only** for identical plaintext (which produces identical
-  ciphertext anyway — the intended dedup), never for distinct plaintext, because the
-  nonce binds `content_address(plaintext)`. The HKDF salt with the cell key keeps
-  nonces unpredictable to a non-member.
-- **Equality leak (accepted, documented):** convergent encryption reveals that two
-  sealed records are byte-identical (that is *how* dedup works). Within a single cell
-  this is the desired property; the cell boundary is the confidentiality boundary. The
-  `domain` input separates record classes (op vs signal-kind) so equality never leaks
-  across classes.
+This is what the streamdb op-log and obs signals get, and what a direct-message Op's
+cell **wrapper** gets. Proven in `specs/PillarMessageFormat.tla`.
 
-This is the single genuinely new cryptographic primitive the refactor introduces; it
-gets its own TLA+ obligations (`ConvergentDeterministic`, `ConvergentConfidential`,
-`NoNonceReuseAcrossDistinctPlaintext`) and `pillar-crypto` contract tests.
+**(b) Random, at the single-recipient application layer.** The *contents* of a direct
+message — a typed `UserMessage` / `NodeMessage` / `KeyOffer` Op — are sealed to **one
+recipient** (X25519 sealed-box to the recipient principal's key) and referenced by
+`Cid` from inside a cell-sealed StreamOp. Only the recipient unseals it; the cell sees
+the op and the reference but never the plaintext (the cell coordinates delivery
+without reading it). Because only one party unseals, the seal may draw a **random**
+per-message nonce, and it should: the message is unique and canonical for itself, so
+**two same-text messages sent at different times are distinct messages with distinct
+`Cid`s — they are not deduped.** The only dedup that applies here is the byte-identity
+of *truly redundant* copies (the same sealed message sprayed to many nodes) and, in
+the astronomically rare true collision, two independent messages that are byte-for-byte
+identical. **Exactly-once coordination between nodes or clients is deliberately NOT a
+property of the message format — it is an application-layer concern (a CP-variant
+streamdb, or any other primitive).**
+
+**(c) Unencrypted, for one-shot non-addressed control.** Some bodies — typically
+libp2p control messages — are encrypted once by the transport and are not
+content-addressed for confidentiality, so they may ride as **plaintext** inside the
+envelope. Anyone holding the bytes reads them; they carry no cell/principal
+confidentiality obligation (only the transport frame seal, if any).
+
+Treatments (b) and (c) — the random single-recipient seal (opaque to the cell,
+distinct-per-message) and the unencrypted body (readable by any holder) — are proven
+in `specs/PillarBodySeals.tla` (`RcptOpaqueToNonHolder`,
+`RcptRandomDistinctByEntropy`, `CellConfidential`, `DedupByCid`,
+`PlainReadableWithoutKey`).
 
 ---
 
@@ -288,7 +336,10 @@ coexist by construction).
   `SignedSegment`/`Cid`/`HeadRecord`/`Visibility`/`ContentStore`/`IpfsBackend` moved
   down from `pillar-streamdb`.
 - **`pillar-crypto`** — add `cell_seal_convergent` / `cell_open_convergent`
-  (deterministic-nonce AEAD, §5) alongside the existing random-nonce `seal_symmetric`.
+  (deterministic-nonce AEAD, §5a) alongside the existing random-nonce `seal_symmetric`;
+  the single-recipient direct-message seal (§5b) reuses the existing X25519 sealed-box
+  (`recipient_seal` / `recipient_open`, random nonce), and a control body may be sealed
+  by the transport only (§5c).
 - **`pillar-streamdb`** — `Op`/`OpLog` payloads become `PillarMessage::StreamOp`
   bodies; persistence re-exports `pillar-wire`'s `ContentStore` (no behavior change to
   the CRDT model or Merkle root).
@@ -303,7 +354,8 @@ coexist by construction).
 ## 9. Invariants (TLA+ obligations, before any Rust)
 
 Refines/extends the existing `versioning-compat-migration-spec` and
-`ObsIngestionSubstrate.tla`:
+`ObsIngestionSubstrate.tla`. The convergent envelope + version negotiation are in
+`specs/PillarMessageFormat.tla`:
 
 - `OneRecordFormat` — every persisted/transmitted byte is a `PillarMessage`.
 - `ContentAddressStable` — `Cid` is a deterministic function of the logical record,
@@ -313,14 +365,30 @@ Refines/extends the existing `versioning-compat-migration-spec` and
   peer gets ciphertext only.
 - `NoNonceReuseAcrossDistinctPlaintext` — convergent content nonces collide only for
   identical plaintext.
+- `NegotiationRefusesIncompatible` / `RollingCoexistence` — the envelope, pillar-UDP,
+  and seal versions bump independently and a mixed-version (incl. Noise-era) swarm
+  never mis-frames or partitions.
+
+The per-body **seal treatments** (§5) are in `specs/PillarBodySeals.tla`:
+
+- `ConvergentCellDedup` — a cell-sealed body's `Cid` is a pure function of
+  (cell, content); identical content collapses (dedup across the many cell nodes),
+  distinct never collides.
+- `RcptRandomDistinctByEntropy` — a random single-recipient seal binds per-message
+  entropy, so same-content direct messages at different times are *distinct* records,
+  not deduped (exactly-once is an application-layer concern, not the wire format).
+- `RcptOpaqueToNonHolder` — a recipient-sealed Op body is opened only by the recipient
+  principal's key-holder; the cell (and any non-holder) holds only the referenced `Cid`.
+- `DedupByCid` — the store is content-addressed, so redundant sprayed datagrams and
+  duplicate blocks collapse to one block by construction.
+- `PlainReadableWithoutKey` — an unencrypted control body is readable by a party
+  holding no cell or principal key (it carries no confidentiality obligation).
+- `RcptSealInjective` (assumed) — AEAD nonce-reuse safety for the random seal.
 
 The transport-frame encryption obligations (portable session-key convergence,
 cell-signed session records, anonymous-as-unattested-principal policy gating, replay
 via dedup, revoked-key erasure) are proven separately in
 `specs/PillarUdpEncryption.tla` — see `pillar-udp-encryption.md` §Invariants.
-- `IndependentVersioning` / `NegotiationRefusesIncompatible` / `RollingCoexistence` —
-  the envelope, pillar-UDP, and seal versions bump independently and a mixed-version
-  (incl. Noise-era) swarm never mis-frames or partitions.
 
 ## 10. Resolved design points
 
