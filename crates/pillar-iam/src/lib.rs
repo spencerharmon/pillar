@@ -357,6 +357,327 @@ pub fn show_user<'a>(records: &'a BTreeMap<String, UserRecord>, handle: &str) ->
     records.get(handle)
 }
 
+// ---------------------------------------------------------------------------
+// user-disable-enable: admit gate + admin disable/enable ops + live-session
+// revocation. Refines `specs/UserLifecycle.tla`'s `DisabledNeverActive`: a
+// disabled account holds no live session and cannot unlock a credential.
+// Disabled != deleted — the record and its full op history are retained; only
+// the `status` field flips (through the SAME [`UserOp::StatusChange`]/[`apply_op`]
+// path as every other IAM mutation), and every live session/token is revoked
+// immediately by reusing the `session-registry-impl` revocation path
+// ([`pillar_identity::session_registry::SessionRegistry::revoke_all`]).
+
+/// The wire/error code an admit denial returns for a disabled account — the
+/// `403 ACCOUNT-DISABLED` the ROI names. Hosts map [`AdmitDenied::AccountDisabled`]
+/// to HTTP 403 carrying this code.
+pub const ACCOUNT_DISABLED_CODE: &str = "ACCOUNT-DISABLED";
+
+/// Why [`admit_credential_unlock`] refused. The admit gate runs BEFORE any
+/// credential unlock (`specs/UserLifecycle.tla`'s `DisabledNeverActive`): a
+/// disabled — or entirely unknown — account never reaches the password/
+/// credential check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmitDenied {
+    /// No record exists for this handle — admit refuses (there is nothing to
+    /// unlock a credential for).
+    NoSuchUser,
+    /// The account is [`UserStatus::Disabled`]. Hosts return `403` with
+    /// [`ACCOUNT_DISABLED_CODE`].
+    AccountDisabled,
+}
+
+impl AdmitDenied {
+    /// The stable error code a host surfaces for this denial (the disabled
+    /// case is the ROI's `ACCOUNT-DISABLED`).
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            AdmitDenied::NoSuchUser => "NO-SUCH-USER",
+            AdmitDenied::AccountDisabled => ACCOUNT_DISABLED_CODE,
+        }
+    }
+}
+
+/// The admit-path status gate: decide whether `handle` may proceed to a
+/// credential unlock right now. Called by the login/admit path BEFORE the
+/// credential (password/token) check — a [`UserStatus::Disabled`] account is
+/// refused with [`AdmitDenied::AccountDisabled`] (host → `403 ACCOUNT-DISABLED`),
+/// and an unknown handle with [`AdmitDenied::NoSuchUser`]. An
+/// [`UserStatus::Invited`] or [`UserStatus::Active`] account is admitted (the
+/// forced-password-change flow is a separate, later gate).
+///
+/// # Errors
+///
+/// See [`AdmitDenied`].
+pub fn admit_credential_unlock(
+    records: &BTreeMap<String, UserRecord>,
+    handle: &str,
+) -> Result<(), AdmitDenied> {
+    match records.get(handle) {
+        None => Err(AdmitDenied::NoSuchUser),
+        Some(record) if record.status == UserStatus::Disabled => Err(AdmitDenied::AccountDisabled),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Error building a disable/enable [`UserOp::StatusChange`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusChangeError {
+    /// No record exists for this handle.
+    NotFound,
+    /// The record is already in the requested target status — the op would be
+    /// a no-op, so it is refused (a disable of an already-disabled account, or
+    /// an enable of an already-enabled one).
+    AlreadyInStatus,
+}
+
+/// Build the signed op for an admin **disable** (`iam:users:write`-gated at the
+/// host's dispatch layer via [`authorize_users_write`]). Pure — the caller
+/// signs + journals the returned op, applies it via [`apply_op`], then
+/// **immediately** revokes every live session/token for the handle via
+/// [`revoke_all_sessions`] (see [`disable_user_and_revoke`], which does both).
+///
+/// # Errors
+///
+/// [`StatusChangeError::NotFound`] for an unknown handle;
+/// [`StatusChangeError::AlreadyInStatus`] if already disabled.
+pub fn disable_user(
+    records: &BTreeMap<String, UserRecord>,
+    handle: &str,
+    at: u64,
+) -> Result<UserOp, StatusChangeError> {
+    status_change_op(records, handle, UserStatus::Disabled, at)
+}
+
+/// Build the signed op for an admin **enable** (re-activate a disabled
+/// account). `iam:users:write`-gated exactly like [`disable_user`]. Enabling
+/// does NOT restore any prior session — the user must log in afresh (a new
+/// mint), so no revocation/mint side effect is needed here.
+///
+/// # Errors
+///
+/// [`StatusChangeError::NotFound`] for an unknown handle;
+/// [`StatusChangeError::AlreadyInStatus`] if already active.
+pub fn enable_user(
+    records: &BTreeMap<String, UserRecord>,
+    handle: &str,
+    at: u64,
+) -> Result<UserOp, StatusChangeError> {
+    status_change_op(records, handle, UserStatus::Active, at)
+}
+
+fn status_change_op(
+    records: &BTreeMap<String, UserRecord>,
+    handle: &str,
+    status: UserStatus,
+    at: u64,
+) -> Result<UserOp, StatusChangeError> {
+    let record = records.get(handle).ok_or(StatusChangeError::NotFound)?;
+    if record.status == status {
+        return Err(StatusChangeError::AlreadyInStatus);
+    }
+    Ok(UserOp::StatusChange {
+        handle: handle.to_owned(),
+        status,
+        at,
+    })
+}
+
+/// Immediately revoke EVERY live session/token for `handle` — the disable-time
+/// side effect the ROI requires ("disabling revokes every live session/token
+/// immediately"). This is a thin, deliberate reuse of the
+/// `session-registry-impl` revocation path
+/// ([`pillar_identity::session_registry::SessionRegistry::revoke_all`]): one
+/// epoch-stamped sweep so every already-admitted bearer action fails closed on
+/// its next fenced admit. Never a parallel revocation mechanism.
+pub fn revoke_all_sessions(
+    registry: &mut pillar_identity::session_registry::SessionRegistry,
+    handle: &str,
+) {
+    registry.revoke_all(handle);
+}
+
+/// Disable `handle` end-to-end: apply the (already signed + journaled)
+/// [`UserOp::StatusChange`] to `records` AND immediately revoke every live
+/// session for the handle. The caller builds the op with [`disable_user`],
+/// signs + journals it, then hands it here with the live session registry. The
+/// two effects are inseparable — a disabled account that still held a live
+/// session would violate `DisabledNeverActive`.
+pub fn disable_user_and_revoke(
+    records: &mut BTreeMap<String, UserRecord>,
+    registry: &mut pillar_identity::session_registry::SessionRegistry,
+    op: UserOp,
+) {
+    let handle = op.handle().to_owned();
+    apply_op(records, op);
+    revoke_all_sessions(registry, &handle);
+}
+
+#[cfg(test)]
+mod disable_enable {
+    use super::*;
+    use pillar_crypto::sign::{sign, signing_keypair_from_seed, verify};
+    use pillar_crypto::Seed;
+    use pillar_identity::session_registry::{AdmitError, SessionRegistry, SessionView};
+
+    fn invited(handle: &str) -> UserOp {
+        UserOp::Invite {
+            handle: handle.to_owned(),
+            display_name: handle.to_owned(),
+            email: format!("{handle}@example.com"),
+            at: 1,
+        }
+    }
+
+    // Admit gate: an ACTIVE (or invited) account passes the status gate; a
+    // DISABLED one is refused with the ROI's `403 ACCOUNT-DISABLED`; an
+    // unknown handle is refused too. Refines `DisabledNeverActive`.
+    #[test]
+    fn disable_enable_admit_gate_refuses_disabled_with_account_disabled_code() {
+        let mut records = replay([invited("alice")]);
+        // Invited passes the status gate (forced-change is a later gate).
+        assert_eq!(admit_credential_unlock(&records, "alice"), Ok(()));
+
+        // Unknown handle refused.
+        assert_eq!(
+            admit_credential_unlock(&records, "ghost"),
+            Err(AdmitDenied::NoSuchUser)
+        );
+
+        // Disable, then the admit gate refuses with ACCOUNT-DISABLED.
+        let op = disable_user(&records, "alice", 5).expect("disable of an active handle succeeds");
+        apply_op(&mut records, op);
+        assert_eq!(records["alice"].status, UserStatus::Disabled);
+        assert_eq!(
+            admit_credential_unlock(&records, "alice"),
+            Err(AdmitDenied::AccountDisabled)
+        );
+        assert_eq!(
+            admit_credential_unlock(&records, "alice").unwrap_err().code(),
+            "ACCOUNT-DISABLED"
+        );
+
+        // Re-enable restores admission.
+        let op = enable_user(&records, "alice", 6).expect("enable of a disabled handle succeeds");
+        apply_op(&mut records, op);
+        assert_eq!(records["alice"].status, UserStatus::Active);
+        assert_eq!(admit_credential_unlock(&records, "alice"), Ok(()));
+    }
+
+    // Disabling revokes every live session immediately, reusing the
+    // session-registry revocation path: an action admitted before disable
+    // fails closed after, on a refreshed fenced view.
+    #[test]
+    fn disable_enable_revokes_every_live_session_immediately() {
+        let mut records = replay([invited("bob")]);
+        // Bob logs in twice (two live sessions).
+        let mut registry = SessionRegistry::new();
+        registry.mint("bob", "s1", 0, 1000);
+        registry.mint("bob", "s2", 0, 1000);
+
+        // Both admit while active.
+        let mut view = SessionView::new();
+        view.refresh(&registry);
+        assert!(view.admit(&registry, "bob", "s1", 10).is_ok());
+        assert!(view.admit(&registry, "bob", "s2", 10).is_ok());
+
+        // Admin disables bob → apply the StatusChange AND revoke every session.
+        let op = disable_user(&records, "bob", 5).expect("disable succeeds");
+        disable_user_and_revoke(&mut records, &mut registry, op);
+        assert_eq!(records["bob"].status, UserStatus::Disabled);
+
+        // A refreshed fenced view now refuses BOTH sessions (revoked sweep).
+        view.refresh(&registry);
+        assert_eq!(
+            view.admit(&registry, "bob", "s1", 10),
+            Err(AdmitError::Revoked)
+        );
+        assert_eq!(
+            view.admit(&registry, "bob", "s2", 10),
+            Err(AdmitError::Revoked)
+        );
+        // No live session survives for the disabled principal.
+        assert!(registry.ls("bob", 10).is_empty());
+    }
+
+    // disable/enable are iam:users:write-gated signed ops: the op payload
+    // signs + verifies exactly like every other portal act, and the gate uses
+    // the SAME shared RBAC decider.
+    #[test]
+    fn disable_enable_is_a_users_write_gated_signed_op() {
+        use pillar_rbac::{ExplicitGrant, GrantEffect};
+        use pillar_wot_authority::WotAuthority;
+
+        let records = replay([invited("carol")]);
+
+        // Gate: only an iam:users:write holder may perform the write.
+        let authority = WotAuthority::new(NodeId::from("root"), 5);
+        let policies: [pillar_rbac::PolicyEvent; 0] = [];
+        let grants = [ExplicitGrant {
+            subject: NodeId::from("admin"),
+            capability: iam_users_write_capability(),
+            effect: GrantEffect::Allow,
+        }];
+        let decider = RbacDecider::new(&authority, &policies, &grants);
+        assert_eq!(
+            authorize_users_write(&decider, NodeId::from("admin"), 1),
+            Decision::Allow
+        );
+        assert_eq!(
+            authorize_users_write(&decider, NodeId::from("stranger"), 1),
+            Decision::Deny
+        );
+
+        // The disable op is a signed, verifiable payload like any portal act.
+        let op = disable_user(&records, "carol", 5).expect("disable succeeds");
+        let seed = Seed::from_bytes(b"pillar-iam-test-seed::carol-disable".to_vec());
+        let (public, secret) = signing_keypair_from_seed(&seed).expect("keygen");
+        let payload = serde_json::to_vec(&op).expect("op serializes");
+        let signature = sign(&secret, &payload).expect("sign");
+        verify(&public, &payload, &signature).expect("the signed disable op must verify");
+    }
+
+    // Disabled != deleted: the record and its history survive a disable, and a
+    // no-op transition (disable-of-disabled / enable-of-active) is refused.
+    #[test]
+    fn disable_enable_retains_record_and_refuses_noops() {
+        let mut records = replay([invited("dave"), UserOp::RoleAssign {
+            handle: "dave".to_owned(),
+            role: "member".to_owned(),
+            at: 2,
+        }]);
+
+        // enable-of-non-disabled (invited) is a refused no-op only when
+        // already Active; here dave is Invited, so activate him first.
+        let op = enable_user(&records, "dave", 3).expect("enable of an invited handle activates it");
+        apply_op(&mut records, op);
+        assert_eq!(records["dave"].status, UserStatus::Active);
+        // Now enable-of-already-active is a refused no-op.
+        assert_eq!(
+            enable_user(&records, "dave", 4),
+            Err(StatusChangeError::AlreadyInStatus)
+        );
+        // unknown handle → NotFound.
+        assert_eq!(
+            disable_user(&records, "ghost", 3),
+            Err(StatusChangeError::NotFound)
+        );
+
+        // Disable retains the record (handle + roles + history), only status flips.
+        let op = disable_user(&records, "dave", 5).expect("disable succeeds");
+        apply_op(&mut records, op);
+        let dave = show_user(&records, "dave").expect("disabled != deleted; record retained");
+        assert_eq!(dave.status, UserStatus::Disabled);
+        assert!(dave.roles.contains("member"), "history/roles retained on disable");
+
+        // disable-of-already-disabled is a refused no-op.
+        assert_eq!(
+            disable_user(&records, "dave", 6),
+            Err(StatusChangeError::AlreadyInStatus)
+        );
+    }
+}
+
 #[cfg(test)]
 mod user_record {
     use super::*;

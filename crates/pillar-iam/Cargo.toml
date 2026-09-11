@@ -10,6 +10,7 @@ description = "Pillar IAM: the user record (handle, display name, email, status,
 [dependencies]
 pillar-core = { path = "../pillar-core" }
 pillar-crypto = { path = "../pillar-crypto" }
+pillar-identity = { path = "../pillar-identity" }
 pillar-rbac = { path = "../pillar-rbac" }
 serde = { version = "1", features = ["derive"] }
 
