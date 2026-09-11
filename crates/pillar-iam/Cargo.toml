@@ -11,10 +11,10 @@ description = "Pillar IAM: the user record (handle, display name, email, status,
 pillar-core = { path = "../pillar-core" }
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-rbac = { path = "../pillar-rbac" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-pillar-wot-authority = { path = "../pillar-wot-authority" }
 serde_json = "1"
 
 [lints]
