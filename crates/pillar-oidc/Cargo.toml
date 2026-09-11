@@ -1,0 +1,18 @@
+[package]
+name = "pillar-oidc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pillar OIDC provider: refines specs/OidcProvider.tla. This crate currently ships the OP's custodied ID-token signing-key machinery (the signing key rides the same pluggable SignerBackend custody trait node/cell keys already use, never a bare on-disk secret) and its JWKS current+prior rotation-grace publication; the authorize/token/userinfo/discovery HTTP surface lands in a later task (oidc-provider-endpoints)."
+
+[dependencies]
+pillar-crypto = { path = "../pillar-crypto" }
+pillar-identity = { path = "../pillar-identity" }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

@@ -3555,6 +3555,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-oidc"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "pillar-crypto",
+ "pillar-identity",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pillar-ops"
 version = "0.1.0"
 dependencies = [
