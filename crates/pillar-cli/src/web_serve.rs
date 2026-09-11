@@ -5197,10 +5197,18 @@ fn dispatch_webauthn_credentials_list(
 }
 
 /// `POST /webauthn/credentials/revoke` — the management surface's revoke. Body:
-/// `<session-token>\n<credential-id-b64url>`. Requires a LIVE session and that
-/// the credential belong to the caller (a user may revoke only their own).
-/// Fail-closed and permanent (journaled `WebauthnRevoke`); the credential never
-/// admits again. Returns `REVOKED <id-b64url>`.
+/// `<session-token>\n<credential-id-b64url>[\nconfirm]`. Requires a LIVE
+/// session and that the credential belong to the caller (a user may revoke
+/// only their own). Fail-closed and permanent (journaled `WebauthnRevoke`); the
+/// credential never admits again.
+///
+/// Revoking the caller's LAST credential disables their enforced second factor.
+/// That must be POSSIBLE (a lost/stolen sole key has to be revocable) but never
+/// accidental: when the target is the last credential and the body does NOT
+/// carry a `confirm` line, the request is refused `409 CONFIRM-REQUIRED` so the
+/// surface can prompt "are you sure?" and resubmit with confirmation. The
+/// last-credential test lives in the shared library (`is_last_credential`) so
+/// the UI and the CLI enforce it identically. Returns `REVOKED <id-b64url>`.
 fn dispatch_webauthn_credentials_revoke(
     ctx: &mut WebAuthContext,
     request: &HttpRequest,
@@ -5208,6 +5216,7 @@ fn dispatch_webauthn_credentials_revoke(
     let mut lines = request.body.lines();
     let token = lines.next().unwrap_or("").trim();
     let cred_b64 = lines.next().unwrap_or("").trim();
+    let confirm = lines.next().unwrap_or("").trim().eq_ignore_ascii_case("confirm");
     let Some(session) = ctx.login_session_for(token).cloned() else {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
@@ -5220,16 +5229,13 @@ fn dispatch_webauthn_credentials_revoke(
     if !ctx.webauthn_rp.user_owns_credential(&subject, &cred) {
         return text_response(404, "Not Found", "DENIED unknown-credential".to_owned());
     }
-    // Refuse to revoke the caller's LAST credential if that would silently drop
-    // an enforced second factor, leaving a weaker login than the user set up.
-    // The user must keep at least one, or disable 2FA through the dedicated
-    // path. (Enforcement keys on "user has >=1 live credential".)
-    let remaining = ctx.webauthn_rp.user_credentials(&subject).len();
-    if remaining <= 1 {
+    // Revoking the LAST key disables 2FA — allowed, but only with explicit
+    // confirmation so it never happens by a stray click / fat-fingered CLI.
+    if ctx.webauthn_rp.is_last_credential(&subject, &cred) && !confirm {
         return text_response(
             409,
             "Conflict",
-            "DENIED last-credential-would-disable-2fa".to_owned(),
+            "CONFIRM-REQUIRED last-credential-disables-2fa".to_owned(),
         );
     }
     ctx.record(&PortalOp::WebauthnRevoke {
@@ -6929,13 +6935,51 @@ mod tests {
         assert_eq!(rows2.len(), 1, "one credential remains: {}", list2.body);
         assert!(rows2[0].contains("laptop-green"), "{}", rows2[0]);
 
-        // Revoking the LAST credential is refused (would silently disable 2FA).
+        // Revoking the LAST credential WITHOUT confirmation is refused with a
+        // distinct CONFIRM-REQUIRED (not a hard denial) so the surface can
+        // prompt "are you sure?" — a lost sole key must still be revocable.
         let last = post(
             &mut ctx,
             "/webauthn/credentials/revoke",
             &format!("{token}\n{}", b64(b"cred-green")),
         );
-        assert_eq!(last.status, 409, "last-credential revoke refused: {}", last.body);
+        assert_eq!(
+            last.status, 409,
+            "last-credential revoke needs confirmation: {}",
+            last.body
+        );
+        assert!(
+            last.body.contains("CONFIRM-REQUIRED"),
+            "last-credential refusal asks for confirmation: {}",
+            last.body
+        );
+        // The credential is still live (the un-confirmed revoke was a no-op).
+        let still = post(&mut ctx, "/webauthn/credentials/list", &token);
+        assert_eq!(
+            still.body.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "un-confirmed last-credential revoke did not remove it: {}",
+            still.body
+        );
+        // WITH an explicit `confirm` line, revoking the last key IS allowed.
+        let last_ok = post(
+            &mut ctx,
+            "/webauthn/credentials/revoke",
+            &format!("{token}\n{}\nconfirm", b64(b"cred-green")),
+        );
+        assert_eq!(
+            last_ok.status, 200,
+            "confirmed last-credential revoke is allowed: {}",
+            last_ok.body
+        );
+        assert!(last_ok.body.starts_with("REVOKED"), "{}", last_ok.body);
+        // The user now has zero credentials — 2FA is disabled for them.
+        let empty = post(&mut ctx, "/webauthn/credentials/list", &token);
+        assert!(
+            empty.body.trim().is_empty(),
+            "all credentials revoked: {}",
+            empty.body
+        );
 
         // A revoked credential can never re-admit: a fresh assertion with the
         // revoked credential is refused even with a valid signature.

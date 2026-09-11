@@ -623,6 +623,7 @@ mod yew_impl {
         ExploreBuilder, ExploreLogsBuilder, ExploreMetadataBuilder, ExploreProfilesBuilder,
         ExploreTracesBuilder,
     };
+    use crate::components::Dialog;
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::{spawn_local, JsFuture};
     use web_sys::{
@@ -1475,32 +1476,59 @@ mod yew_impl {
             })
         };
 
-        let revoke = {
-            let (auth, busy, msg, refresh) =
-                (auth.clone(), busy.clone(), msg.clone(), refresh.clone());
-            move |id: String| {
-                let (auth, busy, msg, refresh) =
-                    (auth.clone(), busy.clone(), msg.clone(), refresh.clone());
-                Callback::from(move |_: MouseEvent| {
-                    if *busy {
-                        return;
-                    }
-                    let token = auth.token.clone().unwrap_or_default();
-                    let body = body_lines(&[&token, &id]);
-                    let (busy, msg, refresh) = (busy.clone(), msg.clone(), refresh.clone());
-                    busy.set(true);
-                    spawn_local(async move {
-                        if let Ok(r) =
-                            http("POST", "/webauthn/credentials/revoke", Some(&body)).await
-                        {
+        let confirm_target = use_state(|| None::<String>);
+
+        // Shared revoke path (row button + "revoke anyway" in the dialog). When
+        // `confirm` is false and the target is the user's LAST key, the node
+        // answers `409 CONFIRM-REQUIRED`; we then open the confirm dialog rather
+        // than surface an error. A lost sole key must still be revocable — just
+        // not by a stray click.
+        let run_revoke: std::rc::Rc<dyn Fn(String, bool)> = {
+            let (auth, busy, msg, refresh, confirm_target) = (
+                auth.clone(),
+                busy.clone(),
+                msg.clone(),
+                refresh.clone(),
+                confirm_target.clone(),
+            );
+            std::rc::Rc::new(move |id: String, confirm: bool| {
+                if *busy {
+                    return;
+                }
+                let token = auth.token.clone().unwrap_or_default();
+                let body = if confirm {
+                    body_lines(&[&token, &id, "confirm"])
+                } else {
+                    body_lines(&[&token, &id])
+                };
+                let (busy, msg, refresh, confirm_target) =
+                    (busy.clone(), msg.clone(), refresh.clone(), confirm_target.clone());
+                busy.set(true);
+                spawn_local(async move {
+                    if let Ok(r) =
+                        http("POST", "/webauthn/credentials/revoke", Some(&body)).await
+                    {
+                        if r.status == 409 && r.body.contains("CONFIRM-REQUIRED") {
+                            // Last key: ask before disabling 2FA.
+                            confirm_target.set(Some(id));
+                        } else {
                             msg.set(Some((r.body.trim().to_owned(), r.ok())));
                             if r.ok() {
+                                confirm_target.set(None);
                                 refresh.emit(());
                             }
                         }
-                        busy.set(false);
-                    });
-                })
+                    }
+                    busy.set(false);
+                });
+            })
+        };
+
+        let revoke = {
+            let run_revoke = run_revoke.clone();
+            move |id: String| {
+                let run_revoke = run_revoke.clone();
+                Callback::from(move |_: MouseEvent| run_revoke(id.clone(), false))
             }
         };
 
@@ -1537,6 +1565,32 @@ mod yew_impl {
                 <input id="credential-label" type="text" value={(*label).clone()} placeholder="e.g. yubikey-blue" oninput={on_label} />
                 <PendingButton id="enroll-credential-btn" label="Add a security key" busy={*busy} onclick={enroll} />
                 { message_line("credential-msg", &msg) }
+                { match (*confirm_target).clone() {
+                    Some(id) => {
+                        let cancel = {
+                            let confirm_target = confirm_target.clone();
+                            Callback::from(move |_: MouseEvent| confirm_target.set(None))
+                        };
+                        let go = {
+                            let run_revoke = run_revoke.clone();
+                            let id = id.clone();
+                            Callback::from(move |_: MouseEvent| run_revoke(id.clone(), true))
+                        };
+                        html! {
+                            <Dialog>
+                                <div class="credential-confirm" id="credential-revoke-confirm">
+                                    <h4>{ "Remove your last security key?" }</h4>
+                                    <p>{ "This is your only enrolled security key. Revoking it will DISABLE two-factor login for your account until you enroll a new key. Continue only if this key is lost or compromised." }</p>
+                                    <div class="credential-confirm__actions">
+                                        <PendingButton label="Cancel" busy={false} onclick={cancel} />
+                                        <PendingButton id="credential-revoke-confirm-btn" label="Revoke anyway" busy={*busy} onclick={go} />
+                                    </div>
+                                </div>
+                            </Dialog>
+                        }
+                    }
+                    None => Html::default(),
+                } }
             </div>
         }
     }

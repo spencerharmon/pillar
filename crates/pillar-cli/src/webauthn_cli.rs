@@ -42,11 +42,20 @@ impl<'a> Args<'a> {
         while i < args.len() {
             let a = args[i].as_str();
             if let Some(name) = a.strip_prefix("--") {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| format!("flag --{name} requires a value"))?;
-                flags.push((name, value.clone()));
-                i += 2;
+                // A flag whose next token is another `--flag` (or which ends the
+                // args) is a valueless boolean flag (e.g. `--yes`); it takes the
+                // value "true". Otherwise it consumes the following token as its
+                // value (e.g. `--credential-id <b64url>`).
+                match args.get(i + 1) {
+                    Some(v) if !v.starts_with("--") => {
+                        flags.push((name, v.clone()));
+                        i += 2;
+                    }
+                    _ => {
+                        flags.push((name, "true".to_owned()));
+                        i += 1;
+                    }
+                }
             } else {
                 return Err(format!("unexpected positional argument `{a}`"));
             }
@@ -88,7 +97,7 @@ fn usage() -> &'static str {
      \x20 pillar webauthn register --user <handle> [--label L] [--domain D] [--token T] [--rp-id R] [--origin O]\n\
      \x20 pillar webauthn login [--credential-id C] [--domain D] [--token T] [--rp-id R] [--origin O]\n\
      \x20 pillar webauthn list [--domain D] [--token T]\n\
-     \x20 pillar webauthn revoke --credential-id <b64url> [--domain D] [--token T]\n\
+     \x20 pillar webauthn revoke --credential-id <b64url> [--yes] [--domain D] [--token T]\n\
      register/login drive the real ceremony over ctap-hid against a locally\n\
      attached hardware authenticator (requires the `passkey` feature); pass\n\
      --rp-id <domain> to register a PORTABLE passkey bound to that domain.\n\
@@ -228,8 +237,12 @@ fn list(args: &[String]) -> Result<String, String> {
     Ok(out.trim_end().to_owned())
 }
 
-/// `pillar webauthn revoke --credential-id <b64url>`: permanently revoke one
-/// credential from the caller's set over HTTP (no hardware needed).
+/// `pillar webauthn revoke --credential-id <b64url> [--yes]`: permanently
+/// revoke one credential from the caller's set over HTTP (no hardware needed).
+/// Revoking the caller's LAST credential disables their second factor, so the
+/// node refuses it with `409 CONFIRM-REQUIRED` unless `--yes` is passed (the
+/// same confirmation the UI prompts for) — a lost sole key must still be
+/// revocable, but not by accident.
 fn revoke(args: &[String]) -> Result<String, String> {
     let parsed = Args::parse(args)?;
     let credential_id_b64 = parsed
@@ -237,12 +250,20 @@ fn revoke(args: &[String]) -> Result<String, String> {
         .ok_or("webauthn revoke requires --credential-id <b64url> (from `webauthn list`)")?;
     let (authority, _host) = domain_from(&parsed)?;
     let token = token_from(&parsed)?;
-    let resp = http(
-        &authority,
-        "POST",
-        "/webauthn/credentials/revoke",
-        &format!("{token}\n{credential_id_b64}"),
-    )?;
+    let confirmed = parsed.get("yes").is_some() || parsed.get("confirm").is_some();
+    let body = if confirmed {
+        format!("{token}\n{credential_id_b64}\nconfirm")
+    } else {
+        format!("{token}\n{credential_id_b64}")
+    };
+    let resp = http(&authority, "POST", "/webauthn/credentials/revoke", &body)?;
+    if resp.status == 409 && resp.body.contains("CONFIRM-REQUIRED") {
+        return Err(
+            "this is your LAST security key — revoking it disables two-factor login. \
+             Re-run with --yes to confirm."
+                .to_owned(),
+        );
+    }
     if resp.status != 200 {
         return Err(format!("credentials/revoke refused: {} {}", resp.status, resp.body));
     }

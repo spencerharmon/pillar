@@ -384,6 +384,20 @@ impl RelyingParty {
             .get(&hex(credential_id))
             .is_some_and(|r| r.user_handle == user_handle)
     }
+
+    /// Whether `credential_id` is the user's LAST live credential — i.e.
+    /// revoking it removes their second factor entirely. Returns `false` if the
+    /// user does not own the credential (that case is a plain not-found at the
+    /// call site). The management surface uses this to REQUIRE explicit
+    /// confirmation before such a revoke: a lost or stolen sole key must still
+    /// be revocable (else the account is unrecoverable), but never by accident.
+    /// Enforcing it HERE (not in each surface) makes the UI and the CLI share
+    /// one definition of "this is the last key".
+    #[must_use]
+    pub fn is_last_credential(&self, user_handle: &str, credential_id: &[u8]) -> bool {
+        self.user_owns_credential(user_handle, credential_id)
+            && self.user_credentials(user_handle).len() <= 1
+    }
 }
 
 #[cfg(test)]
