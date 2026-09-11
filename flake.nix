@@ -112,45 +112,44 @@
 
         # ---------------------------------------------------------------------
         # Stage 1 of the two-stage build: compile the Yew + WebAssembly portal
-        # (crate pillar-frontend, EXCLUDED from the native workspace) to
-        # `wasm32-unknown-unknown` with `trunk`, producing the static asset
-        # bundle (wasm/js/css). NO npm/Node is used anywhere — trunk drives
-        # cargo + wasm-bindgen, and stylist emits the CSS from Rust. Stage 2
-        # (`pillar`, below) embeds `${pillar-frontend}` into the ONE binary via
-        # include_bytes! (see crates/pillar-cli/src/web_serve.rs).
+        # (crate pillar-frontend, a WORKSPACE MEMBER whose `start()` entrypoint
+        # is `wasm32`-gated) to `wasm32-unknown-unknown` with `trunk`, producing
+        # the static asset bundle (wasm/js/css). NO npm/Node is used anywhere —
+        # trunk drives cargo + wasm-bindgen, and stylist emits the CSS from
+        # Rust. Stage 2 (`pillar`, below) embeds `${pillar-frontend}` into the
+        # ONE binary via include_bytes! (see crates/pillar-cli/src/web_serve.rs).
         pillar-frontend = pkgs.rustPlatform.buildRustPackage {
           pname = "pillar-frontend";
           version = cargoVersion;
-          # The frontend crate builds to `wasm32-unknown-unknown` from its OWN
-          # Cargo.lock (own dep closure), but it PATH-depends on sibling crates
-          # (`pillar-web-frontend`, and through it `pillar-web-api`,
+          # pillar-frontend is a workspace member (so its host-native DoD is
+          # `-p`-addressable from the repo root) and PATH-depends on sibling
+          # members (`pillar-web-frontend`, and through it `pillar-web-api`,
           # `pillar-observability`, `pillar-manifest`, `pillar-crypto`, …), so
-          # the build src must contain the whole `crates/` tree, not just
-          # `pillar-frontend/`. `sourceRoot` then points cargo/trunk at the
-          # frontend crate itself. (Filtered to `crates/` so a change elsewhere
-          # in the repo — e.g. docs — does not needlessly bust this build.)
+          # the build src is the whole repo. cargo/trunk are run from the
+          # frontend crate dir in the build phase, but resolve against the ROOT
+          # workspace `Cargo.toml`/`Cargo.lock` (one shared lockfile now — it
+          # already pins this crate's whole closure: yew 0.21, wasm-bindgen
+          # 0.2.121, gloo-net, stylist). The crate-scoped
+          # `crates/pillar-frontend/.cargo/config.toml` still supplies the
+          # `--cfg getrandom_backend="wasm_js"` wasm rustflag when cargo runs
+          # from that dir.
           src = builtins.path {
             path = ./.;
             name = "pillar-src";
-            # The sibling path-deps (`pillar-web-frontend`, …) are workspace
-            # members that inherit `edition`/`version` from the ROOT workspace
-            # manifest, so cargo must see the repo-root `Cargo.toml` above them;
-            # `pillar-frontend` stays `exclude`d there and drives its OWN lock.
             # Drop VCS / build detritus so this stays a clean, cache-stable src.
             filter = path: _type:
               let base = baseNameOf path;
               in base != ".git" && base != "target" && base != "result";
           };
-          sourceRoot = "pillar-src/crates/pillar-frontend";
 
           cargoLock = {
-            lockFile = ./crates/pillar-frontend/Cargo.lock;
+            lockFile = ./Cargo.lock;
           };
 
           # trunk (Node-free wasm bundler) + a wasm-bindgen-cli whose version
-          # MUST equal the crate's `wasm-bindgen` (=0.2.121, pinned in the
-          # frontend Cargo.lock) or wasm-bindgen refuses the module. The pinned
-          # nixpkgs ships 0.2.100, so `wasmBindgenCli` (above) builds 0.2.121.
+          # MUST equal the crate's `wasm-bindgen` (=0.2.121, pinned in the root
+          # Cargo.lock) or wasm-bindgen refuses the module. The pinned nixpkgs
+          # ships 0.2.100, so `wasmBindgenCli` (above) builds 0.2.121.
           nativeBuildInputs = [
             pkgs.trunk
             wasmBindgenCli
@@ -159,10 +158,13 @@
           ];
 
           # nixpkgs rustc ships the wasm32-unknown-unknown std; add the target
-          # so cargo (invoked by trunk) can compile to it.
+          # so cargo (invoked by trunk) can compile to it. Run trunk from the
+          # frontend crate dir (its index.html/Trunk.toml live there) while
+          # cargo resolves the root workspace + shared Cargo.lock above it.
           buildPhase = ''
             runHook preBuild
             export CARGO_HOME=$PWD/.cargo-home
+            cd crates/pillar-frontend
             # Trunk must NOT fetch its own wasm-bindgen/wasm-opt — use the ones
             # from nativeBuildInputs (offline, reproducible).
             trunk build \
@@ -174,7 +176,9 @@
           '';
 
           # There is no cargo-test surface for a wasm bundle; the frontend's
-          # logic is exercised by the workspace crates that consume its assets.
+          # logic is exercised by the workspace crates that consume its assets
+          # (and its host-native `--features acceptance` suite under `cargo
+          # test`).
           doCheck = false;
 
           installPhase = ''

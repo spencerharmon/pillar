@@ -193,6 +193,60 @@ impl ResourceAction {
             ResourceAction::Rollout => None,
         }
     }
+
+    /// Whether this action mutates the resource by declaratively changing a
+    /// **manifest field** — i.e. it is a resource CRUD upsert. Such an action
+    /// is now emitted as a signed [`pillar_ops::ResourceOp`] via the browser
+    /// [`crate::pillar_client`] (superseding the privileged
+    /// `POST /portal/resource/*` REST mutation), so [`Self::path`] is NOT used
+    /// for it. `Apply`/`Edit`/`Scale` all set a `Workload` manifest field
+    /// (image and/or replicas); `Rollout` is a non-manifest restart *trigger*
+    /// (it changes no declared field) and legitimately remains a control act,
+    /// not a CRUD op.
+    #[must_use]
+    pub fn is_resource_op(self) -> bool {
+        matches!(
+            self,
+            ResourceAction::Apply | ResourceAction::Edit | ResourceAction::Scale
+        )
+    }
+
+    /// Translate a manifest-mutating action on `name` with argument `arg` into
+    /// the signed [`pillar_ops::ResourceOp`] the console emits instead of a
+    /// privileged REST call. Returns `None` for [`ResourceAction::Rollout`]
+    /// (a restart trigger, not a CRUD op — see [`Self::is_resource_op`]).
+    ///
+    /// The upsert reuses the SAME `Workload` shape the `change_preview`
+    /// "proposed" side describes: `Apply` sets image (default `app:v1`) with
+    /// `replicas: 1`; `Edit` sets a new image; `Scale` sets a replica count
+    /// (default `1`). It is a full-CRD `Apply` op — the node authorizes the
+    /// signer for the `Workload` write policy and materializes it on replay,
+    /// exactly as a CLI `pillar apply -f` of the same manifest would.
+    #[must_use]
+    pub fn as_resource_op(self, name: &str, arg: &str) -> Option<pillar_ops::ResourceOp> {
+        use pillar_manifest::{Metadata, Value};
+        let arg = arg.trim();
+        let crd = match self {
+            ResourceAction::Rollout => return None,
+            ResourceAction::Apply => {
+                let img = if arg.is_empty() { "app:v1" } else { arg };
+                pillar_ops::Crd::new("pillar.dev/v1", "Workload", Metadata::new(name))
+                    .with_spec("image", Value::String(img.to_owned()))
+                    .with_spec("replicas", Value::Integer(1))
+            }
+            ResourceAction::Edit => {
+                let img = if arg.is_empty() { "app:v2" } else { arg };
+                pillar_ops::Crd::new("pillar.dev/v1", "Workload", Metadata::new(name))
+                    .with_spec("image", Value::String(img.to_owned()))
+            }
+            ResourceAction::Scale => {
+                let replicas = arg.parse::<i64>().unwrap_or(1);
+                pillar_ops::Crd::new("pillar.dev/v1", "Workload", Metadata::new(name))
+                    .with_spec("replicas", Value::Integer(replicas))
+            }
+        };
+        Some(pillar_ops::ResourceOp::Apply { crd })
+    }
 }
 
 /// The `<token>\n<name>\n<arg>` body every resource act POSTs (`arg` is empty
@@ -1332,5 +1386,77 @@ mod tests {
     #[test]
     fn cronjob_delete_body_is_token_name_in_order() {
         assert_eq!(cronjob_delete_body("tk", "backup"), "tk\nbackup");
+    }
+
+    // --- browser-pillar-client migration: manifest-mutating acts emit a
+    // signed ResourceOp, never a privileged /portal/resource/* REST call ---
+
+    #[test]
+    fn apply_edit_scale_are_resource_ops_rollout_is_a_control_act() {
+        assert!(ResourceAction::Apply.is_resource_op());
+        assert!(ResourceAction::Edit.is_resource_op());
+        assert!(ResourceAction::Scale.is_resource_op());
+        // Rollout changes no declared manifest field — it is a restart trigger,
+        // legitimately NOT a CRUD op.
+        assert!(!ResourceAction::Rollout.is_resource_op());
+    }
+
+    #[test]
+    fn every_manifest_mutating_action_translates_to_a_signed_apply_op() {
+        // The migration property: for every covered (manifest-mutating) action,
+        // the console has a real ResourceOp to emit — so it never needs the
+        // privileged REST `path()` for that resource kind.
+        for action in ResourceAction::all() {
+            match action.as_resource_op("web", "app:v3") {
+                Some(pillar_ops::ResourceOp::Apply { crd }) => {
+                    assert!(action.is_resource_op());
+                    assert_eq!(crd.kind, "Workload");
+                    assert_eq!(crd.metadata.name, "web");
+                }
+                Some(other) => panic!("unexpected op {other:?}"),
+                None => assert!(
+                    !action.is_resource_op(),
+                    "{action:?} yielded no op but claims to be a resource-op"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn scale_op_carries_the_typed_replica_count() {
+        let op = ResourceAction::Scale
+            .as_resource_op("web", "5")
+            .expect("scale op");
+        match op {
+            pillar_ops::ResourceOp::Apply { crd } => {
+                assert_eq!(
+                    crd.spec.get("replicas"),
+                    Some(&pillar_manifest::Value::Integer(5))
+                );
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_covered_op_seals_to_a_signed_envelope_via_the_browser_client() {
+        // End-to-end at the console layer: a Scale act becomes a signed,
+        // cell-sealed PillarMessage the node can apply — the same op-emission
+        // the CLI performs, not a REST mutation.
+        use crate::pillar_client::{seal_signed_op_bytes, BrowserClientConfig};
+        let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(
+            &pillar_crypto::Seed::from_bytes(vec![4u8; 32]),
+        )
+        .expect("keypair");
+        let cfg = BrowserClientConfig {
+            node_base_url: "https://node.example.com".into(),
+            cell_id: vec![1u8; 32],
+            cell_seed: vec![2u8; 32],
+            signer_public: public.into_bytes(),
+            signer_secret: secret.into_bytes(),
+        };
+        let op = ResourceAction::Scale.as_resource_op("web", "3").expect("op");
+        let bytes = seal_signed_op_bytes(&op, &cfg).expect("seal+sign");
+        assert!(!bytes.is_empty());
     }
 }

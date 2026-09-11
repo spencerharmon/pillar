@@ -37,13 +37,21 @@ members = [
     "crates/pillar-e2e",
     "crates/pillar-blob-provider",
     "crates/pillar-integration-coverage",
-]
-# pillar-frontend targets wasm32-unknown-unknown and carries the yew/stylist/
-# wasm-bindgen closure with its OWN Cargo.lock; excluding it keeps the wasm
-# toolchain surface out of the native `pillar` binary's lockfile and build.
-exclude = [
+    # pillar-frontend is the wasm entrypoint crate (yew Renderer). It is a
+    # workspace member so its host-native DoD (`cargo test -p pillar-frontend
+    # --features acceptance`, the browser-pillar-client acceptance gate)
+    # resolves from the repo root. Its `start()` entrypoint is
+    # `#[cfg(target_arch = "wasm32")]`-gated, so on the native host the crate is
+    # an ordinary rlib that compiles and tests cleanly; the wasm *bundle* is
+    # still built by the flake's `trunk` stage. The root Cargo.lock already
+    # resolves this crate's whole closure (yew 0.21, wasm-bindgen 0.2.121,
+    # gloo-net, stylist) at the exact versions its former standalone lock
+    # pinned — via the sibling `pillar-web-frontend` member — so sharing the one
+    # workspace lockfile changes no resolved version.
     "crates/pillar-frontend",
 ]
+# (No crate is excluded: pillar-frontend joined the workspace above so its
+# host-native acceptance test is `-p`-addressable from the root.)
 
 [workspace.package]
 version = "0.1.0"
