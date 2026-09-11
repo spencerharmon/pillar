@@ -61,6 +61,16 @@ libp2p = { version = "0.56", features = [
 pillar-streamdb = { path = "../pillar-streamdb" }
 pillar-eventlog = { path = "../pillar-eventlog" }
 pillar-core = { path = "../pillar-core" }
+# The client-op ingest policy (`client_ingest`) accepts a single signed
+# `ResourceOp` from an authenticated non-node client peer and authorizes it
+# under the FULL WoT/RBAC decider before applying it to the same durable
+# op-sync path nodes use with each other. It rides the shared op vocabulary
+# (pillar-ops) and the single pure RBAC decider (pillar-rbac) over the WoT
+# trust graph (pillar-wot-authority) — none of which depend on pillar-net, so
+# these edges are acyclic.
+pillar-ops = { path = "../pillar-ops" }
+pillar-rbac = { path = "../pillar-rbac" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-ipam = { path = "../pillar-ipam" }
 # The live UDP ingress dataplane (udp_dataplane) rides the manifest LB policy
 # types (LoadBalancerPolicy/Algorithm/Affinity) so backend selection is the
