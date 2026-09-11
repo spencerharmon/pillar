@@ -72,6 +72,9 @@ pub enum Route {
     /// Active sessions + revocation.
     #[cfg_attr(feature = "yew", at("/sessions"))]
     Sessions,
+    /// This user's WebAuthn security keys / passkeys (list / enroll / revoke).
+    #[cfg_attr(feature = "yew", at("/credentials"))]
+    Credentials,
     /// Web-of-Trust graph + attestation/custody builders.
     #[cfg_attr(feature = "yew", at("/trust"))]
     Trust,
@@ -106,6 +109,7 @@ impl Route {
                 | Route::Identity
                 | Route::Members
                 | Route::Sessions
+                | Route::Credentials
                 | Route::Trust
                 | Route::Swarm
                 | Route::Inbox
@@ -127,6 +131,7 @@ impl Route {
             Route::Identity => Section::Identity,
             Route::Members => Section::Members,
             Route::Sessions => Section::Sessions,
+            Route::Credentials => Section::Credentials,
             Route::Trust => Section::Trust,
             Route::Swarm => Section::Swarm,
             Route::Inbox => Section::Inbox,

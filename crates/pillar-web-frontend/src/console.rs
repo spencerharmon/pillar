@@ -72,6 +72,8 @@ pub enum Section {
     Members,
     /// Active sessions + revocation.
     Sessions,
+    /// This user's WebAuthn security keys / passkeys (list / enroll / revoke).
+    Credentials,
     /// Web-of-Trust graph + attestation/custody builders.
     Trust,
     /// libp2p swarm identity + mint.
@@ -83,7 +85,7 @@ pub enum Section {
 impl Section {
     /// Every section in canonical (sidebar) order.
     #[must_use]
-    pub const fn all() -> [Section; 10] {
+    pub const fn all() -> [Section; 11] {
         [
             Section::Overview,
             Section::Resources,
@@ -92,6 +94,7 @@ impl Section {
             Section::Identity,
             Section::Members,
             Section::Sessions,
+            Section::Credentials,
             Section::Trust,
             Section::Swarm,
             Section::Inbox,
@@ -111,6 +114,7 @@ impl Section {
             Section::Identity => "/identity",
             Section::Members => "/members",
             Section::Sessions => "/sessions",
+            Section::Credentials => "/credentials",
             Section::Trust => "/trust",
             Section::Swarm => "/swarm",
             Section::Inbox => "/inbox",
@@ -128,6 +132,7 @@ impl Section {
             Section::Identity => "Identity",
             Section::Members => "Members",
             Section::Sessions => "Sessions",
+            Section::Credentials => "Security Keys",
             Section::Trust => "Trust Graph",
             Section::Swarm => "Swarm",
             Section::Inbox => "Requests",
@@ -146,6 +151,7 @@ impl Section {
             Section::Identity => "⬡",
             Section::Members => "☰",
             Section::Sessions => "⏻",
+            Section::Credentials => "⚿",
             Section::Trust => "⤳",
             Section::Swarm => "⟁",
             Section::Inbox => "✉",
@@ -159,9 +165,11 @@ impl Section {
             Section::Overview | Section::Resources => NavGroup::Compute,
             Section::Observability => NavGroup::Observability,
             Section::Topology => NavGroup::Topology,
-            Section::Identity | Section::Members | Section::Sessions | Section::Trust => {
-                NavGroup::Access
-            }
+            Section::Identity
+            | Section::Members
+            | Section::Sessions
+            | Section::Credentials
+            | Section::Trust => NavGroup::Access,
             Section::Swarm | Section::Inbox => NavGroup::Cluster,
         }
     }
@@ -180,7 +188,7 @@ mod yew_impl {
     use crate::command_palette::CommandPalette;
     use crate::obs_console::ObservabilityConsole;
     use crate::overview::OverviewConsole;
-    use crate::portal::{IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile};
+    use crate::portal::{CredentialsTile, IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile};
     use crate::resources_console::ResourcesConsole;
     use crate::router::Route;
     use crate::topology_console::{TopologyConsole, TrustGraphConsole};
@@ -284,6 +292,7 @@ mod yew_impl {
             Section::Identity => html! { <IdentityTile /> },
             Section::Members => html! { <MembersTile /> },
             Section::Sessions => html! { <SessionsTile /> },
+            Section::Credentials => html! { <CredentialsTile /> },
             Section::Trust => html! {
                 <>
                     <TrustGraphConsole />
@@ -309,6 +318,7 @@ mod yew_impl {
             Section::Identity => Route::Identity,
             Section::Members => Route::Members,
             Section::Sessions => Route::Sessions,
+            Section::Credentials => Route::Credentials,
             Section::Trust => Route::Trust,
             Section::Swarm => Route::Swarm,
             Section::Inbox => Route::Inbox,
