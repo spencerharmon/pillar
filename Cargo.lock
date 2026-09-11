@@ -3674,6 +3674,7 @@ name = "pillar-wire"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "getrandom 0.2.17",
  "pillar-core",
  "pillar-crypto",
  "pillar-ipfs",
