@@ -32,8 +32,12 @@
 
 use std::collections::BTreeMap;
 
+use pillar_core::NodeId;
 use pillar_crypto::{Ciphertext, CryptoError, KdfParams, Salt};
+use pillar_rbac::{Decision, ExplicitGrant, PolicyEvent, RbacDecider, Request, ResourceClass, StepUpAssertion};
+use pillar_wot_authority::WotAuthority;
 
+use crate::rbac_bridge::{iam_credentials_manage_capability, sensitive_ops_step_up_policy};
 use crate::{invite_user, InviteError, UserOp, UserRecord};
 
 /// AEAD associated-data domain separator for the sealed operational key —
@@ -197,6 +201,97 @@ pub fn complete_self_password_change(
             at,
         },
     ])
+}
+
+/// Error building an admin-driven password reset
+/// ([`admin_reset_password`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminResetError {
+    /// No record exists for this handle.
+    UnknownUser,
+    /// Sealing the new operational key under the new password failed.
+    Crypto(CryptoError),
+}
+
+/// Build the op pair for an ADMIN-driven password reset
+/// (`admin-password-reset-reprovision`): generates a BRAND NEW operational
+/// key (`new_operational_key` — the caller draws fresh random key material;
+/// this function never re-derives or exposes the retiring key) sealed under
+/// `new_password`, and forces the account through a password change on next
+/// admit. Pure — the caller applies the returned ops, in order, after
+/// signing + journaling each exactly like every other portal act, and must
+/// gate the call on [`authorize_admin_password_reset`] first (the
+/// step-up-gated `iam:credentials:manage` capability).
+///
+/// This retires the OLD sealed operational key through the SAME
+/// [`UserOp::ProvisionOperationalKey`] op the invite and self-change paths
+/// already use — the old sealed material is simply overwritten/replaced by
+/// [`crate::apply_op`], the existing key-rotation machinery, never a
+/// parallel retirement mechanism. It never touches the user's already-
+/// registered WebAuthn/passkey credentials: those live in a separate
+/// credential store this crate does not own, and this op pair only rotates
+/// the password-sealed operational key + the forced-change label.
+///
+/// # Errors
+///
+/// [`AdminResetError::UnknownUser`] if `handle` has no record;
+/// [`AdminResetError::Crypto`] if sealing the new key fails.
+pub fn admin_reset_password(
+    records: &BTreeMap<String, UserRecord>,
+    handle: &str,
+    new_password: &[u8],
+    new_operational_key: &[u8],
+    at: u64,
+) -> Result<[UserOp; 2], AdminResetError> {
+    if !records.contains_key(handle) {
+        return Err(AdminResetError::UnknownUser);
+    }
+
+    let sealed = seal_operational_key(new_operational_key, new_password)
+        .map_err(AdminResetError::Crypto)?;
+
+    Ok([
+        UserOp::ProvisionOperationalKey {
+            handle: handle.to_owned(),
+            sealed,
+            at,
+        },
+        UserOp::RequireChange {
+            handle: handle.to_owned(),
+            at,
+        },
+    ])
+}
+
+/// Decide whether `subject` may perform an admin-driven password reset
+/// ([`admin_reset_password`]) right now — the step-up-gated
+/// `iam:credentials:manage` capability, decided through the SAME
+/// [`RbacDecider::decide`] every other Pillar capability check uses (see
+/// [`crate::rbac_bridge::authorize_effective_capability`]'s doc for the
+/// precedence lattice this preserves). A single call so every admin surface
+/// (CLI, web portal) can never diverge on who may reset another user's
+/// password, and a stale/absent step-up assertion is refused exactly like
+/// every other sensitive roles/groups/credentials act
+/// ([`sensitive_ops_step_up_policy`]).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_admin_password_reset(
+    authority: &WotAuthority,
+    policies: &[PolicyEvent],
+    extra_grants: &[ExplicitGrant],
+    subject: NodeId,
+    now_secs: u64,
+    step_up_assertion: Option<StepUpAssertion>,
+) -> Decision {
+    let step_up = sensitive_ops_step_up_policy();
+    let decider = RbacDecider::new(authority, policies, extra_grants).with_step_up_policy(&step_up);
+    let mut request = Request::new(subject, iam_credentials_manage_capability())
+        .with_resource_class(ResourceClass::All)
+        .at_time(now_secs);
+    if let Some(assertion) = step_up_assertion {
+        request = request.with_step_up(assertion);
+    }
+    decider.decide(&request)
 }
 
 /// A capability-gated act being admitted through the SHARED admit/dispatch
@@ -459,6 +554,125 @@ mod tests {
         assert_eq!(
             admit_gated_action(&records, "ghost", GatedAction::Other, 1, None),
             Err(AdmitError::UnknownUser)
+        );
+    }
+
+    #[test]
+    fn admin_reset_provisions_a_brand_new_key_and_forces_password_change() {
+        let mut records = provisioned_invite("gina", b"temp-pw-0007", b"gina-original-operational-key", 5);
+
+        // Gina completes her own change first, so the "old" key the admin
+        // reset must retire is the SELF-CHOSEN one, not the invite temp one.
+        let ops = complete_self_password_change(&records, "gina", b"temp-pw-0007", b"ginas-own-password!", 6)
+            .expect("self change must succeed");
+        for op in ops {
+            apply_op(&mut records, op);
+        }
+        assert!(!records["gina"].force_password_change);
+
+        let reset_ops = admin_reset_password(
+            &records,
+            "gina",
+            b"admin-set-temp-password",
+            b"gina-BRAND-NEW-operational-key",
+            7,
+        )
+        .expect("admin reset of a known handle must succeed");
+        for op in reset_ops {
+            apply_op(&mut records, op);
+        }
+
+        let gina = records.get("gina").expect("gina must still be recorded");
+        assert!(
+            gina.force_password_change,
+            "an admin reset must force a password change on next admit"
+        );
+
+        // The new admin-set password unseals the BRAND NEW key material —
+        // never the old operational key.
+        let unsealed = unseal_operational_key(
+            gina.sealed_operational_key.as_ref().unwrap(),
+            b"admin-set-temp-password",
+        )
+        .expect("the admin-set password must unseal the newly provisioned key");
+        assert_eq!(unsealed, b"gina-BRAND-NEW-operational-key");
+        assert_ne!(
+            unsealed, b"gina-original-operational-key",
+            "the admin reset must never re-derive or expose the retiring key"
+        );
+
+        // The retired key material is unreachable through EITHER prior
+        // password — the old subkey is retired, not merely shadowed.
+        assert!(
+            unseal_operational_key(gina.sealed_operational_key.as_ref().unwrap(), b"temp-pw-0007").is_err(),
+            "the original invite temp password must no longer unseal anything"
+        );
+        assert!(
+            unseal_operational_key(gina.sealed_operational_key.as_ref().unwrap(), b"ginas-own-password!").is_err(),
+            "the user's own prior self-chosen password must no longer unseal anything"
+        );
+
+        // The reset is contained exactly like every other forced-change
+        // state: only self-profile/self-password-change acts admit.
+        assert_eq!(
+            admit_gated_action(&records, "gina", GatedAction::Other, 8, None),
+            Err(AdmitError::PasswordChangeRequired)
+        );
+    }
+
+    #[test]
+    fn admin_reset_of_an_unknown_handle_is_refused() {
+        let records: BTreeMap<String, UserRecord> = BTreeMap::new();
+        assert_eq!(
+            admin_reset_password(&records, "ghost", b"new-pw", b"new-key", 1),
+            Err(AdminResetError::UnknownUser)
+        );
+    }
+
+    #[test]
+    fn admin_reset_requires_the_step_up_gated_iam_credentials_manage_capability() {
+        use pillar_rbac::{GrantEffect, PolicyEvent};
+
+        let authority = WotAuthority::new(NodeId::from("root"), 5);
+        let policies: [PolicyEvent; 0] = [];
+        let grants = [ExplicitGrant {
+            subject: NodeId::from("admin"),
+            capability: iam_credentials_manage_capability(),
+            effect: GrantEffect::Allow,
+        }];
+
+        // No step-up assertion: the sensitive-ops policy refuses even a
+        // subject holding the capability outright.
+        assert_eq!(
+            authorize_admin_password_reset(&authority, &policies, &grants, NodeId::from("admin"), 10, None),
+            Decision::Deny,
+            "admin credential reset must require a fresh step-up assertion"
+        );
+
+        // A fresh step-up assertion admits it.
+        assert_eq!(
+            authorize_admin_password_reset(
+                &authority,
+                &policies,
+                &grants,
+                NodeId::from("admin"),
+                10,
+                Some(StepUpAssertion::new(9, b"cred")),
+            ),
+            Decision::Allow
+        );
+
+        // A subject with no grant at all is refused regardless of step-up.
+        assert_eq!(
+            authorize_admin_password_reset(
+                &authority,
+                &policies,
+                &grants,
+                NodeId::from("stranger"),
+                10,
+                Some(StepUpAssertion::new(9, b"cred")),
+            ),
+            Decision::Deny
         );
     }
 }
