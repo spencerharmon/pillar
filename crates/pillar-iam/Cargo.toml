@@ -1,0 +1,21 @@
+[package]
+name = "pillar-iam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pillar IAM: the user record (handle, display name, email, status, roles, groups, force_password_change, password_changed_at, timestamps) rebuilt by replaying signed, journaled PortalOps — subsumes the legacy members map. Ships GET/PUT /portal/profile logic and the admin invite/list/show surface, gated by the iam:users:write capability."
+
+[dependencies]
+pillar-core = { path = "../pillar-core" }
+pillar-crypto = { path = "../pillar-crypto" }
+pillar-rbac = { path = "../pillar-rbac" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+pillar-wot-authority = { path = "../pillar-wot-authority" }
+serde_json = "1"
+
+[lints]
+workspace = true
