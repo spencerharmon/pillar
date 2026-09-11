@@ -733,7 +733,12 @@ pub fn wrap_frame_body(
         .map_err(SessionError::Crypto)?;
     let aad = PillarMessage::header_aad(Visibility::Cell, &cell);
     let body_sealed = CellSeal
-        .seal(&group, &plaintext, &aad)
+        .seal(
+            &group,
+            &plaintext,
+            pillar_wire::seal::CONTROL_BODY_SEAL_DOMAIN,
+            &aad,
+        )
         .map_err(SessionError::Crypto)?;
 
     let signature =
