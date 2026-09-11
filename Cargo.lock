@@ -3171,6 +3171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
 name = "pillar-controller"
 version = "0.1.0"
 dependencies = [
@@ -3357,6 +3366,15 @@ dependencies = [
  "pillar-wire",
  "pillar-wot-authority",
  "sha2",
+]
+
+[[package]]
+name = "pillar-ops"
+version = "0.1.0"
+dependencies = [
+ "pillar-manifest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
