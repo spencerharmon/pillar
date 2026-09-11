@@ -25,6 +25,7 @@ pub mod query_console;
 pub mod obs_console;
 pub mod overview;
 pub mod panels;
+pub mod pillar_client;
 pub mod portal;
 pub mod portal_entry;
 pub mod primitives;

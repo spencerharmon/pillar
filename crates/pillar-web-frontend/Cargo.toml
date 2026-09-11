@@ -60,6 +60,22 @@ pillar-web-api = { path = "../pillar-web-api", default-features = false }
 # CRD does rather than inventing a parallel manifest model.
 pillar-observability = { path = "../pillar-observability" }
 pillar-manifest = { path = "../pillar-manifest" }
+# The browser pillar-client (`crate::pillar_client`): the SAME wasm-safe op
+# vocabulary + seal/sign path the CLI uses, so a mutation from the console is a
+# signed, cell-sealed `pillar_wire::PillarMessage` carrying a
+# `pillar_ops::ResourceOp` — byte-identical to the CLI's — sent over HTTPS,
+# never a privileged portal-REST call. `pillar-ops` is deliberately dep-light
+# and wasm-safe (only `pillar-manifest`+serde); `pillar-wire` is taken WITHOUT
+# its default `ipfs` feature so the libp2p closure stays out of the wasm build
+# (the console seals/signs, it never runs an IPFS node); `pillar-crypto` in its
+# default build carries the ed25519 sign + convergent cell-seal primitives with
+# no HSM/native backends. This is EXACTLY the wasm-safe subset of what
+# `pillar-client::transport::seal_resource_op` composes on native — reused here
+# rather than depending on `pillar-client` itself (which pulls tokio/quinn/
+# rustls and does not build for `wasm32-unknown-unknown`).
+pillar-ops = { path = "../pillar-ops" }
+pillar-wire = { path = "../pillar-wire", default-features = false }
+pillar-crypto = { path = "../pillar-crypto" }
 # stylist provides the scoped CSS-in-Rust styling (operator-chosen). The
 # `parser` feature lets us build a `Style` from a raw CSS &str on the NATIVE
 # target (host `cargo test`), which is what makes the design system host-

@@ -18,6 +18,19 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Opt-in acceptance gate for the `browser-pillar-client` definition-of-done:
+# the host-native `tests/browser_pillar_client.rs` suite proving the Yew
+# console emits the SAME signed, cell-sealed `pillar_ops::ResourceOp`
+# envelope the CLI (`pillar_client::transport::seal_resource_op`) emits —
+# byte-for-byte — and that the migrated resource-mutation acts translate to
+# real `ResourceOp`s rather than privileged `/portal/resource/*` REST calls.
+# Off by default so a plain `cargo test` stays fast; the DoD invokes
+# `cargo test -p pillar-frontend --features acceptance` explicitly. The suite
+# is host-native (this crate's `start()` entrypoint is `wasm32`-gated, so the
+# rlib/tests compile and run on the host with no wasm runner or browser).
+acceptance = []
+
 [dependencies]
 # Yew is the portal framework (operator-chosen) — needed here only for
 # `yew::Renderer` at the wasm entrypoint below.
@@ -39,14 +52,24 @@ pillar-web-frontend = { path = "../pillar-web-frontend" }
 # (see https://docs.rs/getrandom/0.3.4/#webassembly-support). Enabling the
 # feature alone is insufficient — the wasm32 build ALSO needs the
 # `--cfg getrandom_backend="wasm_js"` rustc flag, set in this crate's
-# `.cargo/config.toml` (this crate is excluded from the root workspace and
-# carries its own standalone `Cargo.lock`/cargo config, so this override is
-# scoped to this crate's wasm build and never touches the native
-# `pillar`/`pillar-ipfs`/`libp2p` non-wasm resolution or functionality).
+# `.cargo/config.toml`. That cargo config is directory-scoped to this crate's
+# subtree, so the flag applies only when the wasm bundle is built from here and
+# never reaches the native `pillar`/`pillar-ipfs`/`libp2p` build (which targets
+# the host, not wasm32). This crate is now a workspace member (so its host DoD
+# is `-p`-addressable), but the flag stays crate-scoped and the target table
+# below exists only in a wasm32 build.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
-[profile.release]
-# Small, deterministic wasm: optimize for size and strip.
-opt-level = "s"
-lto = true
+# Host-only acceptance-test deps (native target). `pillar-client` is the CLI's
+# real native client library (tokio/quinn/rustls); the acceptance suite uses
+# its `transport::seal_resource_op` as the ORACLE and asserts the browser
+# client's wasm-safe seal/sign produces byte-identical envelopes. These are
+# dev-only, so they never enter the wasm bundle's dependency closure.
+[dev-dependencies]
+pillar-web-frontend = { path = "../pillar-web-frontend" }
+pillar-client = { path = "../pillar-client" }
+pillar-ops = { path = "../pillar-ops" }
+pillar-crypto = { path = "../pillar-crypto" }
+pillar-wire = { path = "../pillar-wire", default-features = false }
+pillar-manifest = { path = "../pillar-manifest" }
