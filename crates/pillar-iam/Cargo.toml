@@ -12,6 +12,7 @@ pillar-core = { path = "../pillar-core" }
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-rbac = { path = "../pillar-rbac" }
 serde = { version = "1", features = ["derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 pillar-wot-authority = { path = "../pillar-wot-authority" }
