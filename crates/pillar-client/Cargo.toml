@@ -7,6 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 description = "The reusable Pillar client library: how an application authenticates to a cell, discovers its nodes, and sends sealed PillarMessages over the standard pillar transports (pillar-UDP preferred; QUIC/HTTPS fallback). pillar-cli is its first consumer; this crate is the best-practices surface every other pillar client builds on."
 
+[features]
+# Opt-in acceptance gate: off by default so `cargo test` stays a fast unit
+# run; `acceptance_full_discovery_then_cached_reconnect_flow` in
+# `src/discovery.rs` is invoked with `--features acceptance` explicitly by
+# its CHECKS.md stub.
+acceptance = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

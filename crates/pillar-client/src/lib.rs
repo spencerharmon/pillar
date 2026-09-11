@@ -15,11 +15,10 @@
 //!
 //! 1. [`config`] — resolving *where* and *who*: the `config.yaml` schema,
 //!    its standard search locations, layered merge, CLI/env overrides, and
-//!    validation into a ready-to-connect [`config::ConnectParams`]. **(this
-//!    slice)**
-//! 2. `discovery` *(later)* — resolving a cell name to its live ingest nodes
-//!    and their published sealing keys via pillar-IPNS, so a client with only
-//!    a cell name can find the nodes to talk to.
+//!    validation into a ready-to-connect [`config::ConnectParams`].
+//! 2. [`discovery`] — resolving a cell name to its live ingest nodes and
+//!    their published sealing keys via pillar-IPNS, so a client with only a
+//!    cell name can find the nodes to talk to. **(this slice)**
 //! 3. `transport` *(later)* — dialing a node over the standard pillar
 //!    transports in preference order (pillar-UDP → QUIC → HTTPS) and
 //!    exchanging sealed [`pillar_wire::PillarMessage`]s.
@@ -35,8 +34,12 @@
 //! swarm key and seed nodes.
 
 pub mod config;
+pub mod discovery;
 
 pub use config::{
     ClientConfig, ConfigDirs, ConfigError, ConnectParams, CredentialConfig, CredentialKind,
     ResolveError, SwarmMode, TransportKind, DEFAULT_TRANSPORT_ORDER,
+};
+pub use discovery::{
+    CellDiscovery, DiscoveryError, InMemoryCellDiscovery, IngestNode, ResolvedNodes,
 };
