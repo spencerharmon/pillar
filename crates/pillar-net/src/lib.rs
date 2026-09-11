@@ -87,6 +87,12 @@ pub use opsync::{
     OpSyncResponse, OP_SYNC_PROTOCOL_NAME,
 };
 
+pub mod client_ingest;
+pub use client_ingest::{
+    authorize_client_op, ingest_client_op, resource_write_capability, signer_subject,
+    ClientOpReject, RESOURCE_WRITE_CAPABILITY_PREFIX,
+};
+
 /// Gossipsub topic carrying Pillar's append-only event log.
 pub const EVENT_LOG_TOPIC: &str = "/pillar/event-log/1.0.0";
 
