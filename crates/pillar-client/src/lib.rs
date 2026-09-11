@@ -35,8 +35,13 @@
 //! swarm key and seed nodes.
 
 pub mod config;
+pub mod transport;
 
 pub use config::{
     ClientConfig, ConfigDirs, ConfigError, ConnectParams, CredentialConfig, CredentialKind,
     ResolveError, SwarmMode, TransportKind, DEFAULT_TRANSPORT_ORDER,
+};
+pub use transport::{
+    open_resource_op, seal_resource_op, send_op_with_fallback, send_with_fallback,
+    SendOutcome, StreamOpMessageError, TierAddr, STREAM_OP_SEAL_DOMAIN,
 };

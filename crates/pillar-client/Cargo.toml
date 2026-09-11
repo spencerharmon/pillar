@@ -10,9 +10,24 @@ description = "The reusable Pillar client library: how an application authentica
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+pillar-crypto = { path = "../pillar-crypto" }
+pillar-wire = { path = "../pillar-wire" }
+pillar-ops = { path = "../pillar-ops" }
+tokio = { version = "1", features = ["rt", "time"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
+pillar-manifest = { path = "../pillar-manifest" }
+
+[features]
+# Opt-in acceptance gate for black-box integration tests that dial real
+# UDP/QUIC/TCP sockets end to end (never an in-process call). Off by default
+# so a plain `cargo test -p pillar-client` stays a fast unit run; the
+# `pillar-client-transport-acceptance` CHECKS.md stub always invokes
+# `--features acceptance` explicitly.
+acceptance = []
 
 [lints]
 workspace = true
