@@ -57,6 +57,9 @@ pub use admin_credentials::{
     authorize_credentials_manage, AdminAuthContext, AdminCredentialError, EnrollmentInvite,
 };
 
+pub mod admin_reset;
+pub use admin_reset::{admin_reset_password, AdminResetError};
+
 /// The capability string gating every admin write to the user/IAM surface
 /// (invite, list, show, role/group edits performed on someone OTHER than the
 /// acting user). A three-segment `namespace:resource:verb` capability, the
@@ -137,6 +140,14 @@ pub struct UserRecord {
     /// `None` only for a record that predates this field / has no
     /// operational key yet.
     pub sealed_operational_key: Option<SealedOperationalKey>,
+    /// Operational keys that have been superseded and RETIRED (never silently
+    /// dropped) — an admin password reset
+    /// (`admin-password-reset-reprovision`) moves the record's prior live key
+    /// here when it installs a fresh one, the crate-local reflection of the
+    /// identity-rotation / WoT-revocation machinery `key-rotation` owns. A
+    /// retired key is never the record's live key and never unlocks a live
+    /// session again; it is kept only for the audit trail.
+    pub retired_operational_keys: Vec<SealedOperationalKey>,
 }
 
 /// One durable IAM mutation. Journaled by the host exactly like a `PortalOp`
@@ -189,6 +200,19 @@ pub enum UserOp {
         sealed: SealedOperationalKey,
         at: u64,
     },
+    /// An admin-driven password reset (`admin-password-reset-reprovision`):
+    /// RETIRE the record's current live operational key (moving it to
+    /// [`UserRecord::retired_operational_keys`]), install `sealed` — a
+    /// genuinely NEW key sealed under the admin-chosen new password — as the
+    /// live key, and set `force_password_change`. Built by
+    /// [`admin_reset::admin_reset_password`] (step-up-gated
+    /// `iam:credentials:manage`); it never re-derives or exposes the old key
+    /// and never touches the user's WebAuthn credentials.
+    AdminReset {
+        handle: String,
+        sealed: SealedOperationalKey,
+        at: u64,
+    },
 }
 
 impl UserOp {
@@ -205,7 +229,8 @@ impl UserOp {
             | UserOp::GroupAdd { handle, .. }
             | UserOp::GroupRemove { handle, .. }
             | UserOp::StatusChange { handle, .. }
-            | UserOp::ProvisionOperationalKey { handle, .. } => handle,
+            | UserOp::ProvisionOperationalKey { handle, .. }
+            | UserOp::AdminReset { handle, .. } => handle,
         }
     }
 }
@@ -234,6 +259,7 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
                 created_at: at,
                 updated_at: at,
                 sealed_operational_key: None,
+                retired_operational_keys: Vec::new(),
             });
         }
         UserOp::ProfileUpdate {
@@ -295,6 +321,11 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
             if let Some(record) = records.get_mut(&handle) {
                 record.sealed_operational_key = Some(sealed);
                 record.updated_at = at;
+            }
+        }
+        UserOp::AdminReset { handle, sealed, at } => {
+            if let Some(record) = records.get_mut(&handle) {
+                admin_reset::apply_admin_reset(record, sealed, at);
             }
         }
     }

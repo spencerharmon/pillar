@@ -158,6 +158,14 @@ pub struct AdminAuthContext<'a> {
 
 impl AdminAuthContext<'_> {
     /// Run the shared gate and the self-target guard: `Ok(())` iff the admin is
+    /// authorized AND `target` is not the admin's own handle. Reused by the
+    /// admin-reset surface (`admin-password-reset-reprovision`) so it can never
+    /// diverge from the credential surface's authorization.
+    pub(crate) fn authorize_target(&self, target: &str) -> Result<(), AdminCredentialError> {
+        self.admit(target)
+    }
+
+    /// Run the shared gate and the self-target guard: `Ok(())` iff the admin is
     /// authorized AND `target` is not the admin's own handle.
     fn admit(&self, target: &str) -> Result<(), AdminCredentialError> {
         if self.admin == target {
