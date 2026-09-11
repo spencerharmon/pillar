@@ -19,6 +19,7 @@ trusted. Each document below links to the specification that proves its claims.
 | [identity.md](identity.md) | The OpenPGP key hierarchy and node-admission handshake (`specs/Registration.tla`) |
 | [credentials.md](credentials.md) | User credentials: WebAuthn passkeys (browser + portable/CLI), rpId/domain binding, and list/create/revoke management (`specs/WebAuthnCustody.tla`) |
 | [node-custody.md](node-custody.md) | How a *node* holds its own sealing secret in hardware — TPM / PKCS#11 / passkey custody backends (`specs/NodeCustodyLogin.tla`) |
+| [user-management.md](user-management.md) | IAM: user lifecycle (invite/first-sign-in/disable), passwords (temp/self-change/rotation/admin-reset), roles + groups + group-roles, admin management of others' keys, self-service profile (`specs/UserLifecycle.tla`) |
 | [plugin-surface.md](plugin-surface.md) | The complete out-of-tree plugin surface and each plugin's interface contract |
 | [cli-surface.md](cli-surface.md) | The single coherent `pillar` CLI: views-vs-acts split, `kind/name` addressing, and the kubectl-parity resource plane |
 | [observability.md](observability.md) | Built-in distributed observability: signal event schema, retention/sampling policy, and RBAC-decider read authority (`specs/Observability.tla`) |
