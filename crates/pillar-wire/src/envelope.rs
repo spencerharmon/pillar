@@ -348,7 +348,9 @@ mod tests {
         let cell = CellId::from_bytes(format!("cell::{cell_seed}").into_bytes());
         let plaintext = body.to_canonical_cbor().expect("encode body");
         let aad = PillarMessage::header_aad(Visibility::Cell, &cell);
-        let body_sealed = CellSeal.seal(&group, &plaintext, &aad).expect("seal");
+        let body_sealed = CellSeal
+            .seal(&group, &plaintext, b"pillar-wire/tests/envelope/v1", &aad)
+            .expect("seal");
 
         let (signer, secret) =
             signing_keypair_from_seed(&Seed::from_bytes(signer_seed.as_bytes().to_vec()))

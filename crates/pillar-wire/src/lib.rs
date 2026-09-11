@@ -5,10 +5,10 @@
 //!
 //! - [`envelope::PillarMessage`] — the version-stamped envelope enum + its
 //!   canonical (deterministic) CBOR codec + [`store::Cid`] derivation.
-//! - [`seal`] — the convergent content-seal interface the envelope's sealed
-//!   body rides (the trait; the deterministic-nonce crypto primitive itself
-//!   lands in `pillar-crypto` via the `cell-seal-convergent-impl` task and
-//!   this crate's [`seal::CellSeal`] switches to it then).
+//! - [`seal`] — the three per-body seal treatments the envelope's sealed
+//!   body rides (`docs/papers/pillar-message-format.md` §5): the convergent
+//!   [`seal::ContentSeal`]/[`seal::CellSeal`], the single-recipient random
+//!   [`seal::RecipientSeal`], and the unencrypted [`seal::plain_cid`].
 //! - [`store`] — `SignedSegment`/`Cid`/`HeadRecord`/`Visibility`/
 //!   `ContentStore` — **moved down** from `pillar-streamdb` verbatim (no
 //!   behavior change; `pillar-streamdb` now re-exports these from here so

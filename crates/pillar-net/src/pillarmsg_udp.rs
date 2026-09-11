@@ -175,7 +175,12 @@ pub fn wrap_control(
         .map_err(HandshakelessError::Seal)?;
     let aad = PillarMessage::header_aad(Visibility::Cell, &cell);
     let body_sealed = CellSeal
-        .seal(&group, &plaintext, &aad)
+        .seal(
+            &group,
+            &plaintext,
+            pillar_wire::seal::CONTROL_BODY_SEAL_DOMAIN,
+            &aad,
+        )
         .map_err(HandshakelessError::Seal)?;
 
     let (signer, secret) = pillar_crypto::sign::signing_keypair_from_seed(&Seed::from_bytes(
