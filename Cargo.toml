@@ -36,12 +36,58 @@ members = [
     "crates/pillar-e2e",
     "crates/pillar-blob-provider",
     "crates/pillar-integration-coverage",
-]
-# pillar-frontend targets wasm32-unknown-unknown and carries the yew/stylist/
-# wasm-bindgen closure with its OWN Cargo.lock; excluding it keeps the wasm
-# toolchain surface out of the native `pillar` binary's lockfile and build.
-exclude = [
+    # A member (so `cargo test -p pillar-frontend --features acceptance` --
+    # the `browser-pillar-client` definition-of-done -- resolves at all: a
+    # workspace-`exclude`d package cannot be selected with `-p` at the root),
+    # but NOT a `default-members` entry (below), so a plain `cargo
+    # build`/`cargo test` at the root never builds/tests it and the native
+    # `pillar` binary's default build set is unchanged.
     "crates/pillar-frontend",
+]
+# The set `cargo build`/`cargo test` operate on with no explicit `-p`/`--
+# workspace` -- i.e. every member EXCEPT `pillar-frontend`. `pillar-frontend`
+# targets wasm32-unknown-unknown and carries the yew/stylist/wasm-bindgen
+# dependency closure; keeping it a member (so it CAN be selected with `-p`)
+# while excluding it from `default-members` keeps that closure out of every
+# default native build/test, exactly as the previous `[workspace] exclude`
+# did, while still letting `-p pillar-frontend` resolve for its own
+# acceptance check.
+default-members = [
+    "crates/pillar-core",
+    "crates/pillar-crypto",
+    "crates/pillar-controller",
+    "crates/pillar-eventlog",
+    "crates/pillar-coordination",
+    "crates/pillar-ipam",
+    "crates/pillar-manifest",
+    "crates/pillar-identity",
+    "crates/pillar-net",
+    "crates/pillar-wire",
+    "crates/pillar-streamdb",
+    "crates/pillar-ipfs",
+    "crates/pillar-swarm",
+    "crates/pillar-observability",
+    "crates/pillar-wot-authority",
+    "crates/pillar-rbac",
+    "crates/pillar-bootstrap",
+    "crates/pillar-key-distribution",
+    "crates/pillar-cells",
+    "crates/pillar-recovery",
+    "crates/pillar-cli",
+    "crates/pillar-client",
+    "crates/pillar-ops",
+    "crates/pillar-web",
+    "crates/pillar-web-frontend",
+    "crates/pillar-web-api",
+    "crates/pillar-trust-artifacts",
+    "crates/pillar-quota-ledger",
+    "crates/pillar-topology",
+    "crates/pillar-upgrade-gate",
+    "crates/pillar-realness-gate",
+    "crates/pillar-surface-inventory",
+    "crates/pillar-e2e",
+    "crates/pillar-blob-provider",
+    "crates/pillar-integration-coverage",
 ]
 
 [workspace.package]

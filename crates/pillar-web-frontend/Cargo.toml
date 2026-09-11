@@ -49,6 +49,19 @@ yew = [
 # cannot drift. This is exactly the crate's stated purpose (compiled into both
 # the Rust server and the Rust/WASM client).
 pillar-web-api = { path = "../pillar-web-api", default-features = false }
+# The wasm-safe CRUD op vocabulary (`ResourceOp::{Apply,Delete}`) the browser
+# pillar client emits — the SAME ops `pillar-cli`'s
+# `apply-over-pillar-message` command sends natively, so a browser-issued op
+# content-addresses identically (see `browser_pillar_client`).
+pillar-ops = { path = "../pillar-ops" }
+# The `PillarMessage` envelope + `ContentSeal`/`CellSeal` seal path, pulled in
+# `default-features = false` exactly like `pillar-observability` does (see
+# that crate's `Cargo.toml`) so the browser build never needs the `ipfs`
+# feature's native-only closure.
+pillar-wire = { path = "../pillar-wire", default-features = false }
+# Ed25519 sign/verify over the sealed body — pure-Rust, wasm32-buildable
+# (see `pillar-crypto/Cargo.toml`'s `default = []`).
+pillar-crypto = { path = "../pillar-crypto" }
 # The real PSL structured-AST builder/parser (`pillar_observability::psl`) and
 # the metadata-index typeahead source (`pillar_observability::metadata_index`)
 # the Explore query builders compose against — never a second, parallel query

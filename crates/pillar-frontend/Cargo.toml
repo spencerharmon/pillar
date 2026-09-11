@@ -1,12 +1,17 @@
 # pillar-frontend — the Yew + WebAssembly portal foundation.
 #
-# This crate is DELIBERATELY EXCLUDED from the root cargo workspace (see the
-# root `Cargo.toml` `[workspace] exclude`): it targets `wasm32-unknown-unknown`
-# and carries its own dependency closure (yew, stylist, wasm-bindgen) with its
-# OWN `Cargo.lock`, so the native `pillar` binary build never pulls the wasm
-# toolchain surface into its lockfile. The static asset bundle (wasm/js/css)
-# `trunk` produces from this crate is what the two-stage nix build embeds into
-# the one `pillar` binary via `include_bytes!` — there is NO npm/Node anywhere.
+# This crate targets `wasm32-unknown-unknown` and carries the yew/stylist/
+# wasm-bindgen dependency closure. It IS a root-workspace `members` entry (so
+# `cargo test -p pillar-frontend --features acceptance` -- the
+# `browser-pillar-client` definition-of-done -- can select it at all) but
+# deliberately NOT a root `default-members` entry (see the root `Cargo.toml`),
+# so a plain `cargo build`/`cargo test` at the root never pulls this crate's
+# wasm-only closure into the native `pillar` binary's default build/test. The
+# static asset bundle (wasm/js/css) `trunk` produces from this crate (invoked
+# from THIS directory, where its own `.cargo/config.toml`'s
+# `getrandom_backend="wasm_js"` rustflag still applies) is what the two-stage
+# nix build embeds into the one `pillar` binary via `include_bytes!` — there
+# is NO npm/Node anywhere.
 [package]
 name = "pillar-frontend"
 version = "0.1.0"
@@ -45,6 +50,21 @@ pillar-web-frontend = { path = "../pillar-web-frontend" }
 # `pillar`/`pillar-ipfs`/`libp2p` non-wasm resolution or functionality).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[features]
+# Gates the `browser-pillar-client` acceptance test below. Off by default so
+# a plain `cargo test -p pillar-frontend` never requires it; matches the
+# `acceptance = []` convention every other acceptance-gated crate uses (see
+# `pillar-e2e`/`pillar-client`/`pillar-cli`).
+acceptance = []
+
+[dev-dependencies]
+# The acceptance test builds real key/cell material and asserts the browser
+# client's seal/sign/open pipeline end to end.
+pillar-crypto = { path = "../pillar-crypto" }
+pillar-ops = { path = "../pillar-ops" }
+pillar-wire = { path = "../pillar-wire", default-features = false }
+pillar-manifest = { path = "../pillar-manifest" }
 
 [profile.release]
 # Small, deterministic wasm: optimize for size and strip.

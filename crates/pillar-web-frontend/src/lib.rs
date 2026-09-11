@@ -17,6 +17,7 @@
 
 pub mod attestation_custody_console;
 pub mod auth;
+pub mod browser_pillar_client;
 pub mod command_palette;
 pub mod console;
 pub mod dashboard;
@@ -40,6 +41,10 @@ pub mod webauthn;
 pub mod components;
 
 pub use auth::{AuthAction, AuthSession};
+pub use browser_pillar_client::{
+    open_and_verify, seal_and_sign, submit_resource_op, BrowserOpError, StreamOpTransport,
+    STREAM_OP_ENDPOINT, STREAM_OP_SEAL_DOMAIN,
+};
 pub use console::{NavGroup, Section};
 pub use dashboard::{render_panel_persisted, CellId, Dashboard, Panel, PeerId};
 pub use explore::{
@@ -56,6 +61,8 @@ pub use webauthn::{authenticate, register, CeremonyError, CredentialCeremony, Rp
 
 #[cfg(feature = "yew")]
 pub use auth::{use_auth, AuthContext, AuthProvider};
+#[cfg(feature = "yew")]
+pub use browser_pillar_client::{submit_resource_op_async, BrowserTransport};
 #[cfg(feature = "yew")]
 pub use console::ConsoleView;
 #[cfg(feature = "yew")]
