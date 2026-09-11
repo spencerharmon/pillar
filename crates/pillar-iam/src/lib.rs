@@ -46,10 +46,9 @@ pub use rbac_bridge::{
 
 pub mod password_lifecycle;
 pub use password_lifecycle::{
-    admin_reset_password, admit_gated_action, authorize_admin_password_reset,
-    complete_self_password_change, evaluate_login_password_age, invite_user_with_temp_password,
-    seal_operational_key, unseal_operational_key, AdmitError, AdminResetError, GatedAction,
-    InviteWithPasswordError, PasswordChangeError, SealedOperationalKey,
+    admit_gated_action, complete_self_password_change, evaluate_login_password_age,
+    invite_user_with_temp_password, seal_operational_key, unseal_operational_key, AdmitError,
+    GatedAction, InviteWithPasswordError, PasswordChangeError, SealedOperationalKey,
 };
 
 pub mod admin_credentials;
