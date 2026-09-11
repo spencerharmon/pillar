@@ -33,10 +33,15 @@
 //! faster direct reconnect. Private-swarm callers additionally supply their
 //! swarm key and seed nodes.
 
+pub mod auth;
 pub mod config;
 pub mod discovery;
 pub mod transport;
 
+pub use auth::{
+    authenticate, cached_token_is_valid, issue_token, now_unix, signer_id_of, AuthError,
+    Credential, NodeAuthority, SessionToken,
+};
 pub use config::{
     ClientConfig, ConfigDirs, ConfigError, ConnectParams, CredentialConfig, CredentialKind,
     ResolveError, SwarmMode, TransportKind, DEFAULT_TRANSPORT_ORDER,
@@ -45,6 +50,6 @@ pub use discovery::{
     CellDiscovery, DiscoveryError, InMemoryCellDiscovery, IngestNode, ResolvedNodes,
 };
 pub use transport::{
-    open_resource_op, seal_resource_op, send_op_with_fallback, send_with_fallback,
-    SendOutcome, StreamOpMessageError, TierAddr, STREAM_OP_SEAL_DOMAIN,
+    open_resource_op, seal_resource_op, send_op_with_fallback, send_with_fallback, SendOutcome,
+    StreamOpMessageError, TierAddr, STREAM_OP_SEAL_DOMAIN,
 };

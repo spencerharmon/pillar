@@ -3306,10 +3306,13 @@ dependencies = [
 name = "pillar-client"
 version = "0.1.0"
 dependencies = [
+ "pillar-core",
  "pillar-crypto",
+ "pillar-identity",
  "pillar-manifest",
  "pillar-ops",
  "pillar-wire",
+ "pillar-wot-authority",
  "quinn",
  "rustls",
  "serde",
