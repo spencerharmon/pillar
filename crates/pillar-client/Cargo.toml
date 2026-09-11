@@ -9,17 +9,26 @@ description = "The reusable Pillar client library: how an application authentica
 
 [features]
 # Opt-in acceptance gate: off by default so `cargo test` stays a fast unit
-# run; `acceptance_full_discovery_then_cached_reconnect_flow` in
-# `src/discovery.rs` is invoked with `--features acceptance` explicitly by
-# its CHECKS.md stub.
+# run. Gates both `acceptance_full_discovery_then_cached_reconnect_flow` in
+# `src/discovery.rs` and the black-box transport integration tests that dial
+# real UDP/QUIC/TCP sockets end to end (never an in-process call); the
+# `pillar-client-transport-acceptance` CHECKS.md stub always invokes
+# `--features acceptance` explicitly.
 acceptance = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+pillar-crypto = { path = "../pillar-crypto" }
+pillar-wire = { path = "../pillar-wire" }
+pillar-ops = { path = "../pillar-ops" }
+tokio = { version = "1", features = ["rt", "time"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
+pillar-manifest = { path = "../pillar-manifest" }
 
 [lints]
 workspace = true

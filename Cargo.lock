@@ -3306,9 +3306,16 @@ dependencies = [
 name = "pillar-client"
 version = "0.1.0"
 dependencies = [
+ "pillar-crypto",
+ "pillar-manifest",
+ "pillar-ops",
+ "pillar-wire",
+ "quinn",
+ "rustls",
  "serde",
  "serde_yaml",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

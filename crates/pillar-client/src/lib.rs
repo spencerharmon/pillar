@@ -35,6 +35,7 @@
 
 pub mod config;
 pub mod discovery;
+pub mod transport;
 
 pub use config::{
     ClientConfig, ConfigDirs, ConfigError, ConnectParams, CredentialConfig, CredentialKind,
@@ -42,4 +43,8 @@ pub use config::{
 };
 pub use discovery::{
     CellDiscovery, DiscoveryError, InMemoryCellDiscovery, IngestNode, ResolvedNodes,
+};
+pub use transport::{
+    open_resource_op, seal_resource_op, send_op_with_fallback, send_with_fallback,
+    SendOutcome, StreamOpMessageError, TierAddr, STREAM_OP_SEAL_DOMAIN,
 };
