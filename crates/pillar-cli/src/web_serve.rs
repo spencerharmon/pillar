@@ -5110,6 +5110,7 @@ fn dispatch_webauthn_register_finish(
         &session,
         &cell,
         now,
+        unix_now_secs(),
         &challenge,
         &attestation,
         prf_salt,
@@ -5141,6 +5142,21 @@ fn dispatch_webauthn_register_finish(
         }
         Err(e) => webauthn_rp_error(&e),
     }
+}
+
+/// Real wall-clock time as unix seconds — the source for a credential's
+/// human-facing `created_at` / `last_used_at` stamps. The web layer's
+/// `session_clock` is a LOGICAL per-session counter (correct for challenge TTLs
+/// and session ordering, but it resets to 0 on restart), so it is the wrong
+/// source for a "when was this credential created / last used" timestamp that
+/// must stay meaningful across restarts. Mirrors the wall-clock reads in
+/// `pillar-net::opsync` / `pillar-observability::query` / `pillar-streamdb`.
+/// A clock set before the unix epoch (the only `duration_since` error) yields
+/// `0`, which the UI renders as "unknown" rather than a bogus date.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// `POST /webauthn/credentials/list` — the management surface's read. Body:
@@ -5297,6 +5313,7 @@ fn dispatch_webauthn_authenticate_finish(
         return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
     };
     let now = ctx.session_clock;
+    let used_at = unix_now_secs();
     // If this token is a PENDING-2FA login (password already admitted, awaiting
     // its assertion), the asserted credential MUST belong to that user — one
     // user's authenticator can never satisfy another's 2FA gate. Check before
@@ -5318,7 +5335,7 @@ fn dispatch_webauthn_authenticate_finish(
         }
     }
     match ctx.webauthn_rp.authenticate_finish(
-        &session, &cell, now, &challenge, &cred, &ad, &cdj, &sig, &prf,
+        &session, &cell, now, used_at, &challenge, &cred, &ad, &cdj, &sig, &prf,
     ) {
         Ok(unlock) => {
             // The operational-key-unlock secret is present only when the
@@ -5334,7 +5351,7 @@ fn dispatch_webauthn_authenticate_finish(
             // state). authenticate_finish already advanced the in-memory record.
             if let Some(rec) = ctx.webauthn_rp.record(&cred) {
                 let (sign_count, last_used_at) =
-                    (rec.sign_count, rec.last_used_at.unwrap_or(now));
+                    (rec.sign_count, rec.last_used_at.unwrap_or(used_at));
                 ctx.record(&PortalOp::WebauthnAssertion {
                     credential_id: cred.clone(),
                     sign_count,

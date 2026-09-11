@@ -183,6 +183,7 @@ impl RelyingParty {
         session: &str,
         cell: &str,
         now: u64,
+        created_at: u64,
         challenge: &[u8],
         attestation_object: &[u8],
         prf_salt: [u8; 32],
@@ -211,7 +212,7 @@ impl RelyingParty {
             cell: cell.to_owned(),
             label: label.to_owned(),
             rp_id: rp_id.to_owned(),
-            created_at: now,
+            created_at,
             last_used_at: None,
         };
         self.records.insert(key, record.clone());
@@ -236,6 +237,7 @@ impl RelyingParty {
         session: &str,
         cell: &str,
         now: u64,
+        used_at: u64,
         challenge: &[u8],
         credential_id: &[u8],
         authenticator_data: &[u8],
@@ -283,7 +285,7 @@ impl RelyingParty {
             record.sign_count = verified.sign_count;
         }
         // Stamp the credential's most-recent-use for the management surface.
-        record.last_used_at = Some(now);
+        record.last_used_at = Some(used_at);
         Ok(unlock)
     }
 
@@ -447,6 +449,7 @@ mod tests {
             "sess-1",
             "cell-A",
             1000,
+            0,
             &ch,
             &attestation(cose, cred, sc),
             [7u8; 32],
@@ -470,6 +473,7 @@ mod tests {
                 "sess-1",
                 "cell-A",
                 2000,
+                0,
                 &ch,
                 b"cred-1",
                 &ad,
@@ -508,7 +512,7 @@ mod tests {
         let (ad, cdj, sig) = assertion(&sk, &ch, 5);
         let unlock = rp
             .authenticate_finish(
-                "sess-1", "cell-A", 2000, &ch, b"cred-noprf", &ad, &cdj, &sig, b"",
+                "sess-1", "cell-A", 2000, 0, &ch, b"cred-noprf", &ad, &cdj, &sig, b"",
             )
             .expect("assertion verifies with no prf output");
         assert_eq!(
@@ -531,7 +535,7 @@ mod tests {
         let (ad, cdj, forged) = assertion(&mallory, &ch, 5);
         assert_eq!(
             rp.authenticate_finish(
-                "sess-1", "cell-A", 2000, &ch, b"cred-1", &ad, &cdj, &forged, b"prf"
+                "sess-1", "cell-A", 2000, 0, &ch, b"cred-1", &ad, &cdj, &forged, b"prf"
             ),
             Err(RpError::Crypto(
                 pillar_crypto::CryptoError::VerificationFailed
@@ -545,7 +549,7 @@ mod tests {
         cdj2[5] ^= 0xff;
         assert_eq!(
             rp.authenticate_finish(
-                "sess-1", "cell-A", 2000, &ch2, b"cred-1", &ad2, &cdj2, &sig2, b"prf"
+                "sess-1", "cell-A", 2000, 0, &ch2, b"cred-1", &ad2, &cdj2, &sig2, b"prf"
             ),
             Err(RpError::Crypto(
                 pillar_crypto::CryptoError::VerificationFailed
@@ -565,7 +569,7 @@ mod tests {
         let (ad, cdj, sig) = assertion(&sk, &ch, 5);
         assert_eq!(
             rp.authenticate_finish(
-                "sess-1", "cell-A", 2500, &ch, b"cred-1", &ad, &cdj, &sig, b"prf"
+                "sess-1", "cell-A", 2500, 0, &ch, b"cred-1", &ad, &cdj, &sig, b"prf"
             ),
             Err(RpError::StaleChallenge),
             "an expired challenge must be rejected"
@@ -576,13 +580,13 @@ mod tests {
         let ch2 = rp.begin("sess-1", "cell-A", 3000, TTL);
         let (ad2, cdj2, sig2) = assertion(&sk, &ch2, 6);
         rp.authenticate_finish(
-            "sess-1", "cell-A", 3000, &ch2, b"cred-1", &ad2, &cdj2, &sig2, b"prf",
+            "sess-1", "cell-A", 3000, 0, &ch2, b"cred-1", &ad2, &cdj2, &sig2, b"prf",
         )
         .expect("first use admits");
         let (ad3, cdj3, sig3) = assertion(&sk, &ch2, 7);
         assert_eq!(
             rp.authenticate_finish(
-                "sess-1", "cell-A", 3000, &ch2, b"cred-1", &ad3, &cdj3, &sig3, b"prf"
+                "sess-1", "cell-A", 3000, 0, &ch2, b"cred-1", &ad3, &cdj3, &sig3, b"prf"
             ),
             Err(RpError::StaleChallenge),
             "a replayed (already-consumed) challenge must be rejected"
@@ -599,7 +603,7 @@ mod tests {
         let ch = rp.begin("sess-1", "cell-A", 2000, TTL);
         let (ad, cdj, sig) = assertion(&sk, &ch, 10);
         rp.authenticate_finish(
-            "sess-1", "cell-A", 2000, &ch, b"cred-1", &ad, &cdj, &sig, b"prf",
+            "sess-1", "cell-A", 2000, 0, &ch, b"cred-1", &ad, &cdj, &sig, b"prf",
         )
         .expect("advance to 10");
 
@@ -608,7 +612,7 @@ mod tests {
         let (ad2, cdj2, sig2) = assertion(&sk, &ch2, 4);
         assert_eq!(
             rp.authenticate_finish(
-                "sess-1", "cell-A", 3000, &ch2, b"cred-1", &ad2, &cdj2, &sig2, b"prf"
+                "sess-1", "cell-A", 3000, 0, &ch2, b"cred-1", &ad2, &cdj2, &sig2, b"prf"
             ),
             Err(RpError::SignCountRegression),
             "a sign_count going backward (clone) must be rejected"
@@ -628,7 +632,7 @@ mod tests {
         let (ad, cdj, sig) = assertion(&sk, &ch, 5);
         assert_eq!(
             rp.authenticate_finish(
-                "sess-1", "cell-A", 2000, &ch, b"cred-1", &ad, &cdj, &sig, b"prf"
+                "sess-1", "cell-A", 2000, 0, &ch, b"cred-1", &ad, &cdj, &sig, b"prf"
             ),
             Err(RpError::Revoked),
             "a revoked credential must fail closed"
@@ -648,6 +652,7 @@ mod tests {
                 "OTHER-sess",
                 "cell-A",
                 2000,
+                0,
                 &ch,
                 b"cred-1",
                 &ad,

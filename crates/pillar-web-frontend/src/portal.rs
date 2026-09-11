@@ -1385,6 +1385,20 @@ mod yew_impl {
         }
     }
 
+    /// Format a unix-seconds timestamp (as sent on the `CRED` wire) into a
+    /// locale date-time string for display. A missing/zero/unparseable value
+    /// (a credential enrolled before the node recorded timestamps) renders as
+    /// "unknown" rather than a bogus epoch date.
+    fn fmt_unix_date(secs: &str) -> String {
+        match secs.parse::<f64>() {
+            Ok(s) if s > 0.0 => {
+                let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(s * 1000.0));
+                String::from(d.to_locale_string("default", &wasm_bindgen::JsValue::UNDEFINED))
+            }
+            _ => "unknown".to_owned(),
+        }
+    }
+
     /// The user's WebAuthn credentials (security keys / passkeys): list each
     /// with its label, bound domain, created / last-used / sign-count; enroll
     /// another; and revoke individually. Register more than one so a lost key
@@ -1497,14 +1511,22 @@ mod yew_impl {
                 <div id="credential-list">
                     { for rows.iter().map(|c| {
                         let rev = revoke(c.id.clone());
-                        let last = if c.last_used == "-" { "never".to_owned() } else { c.last_used.clone() };
+                        let last = if c.last_used == "-" || c.last_used == "0" {
+                            "never".to_owned()
+                        } else {
+                            fmt_unix_date(&c.last_used)
+                        };
+                        let created = fmt_unix_date(&c.created_at);
                         let bound = if c.rp_id.is_empty() { "(unknown)".to_owned() } else { c.rp_id.clone() };
                         let name = if c.label.is_empty() { "(unlabeled)".to_owned() } else { c.label.clone() };
                         html! {
                             <div class="tile credential-row" data-credential-id={c.id.clone()}>
                                 <p><strong>{ name }</strong></p>
                                 <p>{ format!("Bound domain: {bound}") }</p>
-                                <p>{ format!("Created: {}  ·  Last used: {last}  ·  Signs: {}", c.created_at, c.sign_count) }</p>
+                                <p>{ format!("Created: {created}  ·  Last used: {last}") }</p>
+                                <p class="credential-signs" title="The authenticator's internal signature counter. It increments each time the key signs; the node stores the highest value seen and rejects any assertion that reports a lower one, which is how a cloned key is detected. It is a device counter, not a count of your logins here.">
+                                    { format!("Signature counter: {}", c.sign_count) }
+                                </p>
                                 <p class="credential-id">{ c.id.clone() }</p>
                                 <PendingButton label="Revoke" busy={*busy} onclick={rev} />
                             </div>

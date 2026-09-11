@@ -91,6 +91,7 @@ fn register_on(rp: &mut RelyingParty, session: &str, now: u64, cose: &[u8], cred
         session,
         CELL,
         now,
+        now,
         &ch,
         &attestation(cose, cred, 0),
         [9u8; 32],
@@ -113,7 +114,7 @@ fn login_on(
 ) -> Result<[u8; 32], RpError> {
     let ch = rp.begin(session, CELL, now, TTL);
     let (ad, cdj, sig) = assertion(secret, &ch, sign_count);
-    rp.authenticate_finish(session, CELL, now, &ch, cred, &ad, &cdj, &sig, b"prf-out")
+    rp.authenticate_finish(session, CELL, now, now, &ch, cred, &ad, &cdj, &sig, b"prf-out")
         .map(|u| u.expect("non-empty prf output yields an unlock secret"))
 }
 
