@@ -44,6 +44,13 @@ pub use rbac_bridge::{
     SENSITIVE_OPS_STEP_UP_MAX_AGE_SECS,
 };
 
+pub mod password_lifecycle;
+pub use password_lifecycle::{
+    admit_gated_action, complete_self_password_change, evaluate_login_password_age,
+    invite_user_with_temp_password, seal_operational_key, unseal_operational_key, AdmitError,
+    GatedAction, InviteWithPasswordError, PasswordChangeError, SealedOperationalKey,
+};
+
 /// The capability string gating every admin write to the user/IAM surface
 /// (invite, list, show, role/group edits performed on someone OTHER than the
 /// acting user). A three-segment `namespace:resource:verb` capability, the
@@ -116,6 +123,14 @@ pub struct UserRecord {
     pub created_at: u64,
     /// The wall-clock stamp of the last mutation applied to this record.
     pub updated_at: u64,
+    /// The user's operational key, AEAD-sealed under a KEK derived (via the
+    /// SAME `argon2id` custody backend `pillar_crypto::kdf`/`custody` ship)
+    /// from the user's current password. Provisioned on invite (sealed under
+    /// the admin-chosen temp password) and re-sealed on every completed self
+    /// password change (`password_lifecycle::complete_self_password_change`).
+    /// `None` only for a record that predates this field / has no
+    /// operational key yet.
+    pub sealed_operational_key: Option<SealedOperationalKey>,
 }
 
 /// One durable IAM mutation. Journaled by the host exactly like a `PortalOp`
@@ -157,6 +172,17 @@ pub enum UserOp {
     /// stream — landed by `user-disable-enable` — folds through the same
     /// [`apply_op`] path as every other IAM mutation).
     StatusChange { handle: String, status: UserStatus, at: u64 },
+    /// Sets (or replaces) the record's sealed operational key —
+    /// [`password_lifecycle`]'s provisioning primitive. Used at invite time
+    /// (sealed under the admin-chosen temp password) and by a completed self
+    /// password change's re-seal step; kept as its own variant (rather than
+    /// folded only into `Invite`) so an admin re-provision
+    /// (`admin-password-reset-reprovision`) can reuse the same op.
+    ProvisionOperationalKey {
+        handle: String,
+        sealed: SealedOperationalKey,
+        at: u64,
+    },
 }
 
 impl UserOp {
@@ -172,7 +198,8 @@ impl UserOp {
             | UserOp::RoleRevoke { handle, .. }
             | UserOp::GroupAdd { handle, .. }
             | UserOp::GroupRemove { handle, .. }
-            | UserOp::StatusChange { handle, .. } => handle,
+            | UserOp::StatusChange { handle, .. }
+            | UserOp::ProvisionOperationalKey { handle, .. } => handle,
         }
     }
 }
@@ -200,6 +227,7 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
                 password_changed_at: None,
                 created_at: at,
                 updated_at: at,
+                sealed_operational_key: None,
             });
         }
         UserOp::ProfileUpdate {
@@ -254,6 +282,12 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
         UserOp::StatusChange { handle, status, at } => {
             if let Some(record) = records.get_mut(&handle) {
                 record.status = status;
+                record.updated_at = at;
+            }
+        }
+        UserOp::ProvisionOperationalKey { handle, sealed, at } => {
+            if let Some(record) = records.get_mut(&handle) {
+                record.sealed_operational_key = Some(sealed);
                 record.updated_at = at;
             }
         }
