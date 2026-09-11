@@ -191,6 +191,53 @@ impl ClientConfig {
         }
     }
 
+    /// Cache a freshly-minted session `token` into this config (builder-style),
+    /// so the next process starts on the auth fast path. This is the write half
+    /// of the auth cache contract: [`crate::auth::authenticate`] yields a token
+    /// and the caller stores it here, then [`Self::save`]s the config.
+    #[must_use]
+    pub fn with_token(mut self, token: impl Into<String>) -> ClientConfig {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Serialize this config to a `config.yaml` document, ready to write to
+    /// disk. The inverse of [`Self::parse`]; only the SET (`Some`) fields are
+    /// emitted, so writing back a cached token never clobbers unrelated
+    /// commented-out or defaulted fields with explicit nulls.
+    ///
+    /// # Errors
+    /// [`ConfigError::Parse`] if serialization fails (should not happen for a
+    /// well-formed in-memory config).
+    pub fn to_yaml(&self) -> Result<String, ConfigError> {
+        serde_yaml::to_string(self).map_err(|e| ConfigError::Parse {
+            path: PathBuf::from("<in-memory>"),
+            message: e.to_string(),
+        })
+    }
+
+    /// Write this config to `path` as a `config.yaml` (the cached-token
+    /// write-back path). Creates parent directories as needed.
+    ///
+    /// # Errors
+    /// [`ConfigError::Io`] on a create-dir/write fault; [`ConfigError::Parse`]
+    /// on a serialization fault.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
+                    path: parent.to_path_buf(),
+                    message: e.to_string(),
+                })?;
+            }
+        }
+        let text = self.to_yaml()?;
+        std::fs::write(path, text).map_err(|e| ConfigError::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })
+    }
+
     /// Parse a `config.yaml` document. An empty or comments-only document is a
     /// valid *empty* config (not an error), so a placeholder file never breaks
     /// loading.

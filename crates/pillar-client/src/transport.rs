@@ -140,7 +140,13 @@ pub fn seal_resource_op(
         .map_err(StreamOpMessageError::Crypto)?;
     let signature = sign(secret, &PillarMessage::signing_material(&body_sealed))
         .map_err(StreamOpMessageError::Crypto)?;
-    Ok(PillarMessage::new(signer, signature, visibility, cell, body_sealed))
+    Ok(PillarMessage::new(
+        signer,
+        signature,
+        visibility,
+        cell,
+        body_sealed,
+    ))
 }
 
 /// Verify and open a `StreamOp`-bearing [`PillarMessage`], returning the
@@ -384,12 +390,15 @@ mod tests {
         let cell = CellId::from_bytes(b"cell-a".to_vec());
         let op = test_op();
 
-        let msg = seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell)
-            .expect("seal");
+        let msg =
+            seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell).expect("seal");
 
         // Never a silent unsealed/unsigned message: the body ciphertext must
         // not equal the plaintext-encoded op, and the signature must verify.
-        assert_ne!(msg.body_sealed.as_bytes(), op.encode().expect("encode").as_slice());
+        assert_ne!(
+            msg.body_sealed.as_bytes(),
+            op.encode().expect("encode").as_slice()
+        );
         msg.verify_signature().expect("signature verifies");
 
         let opened = open_resource_op(&msg, &group).expect("open");
@@ -406,8 +415,8 @@ mod tests {
         let cell = CellId::from_bytes(b"cell-a".to_vec());
         let op = test_op();
 
-        let msg = seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell)
-            .expect("seal");
+        let msg =
+            seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell).expect("seal");
 
         assert!(open_resource_op(&msg, &wrong_group).is_err());
     }
@@ -421,8 +430,8 @@ mod tests {
             signing_keypair_from_seed(&Seed::from_bytes(b"alice".to_vec())).expect("keypair");
         let cell = CellId::from_bytes(b"cell-a".to_vec());
         let op = test_op();
-        let msg = seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell)
-            .expect("seal");
+        let msg =
+            seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell).expect("seal");
 
         // A dead UDP tier: bind and immediately drop so the port is free
         // again (nothing listens -> the connect+send succeeds but recv times
@@ -493,8 +502,8 @@ mod tests {
             signing_keypair_from_seed(&Seed::from_bytes(b"alice".to_vec())).expect("keypair");
         let cell = CellId::from_bytes(b"cell-a".to_vec());
         let op = test_op();
-        let msg = seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell)
-            .expect("seal");
+        let msg =
+            seal_resource_op(&op, &group, cell, signer, &secret, Visibility::Cell).expect("seal");
 
         let dead_udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
         let dead_udp_addr = dead_udp.local_addr().expect("addr");

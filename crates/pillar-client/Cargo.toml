@@ -13,6 +13,9 @@ serde_yaml = "0.9"
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-wire = { path = "../pillar-wire" }
 pillar-ops = { path = "../pillar-ops" }
+pillar-core = { path = "../pillar-core" }
+pillar-identity = { path = "../pillar-identity" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
 tokio = { version = "1", features = ["rt", "time"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

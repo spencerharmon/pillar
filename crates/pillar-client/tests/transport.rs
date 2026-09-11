@@ -229,5 +229,8 @@ fn every_tier_unreachable_is_a_hard_failure_never_a_fabricated_answer() {
     ];
 
     let result = send_with_fallback(&tiers, &msg);
-    assert!(result.is_err(), "every tier unreachable must be a hard failure");
+    assert!(
+        result.is_err(),
+        "every tier unreachable must be a hard failure"
+    );
 }
