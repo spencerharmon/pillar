@@ -19,12 +19,15 @@ description = "Content-addressed op-log CRDT + materialized view + snapshot/comp
 # `pillar-web-frontend` -> `pillar-observability`) out of the `pillar-ipfs`/
 # `libp2p` closure entirely.
 default = ["ipfs"]
-ipfs = ["dep:pillar-ipfs"]
+ipfs = ["pillar-wire/ipfs"]
 
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
-pillar-ipfs = { path = "../pillar-ipfs", optional = true }
+# SignedSegment/Cid/HeadRecord/Visibility/ContentStore/IpfsBackend moved down
+# to pillar-wire (the shared wire/persistence substrate); streamdb re-exports
+# them from there so every existing call site keeps working unchanged.
+pillar-wire = { path = "../pillar-wire", default-features = false }
 sha2 = "0.10"
 tracing = "0.1"
 

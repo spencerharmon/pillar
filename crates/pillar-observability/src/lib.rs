@@ -3,10 +3,13 @@
 //!
 //! An observability signal (a metric point, log line, trace span, profiling
 //! sample, or metadata sample) is just another append-only, content-addressed
-//! event on the existing streaming DB op-log (`pillar_streamdb`). This crate
-//! adds — on top of, never forking, that op-log — the three safety properties
-//! `Observability.tla` proves, plus the operational surface the ROI P3
-//! addendum (2026-08-26) asks for:
+//! event persisted as a [`pillar_wire::Body::Signal`] body to the SAME
+//! pillar-wire [`pillar_wire::ContentStore`] substrate streamdb uses — there is
+//! no parallel observability store (method #1 step (e),
+//! `obs-signal-pillarmsg-ipfs`). This crate depends on `pillar-wire` ONLY,
+//! never on streamdb or net. On top of — never forking — that substrate it
+//! adds the three safety properties `Observability.tla` proves, plus the
+//! operational surface the ROI P3 addendum (2026-08-26) asks for:
 //!
 //! 1. **Retention/compaction is bounded and lossless** ([`TimeseriesStore`]).
 //!    Signals are grouped into *configurable-size immutable timeseries blocks*
@@ -44,6 +47,7 @@ pub mod alerting;
 pub use alerting::{Alert, AlertEngine, AlertError, AlertPredicate, Notification, Notifier, RecordingNotifier};
 pub mod block;
 pub mod correlation;
+pub mod hop_metric;
 pub mod ingest;
 pub mod instrument;
 pub mod live;
@@ -52,6 +56,7 @@ pub mod metadata;
 pub mod metadata_index;
 pub mod metadata_ingest;
 pub mod otlp;
+pub mod pillarmsg;
 pub mod profiling;
 pub mod psl;
 pub mod query;

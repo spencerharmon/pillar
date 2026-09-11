@@ -29,12 +29,14 @@ use pillar_core::{SideEffect, ViewPolicy};
 #[cfg(feature = "ipfs")]
 use std::path::PathBuf;
 
+use pillar_crypto::cell::CellGroupKey;
 use pillar_crypto::seal::{seal_to_recipients, unseal};
 use pillar_crypto::{
-    CryptoError, SealedEnvelope, SealingPublicKey, SealingSecretKey, SigningPublicKey,
+    CellId, CryptoError, SealedEnvelope, SealingPublicKey, SealingSecretKey, SigningPublicKey,
     SigningSecretKey,
 };
 
+use crate::pillarmsg::{decode_stream_op_segment_payload, encode_stream_op_segment_payload};
 use crate::store::{Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, Visibility};
 use crate::{PolicyViolation, StoreError, Stream};
 
@@ -55,6 +57,10 @@ pub enum IpfsPersistError {
     /// segment-signing secret was never sealed to this node, or is not yet
     /// unsealed) and cannot author new segments.
     ReadOnly,
+    /// A `PillarMessage::StreamOp` envelope (method #1 step (d)) failed to
+    /// seal, open, or decode — including a non-member (wrong cell group key)
+    /// attempting to open a cell-sealed op.
+    StreamOpMessage(crate::pillarmsg::StreamOpMessageError),
 }
 
 impl From<StoreError> for IpfsPersistError {
@@ -77,6 +83,7 @@ impl std::fmt::Display for IpfsPersistError {
                     "no segment-signing secret held — cannot author new segments"
                 )
             }
+            IpfsPersistError::StreamOpMessage(e) => write!(f, "stream-op pillar-message error: {e}"),
         }
     }
 }
@@ -137,18 +144,31 @@ pub struct IpfsPersistentStream {
     seq: u64,
     head: Option<Cid>,
     ttl_secs: u64,
+    /// The cell this stream's ops are sealed to (method #1 step (d)) —
+    /// [`PillarMessage::cell`](pillar_wire::PillarMessage) on every
+    /// `StreamOp` envelope this handle authors/opens.
+    cell: CellId,
+    /// The cell group key ops are sealed under/opened with. `None` on a
+    /// rehydrated-without-cell-key handle (mirrors `secret: None` — held
+    /// read-only until a caller supplies it), in which case a `v2` segment
+    /// cannot be opened (only a legacy `v1` bare payload can still be read).
+    group: Option<CellGroupKey>,
 }
 
 impl IpfsPersistentStream {
     /// Start a brand-new (empty) IPFS-persisted stream, authored + signed by
-    /// `owner`/`secret`, whose segments/head carry `visibility`.
+    /// `owner`/`secret`, whose segments/head carry `visibility`, and whose
+    /// ops are sealed as `PillarMessage::StreamOp` bodies to `cell` under
+    /// `group` (method #1 step (d)).
     #[must_use]
     pub fn genesis(
         owner: SigningPublicKey,
         secret: SigningSecretKey,
         visibility: Visibility,
+        cell: CellId,
+        group: CellGroupKey,
     ) -> Self {
-        Self::genesis_with_policy(owner, secret, visibility, None)
+        Self::genesis_with_policy(owner, secret, visibility, cell, group, None)
     }
 
     /// As [`Self::genesis`] with an explicit declared local admission policy.
@@ -157,6 +177,8 @@ impl IpfsPersistentStream {
         owner: SigningPublicKey,
         secret: SigningSecretKey,
         visibility: Visibility,
+        cell: CellId,
+        group: CellGroupKey,
         policy: Option<ViewPolicy>,
     ) -> Self {
         let stream = match policy {
@@ -172,12 +194,14 @@ impl IpfsPersistentStream {
             seq: 0,
             head: None,
             ttl_secs: 3600,
+            cell,
+            group: Some(group),
         }
     }
 
     /// Open a DURABLE IPFS-persisted stream whose content-object store is
     /// rooted on local disk at `root` (the node's PVC-backed pin store),
-    /// authored by `owner`/`secret`.
+    /// authored by `owner`/`secret`, sealing ops to `cell`/`group`.
     ///
     /// This is the constructor the node entrypoint uses. It is the real fix for
     /// solo-node restart-survival: unlike [`Self::genesis`] (an in-memory
@@ -207,8 +231,10 @@ impl IpfsPersistentStream {
         owner: SigningPublicKey,
         secret: SigningSecretKey,
         visibility: Visibility,
+        cell: CellId,
+        group: CellGroupKey,
     ) -> Result<Self, IpfsPersistError> {
-        Self::open_with_store(ContentStore::open(root)?, owner, secret, visibility)
+        Self::open_with_store(ContentStore::open(root)?, owner, secret, visibility, cell, group)
     }
 
     /// Like [`Self::open`] but over an already-constructed durable
@@ -223,12 +249,16 @@ impl IpfsPersistentStream {
     /// # Errors
     ///
     /// [`IpfsPersistError::Store`] if a chain segment cannot be resolved;
-    /// [`IpfsPersistError::Corrupt`] if a pinned segment is malformed.
+    /// [`IpfsPersistError::Corrupt`] if a pinned segment is malformed;
+    /// [`IpfsPersistError::StreamOpMessage`] if a `v2` `StreamOp` segment
+    /// cannot be opened under `group` (a corrupt/foreign-cell segment).
     pub fn open_with_store(
         store: ContentStore,
         owner: SigningPublicKey,
         secret: SigningSecretKey,
         visibility: Visibility,
+        cell: CellId,
+        group: CellGroupKey,
     ) -> Result<Self, IpfsPersistError> {
         match store.resolve_head(&owner).cloned() {
             Some(head) => {
@@ -242,8 +272,10 @@ impl IpfsPersistentStream {
                     let seg = store
                         .get_local(&cid)
                         .ok_or(IpfsPersistError::Store(StoreError::NotFound))?;
-                    let (prev, payload) =
+                    let (prev, segment_payload) =
                         decode_segment(seg.bytes()).ok_or(IpfsPersistError::Corrupt)?;
+                    let payload = decode_stream_op_segment_payload(&segment_payload, &group)
+                        .map_err(IpfsPersistError::StreamOpMessage)?;
                     payloads_newest_first.push(payload);
                     cursor = prev;
                 }
@@ -259,6 +291,8 @@ impl IpfsPersistentStream {
                     seq: head.seq(),
                     head: Some(head.target().clone()),
                     ttl_secs: head.ttl_secs(),
+                    cell,
+                    group: Some(group),
                 })
             }
             None => Ok(IpfsPersistentStream {
@@ -270,6 +304,8 @@ impl IpfsPersistentStream {
                 seq: 0,
                 head: None,
                 ttl_secs: 3600,
+                cell,
+                group: Some(group),
             }),
         }
     }
@@ -300,16 +336,22 @@ impl IpfsPersistentStream {
         &self.stream
     }
 
-    /// Append `payload` as a fresh op: build + sign the new segment (linking
-    /// to the previous head), store + pin it (advertise to the DHT only if
+    /// Append `payload` as a fresh op: seal it as a `PillarMessage::StreamOp`
+    /// body (method #1 step (d) — [`encode_stream_op_segment_payload`]), build
+    /// + sign the new segment carrying that sealed envelope (linking to the
+    /// previous head), store + pin it (advertise to the DHT only if
     /// `visibility` is public), publish the advanced [`HeadRecord`], and only
-    /// then record the op in the in-memory view — durable-first, matching the
-    /// discipline of the demoted local-fs cache.
+    /// then record the PLAINTEXT op in the in-memory view — durable-first,
+    /// matching the discipline of the demoted local-fs cache. The op-log
+    /// identity/Merkle root are unaffected: they still fold over the
+    /// plaintext `payload`, never the sealed wire bytes.
     ///
     /// # Errors
     ///
     /// [`IpfsPersistError::Policy`] if the view policy refuses `effect`;
-    /// [`IpfsPersistError::ReadOnly`] if this handle holds no signing secret;
+    /// [`IpfsPersistError::ReadOnly`] if this handle holds no signing secret
+    /// or no cell group key to seal under;
+    /// [`IpfsPersistError::StreamOpMessage`] if sealing the envelope fails;
     /// [`IpfsPersistError::Store`] / [`IpfsPersistError::Crypto`] on a
     /// store/crypto fault.
     pub fn append(
@@ -318,6 +360,7 @@ impl IpfsPersistentStream {
         effect: SideEffect,
     ) -> Result<crate::OpId, IpfsPersistError> {
         let secret = self.secret.as_ref().ok_or(IpfsPersistError::ReadOnly)?;
+        let group = self.group.as_ref().ok_or(IpfsPersistError::ReadOnly)?;
         let policy = self.stream.policy();
         if !policy.admits(effect) {
             return Err(IpfsPersistError::Policy(PolicyViolation::new(
@@ -326,7 +369,16 @@ impl IpfsPersistentStream {
         }
         let payload = payload.into();
 
-        let segment_bytes = encode_segment(self.head.as_ref(), &payload);
+        let sealed_payload = encode_stream_op_segment_payload(
+            &payload,
+            group,
+            self.cell.clone(),
+            self.owner.clone(),
+            secret,
+            self.visibility,
+        )
+        .map_err(IpfsPersistError::StreamOpMessage)?;
+        let segment_bytes = encode_segment(self.head.as_ref(), &sealed_payload);
         let segment =
             SignedSegment::author(segment_bytes, self.owner.clone(), secret, self.visibility)
                 .map_err(IpfsPersistError::Crypto)?;
@@ -397,16 +449,28 @@ impl IpfsPersistentStream {
     /// unless [`Self::unseal_signing_key`] is subsequently used to recover
     /// write capability from a sealed segment.
     ///
+    /// `group`, if supplied, opens each segment's `v2` `PillarMessage::StreamOp`
+    /// envelope to recover the plaintext op for the materialized view (method
+    /// #1 step (d)); `None` falls back to treating every segment payload as
+    /// the legacy `v1` bare op bytes (read-compat only — a `v2` segment would
+    /// then materialize its still-sealed envelope bytes as the "op", which is
+    /// wrong for any cell this node cannot yet open — so a caller rehydrating
+    /// a post-migration stream MUST supply `group` once known).
+    ///
     /// # Errors
     ///
     /// [`IpfsPersistError::WrongOwner`] if `head` is not signed by `owner`;
     /// [`IpfsPersistError::Corrupt`] on a malformed segment link;
     /// [`IpfsPersistError::Store`] if the chain cannot be fully backfilled or
-    /// a segment fails verification.
+    /// a segment fails verification;
+    /// [`IpfsPersistError::StreamOpMessage`] if a `v2` segment cannot be
+    /// opened under a supplied `group`.
     pub fn rehydrate(
         owner: SigningPublicKey,
         head: &HeadRecord,
         source: &impl SegmentSource,
+        cell: CellId,
+        group: Option<CellGroupKey>,
     ) -> Result<Self, IpfsPersistError> {
         head.verify().map_err(IpfsPersistError::Store)?;
         if head.owner().as_bytes() != owner.as_bytes() {
@@ -419,7 +483,13 @@ impl IpfsPersistentStream {
         let mut cursor = Some(head.target().clone());
         while let Some(cid) = cursor {
             let seg = store.get(&cid, source)?;
-            let (prev, payload) = decode_segment(seg.bytes()).ok_or(IpfsPersistError::Corrupt)?;
+            let (prev, segment_payload) =
+                decode_segment(seg.bytes()).ok_or(IpfsPersistError::Corrupt)?;
+            let payload = match &group {
+                Some(g) => decode_stream_op_segment_payload(&segment_payload, g)
+                    .map_err(IpfsPersistError::StreamOpMessage)?,
+                None => segment_payload,
+            };
             payloads_newest_first.push(payload);
             store.pin(&cid)?;
             cursor = prev;
@@ -440,6 +510,8 @@ impl IpfsPersistentStream {
             seq: head.seq(),
             head: Some(head.target().clone()),
             ttl_secs: head.ttl_secs(),
+            cell,
+            group,
         })
     }
 

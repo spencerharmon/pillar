@@ -174,6 +174,10 @@ use pillar_wot_authority::{FencedActor, WotAuthority};
 
 use crate::observability_ui::ObservabilityBuilders;
 use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
+use crate::resourceset::{
+    build_graph, collect_resourcesets, defaults_advisory_for_view, member_origin, member_statuses,
+    owned_live, plan_reconcile, roll_up_health, MemberHealth, MemberRef, DEFAULT_RESOURCE_SET,
+};
 use crate::Platform;
 use pillar_manifest::{
     Crd, FieldType, Metadata as CrdMetadata, Schema, SchemaRegistry, Value as CrdValue,
@@ -432,6 +436,20 @@ pub struct WebAuthContext {
     /// back into a fresh context on boot: suppresses [`WebAuthContext::record`]
     /// so replaying an op never re-appends it to the durable log.
     replaying: bool,
+    /// The next monotonic sequence number [`WebAuthContext::record`] stamps
+    /// onto a journaled op. The durable backend is CONTENT-addressed (its
+    /// `order()` is sorted by content address, NOT append order — see
+    /// `pillar_streamdb::persist`), so a replay that depended on that order
+    /// would apply ops in an effectively random sequence. Several
+    /// [`PortalOp`] variants (notably every resource/topology/trust act,
+    /// which requires the acting subject to already be admitted by an
+    /// earlier `BootstrapCellAndUser`/`AddMember`) are NOT order-independent,
+    /// so [`WebAuthContext::replay`] sorts by this stamped sequence to
+    /// reconstruct the ORIGINAL causal append order before applying anything.
+    /// Restarts continuing to append: seeded past the highest sequence seen
+    /// during replay, so a later session's new ops always sort after every
+    /// earlier session's.
+    next_op_seq: u64,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -540,6 +558,86 @@ enum PortalOp {
     /// or revives (RevokedKeyNeverAdmits / RevokedStaysDead).
     WebauthnRevoke {
         credential_id: Vec<u8>,
+    },
+    /// Resource-plane `apply` (declarative workload upsert) — the durable
+    /// counterpart of [`WebAuthContext::resource_apply`], so a restarted node
+    /// rehydrates every workload manifest the portal ever applied, not just
+    /// the login path.
+    ResourceApply {
+        actor: String,
+        name: String,
+        image: String,
+        replicas: i64,
+    },
+    /// Resource-plane `edit` (patch a workload's image) — durable counterpart
+    /// of [`WebAuthContext::resource_edit`].
+    ResourceEdit {
+        actor: String,
+        name: String,
+        new_image: String,
+    },
+    /// Resource-plane `scale` — durable counterpart of
+    /// [`WebAuthContext::resource_scale`].
+    ResourceScale {
+        actor: String,
+        name: String,
+        replicas: i64,
+    },
+    /// Resource-plane `rollout restart` — durable counterpart of
+    /// [`WebAuthContext::resource_rollout`].
+    ResourceRollout { actor: String, name: String },
+    /// Resource-plane `apply` for a scheduled (`CronJob`/`Job`) manifest —
+    /// durable counterpart of [`WebAuthContext::resource_apply_cronjob`] /
+    /// [`WebAuthContext::resource_apply_job`].
+    ResourceApplyScheduled {
+        actor: String,
+        kind: String,
+        name: String,
+        schedule_secs: f64,
+        command: String,
+    },
+    /// Resource-plane `delete` for a scheduled (`CronJob`/`Job`) manifest —
+    /// durable counterpart of [`WebAuthContext::resource_delete_cronjob`].
+    ResourceDeleteScheduled {
+        actor: String,
+        kind: String,
+        name: String,
+    },
+    /// The topology explorer's live node health/capacity registration —
+    /// durable counterpart of [`WebAuthContext::topology_register_node`].
+    TopologyRegisterNode {
+        node: String,
+        health: String,
+        capacity: u64,
+    },
+    /// A self-declared topology label set for a node — durable counterpart of
+    /// [`WebAuthContext::topology_declare`].
+    TopologyDeclare {
+        node: String,
+        labels: Vec<(String, String)>,
+    },
+    /// A signed trust attestation issued through the attestation builder —
+    /// durable counterpart of [`WebAuthContext::build_attestation`].
+    /// `capacity` is `("self", "")` for [`TrustCapacity::SelfCap`] or
+    /// `("role", "<role>@<scope>")` for [`TrustCapacity::Role`].
+    BuildAttestation {
+        issuer: String,
+        capacity_tag: String,
+        capacity_role: String,
+        capacity_scope: String,
+        authority: Option<String>,
+        subject: String,
+        action: String,
+        resource: String,
+        quota: Option<u64>,
+        scope: String,
+    },
+    /// A saved observability dashboard — durable counterpart of
+    /// [`WebAuthContext::save_observability_dashboard`].
+    SaveObservabilityDashboard {
+        signer: String,
+        name: String,
+        spec: String,
     },
 }
 
@@ -758,6 +856,7 @@ impl WebAuthContext {
             scheduler_runtime: None,
             journal: None,
             replaying: false,
+            next_op_seq: 0,
         }
     }
 
@@ -814,6 +913,9 @@ impl WebAuthContext {
             return;
         };
         let mut payload = PORTAL_OP_TAG.to_vec();
+        let seq = self.next_op_seq;
+        self.next_op_seq += 1;
+        payload.extend_from_slice(&seq.to_be_bytes());
         match serde_json::to_vec(op) {
             Ok(json) => payload.extend_from_slice(&json),
             Err(e) => {
@@ -835,16 +937,52 @@ impl WebAuthContext {
 
     /// Fold a persisted portal-op log back into this (freshly constructed)
     /// context on boot — the inverse of [`Self::record`]. `ops` is the durable
-    /// op-payload set in apply order (`stream.stream().log().order()` bytes);
-    /// non-portal ops (no [`PORTAL_OP_TAG`]) and any that fail to decode are
-    /// skipped, so a shared multi-node streaming DB carrying gossiped event-log
-    /// messages replays cleanly. Every applied op re-runs the SAME deterministic
-    /// mutator the live act used, with recording suppressed. Call BEFORE serving.
+    /// op-payload set (`stream.stream().log().order()` bytes) in whatever
+    /// order the CONTENT-addressed backend returns them — NOT necessarily
+    /// original append order (see [`Self::next_op_seq`]); non-portal ops (no
+    /// [`PORTAL_OP_TAG`]) and any that fail to decode are skipped, so a shared
+    /// multi-node streaming DB carrying gossiped event-log messages replays
+    /// cleanly. Every decoded op is sorted by its stamped sequence number and
+    /// THEN applied in that (original, causal) order, each re-running the SAME
+    /// deterministic mutator the live act used, with recording suppressed.
+    /// Call BEFORE serving.
     pub fn replay(&mut self, ops: &[Vec<u8>]) {
         self.replaying = true;
-        let mut applied = 0usize;
+        // Two on-disk journal layouts coexist, and BOTH must replay:
+        //   v1 (pre-sequence-stamp): PORTAL_OP_TAG ++ serde_json(op)
+        //   v2 (current):            PORTAL_OP_TAG ++ seq:[u8;8] ++ serde_json(op)
+        // A serialized `PortalOp` is always a JSON object, so the first byte
+        // after the tag is `{` (0x7b) for v1; a v2 sequence stamp is a
+        // big-endian u64 whose leading byte is its high byte (0x00 for every
+        // sequence a node will ever reach), never 0x7b. That single byte
+        // disambiguates the layouts with no version flag, so a journal written
+        // before the stamp existed still rehydrates instead of being silently
+        // dropped (which stranded a node's whole bootstrap on upgrade). The
+        // sort key is (layout_rank, seq): every v1 op (which predates the
+        // stamp, hence is causally earlier) sorts ahead of every v2 op, and
+        // within a layout the ops sort by their own sequence — v1 by the
+        // synthetic encounter order the content-addressed log yields (already
+        // causal), v2 by its recorded stamp.
+        let mut decoded: Vec<((u8, u64), PortalOp)> = Vec::new();
+        let mut v1_seq: u64 = 0;
+        let mut max_v2_seq: Option<u64> = None;
         for raw in ops {
-            let Some(json) = raw.strip_prefix(PORTAL_OP_TAG) else {
+            let Some(rest) = raw.strip_prefix(PORTAL_OP_TAG) else {
+                continue;
+            };
+            let (rank, seq, json): (u8, u64, &[u8]) = if rest.first() == Some(&b'{') {
+                let s = v1_seq;
+                v1_seq += 1;
+                (0, s, rest)
+            } else if rest.len() >= 8 {
+                let (seq_bytes, json) = rest.split_at(8);
+                let s = u64::from_be_bytes(seq_bytes.try_into().expect("exactly 8 bytes"));
+                max_v2_seq = Some(max_v2_seq.map_or(s, |m| m.max(s)));
+                (1, s, json)
+            } else {
+                tracing::warn!(
+                    "portal journal: skipping op payload too short for a sequence stamp"
+                );
                 continue;
             };
             let op: PortalOp = match serde_json::from_slice(json) {
@@ -854,10 +992,19 @@ impl WebAuthContext {
                     continue;
                 }
             };
+            decoded.push(((rank, seq), op));
+        }
+        decoded.sort_by_key(|(key, _)| *key);
+        let applied = decoded.len();
+        for (_, op) in decoded {
             self.apply_replayed(op);
-            applied += 1;
         }
         self.replaying = false;
+        // New ops must stamp a sequence strictly above any v2 op already on
+        // disk; v1 ops carry no stamp and never constrain it.
+        if let Some(max_v2_seq) = max_v2_seq {
+            self.next_op_seq = max_v2_seq + 1;
+        }
         if applied > 0 {
             tracing::info!(
                 applied,
@@ -967,6 +1114,97 @@ impl WebAuthContext {
             }
             PortalOp::WebauthnRevoke { credential_id } => {
                 self.webauthn_rp.revoke(&credential_id);
+            }
+            PortalOp::ResourceApply {
+                actor,
+                name,
+                image,
+                replicas,
+            } => {
+                let _ = self.resource_apply(&NodeId::from(actor.as_str()), &name, &image, replicas);
+            }
+            PortalOp::ResourceEdit {
+                actor,
+                name,
+                new_image,
+            } => {
+                let _ = self.resource_edit(&NodeId::from(actor.as_str()), &name, &new_image);
+            }
+            PortalOp::ResourceScale {
+                actor,
+                name,
+                replicas,
+            } => {
+                let _ = self.resource_scale(&NodeId::from(actor.as_str()), &name, replicas);
+            }
+            PortalOp::ResourceRollout { actor, name } => {
+                let _ = self.resource_rollout(&NodeId::from(actor.as_str()), &name);
+            }
+            PortalOp::ResourceApplyScheduled {
+                actor,
+                kind,
+                name,
+                schedule_secs,
+                command,
+            } => {
+                let _ = self.resource_apply_scheduled(
+                    &NodeId::from(actor.as_str()),
+                    &kind,
+                    &name,
+                    schedule_secs,
+                    &command,
+                );
+            }
+            PortalOp::ResourceDeleteScheduled { actor, kind, name } => {
+                let _ = self.resource_delete_cronjob(&NodeId::from(actor.as_str()), &kind, &name);
+            }
+            PortalOp::TopologyRegisterNode {
+                node,
+                health,
+                capacity,
+            } => {
+                self.topology_register_node(&node, &health, capacity);
+            }
+            PortalOp::TopologyDeclare { node, labels } => {
+                let labels = labels
+                    .into_iter()
+                    .map(|(tier, value)| TopologyLabel::new(tier, value))
+                    .collect();
+                self.topology_declare(NodeId::from(node.as_str()), labels);
+            }
+            PortalOp::BuildAttestation {
+                issuer,
+                capacity_tag,
+                capacity_role,
+                capacity_scope,
+                authority,
+                subject,
+                action,
+                resource,
+                quota,
+                scope,
+            } => {
+                let capacity = if capacity_tag == "role" {
+                    TrustCapacity::Role {
+                        role: capacity_role,
+                        scope: capacity_scope,
+                    }
+                } else {
+                    TrustCapacity::SelfCap
+                };
+                let _ = self.build_attestation(
+                    NodeId::from(issuer.as_str()),
+                    capacity,
+                    authority.map(|a| TrustCid(a)),
+                    NodeId::from(subject.as_str()),
+                    &action,
+                    &resource,
+                    quota,
+                    &scope,
+                );
+            }
+            PortalOp::SaveObservabilityDashboard { signer, name, spec } => {
+                let _ = self.save_observability_dashboard(&signer, &name, &spec);
             }
         }
     }
@@ -1130,6 +1368,13 @@ impl WebAuthContext {
         // logs and skips scheduling rather than failing the already-recorded
         // signed manifest act — the manifest log is the source of truth).
         self.register_scheduler_job(name, schedule_secs, command);
+        self.record(&PortalOp::ResourceApplyScheduled {
+            actor: actor.to_string(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+            schedule_secs,
+            command: command.to_owned(),
+        });
         Ok(applied)
     }
 
@@ -1159,6 +1404,11 @@ impl WebAuthContext {
                 runtime.deregister(name);
             }
         }
+        self.record(&PortalOp::ResourceDeleteScheduled {
+            actor: actor.to_string(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        });
         Ok(applied)
     }
 
@@ -1297,7 +1547,7 @@ impl WebAuthContext {
         for r in self.observability.explore(kind) {
             body.push_str(&format!(
                 "SIGNAL {} KIND {} PAYLOAD {}\n",
-                r.id.0,
+                r.id,
                 signal_kind_tag(kind),
                 r.payload
             ));
@@ -1341,7 +1591,7 @@ impl WebAuthContext {
                 for r in records {
                     body.push_str(&format!(
                         "SIGNAL {} KIND {} PAYLOAD {}\n",
-                        r.id.0,
+                        r.id,
                         signal_kind_tag(kind),
                         r.payload
                     ));
@@ -1369,7 +1619,7 @@ impl WebAuthContext {
         for r in sub.explore(kind) {
             body.push_str(&format!(
                 "SIGNAL {} KIND {} PAYLOAD {}\n",
-                r.id.0,
+                r.id,
                 signal_kind_tag(r.kind),
                 r.payload
             ));
@@ -1427,7 +1677,7 @@ impl WebAuthContext {
                 .join(";");
             body.push_str(&format!(
                 "SIGNAL {} KIND {} TICK {} TS {} LABELS {} PAYLOAD {}\n",
-                r.id.0,
+                r.id,
                 signal_kind_tag(r.kind),
                 r.tick,
                 r.unix_millis.map(|m| m.to_string()).unwrap_or_default(),
@@ -1441,9 +1691,49 @@ impl WebAuthContext {
                 .map(|m| m.to_hex())
                 .collect::<Vec<_>>()
                 .join(",");
-            body.push_str(&format!("GROUP {} MEMBERS {}\n", anchor.0, ids));
+            body.push_str(&format!("GROUP {} MEMBERS {}\n", anchor, ids));
         }
         Some(Ok(body))
+    }
+
+    /// The ONE `psl-message-api` `PillarMessage` contract (`psl-message-api`,
+    /// 2026-09-09 ROI HEAD): runs `query_text` against the SAME live query
+    /// engine [`Self::live_obs_psl`] rides (`pillar_observability::parse_psl`
+    /// + `psl_query`/`psl_correlate`), but returns the typed
+    /// [`pillar_wire::PslQueryResponse`] every transport tier (pillar-UDP,
+    /// QUIC, HTTPS) serves verbatim as canonical CBOR — never the ad hoc text
+    /// line-protocol `live_obs_psl` renders. `None` when no live substrate is
+    /// attached (the caller maps this to a transport-appropriate "service
+    /// unavailable").
+    pub fn live_obs_psl_message(&self, query_text: &str) -> Option<pillar_wire::PslQueryResponse> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let query = match pillar_observability::parse_psl(query_text) {
+            Ok(q) => q,
+            Err(e) => return Some(pillar_wire::PslQueryResponse::Error(format!("PSL-PARSE {}", e.0))),
+        };
+        let now = sub.latest_tick();
+        let rows: Vec<pillar_wire::PslSignalRow> = sub
+            .psl_query(&query, now)
+            .into_iter()
+            .map(|r| pillar_wire::PslSignalRow {
+                id: r.id.to_hex(),
+                kind: signal_kind_tag(r.kind).to_owned(),
+                tick: r.tick,
+                unix_millis: r.unix_millis,
+                labels: r.labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                payload: r.payload.clone(),
+            })
+            .collect();
+        let groups: Vec<pillar_wire::PslCorrelateGroup> = sub
+            .psl_correlate(&query, now)
+            .into_iter()
+            .map(|(anchor, members)| pillar_wire::PslCorrelateGroup {
+                anchor: anchor.to_hex(),
+                members: members.iter().map(|m| m.to_hex()).collect(),
+            })
+            .collect();
+        Some(pillar_wire::PslQueryResponse::Ok(pillar_wire::PslQueryResult { rows, groups }))
     }
 
     /// The metric-name typeahead for the Explore `select:` builders, one name
@@ -1473,6 +1763,110 @@ impl WebAuthContext {
         let live = self.live_obs.as_ref()?;
         let sub = live.lock().expect("live observability lock");
         Some(sub.metadata_index().label_values(key).join("\n"))
+    }
+
+    /// The per-series retention policy set currently installed on the live
+    /// store, one policy per line as `<SignalKind>|<k=v,k=v>|<window>|
+    /// <downsample>` (empty selector = match all; empty window/downsample =
+    /// unset). `None` when no live substrate is attached. This is the read
+    /// side of the console's retention panel and the machine round-trip form
+    /// accepted by [`Self::live_obs_set_retention`].
+    pub fn live_obs_get_retention(&self) -> Option<String> {
+        let live = self.live_obs.as_ref()?;
+        let sub = live.lock().expect("live observability lock");
+        let mut lines = Vec::new();
+        for p in sub.retention_policies().policies() {
+            let sel = p
+                .selector
+                .match_labels()
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let window = p.window.map(|w| w.to_string()).unwrap_or_default();
+            let downsample = p.downsample.map(|d| d.to_string()).unwrap_or_default();
+            lines.push(format!(
+                "{}|{}|{}|{}",
+                signal_kind_manifest_name(p.kind),
+                sel,
+                window,
+                downsample
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// Install a per-series retention policy set onto the live store,
+    /// declaratively REPLACING the current set. `body` is zero or more lines,
+    /// each `<SignalKind>|<k=v,k=v>|<window>|<downsample>` (the exact form
+    /// [`Self::live_obs_get_retention`] emits); a blank line is ignored. Per
+    /// the store + `specs/RetentionPolicy.tla` contract this affects only
+    /// FUTURE writes. Returns `RETENTION INSTALLED <n>` on success. `None`
+    /// when no live substrate is attached; `Err` on a malformed line.
+    pub fn live_obs_set_retention(&self, body: &str) -> Option<Result<String, String>> {
+        let live = self.live_obs.as_ref()?;
+        let mut set = pillar_observability::RetentionPolicySet::empty();
+        for raw in body.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('|').collect();
+            let [kind_tok, sel_tok, window_tok, downsample_tok] = parts.as_slice() else {
+                return Some(Err(format!(
+                    "RETENTION-SPEC expected <SignalKind>|<matchLabels>|<window>|<downsample>, got {line:?}"
+                )));
+            };
+            let Some(kind) = pillar_observability::retention::signal_kind_from_str(kind_tok.trim())
+            else {
+                return Some(Err(format!(
+                    "RETENTION unknown signalKind {:?}",
+                    kind_tok.trim()
+                )));
+            };
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for entry in sel_tok.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                let Some((k, v)) = entry.split_once('=') else {
+                    return Some(Err(format!(
+                        "RETENTION matchLabels entry {entry:?} is not k=v"
+                    )));
+                };
+                if k.trim().is_empty() {
+                    return Some(Err(format!(
+                        "RETENTION matchLabels entry {entry:?} has empty key"
+                    )));
+                }
+                pairs.push((k.trim().to_string(), v.trim().to_string()));
+            }
+            let window = match window_tok.trim() {
+                "" => None,
+                n => match n.parse::<u64>() {
+                    Ok(w) => Some(w),
+                    Err(_) => return Some(Err(format!("RETENTION window {n:?} is not a u64"))),
+                },
+            };
+            let downsample = match downsample_tok.trim() {
+                "" => None,
+                n => match n.parse::<u64>() {
+                    Ok(d) => Some(d),
+                    Err(_) => return Some(Err(format!("RETENTION downsample {n:?} is not a u64"))),
+                },
+            };
+            set.add(pillar_observability::RetentionPolicy {
+                kind,
+                selector: pillar_observability::LabelSelector::matching(pairs),
+                window,
+                downsample,
+            });
+        }
+        let count = set.policies().len();
+        let mut sub = live.lock().expect("live observability lock");
+        sub.set_retention_policies(set);
+        Some(Ok(format!("RETENTION INSTALLED {count}")))
     }
     /// (the black-box driver's "install this rule and fire it" action): parse
     /// `spec` as `<rule-id>|<kind>|<psl-query>|<emit-name>`, register it, then
@@ -1607,7 +2001,7 @@ impl WebAuthContext {
             for r in records {
                 body.push_str(&format!(
                     "SIGNAL {} KIND {} PAYLOAD {}\n",
-                    r.id.0,
+                    r.id,
                     signal_kind_tag(r.kind),
                     r.payload
                 ));
@@ -1627,7 +2021,26 @@ impl WebAuthContext {
         spec: &str,
     ) -> (OpId, pillar_streamdb::MerkleRoot) {
         let cid = self.observability.create_dashboard(signer, name, spec);
+        self.record(&PortalOp::SaveObservabilityDashboard {
+            signer: signer.to_owned(),
+            name: name.to_owned(),
+            spec: spec.to_owned(),
+        });
         (cid, self.observability.dashboard_tip())
+    }
+
+    /// Read back a saved observability dashboard by its content-addressed id
+    /// (the hex `OpId` [`Self::save_observability_dashboard`] returned) — the
+    /// dashboard builder's read half, so a client (and this task's restart
+    /// test) can confirm a saved dashboard is actually there, not just that
+    /// the save call returned 200.
+    #[must_use]
+    pub fn get_observability_dashboard(
+        &self,
+        dashboard_id_hex: &str,
+    ) -> Option<crate::observability_ui::DashboardView> {
+        let id = OpId::from_hex(dashboard_id_hex)?;
+        self.observability.get_dashboard(&id)
     }
 
     /// Read-only access to this session's global identity log — the
@@ -1830,6 +2243,14 @@ impl WebAuthContext {
         if let Some(q) = quota {
             predicate = predicate.with_quota(q);
         }
+        let (capacity_tag, capacity_role, capacity_scope) = match &capacity {
+            TrustCapacity::SelfCap => ("self".to_owned(), String::new(), String::new()),
+            TrustCapacity::Role { role, scope } => {
+                ("role".to_owned(), role.clone(), scope.clone())
+            }
+        };
+        let authority_for_record = authority.as_ref().map(|a| a.0.clone());
+        let subject_for_record = subject.to_string();
         let attest = Attest {
             issuer: issuer.clone(),
             capacity,
@@ -1849,6 +2270,18 @@ impl WebAuthContext {
             .map_err(|_| TrustError::CapacityNotHeld {
                 issuer: self.trust.genesis().clone(),
             })?;
+        self.record(&PortalOp::BuildAttestation {
+            issuer: issuer.to_string(),
+            capacity_tag,
+            capacity_role,
+            capacity_scope,
+            authority: authority_for_record,
+            subject: subject_for_record,
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+            quota,
+            scope: scope.to_owned(),
+        });
         Ok((cid, proof))
     }
 
@@ -1918,6 +2351,11 @@ impl WebAuthContext {
     pub fn topology_register_node(&mut self, node: &str, health: &str, capacity: u64) {
         self.topology_nodes
             .insert(node.to_owned(), (health.to_owned(), capacity));
+        self.record(&PortalOp::TopologyRegisterNode {
+            node: node.to_owned(),
+            health: health.to_owned(),
+            capacity,
+        });
     }
 
     /// Read-only access to the topology registry (hierarchy + resolved
@@ -1933,7 +2371,14 @@ impl WebAuthContext {
     /// basis for safety-critical placement (attested labels take
     /// precedence; see [`TopologyRegistry::placement`]).
     pub fn topology_declare(&mut self, node: NodeId, labels: Vec<TopologyLabel>) {
-        self.topology.declare(node, &labels);
+        self.topology.declare(node.clone(), &labels);
+        self.record(&PortalOp::TopologyDeclare {
+            node: node.to_string(),
+            labels: labels
+                .into_iter()
+                .map(|l| (l.tier, l.value))
+                .collect(),
+        });
     }
 
     /// Attest ONE topology label for `subject`, signed by `issuer` acting in
@@ -2217,6 +2662,147 @@ impl WebAuthContext {
             .describe(&self.resource_api, kind, name)
     }
 
+    /// Every ResourceSet the resource plane knows, one status line each:
+    /// `SET <name> HEALTH <h> SYNC <s> MEMBERS <n> ADOPT <n> PRUNE <n>`. The
+    /// well-known Default ResourceSet is synthesized when it is not explicitly
+    /// declared, and IMPLICITLY owns every RetentionPolicy resource ("default
+    /// RetentionPolicies belong to the Default ResourceSet"). Health/sync are
+    /// computed live from the folded resource view; signs nothing.
+    #[must_use]
+    pub fn resourcesets_list(&self) -> String {
+        let view = self.resource_platform.view();
+        let sets = collect_resourcesets(&view);
+        let advisory = defaults_advisory_for_view(&view, &self.default_tombstones());
+        let available = crate::defaults::available_count(&advisory);
+        let mut lines = Vec::new();
+        for spec in &sets {
+            let statuses = member_statuses(&view, spec);
+            let healths: Vec<MemberHealth> = statuses.iter().map(|s| s.health).collect();
+            let health = roll_up_health(&healths);
+            let owned = owned_live(&view, spec);
+            let plan = plan_reconcile(&spec.members, &owned);
+            // The defaults advisory is a property of the Default set only; other
+            // sets report 0 (their membership is not seeded from the bundle).
+            let defaults_avail = if spec.name == DEFAULT_RESOURCE_SET {
+                available
+            } else {
+                0
+            };
+            lines.push(format!(
+                "SET {} HEALTH {} SYNC {} MEMBERS {} ADOPT {} PRUNE {} DEFAULTS {}",
+                spec.name,
+                health.as_str(),
+                plan.sync_status().as_str(),
+                spec.members.len(),
+                plan.to_adopt.len(),
+                plan.to_prune.len(),
+                defaults_avail,
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// The operator-recorded default deletions (tombstones) for the Default set.
+    /// Durable deletion tracking is the follow-up slice; today no deletions are
+    /// journaled, so this is empty — the advisory is exact for every cell that
+    /// has not yet deleted a seeded default (which is every cell today).
+    fn default_tombstones(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
+    /// One ResourceSet's full detail: a `SET`/`DESC` header, one `MEMBER
+    /// <Kind/name> HEALTH <h> ORIGIN <origin>` line per declared member, the
+    /// reconcile `PLAN` (`ADOPT`/`PRUNE` refs), the rolled-up `HEALTH`/`SYNC`,
+    /// the shipped-defaults advisory (`DEFAULT-AVAILABLE`/`DEFAULT-TOMBSTONED`,
+    /// a SEPARATE axis from `SYNC`), and the resource GRAPH the console renders
+    /// (`NODE <i> <label>` + `EDGE <from> <to> <label>`). `None` when the named
+    /// set is neither declared nor the synthesizable Default set. Signs nothing.
+    #[must_use]
+    pub fn resourceset_detail(&self, name: &str) -> Option<String> {
+        let view = self.resource_platform.view();
+        let spec = collect_resourcesets(&view)
+            .into_iter()
+            .find(|s| s.name == name)?;
+        let statuses = member_statuses(&view, &spec);
+        let healths: Vec<MemberHealth> = statuses.iter().map(|s| s.health).collect();
+        let health = roll_up_health(&healths);
+        let owned = owned_live(&view, &spec);
+        let plan = plan_reconcile(&spec.members, &owned);
+        let graph = build_graph(&spec.name, &statuses);
+
+        let mut out = Vec::new();
+        out.push(format!("SET {}", spec.name));
+        out.push(format!(
+            "DESC {}",
+            spec.description.as_deref().unwrap_or("")
+        ));
+        for s in &statuses {
+            // Provenance is a SEPARATE axis from health: a member seeded from
+            // the defaults bundle is tagged `defaults@<v>`, an operator-authored
+            // one `operator`. This never affects HEALTH/SYNC.
+            let origin = member_origin(&view, &s.reference);
+            out.push(format!(
+                "MEMBER {} HEALTH {} ORIGIN {}",
+                s.reference,
+                s.health.as_str(),
+                origin.as_tag(),
+            ));
+        }
+        out.push(format!(
+            "PLAN ADOPT {}",
+            plan.to_adopt
+                .iter()
+                .map(MemberRef::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        out.push(format!(
+            "PLAN PRUNE {}",
+            plan.to_prune
+                .iter()
+                .map(MemberRef::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        out.push(format!("HEALTH {}", health.as_str()));
+        out.push(format!("SYNC {}", plan.sync_status().as_str()));
+        // Shipped-defaults advisory (Default set only): an ADDITIVE signal, not
+        // drift. `DEFAULT-AVAILABLE` = net-new adoptable; `DEFAULT-TOMBSTONED` =
+        // operator-deleted (never resurrected). Never folded into SYNC/HEALTH.
+        if spec.name == DEFAULT_RESOURCE_SET {
+            let advisory = defaults_advisory_for_view(&view, &self.default_tombstones());
+            let avail: Vec<&str> = advisory
+                .iter()
+                .filter(|a| a.status == crate::defaults::DefaultStatus::Available)
+                .map(|a| a.name.as_str())
+                .collect();
+            let tombs: Vec<&str> = advisory
+                .iter()
+                .filter(|a| a.status == crate::defaults::DefaultStatus::Tombstoned)
+                .map(|a| a.name.as_str())
+                .collect();
+            let edited: Vec<&str> = advisory
+                .iter()
+                .filter(|a| a.status == crate::defaults::DefaultStatus::Edited)
+                .map(|a| a.name.as_str())
+                .collect();
+            out.push(format!(
+                "DEFAULT-BUNDLE {}",
+                crate::defaults::DEFAULT_BUNDLE_VERSION
+            ));
+            out.push(format!("DEFAULT-AVAILABLE {}", avail.join(",")));
+            out.push(format!("DEFAULT-EDITED {}", edited.join(",")));
+            out.push(format!("DEFAULT-TOMBSTONED {}", tombs.join(",")));
+        }
+        for (i, label) in graph.nodes.iter().enumerate() {
+            out.push(format!("NODE {i} {label}"));
+        }
+        for (from, to, label) in &graph.edges {
+            out.push(format!("EDGE {from} {to} {label}"));
+        }
+        Some(out.join("\n"))
+    }
+
     /// The `--dry-run`-style preview of an act: the decider's ALLOW/DENY for
     /// `actor` WITHOUT signing or appending anything, returned as the PREDICTED
     /// decision. The enforced act (below) runs the SAME decider, so a UI can
@@ -2250,6 +2836,12 @@ impl WebAuthContext {
         // Drive the real workload-runtime reconcile (fetch-by-CID + admit +
         // supervised spawn) toward the just-declared manifest state.
         self.drive_reconcile(name);
+        self.record(&PortalOp::ResourceApply {
+            actor: actor.to_string(),
+            name: name.to_owned(),
+            image: image.to_owned(),
+            replicas,
+        });
         Ok(applied)
     }
 
@@ -2271,6 +2863,14 @@ impl WebAuthContext {
                 CrdValue::String(new_image.to_owned()),
             )
             .map(|applied| format!("{}", applied.event.0))
+            .map(|applied| {
+                self.record(&PortalOp::ResourceEdit {
+                    actor: actor.to_string(),
+                    name: name.to_owned(),
+                    new_image: new_image.to_owned(),
+                });
+                applied
+            })
     }
 
     /// `scale --replicas N` (ACT): emit one signed scale event.
@@ -2290,6 +2890,11 @@ impl WebAuthContext {
             )
             .map(|applied| format!("{}", applied.event.0))?;
         self.drive_reconcile(name);
+        self.record(&PortalOp::ResourceScale {
+            actor: actor.to_string(),
+            name: name.to_owned(),
+            replicas,
+        });
         Ok(applied)
     }
 
@@ -2322,6 +2927,13 @@ impl WebAuthContext {
                 CrdValue::Integer(generation),
             )
             .map(|applied| format!("{}", applied.event.0))
+            .map(|applied| {
+                self.record(&PortalOp::ResourceRollout {
+                    actor: actor.to_string(),
+                    name: name.to_owned(),
+                });
+                applied
+            })
     }
 
     /// `logs`/`exec`/`port-forward` (VIEW-shaped runtime reach): these reach a
@@ -2646,7 +3258,12 @@ impl WebAuthContext {
         token
     }
 
-    fn login_session_for(&self, token: &str) -> Option<&LoginSession> {
+    /// Look up an admitted session by its bearer token. `pub(crate)` (rather
+    /// than private) so the `psl-message-api` pillar-UDP/QUIC tiers
+    /// ([`crate::psl_udp_server`], [`crate::psl_quic_server`]) authenticate
+    /// against the SAME session registry the HTTPS `/login` path admits
+    /// into — never a duplicated/desynced notion of "admitted".
+    pub(crate) fn login_session_for(&self, token: &str) -> Option<&LoginSession> {
         self.login_sessions.get(token)
     }
 
@@ -2737,6 +3354,20 @@ pub fn serve(listener: TcpListener, ctx: &mut WebAuthContext) {
     }
 }
 
+/// Serve HTTP/1.1 on `listener` against a SHARED, mutex-guarded
+/// [`WebAuthContext`] — the same context instance the `psl-message-api`
+/// pillar-UDP and QUIC tiers also read/authenticate against, so a session
+/// token admitted over one tier (e.g. the HTTPS `/login`) is honored by
+/// every other tier serving the SAME running node. Blocking — run on a
+/// dedicated thread.
+pub fn serve_shared(listener: TcpListener, ctx: std::sync::Arc<std::sync::Mutex<WebAuthContext>>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let mut guard = ctx.lock().expect("shared web auth context lock");
+        handle_connection(stream, &mut guard);
+    }
+}
+
 /// The graphical portal UI served at `GET /` — a real login page (two fields:
 /// user identifier + unlock factor, NO CID), whose embedded script drives the
 /// `GET /nonce` → `POST /login` handshake as hidden plumbing and, on success,
@@ -2819,6 +3450,11 @@ struct HttpRequest {
     method: String,
     path: String,
     body: String,
+    /// The raw request body bytes, preserved verbatim (unlike `body`, which
+    /// is a lossy UTF-8 decode) — the ONLY body a binary route (e.g. the
+    /// canonical-CBOR `psl-message-api` contract) may read, so a non-UTF-8
+    /// CBOR payload is never corrupted by the text path's lossy conversion.
+    body_bytes: Vec<u8>,
     /// The raw `X-Pillar-Api-Version` header value the client sent, if any.
     /// `None` means the request asserted no version — served backward-
     /// compatibly at [`API_VERSION`]. `Some` is validated by
@@ -2866,10 +3502,12 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
     }
 
     let mut body = String::new();
+    let mut raw = Vec::new();
     if content_length > 0 {
         let mut buf = vec![0u8; content_length];
         if reader.read_exact(&mut buf).is_ok() {
             body = String::from_utf8_lossy(&buf).into_owned();
+            raw = buf;
         }
     }
 
@@ -2877,6 +3515,7 @@ fn read_http_request(reader: &mut impl BufRead) -> Option<HttpRequest> {
         method,
         path,
         body,
+        body_bytes: raw,
         api_version,
     })
 }
@@ -3386,6 +4025,10 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/portal/obs/query/message"),
+        handler: |ctx, _peer, request| dispatch_obs_query_message(ctx, request),
+    },    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/portal/obs/live/recording"),
         handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request),
     },
@@ -3408,6 +4051,26 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "GET",
         path: PathMatch::Prefix("/portal/obs/live/metric-names"),
         handler: |ctx, _peer, request| dispatch_obs_live_metric_names(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/obs/live/retention"),
+        handler: |ctx, _peer, request| dispatch_obs_live_retention_get(ctx, request),
+    },
+    RouteSpec {
+        method: "PUT",
+        path: PathMatch::Exact("/portal/obs/live/retention"),
+        handler: |ctx, _peer, request| dispatch_obs_live_retention_set(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/resource/sets"),
+        handler: |ctx, _peer, request| dispatch_resourcesets_list(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/resource/set"),
+        handler: |ctx, _peer, request| dispatch_resourceset_detail(ctx, request),
     },
     RouteSpec {
         method: "GET",
@@ -3550,6 +4213,11 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "POST",
         path: PathMatch::Exact("/portal/obs/dashboard"),
         handler: |ctx, _peer, request| dispatch_obs_dashboard(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/obs/dashboard/get"),
+        handler: |ctx, _peer, request| dispatch_obs_dashboard_get(ctx, request),
     },
     RouteSpec {
         method: "GET",
@@ -3727,6 +4395,19 @@ fn signal_kind_tag(kind: SignalKind) -> &'static str {
         SignalKind::TraceSpan => "trace",
         SignalKind::ProfileSample => "profile",
         SignalKind::MetadataSample => "metadata",
+    }
+}
+
+/// The PascalCase `SignalKind` name a `RetentionPolicy` manifest's `signalKind`
+/// field uses (the inverse of `pillar_observability::retention::
+/// signal_kind_from_str`), so a policy round-trips through the retention route.
+fn signal_kind_manifest_name(kind: SignalKind) -> &'static str {
+    match kind {
+        SignalKind::Metric => "Metric",
+        SignalKind::Log => "Log",
+        SignalKind::TraceSpan => "TraceSpan",
+        SignalKind::ProfileSample => "ProfileSample",
+        SignalKind::MetadataSample => "MetadataSample",
     }
 }
 
@@ -4549,6 +5230,29 @@ fn dispatch_obs_dashboard(ctx: &mut WebAuthContext, request: &HttpRequest) -> Ht
     text_response(200, "OK", format!("OBS-DASHBOARD-CID {cid} TIP {tip}"))
 }
 
+/// Read back a saved dashboard: `GET /portal/obs/dashboard/get?token=<s>&id=<hex>`.
+/// Requires an admitted session. A pure view — signs nothing. 404 if no such
+/// dashboard exists (never created, or its latest event is a delete
+/// tombstone).
+fn dispatch_obs_dashboard_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let id = query_value(&request.path, "id").unwrap_or("");
+    match ctx.get_observability_dashboard(id) {
+        Some(view) => text_response(
+            200,
+            "OK",
+            format!(
+                "OBS-DASHBOARD-SIGNER {}\nOBS-DASHBOARD-NAME {}\nOBS-DASHBOARD-CONTENT {}\n",
+                view.signer, view.name, view.content
+            ),
+        ),
+        None => text_response(404, "Not Found", "NOT-FOUND".to_owned()),
+    }
+}
+
 /// Live-store per-kind counts: `GET /portal/obs/live/kinds?token=<s>`.
 /// Requires an admitted session and an attached live substrate. A pure view.
 fn dispatch_obs_live_kinds(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
@@ -4591,6 +5295,44 @@ fn dispatch_obs_live_query(ctx: &mut WebAuthContext, request: &HttpRequest) -> H
         Some(Ok(body)) => text_response(200, "OK", body),
         Some(Err(e)) => text_response(400, "Bad Request", e),
         None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// The `psl-message-api` HTTPS tier: `POST /portal/obs/query/message`, body =
+/// canonical-CBOR [`pillar_wire::PslQueryRequest`] bytes (never text-framed —
+/// this is the ONE typed contract the Yew UI and the CLI's HTTPS fallback
+/// tier both ride). Responds with a canonical-CBOR
+/// [`pillar_wire::PslQueryResponse`] body regardless of outcome (including an
+/// unauthorized/no-substrate case), so a caller never has to branch on HTTP
+/// status to learn what happened — decode the body.
+fn dispatch_obs_query_message(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let req = match pillar_wire::decode_request(&request.body_bytes) {
+        Ok(req) => req,
+        Err(e) => {
+            let bytes = pillar_wire::encode_response(&pillar_wire::PslQueryResponse::Error(
+                format!("BAD-CBOR {e}"),
+            ))
+            .unwrap_or_default();
+            return cbor_response(400, "Bad Request", bytes);
+        }
+    };
+    if ctx.login_session_for(&req.token).is_none() {
+        let bytes = pillar_wire::encode_response(&pillar_wire::PslQueryResponse::Unauthorized)
+            .unwrap_or_default();
+        return cbor_response(401, "Unauthorized", bytes);
+    }
+    match ctx.live_obs_psl_message(&req.query_text) {
+        Some(resp) => {
+            let bytes = pillar_wire::encode_response(&resp).unwrap_or_default();
+            cbor_response(200, "OK", bytes)
+        }
+        None => {
+            let bytes = pillar_wire::encode_response(&pillar_wire::PslQueryResponse::Error(
+                "NO-LIVE-SUBSTRATE".to_owned(),
+            ))
+            .unwrap_or_default();
+            cbor_response(503, "Service Unavailable", bytes)
+        }
     }
 }
 
@@ -4672,6 +5414,75 @@ fn dispatch_obs_live_metric_names(ctx: &mut WebAuthContext, request: &HttpReques
     match ctx.live_obs_metric_names() {
         Some(body) => text_response(200, "OK", body),
         None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// View the installed per-series retention policies: `GET
+/// /portal/obs/live/retention?token=<s>` — one policy per line as
+/// `<SignalKind>|<matchLabels>|<window>|<downsample>`. Requires an admitted
+/// session + live substrate. A pure read.
+fn dispatch_obs_live_retention_get(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_get_retention() {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// Install per-series retention policies: `PUT /portal/obs/live/retention`,
+/// body `<token>\n<policy-lines>` where each line is
+/// `<SignalKind>|<matchLabels>|<window>|<downsample>`. Declaratively REPLACES
+/// the installed set (an empty body clears it). Per the store +
+/// `specs/RetentionPolicy.tla` contract this affects only FUTURE writes.
+/// Requires an admitted session + live substrate.
+fn dispatch_obs_live_retention_set(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let (token, rest) = split_token_body(&request.body);
+    if ctx.login_session_for(&token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    match ctx.live_obs_set_retention(&rest) {
+        Some(Ok(body)) => text_response(200, "OK", body),
+        Some(Err(e)) => text_response(400, "Bad Request", e),
+        None => text_response(503, "Service Unavailable", "NO-LIVE-SUBSTRATE".to_owned()),
+    }
+}
+
+/// List every ResourceSet with its live health/sync roll-up: `GET
+/// /portal/resource/sets?token=<s>` — one `SET <name> HEALTH <h> SYNC <s>
+/// MEMBERS <n> ADOPT <n> PRUNE <n>` line each (the synthesized Default set
+/// included). Requires an admitted session. A pure read.
+fn dispatch_resourcesets_list(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    text_response(200, "OK", ctx.resourcesets_list())
+}
+
+/// One ResourceSet's full detail + resource graph: `GET
+/// /portal/resource/set?token=<s>&name=<set>` — the `SET`/`DESC` header,
+/// per-member health, the reconcile `PLAN`, the rolled-up `HEALTH`/`SYNC`, and
+/// the `NODE`/`EDGE` graph the console renders. 404 when the named set is
+/// neither declared nor the synthesizable Default set. Requires an admitted
+/// session. A pure read.
+fn dispatch_resourceset_detail(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let name = percent_decode(query_value(&request.path, "name").unwrap_or(""));
+    match ctx.resourceset_detail(&name) {
+        Some(body) => text_response(200, "OK", body),
+        None => text_response(404, "Not Found", format!("NO-SUCH-RESOURCESET {name}")),
     }
 }
 
@@ -5647,6 +6458,20 @@ fn text_response(status: u16, reason: &'static str, mut body: String) -> HttpRes
     }
 }
 
+/// A binary response carrying canonical-CBOR bytes — the ONE response shape
+/// the `psl-message-api` HTTPS tier uses, matching the same
+/// [`pillar_wire::PslQueryResponse`] the pillar-UDP and QUIC tiers serve.
+fn cbor_response(status: u16, reason: &'static str, bytes: Vec<u8>) -> HttpResponse {
+    HttpResponse {
+        status,
+        reason,
+        content_type: "application/cbor",
+        session_token: None,
+        body: String::new(),
+        bytes: Some(bytes),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5714,6 +6539,7 @@ mod tests {
                 method: "GET".into(),
                 path: path.into(),
                 body: String::new(),
+                body_bytes: Vec::new(),
                 api_version: None,
             },
         )
@@ -5727,9 +6553,135 @@ mod tests {
                 method: "POST".into(),
                 path: path.into(),
                 body: body.into(),
+                body_bytes: body.as_bytes().to_vec(),
                 api_version: None,
             },
         )
+    }
+
+    // ResourceSet status over the REAL resource plane: the Default set is
+    // synthesized (owning every RetentionPolicy resource), reflects an applied
+    // RetentionPolicy CRD as a healthy synced member, and renders a graph.
+    #[test]
+    fn resourcesets_synthesize_default_and_reflect_applied_retention_policies() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        let actor = ctx.identity_actor_for_test();
+
+        // Empty plane: the Default set is synthesized, empty + synced.
+        let list0 = ctx.resourcesets_list();
+        assert!(
+            list0.contains("SET default HEALTH Empty SYNC Synced MEMBERS 0"),
+            "synthesized empty default: {list0}"
+        );
+
+        // Apply a RetentionPolicy CRD through the real signed resource-plane path.
+        let rp = Crd::new(
+            &ctx.resource_api,
+            "RetentionPolicy",
+            CrdMetadata::new("web-metrics"),
+        )
+        .with_spec("signalKind", CrdValue::String("Metric".into()))
+        .with_spec("window", CrdValue::Integer(600));
+        {
+            let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
+            plane
+                .apply(&actor, RESOURCE_CAP, rp)
+                .expect("owner applies retention policy");
+        }
+
+        // The Default set now owns it: 1 member, Healthy, Synced (implicit).
+        let list1 = ctx.resourcesets_list();
+        assert!(
+            list1.contains("SET default HEALTH Healthy SYNC Synced MEMBERS 1 ADOPT 0 PRUNE 0"),
+            "default owns the retention policy: {list1}"
+        );
+
+        // Detail renders the member + a graph edge from the set to it.
+        let detail = ctx
+            .resourceset_detail("default")
+            .expect("default set exists");
+        assert!(
+            detail.contains("MEMBER RetentionPolicy/web-metrics HEALTH Healthy"),
+            "member line: {detail}"
+        );
+        assert!(
+            detail.contains("NODE 0 ResourceSet/default"),
+            "root node: {detail}"
+        );
+        assert!(
+            detail.contains("NODE 1 RetentionPolicy/web-metrics"),
+            "member node: {detail}"
+        );
+        assert!(detail.contains("EDGE 0 1 Healthy"), "edge: {detail}");
+        assert!(detail.contains("SYNC Synced"), "sync: {detail}");
+
+        // Two-axis model: the operator-authored policy is tagged `operator`,
+        // and the shipped-defaults advisory is SEPARATE from SYNC — all three
+        // shipped defaults are net-new Available, none tombstoned.
+        assert!(
+            list1.contains("MEMBERS 1 ADOPT 0 PRUNE 0 DEFAULTS 3"),
+            "defaults advisory column (3 net-new available): {list1}"
+        );
+        assert!(
+            detail.contains("MEMBER RetentionPolicy/web-metrics HEALTH Healthy ORIGIN operator"),
+            "operator provenance tag: {detail}"
+        );
+        assert!(
+            detail.contains("DEFAULT-BUNDLE 1"),
+            "bundle version: {detail}"
+        );
+        assert!(
+            detail.contains("DEFAULT-AVAILABLE metrics-default,logs-default,traces-default"),
+            "net-new available advisory (additive, not drift): {detail}"
+        );
+        assert!(
+            detail.contains("DEFAULT-TOMBSTONED "),
+            "tombstoned line present (empty): {detail}"
+        );
+
+        // Adopt a shipped default WITH provenance labels + the shipped spec: it
+        // becomes Present (tagged `defaults@1`, dropping it from Available) and
+        // is NOT flagged as drift.
+        let seeded = Crd::new(
+            &ctx.resource_api,
+            "RetentionPolicy",
+            CrdMetadata::new("metrics-default")
+                .with_label("pillar.dev/managed-by", "defaults")
+                .with_label("pillar.dev/default-bundle", "1"),
+        )
+        .with_spec("signalKind", CrdValue::String("Metric".into()))
+        .with_spec("window", CrdValue::Integer(2_592_000));
+        {
+            let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
+            plane
+                .apply(&actor, RESOURCE_CAP, seeded)
+                .expect("owner adopts a shipped default");
+        }
+        let list2 = ctx.resourcesets_list();
+        assert!(
+            list2.contains("MEMBERS 2 ADOPT 0 PRUNE 0 DEFAULTS 2"),
+            "one default adopted -> 2 net-new remain: {list2}"
+        );
+        let detail2 = ctx.resourceset_detail("default").expect("default set");
+        assert!(
+            detail2.contains(
+                "MEMBER RetentionPolicy/metrics-default HEALTH Healthy ORIGIN defaults@1"
+            ),
+            "defaults provenance tag: {detail2}"
+        );
+        assert!(
+            detail2.contains("DEFAULT-AVAILABLE logs-default,traces-default"),
+            "adopted default drops out of Available: {detail2}"
+        );
+
+        // An unknown set is a clean miss.
+        assert!(ctx.resourceset_detail("nope").is_none());
     }
 
     // A GET carrying an explicit `X-Pillar-Api-Version` assertion.
@@ -5741,6 +6693,7 @@ mod tests {
                 method: "GET".into(),
                 path: path.into(),
                 body: String::new(),
+                body_bytes: Vec::new(),
                 api_version: Some(version.into()),
             },
         )
@@ -6284,10 +7237,15 @@ mod tests {
         let seed = pillar_crypto::Seed::from_bytes(b"portal-journal-test-seed".to_vec());
         let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(&seed)
             .expect("ed25519 keygen from valid seed");
+        let cell = pillar_crypto::CellId::from_bytes(b"portal-journal-test-cell".to_vec());
+        let group = pillar_crypto::cell::group_key_from_seed(&seed)
+            .expect("cell group key from valid seed");
         let stream = pillar_streamdb::IpfsPersistentStream::genesis(
             public,
             secret,
             pillar_streamdb::Visibility::Cell,
+            cell,
+            group,
         );
         Arc::new(Mutex::new(stream))
     }
@@ -6404,6 +7362,118 @@ mod tests {
         node_c.replay(&persisted_ops);
         node_c.replay(&persisted_ops);
         assert_eq!(node_c.bootstrap().initial_user(), Some("spencer"));
+    }
+
+    #[test]
+    fn replay_rehydrates_a_pre_sequence_stamp_v1_journal() {
+        // Regression: a journal written BEFORE the 8-byte sequence stamp was
+        // introduced is laid out `PORTAL_OP_TAG ++ serde_json(op)` with NO
+        // stamp. The stamped replay path must still decode it (it previously
+        // ate the first 8 JSON bytes as a bogus sequence and dropped every op,
+        // stranding a live node's entire bootstrap on upgrade). These bytes are
+        // byte-for-byte the layout of the on-disk blocks a v1 node persisted.
+        let v1 = |op: &PortalOp| -> Vec<u8> {
+            let mut p = PORTAL_OP_TAG.to_vec();
+            p.extend_from_slice(&serde_json::to_vec(op).expect("serialize PortalOp"));
+            p
+        };
+        let ops = vec![
+            v1(&PortalOp::CreateCell {
+                cell: "pillar".into(),
+            }),
+            v1(&PortalOp::BootstrapCellAndUser {
+                cell: "pillar".into(),
+                handle: "spencer".into(),
+                bootstrap_offer_sealed: vec![1, 2, 3, 4],
+            }),
+            v1(&PortalOp::AddMember {
+                handle: "test".into(),
+                role: "member".into(),
+            }),
+        ];
+
+        let mut node = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        assert!(node.bootstrap().initial_user().is_none());
+        node.replay(&ops);
+
+        // The pre-stamp bootstrap is fully rehydrated — the node presents as
+        // bootstrapped and the post-bootstrap member act is restored.
+        assert_eq!(node.bootstrap().initial_user(), Some("spencer"));
+        assert_eq!(
+            node.members().get("test").map(String::as_str),
+            Some("member")
+        );
+
+        // A subsequent live mutation stamps a v2 sequence starting at 0 (v1 ops
+        // carry none) and, on the next replay, still sorts AFTER the v1 ops
+        // because v1 outranks v2 in the sort key.
+        node.add_member("charlie", "operator");
+        assert_eq!(
+            node.members().get("charlie").map(String::as_str),
+            Some("operator")
+        );
+    }
+
+    #[test]
+    fn replay_orders_v1_before_v2_and_preserves_both() {
+        // A node upgraded across the stamp boundary can carry BOTH layouts:
+        // pre-stamp v1 ops (no sequence) written first, then post-upgrade v2 ops
+        // (stamped). Every v1 op must sort ahead of every v2 op regardless of
+        // the numeric stamp, and none may be dropped.
+        let v1 = |op: &PortalOp| -> Vec<u8> {
+            let mut p = PORTAL_OP_TAG.to_vec();
+            p.extend_from_slice(&serde_json::to_vec(op).expect("serialize"));
+            p
+        };
+        let v2 = |seq: u64, op: &PortalOp| -> Vec<u8> {
+            let mut p = PORTAL_OP_TAG.to_vec();
+            p.extend_from_slice(&seq.to_be_bytes());
+            p.extend_from_slice(&serde_json::to_vec(op).expect("serialize"));
+            p
+        };
+        let ops = vec![
+            v1(&PortalOp::CreateCell {
+                cell: "pillar".into(),
+            }),
+            v1(&PortalOp::BootstrapCellAndUser {
+                cell: "pillar".into(),
+                handle: "spencer".into(),
+                bootstrap_offer_sealed: vec![9],
+            }),
+            // v2 op with a LOW stamp (0) must still land after the v1 ops.
+            v2(
+                0,
+                &PortalOp::AddMember {
+                    handle: "late".into(),
+                    role: "operator".into(),
+                },
+            ),
+        ];
+        let mut node = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        node.replay(&ops);
+        assert_eq!(node.bootstrap().initial_user(), Some("spencer"));
+        assert_eq!(
+            node.members().get("late").map(String::as_str),
+            Some("operator")
+        );
+        // next_op_seq advanced past the highest v2 stamp (0) → 1.
+        node.add_member("newest", "member");
+        assert_eq!(
+            node.members().get("newest").map(String::as_str),
+            Some("member")
+        );
     }
 
     #[test]

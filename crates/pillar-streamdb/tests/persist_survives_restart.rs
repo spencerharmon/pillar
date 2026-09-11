@@ -12,13 +12,21 @@
 //! observe every op, the advanced head sequence, and remain writable.
 
 use pillar_core::SideEffect;
+use pillar_crypto::cell::{group_key_from_seed, CellGroupKey};
 use pillar_crypto::sign::signing_keypair_from_seed;
-use pillar_crypto::{Seed, SigningPublicKey, SigningSecretKey};
+use pillar_crypto::{CellId, Seed, SigningPublicKey, SigningSecretKey};
 use pillar_streamdb::{ContentStore, IpfsPersistentStream, Visibility};
 
 fn node_keys(label: &str) -> (SigningPublicKey, SigningSecretKey) {
     let seed = Seed::from_bytes(format!("persist-survives-restart::{label}").into_bytes());
     signing_keypair_from_seed(&seed).expect("keygen")
+}
+
+fn node_cell(label: &str) -> (CellId, CellGroupKey) {
+    let cell = CellId::from_bytes(format!("persist-survives-restart::cell::{label}").into_bytes());
+    let seed = Seed::from_bytes(format!("persist-survives-restart::cell-key::{label}").into_bytes());
+    let group = group_key_from_seed(&seed).expect("cell group key");
+    (cell, group)
 }
 
 /// The op payloads a materialized view currently holds, in order — the thing a
@@ -57,11 +65,12 @@ fn durable_stream_survives_a_solo_node_restart_from_local_disk() {
             .as_nanos()
     ));
     let (owner, secret) = node_keys("node-a");
+    let (cell, group) = node_cell("node-a");
 
     // --- Boot 1: first boot, genesis on disk, append three ops. ---
     {
         let mut node =
-            IpfsPersistentStream::open(&root, owner.clone(), secret.clone(), Visibility::Cell)
+            IpfsPersistentStream::open(&root, owner.clone(), secret.clone(), Visibility::Cell, cell.clone(), group.clone())
                 .expect("open (first boot)");
         assert!(node.head_cid().is_none(), "first boot starts with no head");
         node.append(b"cell-genesis".to_vec(), SideEffect::Convergent)
@@ -82,7 +91,7 @@ fn durable_stream_survives_a_solo_node_restart_from_local_disk() {
     ]);
     {
         let mut node =
-            IpfsPersistentStream::open(&root, owner.clone(), secret.clone(), Visibility::Cell)
+            IpfsPersistentStream::open(&root, owner.clone(), secret.clone(), Visibility::Cell, cell.clone(), group.clone())
                 .expect("open (restart)");
         assert_eq!(
             op_set(&node),
@@ -104,7 +113,7 @@ fn durable_stream_survives_a_solo_node_restart_from_local_disk() {
     // --- Boot 3: prove the 4th op also persisted across another restart. ---
     {
         let node =
-            IpfsPersistentStream::open(&root, owner.clone(), secret.clone(), Visibility::Cell)
+            IpfsPersistentStream::open(&root, owner.clone(), secret.clone(), Visibility::Cell, cell.clone(), group.clone())
                 .expect("open (second restart)");
         let mut want = expected.clone();
         want.push(b"user:bob".to_vec());
@@ -143,16 +152,17 @@ fn a_different_owner_sees_an_empty_stream_on_the_same_root() {
             .as_nanos()
     ));
     let (owner_a, secret_a) = node_keys("owner-a");
+    let (cell, group) = node_cell("owner-shared");
     {
         let mut node =
-            IpfsPersistentStream::open(&root, owner_a.clone(), secret_a, Visibility::Cell)
+            IpfsPersistentStream::open(&root, owner_a.clone(), secret_a, Visibility::Cell, cell.clone(), group.clone())
                 .expect("open a");
         node.append(b"a-op".to_vec(), SideEffect::Convergent)
             .expect("append");
     }
     let (owner_b, secret_b) = node_keys("owner-b");
     let node_b =
-        IpfsPersistentStream::open(&root, owner_b, secret_b, Visibility::Cell).expect("open b");
+        IpfsPersistentStream::open(&root, owner_b, secret_b, Visibility::Cell, cell, group).expect("open b");
     assert_eq!(
         node_b.stream().log().len(),
         0,

@@ -196,6 +196,23 @@ impl LiveObservabilitySubstrate {
         self.counters.set_cell_member_count(members);
     }
 
+    /// Install the per-series retention policy set (from applied
+    /// `RetentionPolicy` manifests) onto the live store. Per the store
+    /// contract this affects only FUTURE writes — every already-written
+    /// signal keeps the expiry stamped from the window in force when it was
+    /// written (the `ExpiryFrozenAtWrite`/`NoLossBeforeExpiry` guarantees of
+    /// `specs/RetentionPolicy.tla`). Replaces any previously installed set.
+    pub fn set_retention_policies(&mut self, policies: crate::retention::RetentionPolicySet) {
+        self.store.set_policies(policies);
+    }
+
+    /// The per-series retention policy set currently installed on the live
+    /// store (empty until an operator applies a `RetentionPolicy` manifest).
+    #[must_use]
+    pub fn retention_policies(&self) -> &crate::retention::RetentionPolicySet {
+        self.store.policies()
+    }
+
     // ----------------------------- Ingest paths -----------------------------
 
     /// Drive the PERIODIC producers (metrics + profiles + metadata) once at
@@ -934,5 +951,40 @@ mod probe_tests {
             Some("allocator")
         );
         assert_eq!(rec.labels.get("mtype").map(String::as_str), Some("counter"));
+    }
+
+    /// The substrate passthrough installs a per-series retention policy onto
+    /// the live store: a matched write's lifetime is shortened to the policy
+    /// window while an unmatched series keeps the default, and the installed
+    /// set is reflected by `retention_policies()`.
+    #[test]
+    fn set_retention_policies_installs_per_series_windows_on_the_live_store() {
+        use crate::retention::{LabelSelector, RetentionPolicy, RetentionPolicySet};
+        let mut sub = substrate();
+        assert!(sub.retention_policies().policies().is_empty());
+
+        // Metric{app=web} retained 10 ticks; everything else the default.
+        let mut set = RetentionPolicySet::empty();
+        set.add(RetentionPolicy {
+            kind: SignalKind::Metric,
+            selector: LabelSelector::matching([("app", "web")]),
+            window: Some(10),
+            downsample: None,
+        });
+        sub.set_retention_policies(set);
+        assert_eq!(sub.retention_policies().policies().len(), 1);
+
+        // The effective window for the matched series is the policy's (10);
+        // an unmatched series falls back to the substrate default.
+        let mut web = LabelSet::new();
+        web.insert("app".to_string(), "web".to_string());
+        let eff_web = sub.retention_policies().effective(SignalKind::Metric, &web);
+        assert_eq!(eff_web.window, Some(10));
+        let mut other = LabelSet::new();
+        other.insert("app".to_string(), "db".to_string());
+        let eff_other = sub
+            .retention_policies()
+            .effective(SignalKind::Metric, &other);
+        assert_eq!(eff_other.window, None, "unmatched -> store default applies");
     }
 }

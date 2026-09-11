@@ -9,14 +9,19 @@ description = "Built-in distributed observability riding the streaming DB: confi
 
 [dependencies]
 pillar-core = { path = "../pillar-core" }
-# `default-features = false`: pillar-observability only ever tags signals with
-# a pure content address (`pillar_streamdb::{OpId, content_address}`) and never
-# touches the IPFS-backed durability substrate, so it opts out of the `ipfs`
-# feature (which pulls `pillar-ipfs` -> `libp2p` -> tokio/mio, not portable to
-# `wasm32-unknown-unknown`) — keeping the `pillar-frontend` wasm build's
-# dependency closure out of that unwanted edge entirely. See
-# crates/pillar-streamdb/Cargo.toml's `ipfs` feature doc.
-pillar-streamdb = { path = "../pillar-streamdb", default-features = false }
+# pillar-observability depends on pillar-wire ONLY (never streamdb/net): a
+# signal is a `PillarMessage::Signal` body over the SAME pillar-wire
+# `ContentStore` substrate streamdb uses (method #1 step (e),
+# `obs-signal-pillarmsg-ipfs`) — no parallel obs store.
+# `default-features = false`: obs seals/opens `PillarMessage::Signal` envelopes
+# and derives pure content addresses (`pillar_wire::{Cid, content_address}`),
+# but never touches the IPFS-backed durability node itself, so it opts out of
+# the `ipfs` feature (which pulls `pillar-ipfs` -> `libp2p` -> tokio/mio, not
+# portable to `wasm32-unknown-unknown`) — keeping the `pillar-frontend` wasm
+# build's dependency closure out of that unwanted edge entirely. See
+# crates/pillar-wire/Cargo.toml's `ipfs` feature doc.
+pillar-wire = { path = "../pillar-wire", default-features = false }
+pillar-crypto = { path = "../pillar-crypto" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 pillar-manifest = { path = "../pillar-manifest" }
 pillar-topology = { path = "../pillar-topology" }

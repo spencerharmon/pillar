@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use pillar_streamdb::content_address;
+use pillar_wire::content_address;
 
 use crate::metadata::LabelSet;
 
@@ -57,7 +57,7 @@ pub enum SignalKind {
 /// holding the same signal agree on its id and no adversary can forge a
 /// distinct payload sharing it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SignalId(pub pillar_streamdb::OpId);
+pub struct SignalId(pub pillar_wire::Cid);
 
 impl SignalId {
     /// The raw multihash bytes of this content address.
@@ -67,18 +67,37 @@ impl SignalId {
     }
 
     /// The content address as lowercase hex — the same on-disk/wire form
-    /// `pillar_streamdb::OpId` uses, so a persisted materialized view can
+    /// `pillar_wire::Cid` uses, so a persisted materialized view can
     /// round-trip signal ids without a second encoding.
     #[must_use]
     pub fn to_hex(&self) -> String {
-        self.0.to_hex()
+        let mut s = String::with_capacity(self.as_bytes().len() * 2);
+        for b in self.as_bytes() {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
     }
 
     /// The inverse of [`SignalId::to_hex`]. Returns `None` for any string that
     /// is not valid hex (defensive against on-disk corruption).
     #[must_use]
     pub fn from_hex(s: &str) -> Option<Self> {
-        Some(SignalId(pillar_streamdb::OpId::from_hex(s)?))
+        if s.is_empty() || s.len() % 2 != 0 {
+            return None;
+        }
+        let raw = s.as_bytes();
+        let mut bytes = Vec::with_capacity(s.len() / 2);
+        let mut i = 0;
+        while i < raw.len() {
+            let hi = (raw[i] as char).to_digit(16)?;
+            let lo = (raw[i + 1] as char).to_digit(16)?;
+            bytes.push(((hi << 4) | lo) as u8);
+            i += 2;
+        }
+        Some(SignalId(pillar_wire::Cid(
+            pillar_crypto::ContentId::from_bytes(bytes),
+        )))
     }
 
     /// A deterministic test-only content address derived from a numeric seed —
@@ -87,7 +106,7 @@ impl SignalId {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_test_seed(seed: u64) -> Self {
-        SignalId(pillar_streamdb::OpId(content_address(&seed.to_le_bytes())))
+        SignalId(pillar_wire::Cid(content_address(&seed.to_le_bytes())))
     }
 }
 
@@ -99,6 +118,16 @@ impl PartialOrd for SignalId {
 impl Ord for SignalId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl std::fmt::Display for SignalId {
+    /// The canonical lowercase-hex content address — the same string form the
+    /// underlying `pillar_wire::Cid` (formerly `pillar_streamdb::OpId`) rendered,
+    /// so a signal id prints identically across the migration to the shared
+    /// pillar-wire substrate.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
     }
 }
 
@@ -142,7 +171,7 @@ impl Signal {
         retention_window: u64,
     ) -> Self {
         let payload = payload.into();
-        let id = SignalId(pillar_streamdb::OpId(content_address(&payload)));
+        let id = SignalId(pillar_wire::Cid(content_address(&payload)));
         Signal {
             id,
             kind,

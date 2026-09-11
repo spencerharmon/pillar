@@ -25,6 +25,12 @@ acceptance = []
 
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
+# The `PillarMessage` envelope (version-stamped, cell-sealed, content-addressed)
+# every libp2p control payload is wrapped in before a pillar-UDP datagram is
+# sealed to the peer's WoT static X25519 key (handshakeless cutover, method #1
+# step (f)). pillar-wire depends only on pillar-crypto/pillar-core/pillar-ipfs,
+# never on pillar-net, so this edge is acyclic.
+pillar-wire = { path = "../pillar-wire" }
 libp2p = { version = "0.56", features = [
     "gossipsub",
     "kad",
@@ -53,6 +59,13 @@ pillar-ipam = { path = "../pillar-ipam" }
 # manifest's own decision, not a parallel one. pillar-manifest does not depend
 # on pillar-net, so this is acyclic.
 pillar-manifest = { path = "../pillar-manifest" }
+# The `pillar-message-hop-metric` terminal-delivery metric (`hop_metric.rs`)
+# resolves ATTESTED ingest/destination topology tiers (never self-declared)
+# and writes the `pillar_message_hops` signal onto the observability
+# substrate's shared correlation spine — both are now real runtime deps of
+# the substrate, not merely dev-deps of its tests.
+pillar-topology = { path = "../pillar-topology" }
+pillar-observability = { path = "../pillar-observability" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -68,9 +81,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # which is exactly the "overlay never a bootstrap dep of the substrate"
 # invariant this task requires.
 pillar-streamdb = { path = "../pillar-streamdb" }
-# Dev-only: builds a TopologyScopedIpam fixture for the pillar-UDP reply-set
-# determinism test. Not a runtime dep (pillar-ipam is; topology comes through it).
-pillar-topology = { path = "../pillar-topology" }
+# (pillar-topology is now a runtime dep, above — used to build a
+# TopologyScopedIpam fixture here too, so no separate dev-dep entry.)
 # Dev-only: the distributed-lb-acceptance test composes the ingress/LB
 # manifest model (Route/Frontend/derive_routing_table) and the WoT trust
 # artifacts gating Route attachment. (pillar-manifest is now a runtime dep of

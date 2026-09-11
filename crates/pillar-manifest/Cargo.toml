@@ -7,6 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Signed intent manifests: a CRD-compatible body inside a pillar-native envelope (signer-key, causal-parents, content-hash, capability-scope) riding the merkle-DAG log."
 
+[features]
+# Opt-in acceptance gate. Off by default so a plain `cargo test` stays a fast
+# unit run; the hop-minimizing-scheduler acceptance suite
+# (`tests/hop_minimizing_scheduler.rs`, `#![cfg(feature = "acceptance")]`) is
+# invoked with `--features acceptance` explicitly by its CHECKS.md stub.
+acceptance = []
+
 [dependencies]
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }

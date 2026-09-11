@@ -1221,9 +1221,10 @@ name = "pillar-observability"
 version = "0.1.0"
 dependencies = [
  "pillar-core",
+ "pillar-crypto",
  "pillar-manifest",
- "pillar-streamdb",
  "pillar-topology",
+ "pillar-wire",
  "pillar-wot-authority",
  "sha2",
 ]
@@ -1253,6 +1254,7 @@ version = "0.1.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
+ "pillar-wire",
  "sha2",
  "tracing",
 ]
@@ -1299,6 +1301,18 @@ dependencies = [
  "web-sys",
  "yew",
  "yew-router",
+]
+
+[[package]]
+name = "pillar-wire"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "pillar-core",
+ "pillar-crypto",
+ "serde",
+ "sha2",
+ "tracing",
 ]
 
 [[package]]

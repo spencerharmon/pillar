@@ -8,8 +8,9 @@
 \usepackage{tikz}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.16}
-\usetikzlibrary{arrows.meta,positioning,backgrounds,fit}
+\usetikzlibrary{arrows.meta,positioning,backgrounds,fit,calc}
 \usepackage[hidelinks]{hyperref}
+\usepackage{pifont}
 \usepackage{caption}
 \captionsetup{font=small,labelfont=bf}
 
@@ -19,6 +20,7 @@
 \definecolor{pmid}{RGB}{210,140,20}
 \definecolor{ppur}{RGB}{120,60,150}
 \definecolor{pgray}{RGB}{110,110,110}
+\definecolor{pcell}{RGB}{235,240,248}
 \newcommand{\code}[1]{\texttt{\small #1}}
 \newcommand{\Wstar}{W^{\star}}
 
@@ -394,6 +396,72 @@ reliability without ever becoming a congestion source: it responds to the loss i
 can fix (the link) and stands down on the loss it would worsen (congestion).
 
 \section{Header wire format}\label{sec:header}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  part/.style={rectangle,rounded corners=1pt,draw=pnode,thick,fill=white,
+               font=\scriptsize\bfseries,minimum height=5.5mm,minimum width=16mm,
+               align=center,inner sep=2pt},
+  life/.style={pgray,densely dashed,semithick},
+  msg/.style={-{Stealth[length=2mm]},thick,pgood},
+  lossy/.style={-{Stealth[length=2mm]},thick,pbad,dash pattern=on 1.4pt off 1.4pt},
+  ret/.style={-{Stealth[length=2mm]},thick,pnode,densely dashed},
+  ctl/.style={-{Stealth[length=1.8mm]},semithick,pmid},
+  lbl/.style={midway,above,font=\tiny,fill=white,inner sep=1pt},
+  lblb/.style={midway,below,font=\tiny,fill=white,inner sep=1pt},
+  note/.style={rectangle,rounded corners=1.5pt,draw=pnode,fill=pcell,
+               font=\tiny,align=center,inner sep=2.5pt}]
+  \def\xS{0} \def\xA{6.9} \def\xB{13.2}
+  \def\ybot{-11.7}
+  \foreach \x in {\xS,\xA,\xB}
+     \draw[life] (\x,-0.45) -- (\x,\ybot);
+  \node[part] at (\xS,0) {sender};
+  \node[part] at (\xA,0) {receiver R1};
+  \node[part] at (\xB,0) {receiver R2\\{\tiny dispersed}};
+  % anti-amplification: return-routability token
+  \draw[msg] (\xS,-0.95) -- node[lbl]{first contact} (\xA,-0.95);
+  \draw[ret] (\xA,-1.5) -- node[lblb]{RR token (keyed MAC of client addr)} (\xS,-1.5);
+  % controller derives allowance
+  \node[note,anchor=north west,text width=52mm] at (0.15,-1.95)
+     {$W_t=\mathrm{clamp}\!\big(W^\star(\hat p_t,\varepsilon),1,W_{\max}\big)$
+      \ (copy count, or parity rate $M/K$ for bulk)};
+  % spray W copies, one lost, same CID
+  \draw[lossy] (\xS,-3.35) -- node[lblb]{\textcolor{pbad}{$\times$} copy 1 (CID, allowance, TTL)} (\xA,-3.35);
+  \draw[msg]   (\xS,-3.9)  -- node[lbl]{copy 2 (same CID)} (\xA,-3.9);
+  \draw[msg]   (\xS,-4.45) -- node[lblb]{dispersed copy} (\xB,-4.45);
+  \node[note,anchor=north] at (\xA,-4.95) {CID dedup $\Rightarrow$ process once};
+  % ack / observation
+  \draw[ret] (\xA,-5.85) -- node[lblb]{ack / CID-arrival $\ell_t$ (+ one-way delay sample)} (\xS,-5.85);
+  \node[note,anchor=north west,draw=pmid,text width=64mm] at (0.15,-6.3)
+     {EWMA $\hat p_t=(1-\alpha)\hat p_{t-1}+\alpha\ell_t$; delay-gradient splits
+      \emph{link} loss from \emph{congestion}; re-derive $W_t$ (hysteresis $\delta$);
+      admit against egress $\sum_f\lambda_f W_f S_f\le C$};
+  % bulk erasure
+  \draw[msg]   (\xS,-8.15) -- node[lbl]{bulk: $K{+}M$ erasure shards (rate $M/K$)} (\xA,-8.15);
+  \draw[lossy] (\xS,-8.7)  -- node[lblb]{\textcolor{pbad}{$\times$} shard $j$ lost} (\xA,-8.7);
+  \node[note,anchor=north,draw=pgood,text width=52mm] at (\xA,-9.2)
+     {reconstruct from \emph{any} $K$ of $N{=}K{+}M$ shards $\Rightarrow$ deliver};
+  \node[note,anchor=north,text width=92mm] at ($(\xS,-10.7)!0.5!(\xB,-10.7)$)
+     {no positive feedback: $W$ reacts to link loss on \emph{dispersed} paths, stands down on
+      congestion (delay gradient) $\Rightarrow$ reliability without collapse (\S\ref{sec:safety})};
+\end{tikzpicture}
+\caption{\textbf{The redundancy control loop, in time.} A sender establishes
+return-routability (RR token, anti-amplification), then emits an
+allowance-bounded set of CID-identical copies over dispersed paths; a lost copy
+costs nothing because a surviving copy carries the same CID and the receiver
+processes it once. The receiver's acknowledgement (a CID-arrival observation plus
+a one-way delay sample) feeds the EWMA loss estimate $\hat p_t$, from which the
+sender re-derives the allowance $W_t$ with hysteresis---raising redundancy for
+\emph{link} loss but standing down when the delay gradient indicates
+\emph{congestion} (\S\ref{sec:control},~\S\ref{sec:safety}), and always admitting
+against the egress bound~\eqref{eq:admit}. For bulk transfer the copies become an
+$M$-parity erasure code and the receiver reconstructs from any $K$ of the $N$
+shards (\S\ref{sec:erasure}). Because redundancy on dispersed independent paths
+does not raise the loss that drove it, the loop has no self-reinforcing term---the
+structural difference from a window-based controller.}
+\label{fig:controlloop}
+\end{figure*}
 Every datagram---spray copy, forward, reply, or acknowledgement---carries the
 header below, which binds it to its logical message and states the connection's
 redundancy contract up front. Fields are fixed-width and big-endian; optional

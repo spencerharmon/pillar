@@ -59,6 +59,83 @@ pub fn cell_decrypt(group: &CellGroupKey, ciphertext: &Ciphertext, aad: &[u8]) -
     crate::aead::open_symmetric(&group.0, ciphertext, aad)
 }
 
+/// **Convergent** cell seal: AEAD-encrypt `plaintext` under the cell group key
+/// using a DETERMINISTIC nonce, so the same plaintext sealed under the same
+/// group key on independent nodes yields byte-identical ciphertext — and
+/// therefore an identical [`crate::content::content_address`]/`Cid` — while
+/// two DISTINCT plaintexts never reuse a nonce (see the module-level design
+/// paper §5, `docs/papers/pillar-message-format.md`).
+///
+/// The nonce is derived as:
+/// `HKDF(key = group key, info = "pillar-wire/convergent-nonce/v1" || domain,
+///       ikm = content_address(plaintext))[..nonce_len]`
+///
+/// `domain` separates record classes (e.g. streamdb op vs observability
+/// signal) so the convergent-equality leak (two sealed records are provably
+/// byte-identical) never crosses class boundaries. `aad` is the same
+/// authenticated-but-not-encrypted context [`cell_encrypt`] takes (the
+/// envelope header, binding this seal to it).
+///
+/// Contract: [`cell_open_convergent`] with the same group key and aad
+/// recovers the plaintext; a different group key cannot; sealing the SAME
+/// `(plaintext, domain)` under the SAME group key twice yields byte-identical
+/// [`Ciphertext`] (convergence); sealing DISTINCT plaintexts never reuses a
+/// nonce (nonce-safety), because the nonce is bound to
+/// `content_address(plaintext)`.
+pub fn cell_seal_convergent(
+    group: &CellGroupKey,
+    plaintext: &[u8],
+    domain: &[u8],
+    aad: &[u8],
+) -> Result<Ciphertext> {
+    use crate::types::AeadAlgorithm;
+
+    let algorithm = AeadAlgorithm::current_default();
+    let nonce = convergent_nonce(group, plaintext, domain, algorithm)?;
+    crate::aead::seal_symmetric_with_nonce(algorithm, &group.0, &nonce, plaintext, aad)
+}
+
+/// Decrypt a record/broadcast produced by [`cell_seal_convergent`].
+///
+/// Reads the producing algorithm off the ciphertext's own inline tag (via
+/// [`crate::aead::open_symmetric`]), exactly like [`cell_decrypt`] — a
+/// convergent and a non-convergent seal share the same on-the-wire envelope
+/// shape and are interchangeable to open (only the sealing side differs).
+pub fn cell_open_convergent(
+    group: &CellGroupKey,
+    ciphertext: &Ciphertext,
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    crate::aead::open_symmetric(&group.0, ciphertext, aad)
+}
+
+/// Derive the deterministic convergent nonce for `plaintext` under `group`
+/// and `domain`, sized for `algorithm`. Internal to [`cell_seal_convergent`];
+/// exposed at crate-visibility only for the contract tests below that must
+/// assert non-reuse/determinism directly against the derivation.
+fn convergent_nonce(
+    group: &CellGroupKey,
+    plaintext: &[u8],
+    domain: &[u8],
+    algorithm: crate::types::AeadAlgorithm,
+) -> Result<Vec<u8>> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let ikm = crate::content::content_address(plaintext)?;
+
+    let mut info = Vec::with_capacity(32 + domain.len());
+    info.extend_from_slice(b"pillar-wire/convergent-nonce/v1");
+    info.extend_from_slice(domain);
+
+    let hk = Hkdf::<Sha256>::new(Some(group.0.as_bytes()), ikm.as_bytes());
+    let nonce_len = crate::aead::nonce_len(algorithm);
+    let mut nonce = vec![0u8; nonce_len];
+    hk.expand(&info, &mut nonce)
+        .map_err(|_| crate::error::CryptoError::InvalidLength)?;
+    Ok(nonce)
+}
+
 /// Seal the cell group key to a set of member recipients (node and/or user
 /// sealing public keys) for distribution.
 ///
@@ -130,6 +207,119 @@ mod tests {
         assert!(
             recover_group_key(&sealed, &out_sec.sealing).is_err(),
             "a non-member cannot recover the group key"
+        );
+    }
+
+    // ---- cell_seal_convergent / cell_open_convergent ----
+
+    #[test]
+    fn convergent_seal_round_trips() {
+        let group = group_key_from_seed(&seed("cell-convergent")).expect("group key");
+        let plaintext = b"a pillar-message body sealed convergently";
+        let aad = b"envelope-header-v1";
+        let domain = b"streamdb-op";
+
+        let ct = cell_seal_convergent(&group, plaintext, domain, aad).expect("seal");
+        assert_eq!(
+            cell_open_convergent(&group, &ct, aad).as_deref(),
+            Ok(plaintext.as_ref()),
+            "convergent open must recover the exact plaintext"
+        );
+    }
+
+    #[test]
+    fn convergent_seal_is_deterministic_same_body_same_key_same_ciphertext() {
+        // ConvergentDeterministic: identical (plaintext, domain, aad) sealed
+        // twice under the same group key must yield BYTE-IDENTICAL
+        // ciphertext, so the derived Cid is stable across independently-
+        // sealing nodes (dedup / IPFS convergence).
+        let group = group_key_from_seed(&seed("cell-convergent")).expect("group key");
+        let plaintext = b"identical body sealed on two different nodes";
+        let aad = b"envelope-header-v1";
+        let domain = b"streamdb-op";
+
+        let ct1 = cell_seal_convergent(&group, plaintext, domain, aad).expect("seal 1");
+        let ct2 = cell_seal_convergent(&group, plaintext, domain, aad).expect("seal 2");
+        assert_eq!(
+            ct1, ct2,
+            "sealing the same plaintext under the same group key and domain must be \
+             byte-identical (convergence)"
+        );
+    }
+
+    #[test]
+    fn convergent_seal_never_reuses_a_nonce_across_distinct_plaintext() {
+        // NoNonceReuseAcrossDistinctPlaintext: distinct plaintexts must
+        // produce distinct ciphertext (in particular, distinct nonces),
+        // never the AEAD-breaking nonce-reuse-under-one-key case.
+        let group = group_key_from_seed(&seed("cell-convergent")).expect("group key");
+        let aad = b"envelope-header-v1";
+        let domain = b"streamdb-op";
+
+        let ct_a = cell_seal_convergent(&group, b"plaintext A", domain, aad).expect("seal A");
+        let ct_b = cell_seal_convergent(&group, b"plaintext B", domain, aad).expect("seal B");
+        assert_ne!(
+            ct_a, ct_b,
+            "distinct plaintexts must never share ciphertext (nonce reuse)"
+        );
+
+        // The nonce is the fixed-width prefix right after the 1-byte algorithm
+        // tag; assert THAT specifically differs (not merely the tail, which
+        // trivially differs because the plaintexts differ).
+        let nonce_len = crate::aead::nonce_len(crate::types::AeadAlgorithm::current_default());
+        let nonce_a = &ct_a.as_bytes()[1..1 + nonce_len];
+        let nonce_b = &ct_b.as_bytes()[1..1 + nonce_len];
+        assert_ne!(
+            nonce_a, nonce_b,
+            "distinct plaintexts must derive distinct nonces, never reuse one"
+        );
+    }
+
+    #[test]
+    fn convergent_seal_domain_separates_otherwise_identical_bodies() {
+        // The `domain` input separates record classes so the
+        // convergent-equality leak never crosses class boundaries: the same
+        // plaintext sealed under two different domains must NOT converge to
+        // the same ciphertext/nonce.
+        let group = group_key_from_seed(&seed("cell-convergent")).expect("group key");
+        let plaintext = b"same body, different record classes";
+        let aad = b"envelope-header-v1";
+
+        let ct_op = cell_seal_convergent(&group, plaintext, b"streamdb-op", aad).expect("seal op");
+        let ct_signal =
+            cell_seal_convergent(&group, plaintext, b"observability-signal", aad).expect("seal signal");
+        assert_ne!(
+            ct_op, ct_signal,
+            "the same plaintext under different domains must not converge across classes"
+        );
+    }
+
+    #[test]
+    fn convergent_seal_is_confidential_only_to_the_group_key() {
+        // ConvergentConfidential: a different cell's group key cannot open a
+        // convergently-sealed record.
+        let group = group_key_from_seed(&seed("cell-convergent-A")).expect("group key");
+        let other = group_key_from_seed(&seed("cell-convergent-B")).expect("group key");
+        let plaintext = b"confidential to cell A only";
+        let aad = b"envelope-header-v1";
+
+        let ct = cell_seal_convergent(&group, plaintext, b"streamdb-op", aad).expect("seal");
+        assert!(
+            cell_open_convergent(&other, &ct, aad).is_err(),
+            "a different cell's group key must not open a convergently-sealed record"
+        );
+    }
+
+    #[test]
+    fn convergent_seal_authenticates_aad() {
+        let group = group_key_from_seed(&seed("cell-convergent")).expect("group key");
+        let plaintext = b"header-bound body";
+
+        let ct = cell_seal_convergent(&group, plaintext, b"streamdb-op", b"header-v1")
+            .expect("seal");
+        assert!(
+            cell_open_convergent(&group, &ct, b"different-header").is_err(),
+            "wrong aad must fail to open even with the right group key"
         );
     }
 }
