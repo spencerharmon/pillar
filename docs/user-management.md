@@ -94,24 +94,26 @@ succeeds and clears the flag.
 
 ### 2.5 Admin password reset (user forgot; admin does NOT know the password)
 The admin cannot unwrap the user's operational key (only the password or the
-node secret can, and the node secret unseals only the outer layer). Two designs:
+node secret can, and the node secret unseals only the outer layer). The reset
+(admin-driven OR self-service "forgot password") therefore **re-provisions**:
 
-- **(A) Re-provision (chosen).** Reset generates a **new operational subkey**
-  for the user, sealed under a new admin-chosen temporary password, and rotates
-  the user's identity so the old subkey is retired (reusing the existing
-  `IdentityRotate` / WoT-revocation machinery). Sets `force_password_change`.
-  No standing secret is introduced.
-  - Op: `AdminResetPassword { handle, new_sealed_offer, new_subkey, changed_at }`.
+- **(A) Re-provision (chosen, operator-confirmed).** Reset generates a **new
+  operational subkey** for the user, sealed under a new (admin- or user-chosen)
+  password, and rotates the user's identity so the old subkey is retired
+  (reusing the existing `IdentityRotate` / WoT-revocation machinery). Sets
+  `force_password_change` for an admin-driven reset. **The user's already-
+  registered 2FA credentials are PRESERVED**: WebAuthn passkeys are filed
+  per-`user_handle` (`pillar-web/src/webauthn.rs`), independent of the
+  password-sealed operational key, so re-provisioning the key does NOT touch the
+  credential registry — the user keeps every enrolled security key. No standing
+  secret is introduced.
+  - Op: `AdminResetPassword { handle, new_sealed_offer, new_subkey, changed_at }`
+    (a self-service forgot-password path shares the same op, gated by an
+    out-of-band recovery proof rather than `iam:users:write`).
 - **(B) Cell escrow (rejected).** Wrap each user's operational key under a
   cell-held recovery key at provisioning so an admin can unwrap and re-seal.
   Rejected: it introduces a standing escrow secret whose compromise defeats
   every user's password.
-
-> **[OPERATOR REVIEW]** §2.5 is the one hard-to-reverse security decision here.
-> The design proceeds on (A) re-provision (no escrow). If you want (B) escrow
-> instead — e.g. to preserve a user's subkey identity across a reset — say so
-> before the reset path is built; switching later is a breaking change to the
-> provisioning format.
 
 ## 3. Disable / enable users
 `status = Disabled` makes `admit` refuse the login (before any password work),
@@ -215,6 +217,7 @@ secret), never embedded in the node source.
 4. Roles + groups + group-roles + RBAC capability bridge + admin gating.
 5. Passwords: self-change (§2.1), invite+temp (§2.2), forced-change guard
    (§2.4), rotation label (§2.3).
-6. Admin password reset re-provision (§2.5A) — after operator sign-off.
+6. Admin password reset re-provision (§2.5A) — new key under the new password,
+   registered 2FA credentials preserved (operator-confirmed).
 7. Admin management of others' security keys (§5).
 8. Frontend: Profile, Users, Roles & Groups sections; forced-change router guard.
