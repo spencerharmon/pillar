@@ -3416,10 +3416,12 @@ dependencies = [
 name = "pillar-iam"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "pillar-core",
  "pillar-crypto",
  "pillar-identity",
  "pillar-rbac",
+ "pillar-web",
  "pillar-wot-authority",
  "rand_core 0.6.4",
  "serde",

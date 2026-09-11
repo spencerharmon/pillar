@@ -51,6 +51,12 @@ pub use password_lifecycle::{
     GatedAction, InviteWithPasswordError, PasswordChangeError, SealedOperationalKey,
 };
 
+pub mod admin_credentials;
+pub use admin_credentials::{
+    admin_issue_enrollment_invite, admin_list_credentials, admin_revoke_credential,
+    authorize_credentials_manage, AdminAuthContext, AdminCredentialError, EnrollmentInvite,
+};
+
 /// The capability string gating every admin write to the user/IAM surface
 /// (invite, list, show, role/group edits performed on someone OTHER than the
 /// acting user). A three-segment `namespace:resource:verb` capability, the
