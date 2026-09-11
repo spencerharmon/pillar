@@ -170,7 +170,11 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "apply",
-        handler: live_platform_guidance,
+        handler: |_v, args| crate::apply_over_pillar_message::apply(args),
+    },
+    VerbSpec {
+        name: "delete",
+        handler: |_v, args| crate::apply_over_pillar_message::delete(args),
     },
     VerbSpec {
         name: "get",

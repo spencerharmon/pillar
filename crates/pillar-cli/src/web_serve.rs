@@ -2845,6 +2845,55 @@ impl WebAuthContext {
         Ok(applied)
     }
 
+    /// `pillar apply -f`/`pillar delete` over pillar-message (ACT): ingest
+    /// one already-decoded [`pillar_ops::ResourceOp`] — produced by a
+    /// `pillar-client` caller and delivered over the resource-op pillar-UDP
+    /// tier ([`crate::resource_op_udp_server`]) — into the SAME signed
+    /// resource-plane apply/delete path every other resource mutation
+    /// (workload/cronjob/manifest) rides. `actor` MUST already be the
+    /// message's cryptographically verified signer identity (see
+    /// `pillar_net::client_ingest::signer_subject`) — this method performs
+    /// NO signature verification itself; the caller (the resource-op UDP
+    /// listener) has already authenticated the envelope before calling this,
+    /// and authorization is the SAME WoT/RBAC decider [`ResourcePlane::apply`]/
+    /// `delete` already run for an HTTP-triggered mutation. There is no
+    /// bypass gate here: an unauthorized signer is refused exactly like an
+    /// unauthorized HTTP mutation would be.
+    ///
+    /// # Errors
+    /// [`ResourceError::NotFound`] for a `Delete` naming an object that does
+    /// not exist; else the underlying signed-apply error (schema/authorization
+    /// failure). Nothing is mutated on any error.
+    pub fn resource_op_apply(
+        &mut self,
+        actor: &NodeId,
+        op: &pillar_ops::ResourceOp,
+    ) -> Result<String, ResourceError> {
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        match op {
+            pillar_ops::ResourceOp::Apply { crd } => plane
+                .apply(actor, RESOURCE_CAP, crd.clone())
+                .map(|applied| applied.event.0.to_string()),
+            pillar_ops::ResourceOp::Delete { kind, name } => plane
+                .delete(actor, RESOURCE_CAP, &Address::new(kind.clone(), name.clone()))
+                .map(|applied| applied.event.0.to_string()),
+        }
+    }
+
+    /// Admit `subject` as a WoT-authoritative resource-op signer at full
+    /// trust depth — the non-HTTP-bootstrap-user counterpart of
+    /// [`Self::admit_subject`], used to authorize a `pillar-client` caller's
+    /// OWN signing key (rather than a handle-derived subkey name) to mutate
+    /// the resource plane over the resource-op pillar-UDP tier. `subject` is
+    /// normally the lowercase-hex encoding of the caller's ed25519 signing
+    /// public key (see `pillar_net::client_ingest::signer_subject`) — the
+    /// SAME identity [`Self::resource_op_apply`]'s `actor` is derived from —
+    /// so admitting it here is exactly what makes that specific key
+    /// authoritative.
+    pub fn admit_resource_op_signer(&mut self, subject: NodeId) {
+        self.admit_subject(subject, self.authority.max_depth());
+    }
+
     /// `edit` (ACT): apply an edited workload body (here, a new image) as one
     /// signed patch act — reuses the same authorized apply path as `apply`.
     pub fn resource_edit(
@@ -3801,6 +3850,31 @@ fn dispatch_bootstrap_create(
     }
 }
 
+/// `POST /bootstrap/admit-resource-signer` — SETUP-time only (never part of
+/// the pillar-message apply/delete mutation path itself): admits a
+/// `pillar-client` caller's own ed25519 signing public key (lowercase hex,
+/// the request body verbatim) as a WoT-authoritative subject at full trust
+/// depth, so the resource-op pillar-UDP tier
+/// ([`crate::resource_op_udp_server`]) will authorize mutations it signs
+/// (see [`WebAuthContext::admit_resource_op_signer`]). Requires a
+/// bootstrapped cell (a first user must already exist) — a fresh node
+/// refuses, mirroring every other post-bootstrap admission action.
+fn dispatch_bootstrap_admit_resource_signer(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    if ctx.bootstrap().initial_user().is_none() {
+        return text_response(409, "Conflict", "DENIED not-bootstrapped".to_owned());
+    }
+    let signer_hex = request.body.trim();
+    if signer_hex.is_empty() {
+        return text_response(400, "Bad Request", "MISSING signer-hex".to_owned());
+    }
+    ctx.admit_resource_op_signer(NodeId::from(signer_hex));
+    text_response(200, "OK", format!("RESOURCE-SIGNER-ADMITTED {signer_hex}"))
+}
+
 fn dispatch_nonce(
     ctx: &mut WebAuthContext,
     _peer: &SocketAddr,
@@ -3857,6 +3931,11 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "POST",
         path: PathMatch::Exact("/bootstrap/create"),
         handler: dispatch_bootstrap_create,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/admit-resource-signer"),
+        handler: dispatch_bootstrap_admit_resource_signer,
     },
     RouteSpec {
         method: "GET",

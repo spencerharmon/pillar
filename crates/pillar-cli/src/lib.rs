@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply_over_pillar_message;
 pub mod bootstrap;
 pub mod cli_surface;
 pub mod cluster;
@@ -44,6 +45,7 @@ pub mod psl_client;
 pub mod psl_quic_server;
 pub mod psl_udp_server;
 pub mod resource;
+pub mod resource_op_udp_server;
 pub mod resourceset;
 pub mod run;
 pub mod secrets_audit_rotation_mfa;

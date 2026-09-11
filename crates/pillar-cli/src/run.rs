@@ -819,6 +819,12 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             path: streamdb_root.clone(),
             reason: format!("derive streamdb cell group key: {e}"),
         })?;
+    // The resource-op pillar-UDP tier (see below) needs the SAME cell
+    // id/group key the streamdb segment signer just derived, to open a
+    // client-sealed `ResourceOp` message — clone before the stream
+    // constructor below consumes both by value.
+    let resource_op_cell_id = cell_id.clone();
+    let resource_op_group_key = cell_group_key.clone();
     let store =
         pillar_streamdb::ContentStore::open(&streamdb_root).map_err(|e| BootError::StreamDb {
             path: streamdb_root.clone(),
@@ -1296,6 +1302,28 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         match crate::psl_quic_server::spawn(addr, std::sync::Arc::clone(&ctx)) {
                             Ok(bound) => tracing::info!(%bound, "psl-message-api QUIC tier listening"),
                             Err(e) => tracing::warn!(error = %e, %addr, "psl-message-api QUIC tier failed to bind"),
+                        }
+                    }
+                }
+
+                // The resource-op pillar-UDP tier (`cli-apply-over-pillar-
+                // message`, 2026-09-11 ROI HEAD): lets a `pillar-client`
+                // caller — `pillar apply -f`/`pillar delete` — mutate this
+                // node's resource plane over a real dial/seal/sign
+                // `PillarMessage` carrying a `pillar_ops::ResourceOp`,
+                // superseding a privileged REST mutation call. Opt-in like
+                // the two tiers above; unset in production until a deployed
+                // node's real multi-member cell group key replaces this
+                // solo-node interim derivation.
+                if let Ok(bind) = std::env::var("PILLAR_RESOURCE_OP_UDP_BIND") {
+                    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
+                        let keys = crate::resource_op_udp_server::ResourceOpServerKeys::derive(
+                            resource_op_cell_id.clone(),
+                            resource_op_group_key.clone(),
+                        );
+                        match crate::resource_op_udp_server::spawn(addr, std::sync::Arc::clone(&ctx), keys) {
+                            Ok(bound) => tracing::info!(%bound, "resource-op pillar-UDP tier listening"),
+                            Err(e) => tracing::warn!(error = %e, %addr, "resource-op pillar-UDP tier failed to bind"),
                         }
                     }
                 }

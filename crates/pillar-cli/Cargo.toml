@@ -32,6 +32,8 @@ pillar-coordination = { path = "../pillar-coordination" }
 pillar-observability = { path = "../pillar-observability" }
 pillar-wire = { path = "../pillar-wire" }
 pillar-cells = { path = "../pillar-cells" }
+pillar-ops = { path = "../pillar-ops" }
+pillar-client = { path = "../pillar-client" }
 pillar-crypto = { path = "../pillar-crypto", default-features = false }
 libp2p = { version = "0.56", features = ["ed25519"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
