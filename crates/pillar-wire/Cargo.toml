@@ -26,5 +26,21 @@ tracing = "0.1"
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 
+# `pillar-crypto`'s signature/sealing primitives (p256/p384/p521/rsa via
+# `rand_core`) pull `getrandom` v0.2 for their CSPRNG seeding. `getrandom` v0.2
+# refuses `wasm32-unknown-unknown` by default (it cannot assume a Web Crypto
+# API is present) unless its `js` backend is explicitly enabled — the exact
+# reason a plain `cargo build -p pillar-wire --no-default-features --target
+# wasm32-unknown-unknown` failed before this entry with "the wasm*-unknown-
+# unknown targets are not supported by default". Declaring the SAME
+# `getrandom` version here with `js` turned on, scoped to
+# `cfg(target_arch = "wasm32")` only, unifies (Cargo resolves one feature set
+# per dependency version across the whole build graph) so the wasm build gets
+# a real browser-CSPRNG-backed `getrandom` while every native build (the CLI,
+# `pillar-streamdb`, tests) is completely untouched — this target table simply
+# does not exist outside a wasm32 build.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [lints]
 workspace = true
