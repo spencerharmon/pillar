@@ -36,6 +36,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use pillar_core::NodeId;
 use pillar_rbac::{Capability, Decision, RbacDecider, Request, ResourceClass};
 
+pub mod rbac_bridge;
+pub use rbac_bridge::{
+    authorize_effective_capability, effective_capabilities, iam_credentials_manage_capability,
+    iam_groups_write_capability, iam_roles_write_capability, role_group_grants, sensitive_ops_step_up_policy,
+    ManagedGroup, Role, IAM_CREDENTIALS_MANAGE_CAPABILITY, IAM_GROUPS_WRITE_CAPABILITY, IAM_ROLES_WRITE_CAPABILITY,
+    SENSITIVE_OPS_STEP_UP_MAX_AGE_SECS,
+};
+
 /// The capability string gating every admin write to the user/IAM surface
 /// (invite, list, show, role/group edits performed on someone OTHER than the
 /// acting user). A three-segment `namespace:resource:verb` capability, the
