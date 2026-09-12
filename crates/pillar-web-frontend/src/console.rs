@@ -83,12 +83,21 @@ pub enum Section {
     Swarm,
     /// Node/user bootstrap request inbox.
     Inbox,
+    /// Self-service profile (display name / email).
+    Profile,
+    /// Admin user directory: invite/list/disable/enable/reset-password/
+    /// require-password-change (`pillar-iam::user_record`).
+    Users,
+    /// Admin roles + managed groups (`pillar-iam::rbac_bridge`).
+    RolesGroups,
+    /// Admin OAuth client registry + consent (`pillar-oidc::client_registry`).
+    OAuthClients,
 }
 
 impl Section {
     /// Every section in canonical (sidebar) order.
     #[must_use]
-    pub const fn all() -> [Section; 12] {
+    pub const fn all() -> [Section; 16] {
         [
             Section::Overview,
             Section::Resources,
@@ -102,6 +111,10 @@ impl Section {
             Section::Trust,
             Section::Swarm,
             Section::Inbox,
+            Section::Profile,
+            Section::Users,
+            Section::RolesGroups,
+            Section::OAuthClients,
         ]
     }
 
@@ -123,6 +136,10 @@ impl Section {
             Section::Trust => "/trust",
             Section::Swarm => "/swarm",
             Section::Inbox => "/inbox",
+            Section::Profile => "/profile",
+            Section::Users => "/users",
+            Section::RolesGroups => "/roles-groups",
+            Section::OAuthClients => "/oauth-clients",
         }
     }
 
@@ -142,6 +159,10 @@ impl Section {
             Section::Trust => "Trust Graph",
             Section::Swarm => "Swarm",
             Section::Inbox => "Requests",
+            Section::Profile => "Profile",
+            Section::Users => "Users",
+            Section::RolesGroups => "Roles & Groups",
+            Section::OAuthClients => "OAuth Clients",
         }
     }
 
@@ -162,6 +183,10 @@ impl Section {
             Section::Trust => "⤳",
             Section::Swarm => "⟁",
             Section::Inbox => "✉",
+            Section::Profile => "☺",
+            Section::Users => "◈",
+            Section::RolesGroups => "⚑",
+            Section::OAuthClients => "⚷",
         }
     }
 
@@ -177,7 +202,11 @@ impl Section {
             | Section::Members
             | Section::Sessions
             | Section::Credentials
-            | Section::Trust => NavGroup::Access,
+            | Section::Trust
+            | Section::Profile
+            | Section::Users
+            | Section::RolesGroups
+            | Section::OAuthClients => NavGroup::Access,
             Section::Swarm | Section::Inbox => NavGroup::Cluster,
         }
     }
@@ -194,9 +223,12 @@ mod yew_impl {
     use crate::attestation_custody_console::{AttestationWizard, CustodyWizard};
     use crate::auth::{use_auth, AuthAction};
     use crate::command_palette::CommandPalette;
+    use crate::iam_console::{OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile};
     use crate::obs_console::ObservabilityConsole;
     use crate::overview::OverviewConsole;
-    use crate::portal::{CredentialsTile, IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile};
+    use crate::portal::{
+        CredentialsTile, IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile,
+    };
     use crate::resources_console::ResourcesConsole;
     use crate::resourcesets_console::ResourceSetsConsole;
     use crate::router::Route;
@@ -312,6 +344,10 @@ mod yew_impl {
             },
             Section::Swarm => html! { <SwarmTile /> },
             Section::Inbox => html! { <InboxTile /> },
+            Section::Profile => html! { <ProfileTile /> },
+            Section::Users => html! { <UsersTile /> },
+            Section::RolesGroups => html! { <RolesGroupsTile /> },
+            Section::OAuthClients => html! { <OAuthClientsTile /> },
         }
     }
 
@@ -333,6 +369,10 @@ mod yew_impl {
             Section::Trust => Route::Trust,
             Section::Swarm => Route::Swarm,
             Section::Inbox => Route::Inbox,
+            Section::Profile => Route::Profile,
+            Section::Users => Route::Users,
+            Section::RolesGroups => Route::RolesGroups,
+            Section::OAuthClients => Route::OAuthClients,
         }
     }
 }

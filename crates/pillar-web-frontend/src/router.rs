@@ -87,6 +87,22 @@ pub enum Route {
     /// Node/user bootstrap request inbox.
     #[cfg_attr(feature = "yew", at("/inbox"))]
     Inbox,
+    /// Self-service profile (display name / email).
+    #[cfg_attr(feature = "yew", at("/profile"))]
+    Profile,
+    /// Admin user directory (invite/list/disable/enable/reset/require-change).
+    #[cfg_attr(feature = "yew", at("/users"))]
+    Users,
+    /// Admin roles + managed groups (`pillar-iam::rbac_bridge`).
+    #[cfg_attr(feature = "yew", at("/roles-groups"))]
+    RolesGroups,
+    /// Admin OAuth client registry + consent (`pillar-oidc::client_registry`).
+    #[cfg_attr(feature = "yew", at("/oauth-clients"))]
+    OAuthClients,
+    /// The forced password-change interstitial: intercepts every OTHER route
+    /// while the session's `force_password_change` is set (see [`guard`]).
+    #[cfg_attr(feature = "yew", at("/change-password"))]
+    ChangePassword,
     /// Legacy alias for the old single-page portal — redirects to the
     /// [`Route::Overview`] console home so existing links keep working.
     #[cfg_attr(feature = "yew", at("/dashboard"))]
@@ -117,6 +133,11 @@ impl Route {
                 | Route::Trust
                 | Route::Swarm
                 | Route::Inbox
+                | Route::Profile
+                | Route::Users
+                | Route::RolesGroups
+                | Route::OAuthClients
+                | Route::ChangePassword
                 | Route::Dashboard
         )
     }
@@ -140,7 +161,11 @@ impl Route {
             Route::Trust => Section::Trust,
             Route::Swarm => Section::Swarm,
             Route::Inbox => Section::Inbox,
-            Route::Home | Route::Login | Route::NotFound => return None,
+            Route::Profile => Section::Profile,
+            Route::Users => Section::Users,
+            Route::RolesGroups => Section::RolesGroups,
+            Route::OAuthClients => Section::OAuthClients,
+            Route::Home | Route::Login | Route::NotFound | Route::ChangePassword => return None,
             // The detail page is not a `Section` — it renders its own page
             // directly (see `guarded` below), not the `ConsoleView` frame.
             Route::ResourceDetail { .. } => return None,
@@ -150,13 +175,23 @@ impl Route {
 
 /// The redirect-to-login guard: given the requested route and the current
 /// session, returns the EFFECTIVE route to render — `Route::Login` for a
-/// protected route with no active session, else the requested route
-/// unchanged. Applied on every render (including a `401` that cleared the
-/// session mid-session, via [`crate::auth::AuthAction::Unauthorized`]).
+/// protected route with no active session, `Route::ChangePassword` for ANY
+/// other route while the session's `force_password_change` is set (the
+/// `UserLifecycle.tla` `InvitedForcesChange` invariant, applied to routing:
+/// an operator with a pending forced change cannot navigate away from it to
+/// any other section), else the requested route unchanged. Applied on every
+/// render (including a `401` that cleared the session mid-session, via
+/// [`crate::auth::AuthAction::Unauthorized`]).
 pub fn guard(route: Route, session: &AuthSession) -> Route {
     if route.requires_auth() && !session.is_authenticated() {
         // A protected route without a session falls back to the login screen.
         Route::Login
+    } else if session.is_authenticated()
+        && session.force_password_change
+        && route != Route::ChangePassword
+    {
+        // A forced password change intercepts every other destination.
+        Route::ChangePassword
     } else if session.is_authenticated() && matches!(route, Route::Home | Route::Login) {
         // An authenticated user has no business on the public entry / login
         // screens — send them to the console home so signing in (or reloading
@@ -193,6 +228,7 @@ fn guarded(props: &GuardedProps) -> Html {
     match effective {
         Route::Login => html! { <LoginPanel /> },
         Route::NotFound => html! { <p>{ "not found" }</p> },
+        Route::ChangePassword => html! { <crate::iam_console::ChangePasswordPage /> },
         // The resource detail page is a real registered route, mounted
         // directly (not via `ConsoleView`'s `Section` dispatch) so
         // `crate::resources_console::ResourceDetailPage` is reachable at
@@ -263,6 +299,7 @@ mod tests {
             AuthAction::LoginSuccess {
                 user: "alice".to_string(),
                 token: "tok-123".to_string(),
+                force_password_change: false,
             },
         );
         let route = Route::ResourceDetail {
@@ -311,6 +348,7 @@ mod tests {
             AuthAction::LoginSuccess {
                 user: "alice".to_string(),
                 token: "tok-123".to_string(),
+                force_password_change: false,
             },
         );
         // Logged in: the protected route now renders as itself.
@@ -332,6 +370,7 @@ mod tests {
             AuthAction::LoginSuccess {
                 user: "alice".to_string(),
                 token: "tok-123".to_string(),
+                force_password_change: false,
             },
         );
         // The public entry (`/`) and the login screen both redirect an
@@ -361,11 +400,64 @@ mod tests {
             AuthAction::LoginSuccess {
                 user: "alice".to_string(),
                 token: "tok-123".to_string(),
+                force_password_change: false,
             },
         );
         assert_eq!(guard(Route::Dashboard, &session), Route::Dashboard);
         // A 401 anywhere clears the session; the SAME route now redirects.
         let session = reduce(&session, AuthAction::Unauthorized);
         assert_eq!(guard(Route::Dashboard, &session), Route::Login);
+    }
+
+    #[test]
+    fn a_forced_password_change_intercepts_every_other_route() {
+        let session = reduce(
+            &AuthSession::default(),
+            AuthAction::LoginSuccess {
+                user: "alice".to_string(),
+                token: "tok-123".to_string(),
+                force_password_change: true,
+            },
+        );
+        // Every protected destination — including the console home and the
+        // legacy dashboard alias — is intercepted to the change-password
+        // screen while the flag is set.
+        assert_eq!(guard(Route::Overview, &session), Route::ChangePassword);
+        assert_eq!(guard(Route::Dashboard, &session), Route::ChangePassword);
+        assert_eq!(guard(Route::Users, &session), Route::ChangePassword);
+        // Home/Login also resolve there (not to Overview) while forced.
+        assert_eq!(guard(Route::Home, &session), Route::ChangePassword);
+        assert_eq!(guard(Route::Login, &session), Route::ChangePassword);
+        // The change-password route itself renders as itself (no loop).
+        assert_eq!(
+            guard(Route::ChangePassword, &session),
+            Route::ChangePassword
+        );
+    }
+
+    #[test]
+    fn password_changed_lifts_the_forced_change_interception() {
+        let session = reduce(
+            &AuthSession::default(),
+            AuthAction::LoginSuccess {
+                user: "alice".to_string(),
+                token: "tok-123".to_string(),
+                force_password_change: true,
+            },
+        );
+        assert_eq!(guard(Route::Overview, &session), Route::ChangePassword);
+        let session = reduce(&session, AuthAction::PasswordChanged);
+        // The interception lifts; ordinary navigation resumes.
+        assert_eq!(guard(Route::Overview, &session), Route::Overview);
+        assert_eq!(guard(Route::Users, &session), Route::Users);
+    }
+
+    #[test]
+    fn an_unauthenticated_session_is_never_forced_to_change_password() {
+        // `force_password_change` is only meaningful for an authenticated
+        // session; an unauthenticated request for the change-password route
+        // still redirects to Login like any other protected route.
+        let session = AuthSession::default();
+        assert_eq!(guard(Route::ChangePassword, &session), Route::Login);
     }
 }
