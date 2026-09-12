@@ -5,16 +5,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Pillar OIDC provider: refines specs/OidcProvider.tla. This crate currently ships the OP's custodied ID-token signing-key machinery (the signing key rides the same pluggable SignerBackend custody trait node/cell keys already use, never a bare on-disk secret) and its JWKS current+prior rotation-grace publication; the authorize/token/userinfo/discovery HTTP surface lands in a later task (oidc-provider-endpoints)."
+description = "Pillar OIDC provider: refines specs/OidcProvider.tla. Ships the OP's custodied ID-token signing-key machinery (the signing key rides the same pluggable SignerBackend custody trait node/cell keys already use, never a bare on-disk secret) with its JWKS current+prior rotation-grace publication, the OAuth client registry + consent store, and the discovery/JWKS/authorize/token/userinfo/revocation HTTP surface (endpoints::Provider) as a pure, host-agnostic refinement of the spec."
+
+[features]
+acceptance = []
 
 [dependencies]
 pillar-core = { path = "../pillar-core" }
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-identity = { path = "../pillar-identity" }
+pillar-iam = { path = "../pillar-iam" }
 pillar-rbac = { path = "../pillar-rbac" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 pillar-wot-authority = { path = "../pillar-wot-authority" }

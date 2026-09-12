@@ -3561,11 +3561,13 @@ dependencies = [
  "base64 0.22.1",
  "pillar-core",
  "pillar-crypto",
+ "pillar-iam",
  "pillar-identity",
  "pillar-rbac",
  "pillar-wot-authority",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
