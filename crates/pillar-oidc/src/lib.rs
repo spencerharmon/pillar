@@ -14,15 +14,23 @@
 //!   surface ([`endpoints`], via [`endpoints::Provider`]) — a pure,
 //!   host-agnostic refinement of every action `specs/OidcProvider.tla` proves.
 //!
-//! Full OIDC claims mapping (scope-gated profile/email/roles from the user
-//! record) lands in a later task (`oidc-claims-from-user-record`).
+//! * The scope-gated OIDC **claims mapping** ([`claims`]): projects the
+//!   `pillar-iam` user record + resolved roles/groups into a `sub` /
+//!   `name` / `email` / `roles` / `groups` claim set gated by the client's
+//!   granted scopes, with `acr`/`amr` reflecting whether a genuine WebAuthn
+//!   assertion (per `stepup-mfa`) or only a password gated the session.
 
 #![forbid(unsafe_code)]
 
+pub mod claims;
 pub mod client_registry;
 pub mod custodied_keys;
 pub mod endpoints;
 
+pub use claims::{
+    map_claims, AuthMethod, ClaimSet, ACR_PASSWORD, ACR_WEBAUTHN, AMR_PWD, AMR_WEBAUTHN,
+    SCOPE_EMAIL, SCOPE_OPENID, SCOPE_PROFILE, SCOPE_ROLES,
+};
 pub use client_registry::{
     apply_op, authorize_oauth_write, authorize_redirect, introspect, list_consents,
     oauth_write_capability, register_client, replay, validate_registration, ClientOp,
