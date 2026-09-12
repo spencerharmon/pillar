@@ -45,7 +45,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pillar_core::NodeId;
-use pillar_rbac::{Capability, Decision, ExplicitGrant, GrantEffect, RbacDecider, Request, ResourceClass, StepUpPolicy};
+use pillar_rbac::{
+    Capability, Decision, ExplicitGrant, GrantEffect, RbacDecider, Request, ResourceClass,
+    StepUpPolicy,
+};
 
 use crate::UserRecord;
 
@@ -120,7 +123,10 @@ pub struct Role {
 impl Role {
     /// Build a new role from a name and capability strings.
     #[must_use]
-    pub fn new(name: impl Into<String>, capabilities: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        capabilities: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Role {
             name: name.into(),
             capabilities: capabilities.into_iter().map(Into::into).collect(),
@@ -150,7 +156,10 @@ impl ManagedGroup {
     /// Build a new, empty-membership managed group with the given attached
     /// role names.
     #[must_use]
-    pub fn new(name: impl Into<String>, roles: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        roles: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         ManagedGroup {
             name: name.into(),
             members: BTreeSet::new(),
@@ -291,12 +300,16 @@ mod tests {
                 handle: "alice".to_owned(),
                 display_name: "Alice".to_owned(),
                 email: "alice@example.com".to_owned(),
+                force_password_change: true,
+                require_passkey_enrollment: false,
                 at: 1,
             },
             UserOp::Invite {
                 handle: "bob".to_owned(),
                 display_name: "Bob".to_owned(),
                 email: "bob@example.com".to_owned(),
+                force_password_change: true,
+                require_passkey_enrollment: false,
                 at: 1,
             },
         ]);
@@ -394,6 +407,8 @@ mod tests {
             handle: "erin".to_owned(),
             display_name: "Erin".to_owned(),
             email: "erin@example.com".to_owned(),
+            force_password_change: true,
+            require_passkey_enrollment: false,
             at: 1,
         }]);
         let mut records = records;

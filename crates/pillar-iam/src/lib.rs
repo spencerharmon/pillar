@@ -39,9 +39,9 @@ use pillar_rbac::{Capability, Decision, RbacDecider, Request, ResourceClass};
 pub mod rbac_bridge;
 pub use rbac_bridge::{
     authorize_effective_capability, effective_capabilities, iam_credentials_manage_capability,
-    iam_groups_write_capability, iam_roles_write_capability, role_group_grants, sensitive_ops_step_up_policy,
-    ManagedGroup, Role, IAM_CREDENTIALS_MANAGE_CAPABILITY, IAM_GROUPS_WRITE_CAPABILITY, IAM_ROLES_WRITE_CAPABILITY,
-    SENSITIVE_OPS_STEP_UP_MAX_AGE_SECS,
+    iam_groups_write_capability, iam_roles_write_capability, role_group_grants,
+    sensitive_ops_step_up_policy, ManagedGroup, Role, IAM_CREDENTIALS_MANAGE_CAPABILITY,
+    IAM_GROUPS_WRITE_CAPABILITY, IAM_ROLES_WRITE_CAPABILITY, SENSITIVE_OPS_STEP_UP_MAX_AGE_SECS,
 };
 
 pub mod password_lifecycle;
@@ -78,7 +78,11 @@ pub fn iam_users_write_capability() -> Capability {
 /// is allowed — exactly [`pillar_rbac::key_export::authorize_key_export`]'s
 /// pattern applied to the IAM surface.
 #[must_use]
-pub fn authorize_users_write(decider: &RbacDecider<'_>, subject: NodeId, now_secs: u64) -> Decision {
+pub fn authorize_users_write(
+    decider: &RbacDecider<'_>,
+    subject: NodeId,
+    now_secs: u64,
+) -> Decision {
     let request = Request::new(subject, iam_users_write_capability())
         .with_resource_class(ResourceClass::All)
         .at_time(now_secs);
@@ -87,7 +91,9 @@ pub fn authorize_users_write(decider: &RbacDecider<'_>, subject: NodeId, now_sec
 
 /// A user's lifecycle status. Refines `specs/UserLifecycle.tla`'s `Status`
 /// (minus `"none"`, which here is simply "no record exists yet").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum UserStatus {
     /// Created by an admin invite; always carries `force_password_change =
     /// true` until the invitee completes their first self password change
@@ -125,6 +131,14 @@ pub struct UserRecord {
     /// Set on invite and by an admin `RequireChange`; cleared on the user's
     /// own completed password change.
     pub force_password_change: bool,
+    /// Set on invite when the admin requires the invitee to enrol a WebAuthn
+    /// passkey before the account is usable for anything else; cleared when
+    /// the user's first credential registers (`UserOp::PasskeyEnrolled`). An
+    /// onboarding required action independent of and symmetric to
+    /// `force_password_change` (`specs/UserLifecycle.tla`'s `requirePasskey`/
+    /// `RequiredPasskeyContained`). Defaults `false` for pre-options records.
+    #[serde(default)]
+    pub require_passkey_enrollment: bool,
     /// The wall-clock stamp of the last completed self password change, if
     /// any.
     pub password_changed_at: Option<u64>,
@@ -165,8 +179,23 @@ pub enum UserOp {
         handle: String,
         display_name: String,
         email: String,
+        /// Whether the invitee must change their password on first login (the
+        /// forced-change required action). Journaled with a `true` default so
+        /// a pre-options invite (always forced) replays with identical
+        /// semantics.
+        #[serde(default = "invite_default_force_change")]
+        force_password_change: bool,
+        /// Whether the invitee must enrol a WebAuthn passkey before the
+        /// account is usable (the required-passkey action). Defaults `false`
+        /// for pre-options journals.
+        #[serde(default)]
+        require_passkey_enrollment: bool,
         at: u64,
     },
+    /// Clears the required-passkey onboarding action once the user's first
+    /// WebAuthn credential registers (`specs/UserLifecycle.tla`'s
+    /// `EnrollPasskey`). A no-op (via [`apply_op`]) if the handle is unknown.
+    PasskeyEnrolled { handle: String, at: u64 },
     /// A profile edit (self `PUT /portal/profile`, or an admin edit): updates
     /// `display_name`/`email` on an EXISTING record.
     ProfileUpdate {
@@ -181,14 +210,34 @@ pub enum UserOp {
     PasswordChanged { handle: String, at: u64 },
     /// Admin sets the forced-change label (`RequireChange`).
     RequireChange { handle: String, at: u64 },
-    RoleAssign { handle: String, role: String, at: u64 },
-    RoleRevoke { handle: String, role: String, at: u64 },
-    GroupAdd { handle: String, group: String, at: u64 },
-    GroupRemove { handle: String, group: String, at: u64 },
+    RoleAssign {
+        handle: String,
+        role: String,
+        at: u64,
+    },
+    RoleRevoke {
+        handle: String,
+        role: String,
+        at: u64,
+    },
+    GroupAdd {
+        handle: String,
+        group: String,
+        at: u64,
+    },
+    GroupRemove {
+        handle: String,
+        group: String,
+        at: u64,
+    },
     /// Admin disable/enable (carried here so a replay of a disable/enable op
     /// stream — landed by `user-disable-enable` — folds through the same
     /// [`apply_op`] path as every other IAM mutation).
-    StatusChange { handle: String, status: UserStatus, at: u64 },
+    StatusChange {
+        handle: String,
+        status: UserStatus,
+        at: u64,
+    },
     /// Sets (or replaces) the record's sealed operational key —
     /// [`password_lifecycle`]'s provisioning primitive. Used at invite time
     /// (sealed under the admin-chosen temp password) and by a completed self
@@ -221,6 +270,7 @@ impl UserOp {
     pub fn handle(&self) -> &str {
         match self {
             UserOp::Invite { handle, .. }
+            | UserOp::PasskeyEnrolled { handle, .. }
             | UserOp::ProfileUpdate { handle, .. }
             | UserOp::PasswordChanged { handle, .. }
             | UserOp::RequireChange { handle, .. }
@@ -245,6 +295,8 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
             handle,
             display_name,
             email,
+            force_password_change,
+            require_passkey_enrollment,
             at,
         } => {
             records.entry(handle.clone()).or_insert_with(|| UserRecord {
@@ -254,13 +306,20 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
                 status: UserStatus::Invited,
                 roles: BTreeSet::new(),
                 groups: BTreeSet::new(),
-                force_password_change: true,
+                force_password_change,
+                require_passkey_enrollment,
                 password_changed_at: None,
                 created_at: at,
                 updated_at: at,
                 sealed_operational_key: None,
                 retired_operational_keys: Vec::new(),
             });
+        }
+        UserOp::PasskeyEnrolled { handle, at } => {
+            if let Some(record) = records.get_mut(&handle) {
+                record.require_passkey_enrollment = false;
+                record.updated_at = at;
+            }
         }
         UserOp::ProfileUpdate {
             handle,
@@ -360,6 +419,8 @@ pub fn invite_user(
     handle: &str,
     display_name: String,
     email: String,
+    force_password_change: bool,
+    require_passkey_enrollment: bool,
     at: u64,
 ) -> Result<UserOp, InviteError> {
     if records.contains_key(handle) {
@@ -369,8 +430,18 @@ pub fn invite_user(
         handle: handle.to_owned(),
         display_name,
         email,
+        force_password_change,
+        require_passkey_enrollment,
         at,
     })
+}
+
+/// Serde default for [`UserOp::Invite`]'s `force_password_change` field:
+/// `true`, so a pre-options journal (whose invites carried no such field and
+/// were unconditionally forced) replays with identical forced-change
+/// semantics.
+fn invite_default_force_change() -> bool {
+    true
 }
 
 /// Error building a [`UserOp::ProfileUpdate`].
@@ -432,7 +503,10 @@ pub fn list_users(records: &BTreeMap<String, UserRecord>) -> Vec<&UserRecord> {
 /// The admin `show` view: one record in full, or `None` for an unknown
 /// handle.
 #[must_use]
-pub fn show_user<'a>(records: &'a BTreeMap<String, UserRecord>, handle: &str) -> Option<&'a UserRecord> {
+pub fn show_user<'a>(
+    records: &'a BTreeMap<String, UserRecord>,
+    handle: &str,
+) -> Option<&'a UserRecord> {
     records.get(handle)
 }
 
@@ -604,6 +678,8 @@ mod disable_enable {
             handle: handle.to_owned(),
             display_name: handle.to_owned(),
             email: format!("{handle}@example.com"),
+            force_password_change: true,
+            require_passkey_enrollment: false,
             at: 1,
         }
     }
@@ -632,7 +708,9 @@ mod disable_enable {
             Err(AdmitDenied::AccountDisabled)
         );
         assert_eq!(
-            admit_credential_unlock(&records, "alice").unwrap_err().code(),
+            admit_credential_unlock(&records, "alice")
+                .unwrap_err()
+                .code(),
             "ACCOUNT-DISABLED"
         );
 
@@ -720,15 +798,19 @@ mod disable_enable {
     // no-op transition (disable-of-disabled / enable-of-active) is refused.
     #[test]
     fn disable_enable_retains_record_and_refuses_noops() {
-        let mut records = replay([invited("dave"), UserOp::RoleAssign {
-            handle: "dave".to_owned(),
-            role: "member".to_owned(),
-            at: 2,
-        }]);
+        let mut records = replay([
+            invited("dave"),
+            UserOp::RoleAssign {
+                handle: "dave".to_owned(),
+                role: "member".to_owned(),
+                at: 2,
+            },
+        ]);
 
         // enable-of-non-disabled (invited) is a refused no-op only when
         // already Active; here dave is Invited, so activate him first.
-        let op = enable_user(&records, "dave", 3).expect("enable of an invited handle activates it");
+        let op =
+            enable_user(&records, "dave", 3).expect("enable of an invited handle activates it");
         apply_op(&mut records, op);
         assert_eq!(records["dave"].status, UserStatus::Active);
         // Now enable-of-already-active is a refused no-op.
@@ -747,7 +829,10 @@ mod disable_enable {
         apply_op(&mut records, op);
         let dave = show_user(&records, "dave").expect("disabled != deleted; record retained");
         assert_eq!(dave.status, UserStatus::Disabled);
-        assert!(dave.roles.contains("member"), "history/roles retained on disable");
+        assert!(
+            dave.roles.contains("member"),
+            "history/roles retained on disable"
+        );
 
         // disable-of-already-disabled is a refused no-op.
         assert_eq!(
@@ -788,6 +873,8 @@ mod user_record {
                 handle: handle.clone(),
                 display_name: handle.clone(),
                 email: format!("{handle}@example.com"),
+                force_password_change: true,
+                require_passkey_enrollment: false,
                 at,
             });
             at += 1;
@@ -825,6 +912,8 @@ mod user_record {
             "carol",
             "Carol".to_owned(),
             "carol@example.com".to_owned(),
+            true,
+            false,
             100,
         )
         .expect("invite of a fresh handle must succeed");
@@ -844,10 +933,20 @@ mod user_record {
             handle: "dave".to_owned(),
             display_name: "Dave".to_owned(),
             email: "dave@example.com".to_owned(),
+            force_password_change: true,
+            require_passkey_enrollment: false,
             at: 1,
         }]);
         assert_eq!(
-            invite_user(&records, "dave", "Dave2".to_owned(), "d2@example.com".to_owned(), 2),
+            invite_user(
+                &records,
+                "dave",
+                "Dave2".to_owned(),
+                "d2@example.com".to_owned(),
+                true,
+                false,
+                2
+            ),
             Err(InviteError::AlreadyExists)
         );
     }
@@ -858,6 +957,8 @@ mod user_record {
             handle: "erin".to_owned(),
             display_name: "Erin".to_owned(),
             email: "erin@old.example.com".to_owned(),
+            force_password_change: true,
+            require_passkey_enrollment: false,
             at: 1,
         }]);
 
@@ -881,7 +982,8 @@ mod user_record {
         let (public, secret) = signing_keypair_from_seed(&seed).expect("keygen");
         let payload = serde_json::to_vec(&op).expect("op must serialize");
         let signature = sign(&secret, &payload).expect("sign");
-        verify(&public, &payload, &signature).expect("the signed profile-update payload must verify");
+        verify(&public, &payload, &signature)
+            .expect("the signed profile-update payload must verify");
 
         apply_op(&mut records, op);
 
@@ -894,7 +996,13 @@ mod user_record {
     fn updating_an_unknown_handle_is_refused() {
         let records: BTreeMap<String, UserRecord> = BTreeMap::new();
         assert_eq!(
-            update_profile(&records, "ghost", "Ghost".to_owned(), "g@example.com".to_owned(), 1),
+            update_profile(
+                &records,
+                "ghost",
+                "Ghost".to_owned(),
+                "g@example.com".to_owned(),
+                1
+            ),
             Err(ProfileError::NotFound)
         );
     }
@@ -929,6 +1037,8 @@ mod user_record {
             handle: "finn".to_owned(),
             display_name: "Finn".to_owned(),
             email: "finn@example.com".to_owned(),
+            force_password_change: true,
+            require_passkey_enrollment: false,
             at: 1,
         }]);
         assert_eq!(list_users(&records).len(), 1);

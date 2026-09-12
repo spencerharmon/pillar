@@ -201,11 +201,7 @@ pub fn admin_list_credentials(
     target: &str,
 ) -> Result<Vec<CredentialRecord>, AdminCredentialError> {
     auth.admit(target)?;
-    Ok(rp
-        .user_credentials(target)
-        .into_iter()
-        .cloned()
-        .collect())
+    Ok(rp.user_credentials(target).into_iter().cloned().collect())
 }
 
 /// REVOKE one of `target`'s credentials by id, reusing
@@ -335,12 +331,16 @@ mod admin_credentials {
                 handle: "admin".to_owned(),
                 display_name: "Admin".to_owned(),
                 email: "admin@example.com".to_owned(),
+                force_password_change: true,
+                require_passkey_enrollment: false,
                 at: 1,
             },
             UserOp::Invite {
                 handle: "target".to_owned(),
                 display_name: "Target".to_owned(),
                 email: "target@example.com".to_owned(),
+                force_password_change: true,
+                require_passkey_enrollment: false,
                 at: 1,
             },
         ])
@@ -419,7 +419,15 @@ mod admin_credentials {
 
         // Same role, but NO step-up assertion → Deny (always step-up gated).
         let d = authorize_credentials_manage(
-            &authority, &[], &[], &records, &roles, &groups, "admin", 10, None,
+            &authority,
+            &[],
+            &[],
+            &records,
+            &roles,
+            &groups,
+            "admin",
+            10,
+            None,
         );
         assert_eq!(d, Decision::Deny);
 
@@ -478,7 +486,13 @@ mod admin_credentials {
         register(&mut rp, "target", b"cred-2", "auth-2");
 
         // Authorized (fresh step-up) → both credentials.
-        let auth = ctx(&authority, &records, &roles, &groups, Some(StepUpAssertion::new(9, b"c")));
+        let auth = ctx(
+            &authority,
+            &records,
+            &roles,
+            &groups,
+            Some(StepUpAssertion::new(9, b"c")),
+        );
         let creds = admin_list_credentials(&auth, &rp, "target").expect("authorized list");
         let ids: BTreeSet<Vec<u8>> = creds.iter().map(|c| c.credential_id.clone()).collect();
         assert_eq!(
@@ -495,7 +509,13 @@ mod admin_credentials {
         );
 
         // Self-target → forbidden even when otherwise authorized.
-        let auth = ctx(&authority, &records, &roles, &groups, Some(StepUpAssertion::new(9, b"c")));
+        let auth = ctx(
+            &authority,
+            &records,
+            &roles,
+            &groups,
+            Some(StepUpAssertion::new(9, b"c")),
+        );
         assert_eq!(
             admin_list_credentials(&auth, &rp, "admin"),
             Err(AdminCredentialError::SelfTargetForbidden)
@@ -514,7 +534,13 @@ mod admin_credentials {
         register(&mut rp, "target", b"cred-1", "auth-1");
         register(&mut rp, "target", b"cred-2", "auth-2");
 
-        let auth = ctx(&authority, &records, &roles, &groups, Some(StepUpAssertion::new(9, b"c")));
+        let auth = ctx(
+            &authority,
+            &records,
+            &roles,
+            &groups,
+            Some(StepUpAssertion::new(9, b"c")),
+        );
 
         // Revoke cred-1 (not the last key → no confirmation needed).
         admin_revoke_credential(&auth, &mut rp, "target", b"cred-1", false).expect("revoke");
@@ -570,7 +596,13 @@ mod admin_credentials {
         let mut rp = RelyingParty::new();
         register(&mut rp, "target", b"only-cred", "auth-1");
 
-        let auth = ctx(&authority, &records, &roles, &groups, Some(StepUpAssertion::new(9, b"c")));
+        let auth = ctx(
+            &authority,
+            &records,
+            &roles,
+            &groups,
+            Some(StepUpAssertion::new(9, b"c")),
+        );
 
         // Without confirmation → refused, credential retained.
         assert_eq!(
@@ -585,7 +617,10 @@ mod admin_credentials {
         // With explicit confirmation → the lost/stolen sole key is revocable.
         admin_revoke_credential(&auth, &mut rp, "target", b"only-cred", true)
             .expect("confirmed last-key revoke succeeds");
-        assert!(rp.record(b"only-cred").is_none(), "confirmed last-key revoke deletes it");
+        assert!(
+            rp.record(b"only-cred").is_none(),
+            "confirmed last-key revoke deletes it"
+        );
     }
 
     // An admin can only ISSUE an enrollment invite — never mint a credential.
@@ -599,11 +634,20 @@ mod admin_credentials {
         let groups = BTreeMap::new();
         let rp_before = RelyingParty::new();
 
-        let auth = ctx(&authority, &records, &roles, &groups, Some(StepUpAssertion::new(9, b"c")));
+        let auth = ctx(
+            &authority,
+            &records,
+            &roles,
+            &groups,
+            Some(StepUpAssertion::new(9, b"c")),
+        );
         let invite = admin_issue_enrollment_invite(&auth, "target", TTL).expect("issue invite");
         assert_eq!(invite.target_handle, "target");
         assert_eq!(invite.issued_by, "admin");
-        assert!(invite.is_valid_at(10), "issued invite is valid at issue time");
+        assert!(
+            invite.is_valid_at(10),
+            "issued invite is valid at issue time"
+        );
         assert!(invite.is_valid_at(10 + TTL), "valid up to expiry");
         assert!(!invite.is_valid_at(10 + TTL + 1), "expired after its TTL");
 

@@ -79,8 +79,7 @@ pub fn seal_operational_key(
     let salt = Salt::from_bytes(salt_bytes.clone());
 
     let kek = pillar_crypto::kdf::derive_key(password, &salt, &params)?;
-    let wrapped =
-        pillar_crypto::aead::seal_symmetric(&kek, operational_key, OPERATIONAL_KEY_AAD)?;
+    let wrapped = pillar_crypto::aead::seal_symmetric(&kek, operational_key, OPERATIONAL_KEY_AAD)?;
 
     Ok(SealedOperationalKey {
         mem_kib: params.mem_kib,
@@ -122,9 +121,14 @@ pub enum InviteWithPasswordError {
 
 /// Build the op pair for an admin invite that ALSO provisions the invitee's
 /// operational key, sealed under an admin-chosen temp password
-/// (`specs/UserLifecycle.tla`'s `Invite`/`InvitedForcesChange`). Pure — see
-/// [`crate::invite_user`]'s doc for the sign-then-apply contract the caller
-/// must follow for EACH returned op, in order.
+/// (`specs/UserLifecycle.tla`'s `Invite`). Pure — see [`crate::invite_user`]'s
+/// doc for the sign-then-apply contract the caller must follow for EACH
+/// returned op, in order. The `force_password_change`/`require_passkey_enrollment`
+/// flags are the admin's per-invite Keycloak-style required-action choices.
+// Threads the full provisioning material (handle/profile, temp password,
+// operational key, the two required-action flags, timestamp) in one call; the
+// count is inherent to the invite contract, not an accidental parameter list.
+#[allow(clippy::too_many_arguments)]
 pub fn invite_user_with_temp_password(
     records: &BTreeMap<String, UserRecord>,
     handle: &str,
@@ -132,10 +136,20 @@ pub fn invite_user_with_temp_password(
     email: String,
     temp_password: &[u8],
     operational_key: &[u8],
+    force_password_change: bool,
+    require_passkey_enrollment: bool,
     at: u64,
 ) -> Result<[UserOp; 2], InviteWithPasswordError> {
-    let invite_op = invite_user(records, handle, display_name, email, at)
-        .map_err(InviteWithPasswordError::Invite)?;
+    let invite_op = invite_user(
+        records,
+        handle,
+        display_name,
+        email,
+        force_password_change,
+        require_passkey_enrollment,
+        at,
+    )
+    .map_err(InviteWithPasswordError::Invite)?;
     let sealed = seal_operational_key(operational_key, temp_password)
         .map_err(InviteWithPasswordError::Crypto)?;
     let provision_op = UserOp::ProvisionOperationalKey {
@@ -174,7 +188,9 @@ pub fn complete_self_password_change(
     new_password: &[u8],
     at: u64,
 ) -> Result<[UserOp; 2], PasswordChangeError> {
-    let record = records.get(handle).ok_or(PasswordChangeError::UnknownUser)?;
+    let record = records
+        .get(handle)
+        .ok_or(PasswordChangeError::UnknownUser)?;
     let sealed = record
         .sealed_operational_key
         .as_ref()
@@ -210,8 +226,11 @@ pub enum GatedAction {
     OwnProfile,
     /// Completing the acting user's OWN password change
     /// ([`complete_self_password_change`]). Always permitted, even while
-    /// contained — it is the ONLY way OUT of containment.
+    /// contained — it is the ONLY way OUT of forced-change containment.
     OwnPasswordChange,
+    /// Enrolling the acting user's OWN WebAuthn passkey (the way OUT of
+    /// required-passkey containment). Always permitted, even while contained.
+    OwnPasskeyEnrollment,
     /// Any other capability-gated act (`iam:users:write`, or any future
     /// capability) — refused while the acting user is contained.
     Other,
@@ -222,11 +241,15 @@ pub enum GatedAction {
 pub enum AdmitError {
     /// No record exists for this handle.
     UnknownUser,
-    /// `force_password_change` is set and `action` is not one of the two
-    /// exempted self-service acts (`specs/UserLifecycle.tla`'s
-    /// `ForcedChangeContained`). The host surfaces this as
-    /// `403 PASSWORD-CHANGE-REQUIRED`.
+    /// `force_password_change` is set and `action` is not one of the exempted
+    /// self-service acts (`specs/UserLifecycle.tla`'s `ForcedChangeContained`).
+    /// The host surfaces this as `403 PASSWORD-CHANGE-REQUIRED`.
     PasswordChangeRequired,
+    /// `require_passkey_enrollment` is set (and no forced change is
+    /// outstanding) and `action` is not one of the exempted self-service acts
+    /// (`specs/UserLifecycle.tla`'s `RequiredPasskeyContained`). The host
+    /// surfaces this as `403 PASSKEY-ENROLLMENT-REQUIRED`.
+    PasskeyEnrollmentRequired,
 }
 
 /// The SHARED admit/dispatch gate: decide whether `handle` may perform
@@ -244,9 +267,23 @@ pub fn admit_gated_action(
     max_password_age_secs: Option<u64>,
 ) -> Result<(), AdmitError> {
     let record = records.get(handle).ok_or(AdmitError::UnknownUser)?;
-    let contained = record.force_password_change || is_password_over_age(record, now, max_password_age_secs);
-    if contained && !matches!(action, GatedAction::OwnProfile | GatedAction::OwnPasswordChange) {
+    let exempt = matches!(
+        action,
+        GatedAction::OwnProfile
+            | GatedAction::OwnPasswordChange
+            | GatedAction::OwnPasskeyEnrollment
+    );
+    // Forced-change containment (`ForcedChangeContained`) takes precedence in
+    // its error code; over-age is folded into the same forced-change gate.
+    let force_contained =
+        record.force_password_change || is_password_over_age(record, now, max_password_age_secs);
+    if force_contained && !exempt {
         return Err(AdmitError::PasswordChangeRequired);
+    }
+    // Required-passkey containment (`RequiredPasskeyContained`) — symmetric,
+    // independent second gate.
+    if record.require_passkey_enrollment && !exempt {
+        return Err(AdmitError::PasskeyEnrollmentRequired);
     }
     Ok(())
 }
@@ -297,7 +334,12 @@ mod tests {
     use super::*;
     use crate::{apply_op, replay, UserStatus};
 
-    fn provisioned_invite(handle: &str, temp_password: &[u8], key: &[u8], at: u64) -> BTreeMap<String, UserRecord> {
+    fn provisioned_invite(
+        handle: &str,
+        temp_password: &[u8],
+        key: &[u8],
+        at: u64,
+    ) -> BTreeMap<String, UserRecord> {
         let records = BTreeMap::new();
         let ops = invite_user_with_temp_password(
             &records,
@@ -306,6 +348,8 @@ mod tests {
             format!("{handle}@example.com"),
             temp_password,
             key,
+            true,
+            false,
             at,
         )
         .expect("invite with temp password must succeed");
@@ -314,7 +358,12 @@ mod tests {
 
     #[test]
     fn invite_provisions_a_sealed_operational_key_and_forces_password_change() {
-        let records = provisioned_invite("alice", b"temp-pw-0001", b"alice-operational-key-material", 10);
+        let records = provisioned_invite(
+            "alice",
+            b"temp-pw-0001",
+            b"alice-operational-key-material",
+            10,
+        );
         let alice = records.get("alice").expect("alice must be recorded");
         assert_eq!(alice.status, UserStatus::Invited);
         assert!(alice.force_password_change);
@@ -333,10 +382,17 @@ mod tests {
 
     #[test]
     fn self_password_change_reseals_the_same_key_and_clears_forced_change() {
-        let mut records = provisioned_invite("bob", b"temp-pw-0002", b"bob-operational-key-material", 20);
+        let mut records =
+            provisioned_invite("bob", b"temp-pw-0002", b"bob-operational-key-material", 20);
 
-        let ops = complete_self_password_change(&records, "bob", b"temp-pw-0002", b"bobs-new-password!", 30)
-            .expect("a correct current password must complete the change");
+        let ops = complete_self_password_change(
+            &records,
+            "bob",
+            b"temp-pw-0002",
+            b"bobs-new-password!",
+            30,
+        )
+        .expect("a correct current password must complete the change");
         for op in ops {
             apply_op(&mut records, op);
         }
@@ -350,21 +406,39 @@ mod tests {
 
         // The operational key survives the re-seal unchanged, now reachable
         // ONLY via the new password.
-        let unsealed = unseal_operational_key(bob.sealed_operational_key.as_ref().unwrap(), b"bobs-new-password!")
-            .expect("the new password must unseal the resealed key");
+        let unsealed = unseal_operational_key(
+            bob.sealed_operational_key.as_ref().unwrap(),
+            b"bobs-new-password!",
+        )
+        .expect("the new password must unseal the resealed key");
         assert_eq!(unsealed, b"bob-operational-key-material");
 
         assert!(
-            unseal_operational_key(bob.sealed_operational_key.as_ref().unwrap(), b"temp-pw-0002").is_err(),
+            unseal_operational_key(
+                bob.sealed_operational_key.as_ref().unwrap(),
+                b"temp-pw-0002"
+            )
+            .is_err(),
             "the old temp password must no longer unseal the resealed key"
         );
     }
 
     #[test]
     fn self_password_change_with_a_wrong_current_password_is_refused() {
-        let records = provisioned_invite("carol", b"temp-pw-0003", b"carol-operational-key-material", 40);
+        let records = provisioned_invite(
+            "carol",
+            b"temp-pw-0003",
+            b"carol-operational-key-material",
+            40,
+        );
 
-        let result = complete_self_password_change(&records, "carol", b"wrong-password", b"new-password", 50);
+        let result = complete_self_password_change(
+            &records,
+            "carol",
+            b"wrong-password",
+            b"new-password",
+            50,
+        );
         assert_eq!(result, Err(PasswordChangeError::IncorrectCurrentPassword));
 
         // Refusal must be side-effect-free: force_password_change stays set.
@@ -374,7 +448,12 @@ mod tests {
 
     #[test]
     fn contained_user_may_only_use_its_own_profile_and_password_change_acts() {
-        let records = provisioned_invite("dave", b"temp-pw-0004", b"dave-operational-key-material", 60);
+        let records = provisioned_invite(
+            "dave",
+            b"temp-pw-0004",
+            b"dave-operational-key-material",
+            60,
+        );
 
         assert_eq!(
             admit_gated_action(&records, "dave", GatedAction::OwnProfile, 61, None),
@@ -395,9 +474,20 @@ mod tests {
 
     #[test]
     fn a_successful_self_change_uncontains_the_session() {
-        let mut records = provisioned_invite("erin", b"temp-pw-0005", b"erin-operational-key-material", 70);
-        let ops = complete_self_password_change(&records, "erin", b"temp-pw-0005", b"erins-new-password!", 80)
-            .expect("correct current password must complete the change");
+        let mut records = provisioned_invite(
+            "erin",
+            b"temp-pw-0005",
+            b"erin-operational-key-material",
+            70,
+        );
+        let ops = complete_self_password_change(
+            &records,
+            "erin",
+            b"temp-pw-0005",
+            b"erins-new-password!",
+            80,
+        )
+        .expect("correct current password must complete the change");
         for op in ops {
             apply_op(&mut records, op);
         }
@@ -413,9 +503,16 @@ mod tests {
     fn max_password_age_forces_the_flag_on_an_over_age_login() {
         // finn changed their password at t=0 and is no longer freshly
         // invited (force_password_change already cleared by a prior change).
-        let mut records = provisioned_invite("finn", b"temp-pw-0006", b"finn-operational-key-material", 0);
-        let ops = complete_self_password_change(&records, "finn", b"temp-pw-0006", b"finns-second-password!", 0)
-            .expect("initial self change must succeed");
+        let mut records =
+            provisioned_invite("finn", b"temp-pw-0006", b"finn-operational-key-material", 0);
+        let ops = complete_self_password_change(
+            &records,
+            "finn",
+            b"temp-pw-0006",
+            b"finns-second-password!",
+            0,
+        )
+        .expect("initial self change must succeed");
         for op in ops {
             apply_op(&mut records, op);
         }
@@ -430,9 +527,10 @@ mod tests {
         );
 
         let now_over_age = 500;
-        let forced_op = evaluate_login_password_age(&records, "finn", now_over_age, Some(max_age_secs))
-            .expect("evaluation must succeed")
-            .expect("an over-age login must yield a RequireChange op");
+        let forced_op =
+            evaluate_login_password_age(&records, "finn", now_over_age, Some(max_age_secs))
+                .expect("evaluation must succeed")
+                .expect("an over-age login must yield a RequireChange op");
         assert_eq!(
             forced_op,
             UserOp::RequireChange {
@@ -459,6 +557,127 @@ mod tests {
         assert_eq!(
             admit_gated_action(&records, "ghost", GatedAction::Other, 1, None),
             Err(AdmitError::UnknownUser)
+        );
+    }
+
+    fn provisioned_invite_opts(
+        handle: &str,
+        temp_password: &[u8],
+        key: &[u8],
+        force_password_change: bool,
+        require_passkey_enrollment: bool,
+        at: u64,
+    ) -> BTreeMap<String, UserRecord> {
+        let records = BTreeMap::new();
+        let ops = invite_user_with_temp_password(
+            &records,
+            handle,
+            format!("{handle} display"),
+            format!("{handle}@example.com"),
+            temp_password,
+            key,
+            force_password_change,
+            require_passkey_enrollment,
+            at,
+        )
+        .expect("invite with temp password must succeed");
+        replay(ops)
+    }
+
+    #[test]
+    fn invite_without_forced_change_is_immediately_usable() {
+        // Keycloak "require password change on first login = off": an
+        // admin-set permanent password, no forced change, no passkey action.
+        let records = provisioned_invite_opts("gus", b"perm-pw-0007", b"gus-key", false, false, 10);
+        let gus = records.get("gus").unwrap();
+        assert!(!gus.force_password_change);
+        assert!(!gus.require_passkey_enrollment);
+        assert_eq!(
+            admit_gated_action(&records, "gus", GatedAction::Other, 11, None),
+            Ok(()),
+            "an invite with no required actions must be usable immediately"
+        );
+    }
+
+    #[test]
+    fn required_passkey_contains_the_user_until_enrolled() {
+        // Invited with a required passkey but NO forced password change: the
+        // account is contained by the passkey gate alone.
+        let mut records =
+            provisioned_invite_opts("hana", b"perm-pw-0008", b"hana-key", false, true, 20);
+        let hana = records.get("hana").unwrap();
+        assert!(!hana.force_password_change);
+        assert!(hana.require_passkey_enrollment);
+
+        // Exempt self-service acts still pass while contained.
+        assert_eq!(
+            admit_gated_action(&records, "hana", GatedAction::OwnProfile, 21, None),
+            Ok(())
+        );
+        assert_eq!(
+            admit_gated_action(
+                &records,
+                "hana",
+                GatedAction::OwnPasskeyEnrollment,
+                21,
+                None
+            ),
+            Ok(())
+        );
+        // Every other act is refused with the passkey-specific code.
+        assert_eq!(
+            admit_gated_action(&records, "hana", GatedAction::Other, 21, None),
+            Err(AdmitError::PasskeyEnrollmentRequired)
+        );
+
+        // Enrolling the passkey clears the gate.
+        apply_op(
+            &mut records,
+            UserOp::PasskeyEnrolled {
+                handle: "hana".to_owned(),
+                at: 22,
+            },
+        );
+        assert!(!records.get("hana").unwrap().require_passkey_enrollment);
+        assert_eq!(
+            admit_gated_action(&records, "hana", GatedAction::Other, 23, None),
+            Ok(()),
+            "enrolling the required passkey must un-contain the session"
+        );
+    }
+
+    #[test]
+    fn forced_change_takes_precedence_over_required_passkey_in_the_error_code() {
+        // Invited with BOTH required actions: the forced-change code is
+        // reported first, and BOTH must clear before the account is usable.
+        let mut records =
+            provisioned_invite_opts("ivan", b"temp-pw-0009", b"ivan-key", true, true, 30);
+        assert_eq!(
+            admit_gated_action(&records, "ivan", GatedAction::Other, 31, None),
+            Err(AdmitError::PasswordChangeRequired)
+        );
+        // Clear the password change; the passkey gate still contains.
+        let ops =
+            complete_self_password_change(&records, "ivan", b"temp-pw-0009", b"ivans-new-pw!", 32)
+                .expect("self change");
+        for op in ops {
+            apply_op(&mut records, op);
+        }
+        assert_eq!(
+            admit_gated_action(&records, "ivan", GatedAction::Other, 33, None),
+            Err(AdmitError::PasskeyEnrollmentRequired)
+        );
+        // Clear the passkey; now usable.
+        apply_op(
+            &mut records,
+            UserOp::PasskeyEnrolled {
+                handle: "ivan".to_owned(),
+                at: 34,
+            },
+        );
+        assert_eq!(
+            admit_gated_action(&records, "ivan", GatedAction::Other, 35, None),
+            Ok(())
         );
     }
 }

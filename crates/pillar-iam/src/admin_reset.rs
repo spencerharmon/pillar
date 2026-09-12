@@ -75,7 +75,9 @@ impl From<AdminCredentialError> for AdminResetError {
             AdminCredentialError::SelfTargetForbidden => AdminResetError::SelfTargetForbidden,
             // The reset surface never triggers the credential-specific arms.
             AdminCredentialError::NoSuchCredential
-            | AdminCredentialError::LastCredentialNeedsConfirmation => AdminResetError::NotAuthorized,
+            | AdminCredentialError::LastCredentialNeedsConfirmation => {
+                AdminResetError::NotAuthorized
+            }
         }
     }
 }
@@ -125,8 +127,7 @@ pub fn admin_reset_password(
     // A genuinely NEW operational key, sealed under the admin-chosen password.
     // The old key is never re-derived or exposed.
     let new_key = generate_operational_key();
-    let sealed =
-        seal_operational_key(&new_key, new_password).map_err(AdminResetError::Crypto)?;
+    let sealed = seal_operational_key(&new_key, new_password).map_err(AdminResetError::Crypto)?;
 
     Ok(UserOp::AdminReset {
         handle: target.to_owned(),
@@ -206,15 +207,22 @@ mod admin_reset {
             "target@example.com".to_owned(),
             b"old-temp-password",
             b"targets-original-operational-key",
+            true,
+            false,
             1,
         )
         .expect("invite target with temp password");
         let mut records = replay(target_ops);
         // The target completes its first self change so it has a NON-forced,
         // settled state before the admin reset (proves the reset re-forces).
-        let ops =
-            complete_self_password_change(&records, "target", b"old-temp-password", b"user-chosen-pw", 2)
-                .expect("target self-change");
+        let ops = complete_self_password_change(
+            &records,
+            "target",
+            b"old-temp-password",
+            b"user-chosen-pw",
+            2,
+        )
+        .expect("target self-change");
         for op in ops {
             apply_op(&mut records, op);
         }
@@ -225,6 +233,8 @@ mod admin_reset {
                 handle: "admin".to_owned(),
                 display_name: "Admin".to_owned(),
                 email: "admin@example.com".to_owned(),
+                force_password_change: true,
+                require_passkey_enrollment: false,
                 at: 1,
             },
         );
@@ -283,7 +293,16 @@ mod admin_reset {
         ciborium::into_writer(&att, &mut attestation).expect("enc");
         let ch = rp.begin("sess", "cell-A", 1000, TTL);
         rp.register_finish(
-            "sess", "cell-A", 1000, 0, &ch, &attestation, [7u8; 32], handle, "key", "pillar.local",
+            "sess",
+            "cell-A",
+            1000,
+            0,
+            &ch,
+            &attestation,
+            [7u8; 32],
+            handle,
+            "key",
+            "pillar.local",
         )
         .expect("register");
     }
@@ -489,7 +508,10 @@ mod admin_reset {
         let mut b = records.clone();
         apply_op(&mut a, op.clone());
         apply_op(&mut b, op);
-        assert_eq!(a["target"], b["target"], "apply_op is deterministic for AdminReset");
+        assert_eq!(
+            a["target"], b["target"],
+            "apply_op is deterministic for AdminReset"
+        );
     }
 
     // After a reset, the user escapes containment by completing a self password
