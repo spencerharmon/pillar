@@ -62,7 +62,14 @@ const MAX_DATAGRAM: usize = 60_000;
 /// libp2p peer `4001`. A `pillar apply` client dials this port by default (see
 /// `pillar_client` / the UI-exported `config.yaml`), so a fresh node is
 /// mutable over pillar-message with zero configuration.
-pub const DEFAULT_RESOURCE_OP_UDP_PORT: u16 = 8644;
+///
+/// The DECLARED constant lives in `pillar-net`
+/// ([`pillar_net::DEFAULT_RESOURCE_OP_UDP_PORT`]) alongside the shared
+/// default-bind resolution helper ([`pillar_net::resolve_resource_op_bind`])
+/// so the "bind by default, override via env" policy is one testable, pure
+/// function rather than re-derived here; this is a re-export for callers
+/// that only need the port.
+pub const DEFAULT_RESOURCE_OP_UDP_PORT: u16 = pillar_net::DEFAULT_RESOURCE_OP_UDP_PORT;
 
 /// The domain separator this tier's ack seal uses — distinct from
 /// [`pillar_client::transport::STREAM_OP_SEAL_DOMAIN`] (the INBOUND op's

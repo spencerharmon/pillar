@@ -1354,24 +1354,13 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // single-member cell; multi-member key coordination is a
                 // separate follow-up and does not gate default-on.
                 {
-                    let resource_op_bind: std::net::SocketAddr = match std::env::var(
-                        "PILLAR_RESOURCE_OP_UDP_BIND",
-                    ) {
-                        Ok(s) => match s.parse() {
-                            Ok(addr) => addr,
-                            Err(e) => {
-                                tracing::warn!(error = %e, bind = %s, "invalid PILLAR_RESOURCE_OP_UDP_BIND; falling back to the default 0.0.0.0 bind");
-                                std::net::SocketAddr::from((
-                                    std::net::Ipv4Addr::UNSPECIFIED,
-                                    crate::resource_op_udp_server::DEFAULT_RESOURCE_OP_UDP_PORT,
-                                ))
-                            }
-                        },
-                        Err(_) => std::net::SocketAddr::from((
-                            std::net::Ipv4Addr::UNSPECIFIED,
-                            crate::resource_op_udp_server::DEFAULT_RESOURCE_OP_UDP_PORT,
-                        )),
-                    };
+                    let override_value = std::env::var(pillar_net::RESOURCE_OP_UDP_BIND_ENV).ok();
+                    let resolved =
+                        pillar_net::resolve_resource_op_bind(override_value.as_deref());
+                    if let Some(invalid) = &resolved.invalid_override {
+                        tracing::warn!(bind = %invalid, "invalid PILLAR_RESOURCE_OP_UDP_BIND; falling back to the default 0.0.0.0 bind");
+                    }
+                    let resource_op_bind: std::net::SocketAddr = resolved.addr;
                     let keys = crate::resource_op_udp_server::ResourceOpServerKeys::derive(
                         resource_op_cell_id.clone(),
                         resource_op_group_key.clone(),
