@@ -40,6 +40,7 @@ UserRecord {
   roles:         BTreeSet<String>,// role names (see §4)
   groups:        BTreeSet<String>,// group names (see §4)
   force_password_change: bool,    // set on invite/reset/admin-require
+  require_passkey_enrollment: bool,// invite-time "must enrol a 2FA passkey"
   password_changed_at:   u64,     // unix secs; for rotation-age policy
   created_at:    u64,             // unix secs
   last_login_at: Option<u64>,     // unix secs
@@ -65,16 +66,31 @@ the node secret, and replace the stored offer.
   password; the node verifies the current password by performing the unlock
   (a wrong current password fails the AEAD open → 403).
 
-### 2.2 Invite + temporary password (admin)
-Admin provisions a new user: generate the user's operational subkey, seal it
-under an **admin-chosen temporary password**, mark the account `Invited` with
-`force_password_change = true`.
-- Op: `InviteUser { handle, display_name, email, roles, sealed_offer, created_at }`.
-- The admin has the freshly-generated operational key at provisioning time, so
-  no escrow is needed. The temp password is delivered out of band (shown once to
-  the admin); the node never emails it (no mailer exists — see §8).
-- First sign-in with the temp password succeeds (the user knows it) and is
-  immediately forced into §2.1 (see §2.4).
+### 2.2 Invite (admin) — Keycloak-style options
+Admin provisions a new user. As in Keycloak's "add user", the admin chooses,
+per invite, among independent options; the account is created `Invited` and its
+operational subkey is sealed under the chosen initial password.
+- **Username/handle, display name, email** — the identity fields.
+- **Initial password**: either **(a) admin-set** — the admin types the initial
+  password directly — or **(b) auto-generated temporary** — the node draws a
+  random temp password and returns it **once** to the admin (shown-once,
+  delivered out of band; the node never emails it — no mailer, see §8). Either
+  way the operational subkey is sealed under that initial password; the admin
+  holds the freshly-generated operational key at provisioning time, so no escrow
+  is needed.
+- **Require password change on first login** (`force_password_change`): a
+  per-invite toggle. Default **on** (the Keycloak "Temporary" default) — the
+  invitee is forced into §2.1 before any other act. An admin may turn it **off**
+  to hand out a permanent admin-set password (an immediately-usable account).
+- **Require passkey enrolment** (`require_passkey_enrollment`): an optional
+  per-invite toggle. When on, the user is admitted on first sign-in but is
+  **contained** (exactly like a forced password change — see §2.4) until they
+  enrol a WebAuthn passkey; the containment clears when the first credential is
+  registered. This is Keycloak's "Configure OTP / WebAuthn" required action.
+- Op: `InviteUser { handle, display_name, email, roles, sealed_offer,
+  force_password_change, require_passkey_enrollment, created_at }`.
+- The two required actions are **independent** and either/both/neither may be
+  attached. An invite with neither is a ready-to-use account.
 
 ### 2.3 Rotation policy / "require new password" label
 - `force_password_change` is the per-user label. An admin sets it with
@@ -85,12 +101,17 @@ under an **admin-chosen temporary password**, mark the account `Invited` with
   act). This is a policy label, not a separate op per user.
 
 ### 2.4 First-time / forced sign-in
-When a session's user has `force_password_change` set, the node admits the
-session but **refuses every act except the password change** (and read of the
-caller's own profile), returning `403 PASSWORD-CHANGE-REQUIRED`. The console
-router sees the flag on the `AuthSession` and redirects to a mandatory
-"set a new password" screen; no console section is reachable until the change
-succeeds and clears the flag.
+When a session's user carries an outstanding onboarding **required action** —
+`force_password_change` OR `require_passkey_enrollment` — the node admits the
+session but **refuses every capability-gated act except the ones that clear the
+requirement** (changing the caller's own password; enrolling the caller's own
+passkey) plus a read of the caller's own profile, returning
+`403 PASSWORD-CHANGE-REQUIRED` or `403 PASSKEY-ENROLLMENT-REQUIRED`
+respectively. The console router sees the flags on the `AuthSession` and
+redirects to the matching mandatory screen; no console section is reachable
+until every required action is cleared. The two gates are symmetric and
+independent — a user invited with both must both set a password and enrol a
+passkey before the account is usable for anything else.
 
 ### 2.5 Admin password reset (user forgot; admin does NOT know the password)
 The admin cannot unwrap the user's operational key (only the password or the
@@ -191,22 +212,31 @@ added later, must live on the infrastructure side (SMTP creds are a deployment
 secret), never embedded in the node source.
 
 ## 9. Invariants (model-checked in `specs/UserLifecycle.tla`)
-1. **Invited ⇒ force-change**: a freshly invited user always has
-   `force_password_change` until they complete a self password change.
-2. **Forced-change containment**: while `force_password_change` is set, the only
-   act the user can perform is changing their own password (and reading their
-   own profile); every other act is refused.
-3. **Disabled ⇒ no admit**: a `Disabled` user never obtains a session, and
+1. **Onboarding required actions are optional and independent**: an invite may
+   attach a forced first-login password change and/or a required passkey
+   enrolment, or neither. (Design change 2026-09: this supersedes the former
+   unconditional "Invited ⇒ force-change"; a forced change is now one optional
+   required action, not a property of every invited user.)
+2. **Forced-change containment** (`ForcedChangeContained`): while
+   `force_password_change` is set, the only acts the user can perform are
+   changing their own password and reading their own profile; every other
+   capability-gated act is refused.
+3. **Required-passkey containment** (`RequiredPasskeyContained`): while
+   `require_passkey_enrollment` is set, the user likewise passes no capability
+   gate — they may only enrol the passkey (and touch their own profile /
+   password); the flag clears when the first credential registers.
+4. **Disabled ⇒ no admit**: a `Disabled` user never obtains a session, and
    disabling revokes existing sessions.
-4. **Password change requires the current password** — except the admin
+5. **Password change requires the current password** — except the admin
    re-provision reset (§2.5A), which requires `iam:users:write` + step-up and
    issues a new subkey.
-5. **Capability derivation**: a user's effective capabilities equal the union
+6. **Capability derivation**: a user's effective capabilities equal the union
    over their roles and their groups' roles; revoking a role/group membership
-   removes exactly the capabilities it contributed (no residual grant).
-6. **Last-key revoke needs confirmation** (already shipped): revoking a user's
+   removes exactly the capabilities it contributed (no residual grant)
+   (`NoAmbientAuthority`).
+7. **Last-key revoke needs confirmation** (already shipped): revoking a user's
    sole credential requires explicit confirmation, but is always possible.
-7. **Admin credential management is capability-gated**: only a caller with
+8. **Admin credential management is capability-gated**: only a caller with
    `iam:credentials:manage` may list/revoke another user's keys; self-management
    is unchanged.
 
