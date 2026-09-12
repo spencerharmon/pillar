@@ -21,7 +21,7 @@ pub mod command_palette;
 pub mod console;
 pub mod dashboard;
 pub mod explore;
-pub mod query_console;
+pub mod iam_console;
 pub mod obs_console;
 pub mod overview;
 pub mod panels;
@@ -29,6 +29,7 @@ pub mod pillar_client;
 pub mod portal;
 pub mod portal_entry;
 pub mod primitives;
+pub mod query_console;
 pub mod resources_console;
 pub mod resourcesets_console;
 pub mod router;
@@ -296,14 +297,26 @@ mod tests {
         }
         // Raised tiles + auth cards use the layered surface, accent, and the
         // multi-layer shadows — the Linear aesthetic tokens.
-        assert!(g.contains(t.surface_raised), "global missing raised surface");
+        assert!(
+            g.contains(t.surface_raised),
+            "global missing raised surface"
+        );
         assert!(g.contains(t.accent), "global missing accent");
         assert!(g.contains(t.accent_glow), "global missing accent glow");
-        assert!(g.contains(t.shadow_resting), "global missing resting shadow");
-        assert!(g.contains(t.shadow_elevated), "global missing elevated shadow");
+        assert!(
+            g.contains(t.shadow_resting),
+            "global missing resting shadow"
+        );
+        assert!(
+            g.contains(t.shadow_elevated),
+            "global missing elevated shadow"
+        );
         // Full motion emits a transition with the token duration.
         assert!(g.contains("transition"), "global missing transition");
-        assert!(g.contains(t.motion_duration), "global missing motion duration");
+        assert!(
+            g.contains(t.motion_duration),
+            "global missing motion duration"
+        );
     }
 
     #[test]

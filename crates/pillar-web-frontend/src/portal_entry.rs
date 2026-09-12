@@ -112,6 +112,7 @@ mod yew_impl {
                                             auth.dispatch(AuthAction::LoginSuccess {
                                                 user: handle,
                                                 token: real,
+                                                force_password_change: false,
                                             });
                                         }
                                         _ => message.set(Some(friendly_error(
@@ -127,6 +128,7 @@ mod yew_impl {
                                         auth.dispatch(AuthAction::LoginSuccess {
                                             user: handle,
                                             token: r.session_token.unwrap_or_default(),
+                                            force_password_change: false,
                                         });
                                     }
                                     Err(reason) => message.set(Some(friendly_error(&reason))),
@@ -271,7 +273,8 @@ mod yew_impl {
                     true,
                 )));
                 spawn_local(async move {
-                    let body = bootstrap_wire(cell_v.trim(), handle_v.trim(), &factor_v, &second_factor_v);
+                    let body =
+                        bootstrap_wire(cell_v.trim(), handle_v.trim(), &factor_v, &second_factor_v);
                     match http("POST", "/bootstrap/create", Some(&body)).await {
                         Ok(r) => match interpret_bootstrap(r.ok(), &r.body) {
                             Ok(()) => {
@@ -299,8 +302,7 @@ mod yew_impl {
                                         .await
                                         {
                                             Ok(r) if r.ok() => {
-                                                let token =
-                                                    r.session_token.unwrap_or_default();
+                                                let token = r.session_token.unwrap_or_default();
                                                 on_enroll.emit((
                                                     token,
                                                     handle_v.trim().to_owned(),
@@ -429,6 +431,7 @@ mod yew_impl {
                             auth.dispatch(AuthAction::LoginSuccess {
                                 user: handle,
                                 token,
+                                force_password_change: false,
                             });
                         }
                         Err(e) => {

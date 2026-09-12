@@ -41,6 +41,16 @@ yew = [
     "dep:gloo-net",
     "dep:base64",
 ]
+# Opt-in acceptance gate for the `iam-console-sections` definition-of-done:
+# `tests/iam_console_acceptance.rs` (`#![cfg(feature = "acceptance")]`) proves
+# the four IAM console sections (Profile, Users, Roles & Groups, OAuth
+# Clients) are REAL, wired route/section/wire-parser surfaces — not a
+# decorative facade — and that the forced-password-change router guard
+# intercepts every route. Host-native (no browser/wasm runner needed; this
+# crate's Yew components already typecheck on the host per the `yew` feature
+# doc above). Off by default so a plain `cargo test` stays fast; the DoD
+# invokes `cargo test -p pillar-web-frontend --features acceptance` directly.
+acceptance = []
 
 [dependencies]
 # The shared client/server DTO crate: every request/response wire type that
