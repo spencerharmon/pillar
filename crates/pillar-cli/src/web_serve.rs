@@ -223,6 +223,18 @@ struct PendingLogin {
     identifier: String,
 }
 
+/// The cell id + seed material a CLI-config export bakes into a downloadable
+/// `config.yaml` so a `pillar` CLI can seal/open this cell's content, plus the
+/// externally-reachable `host:port` endpoint the exported config dials. Wired
+/// at boot via [`WebAuthContext::with_cli_export_material`]; `None` until then
+/// (the export route replies 503 without it).
+#[derive(Clone)]
+struct CliExportMaterial {
+    cell_id: pillar_crypto::CellId,
+    cell_seed: pillar_crypto::Seed,
+    endpoint: String,
+}
+
 pub struct WebAuthContext {
     verifier: NodeCustodyVerifier,
     authority: WotAuthority,
@@ -450,6 +462,9 @@ pub struct WebAuthContext {
     /// during replay, so a later session's new ops always sort after every
     /// earlier session's.
     next_op_seq: u64,
+    /// Cell id + seed material the CLI-config export bakes into a `config.yaml`,
+    /// plus the resource-op tier port; `None` until wired at boot.
+    cli_export: Option<CliExportMaterial>,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -483,6 +498,16 @@ enum PortalOp {
     /// A cell created without a first user yet (the split create-cell step).
     CreateCell {
         cell: String,
+    },
+    /// A scoped client signing subkey admitted as a WoT-authoritative
+    /// resource-op signer (the durable record of
+    /// [`WebAuthContext::admit_resource_op_signer`], written by the
+    /// authenticated CLI-config export and the setup admit endpoint). Replayed
+    /// so a node restart keeps every issued `pillar` CLI credential authorized
+    /// instead of silently breaking it. `signer` is the lowercase-hex ed25519
+    /// signing public key.
+    AdmitResourceSigner {
+        signer: String,
     },
     AddMember {
         handle: String,
@@ -585,7 +610,10 @@ enum PortalOp {
     },
     /// Resource-plane `rollout restart` — durable counterpart of
     /// [`WebAuthContext::resource_rollout`].
-    ResourceRollout { actor: String, name: String },
+    ResourceRollout {
+        actor: String,
+        name: String,
+    },
     /// Resource-plane `apply` for a scheduled (`CronJob`/`Job`) manifest —
     /// durable counterpart of [`WebAuthContext::resource_apply_cronjob`] /
     /// [`WebAuthContext::resource_apply_job`].
@@ -857,6 +885,7 @@ impl WebAuthContext {
             journal: None,
             replaying: false,
             next_op_seq: 0,
+            cli_export: None,
         }
     }
 
@@ -895,6 +924,25 @@ impl WebAuthContext {
     #[must_use]
     pub fn with_persistent_journal(mut self, journal: SharedPortalJournal) -> Self {
         self.journal = Some(journal);
+        self
+    }
+
+    /// Wire the cell id + seed material the CLI-config export bakes into a
+    /// downloadable `config.yaml` (see `dispatch_cli_config_export`), plus the
+    /// externally-reachable `host:port` a client should dial the resource-op
+    /// tier at (the node cannot infer its own external address, so the deploy
+    /// supplies it; see `run`).
+    pub fn with_cli_export_material(
+        mut self,
+        cell_id: pillar_crypto::CellId,
+        cell_seed: pillar_crypto::Seed,
+        endpoint: String,
+    ) -> Self {
+        self.cli_export = Some(CliExportMaterial {
+            cell_id,
+            cell_seed,
+            endpoint,
+        });
         self
     }
 
@@ -1022,6 +1070,9 @@ impl WebAuthContext {
         match op {
             PortalOp::CreateCell { cell } => {
                 self.restore_cell(NodeId::from(cell.as_str()));
+            }
+            PortalOp::AdmitResourceSigner { signer } => {
+                self.admit_resource_op_signer(NodeId::from(signer.as_str()));
             }
             PortalOp::BootstrapCellAndUser {
                 cell,
@@ -1710,7 +1761,12 @@ impl WebAuthContext {
         let sub = live.lock().expect("live observability lock");
         let query = match pillar_observability::parse_psl(query_text) {
             Ok(q) => q,
-            Err(e) => return Some(pillar_wire::PslQueryResponse::Error(format!("PSL-PARSE {}", e.0))),
+            Err(e) => {
+                return Some(pillar_wire::PslQueryResponse::Error(format!(
+                    "PSL-PARSE {}",
+                    e.0
+                )))
+            }
         };
         let now = sub.latest_tick();
         let rows: Vec<pillar_wire::PslSignalRow> = sub
@@ -1721,7 +1777,11 @@ impl WebAuthContext {
                 kind: signal_kind_tag(r.kind).to_owned(),
                 tick: r.tick,
                 unix_millis: r.unix_millis,
-                labels: r.labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                labels: r
+                    .labels
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
                 payload: r.payload.clone(),
             })
             .collect();
@@ -1733,7 +1793,9 @@ impl WebAuthContext {
                 members: members.iter().map(|m| m.to_hex()).collect(),
             })
             .collect();
-        Some(pillar_wire::PslQueryResponse::Ok(pillar_wire::PslQueryResult { rows, groups }))
+        Some(pillar_wire::PslQueryResponse::Ok(
+            pillar_wire::PslQueryResult { rows, groups },
+        ))
     }
 
     /// The metric-name typeahead for the Explore `select:` builders, one name
@@ -2245,9 +2307,7 @@ impl WebAuthContext {
         }
         let (capacity_tag, capacity_role, capacity_scope) = match &capacity {
             TrustCapacity::SelfCap => ("self".to_owned(), String::new(), String::new()),
-            TrustCapacity::Role { role, scope } => {
-                ("role".to_owned(), role.clone(), scope.clone())
-            }
+            TrustCapacity::Role { role, scope } => ("role".to_owned(), role.clone(), scope.clone()),
         };
         let authority_for_record = authority.as_ref().map(|a| a.0.clone());
         let subject_for_record = subject.to_string();
@@ -2374,10 +2434,7 @@ impl WebAuthContext {
         self.topology.declare(node.clone(), &labels);
         self.record(&PortalOp::TopologyDeclare {
             node: node.to_string(),
-            labels: labels
-                .into_iter()
-                .map(|l| (l.tier, l.value))
-                .collect(),
+            labels: labels.into_iter().map(|l| (l.tier, l.value)).collect(),
         });
     }
 
@@ -2875,7 +2932,11 @@ impl WebAuthContext {
                 .apply(actor, RESOURCE_CAP, crd.clone())
                 .map(|applied| applied.event.0.to_string()),
             pillar_ops::ResourceOp::Delete { kind, name } => plane
-                .delete(actor, RESOURCE_CAP, &Address::new(kind.clone(), name.clone()))
+                .delete(
+                    actor,
+                    RESOURCE_CAP,
+                    &Address::new(kind.clone(), name.clone()),
+                )
                 .map(|applied| applied.event.0.to_string()),
         }
     }
@@ -3872,7 +3933,114 @@ fn dispatch_bootstrap_admit_resource_signer(
         return text_response(400, "Bad Request", "MISSING signer-hex".to_owned());
     }
     ctx.admit_resource_op_signer(NodeId::from(signer_hex));
+    ctx.record(&PortalOp::AdmitResourceSigner {
+        signer: signer_hex.to_owned(),
+    });
     text_response(200, "OK", format!("RESOURCE-SIGNER-ADMITTED {signer_hex}"))
+}
+
+/// Lowercase-hex encode `bytes` (the canonical rendering for a signer subject
+/// / a hex-carried key or cell id in an exported `config.yaml`).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// `POST /portal/profile/cli-config` — body `<token>`: an authenticated user
+/// downloads a ready-to-use `config.yaml` for the `pillar` CLI. Mints a FRESH,
+/// scoped ed25519 signing subkey for this session (never the user's own cell
+/// key), DURABLY admits it as a WoT-authoritative resource-op signer (journaled
+/// as [`PortalOp::AdmitResourceSigner`], so a node restart keeps it authorized),
+/// and returns a `config.yaml` pre-filled with the cell, user, the reachable
+/// node endpoint, and the baked-in seal+sign material — so `pillar apply -f`
+/// works with no interactive unlock. The file carries sensitive,
+/// kubeconfig-equivalent key material (the cell seed opens cell content; the
+/// signer secret acts as an admitted writer); the banner tells the user to
+/// `chmod 600` it. Revoking this CLI credential (retiring its admission) never
+/// revokes the user's own key.
+fn dispatch_cli_config_export(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let token = request.body.lines().next().unwrap_or("").trim();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let Some(material) = ctx.cli_export.clone() else {
+        return text_response(
+            503,
+            "Service Unavailable",
+            "DENIED cli-export-material-unwired".to_owned(),
+        );
+    };
+    // Mint a fresh, scoped CLI signing subkey (never the user's own cell key).
+    let (signer_pub, signer_secret) = match pillar_crypto::sign::random_signing_keypair() {
+        Ok(kp) => kp,
+        Err(e) => {
+            tracing::error!(error = ?e, "cli-config export: failed to mint signing subkey");
+            return text_response(
+                500,
+                "Internal Server Error",
+                "DENIED keygen-failed".to_owned(),
+            );
+        }
+    };
+    let signer_public_hex = hex_encode(signer_pub.as_bytes());
+    let signer_secret_hex = hex_encode(signer_secret.as_bytes());
+    // Durably admit the subkey as a resource-op signer. The subject is the SAME
+    // lowercase-hex derivation the resource-op tier authorizes against
+    // (`pillar_net::client_ingest::signer_subject`).
+    ctx.admit_resource_op_signer(NodeId::from(signer_public_hex.as_str()));
+    ctx.record(&PortalOp::AdmitResourceSigner {
+        signer: signer_public_hex.clone(),
+    });
+
+    let cell = ctx
+        .bootstrap()
+        .cell()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    let user = session.subject.to_string();
+
+    let cfg = pillar_client::ClientConfig {
+        cell: Some(cell),
+        user: Some(user),
+        token: None,
+        credential: None,
+        nodes: None,
+        transport: Some(pillar_client::DEFAULT_TRANSPORT_ORDER.to_vec()),
+        swarm: None,
+        identity: Some(pillar_client::IdentityMaterial {
+            addr: material.endpoint.clone(),
+            cell_id_hex: hex_encode(material.cell_id.as_bytes()),
+            cell_seed_hex: hex_encode(material.cell_seed.as_bytes()),
+            signer_public_hex,
+            signer_secret_hex,
+        }),
+    };
+    let yaml = match cfg.to_yaml() {
+        Ok(y) => y,
+        Err(e) => {
+            tracing::error!(error = %e, "cli-config export: failed to serialize config.yaml");
+            return text_response(
+                500,
+                "Internal Server Error",
+                "DENIED serialize-failed".to_owned(),
+            );
+        }
+    };
+    let banner = "# pillar CLI config — SENSITIVE (carries this cell's seed and a\n\
+                  # scoped signer secret). Save as ~/.config/pillar/config.yaml\n\
+                  # and `chmod 600` it. Revoke this credential from the portal\n\
+                  # to disable it without affecting your own account.\n";
+    let mut resp = text_response(200, "OK", format!("{banner}{yaml}"));
+    resp.content_type = "application/yaml";
+    resp
 }
 
 fn dispatch_nonce(
@@ -3936,6 +4104,11 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "POST",
         path: PathMatch::Exact("/bootstrap/admit-resource-signer"),
         handler: dispatch_bootstrap_admit_resource_signer,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/profile/cli-config"),
+        handler: dispatch_cli_config_export,
     },
     RouteSpec {
         method: "GET",
@@ -4106,7 +4279,8 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "POST",
         path: PathMatch::Exact("/portal/obs/query/message"),
         handler: |ctx, _peer, request| dispatch_obs_query_message(ctx, request),
-    },    RouteSpec {
+    },
+    RouteSpec {
         method: "POST",
         path: PathMatch::Exact("/portal/obs/live/recording"),
         handler: |ctx, _peer, request| dispatch_obs_live_recording(ctx, request),
@@ -6064,7 +6238,13 @@ fn dispatch_webauthn_credentials_list(
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
     let subject = session.subject.to_string();
-    let dash = |s: &str| if s.is_empty() { "-".to_owned() } else { s.to_owned() };
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "-".to_owned()
+        } else {
+            s.to_owned()
+        }
+    };
     let lines: Vec<String> = ctx
         .webauthn_rp
         .user_credentials(&subject)
@@ -6106,7 +6286,11 @@ fn dispatch_webauthn_credentials_revoke(
     let mut lines = request.body.lines();
     let token = lines.next().unwrap_or("").trim();
     let cred_b64 = lines.next().unwrap_or("").trim();
-    let confirm = lines.next().unwrap_or("").trim().eq_ignore_ascii_case("confirm");
+    let confirm = lines
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("confirm");
     let Some(session) = ctx.login_session_for(token).cloned() else {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
@@ -6166,11 +6350,7 @@ fn dispatch_webauthn_authenticate_begin(
         .map(|c| pillar_crypto::webauthn::base64url_encode(c))
         .collect();
     let allow_csv = allow.join(",");
-    text_response(
-        200,
-        "OK",
-        format!("CHALLENGE {b64} {allow_csv}"),
-    )
+    text_response(200, "OK", format!("CHALLENGE {b64} {allow_csv}"))
 }
 
 /// `POST /webauthn/authenticate/finish` — verify the assertion and derive the
@@ -6223,11 +6403,7 @@ fn dispatch_webauthn_authenticate_finish(
             .into_iter()
             .any(|id| id == cred);
         if !owns {
-            return text_response(
-                403,
-                "Forbidden",
-                "DENIED credential-not-owned".to_owned(),
-            );
+            return text_response(403, "Forbidden", "DENIED credential-not-owned".to_owned());
         }
     }
     match ctx.webauthn_rp.authenticate_finish(
@@ -7742,6 +7918,67 @@ mod tests {
         login.session_token.expect("session token")
     }
 
+    /// The CLI-config export mints a fresh scoped signer, returns a parseable
+    /// `config.yaml` whose `identity:` block bakes the cell material verbatim,
+    /// mints a DISTINCT subkey per call, and refuses an unauthenticated caller.
+    #[test]
+    fn cli_config_export_mints_and_returns_a_parseable_turnkey_config() {
+        let (ctx, _sk) = provisioned_ctx();
+        let mut ctx = ctx.with_cli_export_material(
+            pillar_crypto::CellId::from_bytes(b"export-test-cell-id".to_vec()),
+            pillar_crypto::Seed::from_bytes(b"export-test-cell-seed".to_vec()),
+            "node.example.com:8643".to_owned(),
+        );
+        let token = login_alice(&mut ctx);
+
+        let resp = post(&mut ctx, "/portal/profile/cli-config", &token);
+        assert_eq!(resp.status, 200, "export failed: {}", resp.body);
+        assert_eq!(resp.content_type, "application/yaml");
+
+        let cfg = pillar_client::ClientConfig::parse(&resp.body, std::path::Path::new("c.yaml"))
+            .expect("exported config parses");
+        let id = cfg.identity.as_ref().expect("identity block present");
+        assert_eq!(id.addr, "node.example.com:8643");
+        assert_eq!(
+            id.cell_seed_hex,
+            hex_encode(b"export-test-cell-seed"),
+            "the cell seed is baked verbatim so the CLI derives the same group key"
+        );
+        assert_eq!(id.cell_id_hex, hex_encode(b"export-test-cell-id"));
+        assert!(
+            !id.signer_public_hex.is_empty() && !id.signer_secret_hex.is_empty(),
+            "a real scoped signer keypair is baked in"
+        );
+
+        // Each export mints a FRESH scoped subkey (real randomness).
+        let resp2 = post(&mut ctx, "/portal/profile/cli-config", &token);
+        let cfg2 = pillar_client::ClientConfig::parse(&resp2.body, std::path::Path::new("c2.yaml"))
+            .expect("second export parses");
+        assert_ne!(
+            id.signer_public_hex,
+            cfg2.identity.expect("id2").signer_public_hex,
+            "each export mints a distinct scoped subkey"
+        );
+
+        // The minted signer is REALLY admitted: it is authorized to write the
+        // resource plane (the exact predicate the resource-op tier enforces),
+        // while an un-exported random signer is refused fail-closed.
+        let admitted = NodeId::from(id.signer_public_hex.as_str());
+        assert!(
+            ctx.resource_dry_run(&admitted),
+            "the exported (admitted) signer must be authorized to write the resource plane"
+        );
+        let stranger = NodeId::from("00ff00ff00ff00ff00ff00ff00ff00ff");
+        assert!(
+            !ctx.resource_dry_run(&stranger),
+            "an un-admitted signer must be refused fail-closed"
+        );
+
+        // Unauthenticated export is refused.
+        let bad = post(&mut ctx, "/portal/profile/cli-config", "not-a-token");
+        assert_eq!(bad.status, 401, "unauthenticated export must be refused");
+    }
+
     // ---- WebAuthn RP ceremony (real browser-driven relying-party path) ----
 
     // A test Ed25519 authenticator: returns (attestation_object, secret, cose).
@@ -7952,7 +8189,11 @@ mod tests {
             .nth(1)
             .unwrap()
             .to_owned();
-        let login = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"));
+        let login = post(
+            &mut ctx,
+            "/login",
+            &format!("alice@pillar\n{PASSWORD}\n{nid}"),
+        );
         assert_eq!(login.status, 200, "{}", login.body);
         assert!(
             login.body.starts_with("NEEDS-2FA"),
@@ -8039,8 +8280,18 @@ mod tests {
             assert_eq!(r.status, 200, "{}", r.body);
             secret
         };
-        let _s1 = enroll(&mut ctx, b"cred-blue", "yubikey-blue", "deleteme.example.com");
-        let _s2 = enroll(&mut ctx, b"cred-green", "laptop-green", "pillar.example.net");
+        let _s1 = enroll(
+            &mut ctx,
+            b"cred-blue",
+            "yubikey-blue",
+            "deleteme.example.com",
+        );
+        let _s2 = enroll(
+            &mut ctx,
+            b"cred-green",
+            "laptop-green",
+            "pillar.example.net",
+        );
 
         // LIST returns both, oldest-first, with the metadata we enrolled.
         let list = post(&mut ctx, "/webauthn/credentials/list", &token);
@@ -8059,7 +8310,11 @@ mod tests {
             rows[1]
         );
         // Neither has been used to log in yet -> last-used is `-`.
-        assert!(rows[0].contains(" - "), "unused credential shows -: {}", rows[0]);
+        assert!(
+            rows[0].contains(" - "),
+            "unused credential shows -: {}",
+            rows[0]
+        );
 
         // A credential the caller does NOT own -> 404 (never 403, no probing).
         let bogus = post(
@@ -8183,7 +8438,11 @@ mod tests {
             .nth(1)
             .unwrap()
             .to_owned();
-        let login = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"));
+        let login = post(
+            &mut ctx,
+            "/login",
+            &format!("alice@pillar\n{PASSWORD}\n{nid}"),
+        );
         let ptoken = login.session_token.clone().expect("pending token");
         let ch2 = challenge_of(&post(&mut ctx, "/webauthn/authenticate/begin", &ptoken));
         let (ad, cdj, sig) = webauthn_assertion(&secret, &ch2, 4);
@@ -8244,9 +8503,13 @@ mod tests {
             .nth(1)
             .unwrap()
             .to_owned();
-        let ptoken = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"))
-            .session_token
-            .expect("pending token");
+        let ptoken = post(
+            &mut ctx,
+            "/login",
+            &format!("alice@pillar\n{PASSWORD}\n{nid}"),
+        )
+        .session_token
+        .expect("pending token");
         // An assertion from a DIFFERENT (never-enrolled) credential id is
         // refused before it can promote the session.
         let (_a2, mallory, _c2) = webauthn_authenticator("mallory", b"cred-x", 0);
@@ -8301,9 +8564,13 @@ mod tests {
             .nth(1)
             .unwrap()
             .to_owned();
-        let ptoken = post(&mut ctx, "/login", &format!("alice@pillar\n{PASSWORD}\n{nid}"))
-            .session_token
-            .expect("pending token");
+        let ptoken = post(
+            &mut ctx,
+            "/login",
+            &format!("alice@pillar\n{PASSWORD}\n{nid}"),
+        )
+        .session_token
+        .expect("pending token");
         let begin = post(&mut ctx, "/webauthn/authenticate/begin", &ptoken);
         assert_eq!(begin.status, 200, "{}", begin.body);
         // Body: CHALLENGE <b64> <allow-cred-csv>
@@ -8401,7 +8668,11 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let login = post(&mut node_b, "/login", &format!("spencer\n{PASSWORD}\n{id2}"));
+        let login = post(
+            &mut node_b,
+            "/login",
+            &format!("spencer\n{PASSWORD}\n{id2}"),
+        );
         assert_eq!(login.status, 200, "{}", login.body);
         assert!(
             login.body.starts_with("NEEDS-2FA"),
@@ -9396,7 +9667,11 @@ mod tests {
 
         // Unauthenticated is refused.
         assert_eq!(
-            get(&mut ctx, "/portal/key-export?token=nope&principal=founder@pillar").status,
+            get(
+                &mut ctx,
+                "/portal/key-export?token=nope&principal=founder@pillar"
+            )
+            .status,
             401
         );
 
@@ -9411,7 +9686,10 @@ mod tests {
         );
 
         // Secret export of OWN key: allowed (role + fresh login step-up).
-        let secx = get(&mut ctx, &format!("/portal/key-export?token={token}&secret=true"));
+        let secx = get(
+            &mut ctx,
+            &format!("/portal/key-export?token={token}&secret=true"),
+        );
         assert_eq!(secx.status, 200, "got: {}", secx.body);
         assert!(
             secx.body.contains("-----BEGIN PGP PRIVATE KEY BLOCK-----"),

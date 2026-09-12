@@ -43,8 +43,8 @@ pub use auth::{
     Credential, NodeAuthority, SessionToken,
 };
 pub use config::{
-    ClientConfig, ConfigDirs, ConfigError, ConnectParams, CredentialConfig, CredentialKind,
-    ResolveError, SwarmMode, TransportKind, DEFAULT_TRANSPORT_ORDER,
+    load, ClientConfig, ConfigDirs, ConfigError, ConnectParams, CredentialConfig, CredentialKind,
+    IdentityMaterial, ResolveError, SwarmMode, TransportKind, DEFAULT_TRANSPORT_ORDER,
 };
 pub use discovery::{
     CellDiscovery, DiscoveryError, InMemoryCellDiscovery, IngestNode, ResolvedNodes,

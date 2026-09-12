@@ -1258,7 +1258,32 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // thereafter persisted as a signed op on the SAME stream the
                 // controller loop rides, so a restart rehydrates a
                 // login-capable node instead of re-serving bootstrap.
-                .with_persistent_journal(std::sync::Arc::clone(&stream));
+                .with_persistent_journal(std::sync::Arc::clone(&stream))
+                // Wire the cell id + seed the CLI-config export bakes into a
+                // downloadable `config.yaml` (so a `pillar` CLI can seal/open
+                // this cell's content and sign resource ops). The seed is the
+                // SAME material `cell_group_key` was derived from above. The
+                // node cannot infer its own externally-reachable address, so
+                // the deploy supplies it via `PILLAR_PUBLIC_RESOURCE_OP_ADDR`
+                // (a full `host:port`) or `PILLAR_PUBLIC_HOST` (host only, the
+                // default port is appended); absent both, loopback is used (a
+                // CLI on the same host).
+                .with_cli_export_material(
+                    resource_op_cell_id.clone(),
+                    identity_seed_material.clone(),
+                    {
+                        let default_port =
+                            crate::resource_op_udp_server::DEFAULT_RESOURCE_OP_UDP_PORT;
+                        std::env::var("PILLAR_PUBLIC_RESOURCE_OP_ADDR")
+                            .ok()
+                            .or_else(|| {
+                                std::env::var("PILLAR_PUBLIC_HOST")
+                                    .ok()
+                                    .map(|h| format!("{h}:{default_port}"))
+                            })
+                            .unwrap_or_else(|| format!("127.0.0.1:{default_port}"))
+                    },
+                );
 
                 // Rehydrate the portal state from the ops already persisted in
                 // the streaming DB (rebuilt from IPFS-pinned segments by
@@ -1292,16 +1317,24 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 if let Ok(bind) = std::env::var("PILLAR_PSL_UDP_BIND") {
                     if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
                         match crate::psl_udp_server::spawn(addr, std::sync::Arc::clone(&ctx)) {
-                            Ok(bound) => tracing::info!(%bound, "psl-message-api pillar-UDP tier listening"),
-                            Err(e) => tracing::warn!(error = %e, %addr, "psl-message-api pillar-UDP tier failed to bind"),
+                            Ok(bound) => {
+                                tracing::info!(%bound, "psl-message-api pillar-UDP tier listening")
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, %addr, "psl-message-api pillar-UDP tier failed to bind")
+                            }
                         }
                     }
                 }
                 if let Ok(bind) = std::env::var("PILLAR_PSL_QUIC_BIND") {
                     if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
                         match crate::psl_quic_server::spawn(addr, std::sync::Arc::clone(&ctx)) {
-                            Ok(bound) => tracing::info!(%bound, "psl-message-api QUIC tier listening"),
-                            Err(e) => tracing::warn!(error = %e, %addr, "psl-message-api QUIC tier failed to bind"),
+                            Ok(bound) => {
+                                tracing::info!(%bound, "psl-message-api QUIC tier listening")
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, %addr, "psl-message-api QUIC tier failed to bind")
+                            }
                         }
                     }
                 }
@@ -1311,19 +1344,48 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // caller — `pillar apply -f`/`pillar delete` — mutate this
                 // node's resource plane over a real dial/seal/sign
                 // `PillarMessage` carrying a `pillar_ops::ResourceOp`,
-                // superseding a privileged REST mutation call. Opt-in like
-                // the two tiers above; unset in production until a deployed
-                // node's real multi-member cell group key replaces this
-                // solo-node interim derivation.
-                if let Ok(bind) = std::env::var("PILLAR_RESOURCE_OP_UDP_BIND") {
-                    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
-                        let keys = crate::resource_op_udp_server::ResourceOpServerKeys::derive(
-                            resource_op_cell_id.clone(),
-                            resource_op_group_key.clone(),
-                        );
-                        match crate::resource_op_udp_server::spawn(addr, std::sync::Arc::clone(&ctx), keys) {
-                            Ok(bound) => tracing::info!(%bound, "resource-op pillar-UDP tier listening"),
-                            Err(e) => tracing::warn!(error = %e, %addr, "resource-op pillar-UDP tier failed to bind"),
+                // superseding a privileged REST mutation call. Binds by
+                // DEFAULT on `0.0.0.0:<DEFAULT_RESOURCE_OP_UDP_PORT>` so a
+                // fresh node is reachable by `pillar apply` with zero config;
+                // `PILLAR_RESOURCE_OP_UDP_BIND` overrides the bind addr/port.
+                // Every op is sealed + signed + RBAC-checked, so a `0.0.0.0`
+                // bind exposes only an authenticated mutation surface. The
+                // interim solo-node cell group key is correct for the current
+                // single-member cell; multi-member key coordination is a
+                // separate follow-up and does not gate default-on.
+                {
+                    let resource_op_bind: std::net::SocketAddr = match std::env::var(
+                        "PILLAR_RESOURCE_OP_UDP_BIND",
+                    ) {
+                        Ok(s) => match s.parse() {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                tracing::warn!(error = %e, bind = %s, "invalid PILLAR_RESOURCE_OP_UDP_BIND; falling back to the default 0.0.0.0 bind");
+                                std::net::SocketAddr::from((
+                                    std::net::Ipv4Addr::UNSPECIFIED,
+                                    crate::resource_op_udp_server::DEFAULT_RESOURCE_OP_UDP_PORT,
+                                ))
+                            }
+                        },
+                        Err(_) => std::net::SocketAddr::from((
+                            std::net::Ipv4Addr::UNSPECIFIED,
+                            crate::resource_op_udp_server::DEFAULT_RESOURCE_OP_UDP_PORT,
+                        )),
+                    };
+                    let keys = crate::resource_op_udp_server::ResourceOpServerKeys::derive(
+                        resource_op_cell_id.clone(),
+                        resource_op_group_key.clone(),
+                    );
+                    match crate::resource_op_udp_server::spawn(
+                        resource_op_bind,
+                        std::sync::Arc::clone(&ctx),
+                        keys,
+                    ) {
+                        Ok(bound) => {
+                            tracing::info!(%bound, "resource-op pillar-UDP tier listening (default-on)")
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, %resource_op_bind, "resource-op pillar-UDP tier failed to bind")
                         }
                     }
                 }

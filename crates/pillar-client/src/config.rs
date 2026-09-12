@@ -107,6 +107,38 @@ pub struct CredentialConfig {
     pub key_id: Option<String>,
 }
 
+/// Baked-in seal+sign material for a NON-interactive client (the UI-exported
+/// `config.yaml`, see the node's `POST /portal/profile/cli-config`). Unlike
+/// [`CredentialConfig`] — which only *references* a custody-held key the client
+/// unlocks interactively — this block carries the actual material a `pillar`
+/// CLI needs to seal/open this cell's content and sign resource ops with a
+/// scoped, node-admitted subkey, so `pillar apply -f` works with no prompt.
+///
+/// **Security:** this is sensitive, kubeconfig-equivalent material (the cell
+/// seed lets its holder open cell content; the signer secret acts as an
+/// admitted writer). The exporting UI warns on download and the CLI persists
+/// the file `0600`. The signer here is a scoped CLI subkey, so revoking it
+/// (retiring its node admission) never revokes the user's own cell key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityMaterial {
+    /// `host:port` of the target node's resource-op pillar-UDP tier.
+    pub addr: String,
+    /// The target cell id's raw bytes, lowercase hex (a cell id is derived
+    /// bytes, not readable UTF-8, so it travels as hex).
+    #[serde(rename = "cell-id-hex")]
+    pub cell_id_hex: String,
+    /// The per-cell seed the node derived its cell group key from, lowercase
+    /// hex. The client derives the same group key from it identically.
+    #[serde(rename = "cell-seed-hex")]
+    pub cell_seed_hex: String,
+    /// The scoped CLI signing subkey's ed25519 public key, lowercase hex.
+    #[serde(rename = "signer-public-hex")]
+    pub signer_public_hex: String,
+    /// The scoped CLI signing subkey's ed25519 secret key, lowercase hex.
+    #[serde(rename = "signer-secret-hex")]
+    pub signer_secret_hex: String,
+}
+
 /// The private-swarm parameters a non-public-swarm client must additionally
 /// supply: the swarm pnet key file and the seed nodes to bootstrap from. Public
 /// -swarm clients omit this block entirely.
@@ -167,6 +199,11 @@ pub struct ClientConfig {
     /// Private-swarm parameters (public-swarm clients omit this).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub swarm: Option<SwarmConfig>,
+    /// Baked-in seal+sign material for a non-interactive client (the
+    /// UI-exported turnkey config). When present, `pillar apply`/`delete`
+    /// dial and sign directly from it with no prompt.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub identity: Option<IdentityMaterial>,
 }
 
 impl ClientConfig {
@@ -188,6 +225,7 @@ impl ClientConfig {
                 (Some(lo), Some(hi)) => Some(lo.merge(hi)),
                 (lo, hi) => hi.or(lo),
             },
+            identity: higher.identity.or(self.identity),
         }
     }
 
@@ -596,6 +634,34 @@ swarm:
         let text = serde_yaml::to_string(&cfg).expect("serialize");
         let again = ClientConfig::parse(&text, Path::new("t.yaml")).expect("reparse");
         assert_eq!(cfg, again, "serialize -> parse is faithful");
+    }
+
+    #[test]
+    fn identity_material_block_round_trips_with_kebab_case_keys() {
+        let cfg = ClientConfig {
+            cell: Some("pillar".to_owned()),
+            user: Some("spencer".to_owned()),
+            identity: Some(IdentityMaterial {
+                addr: "node.example.com:8643".to_owned(),
+                cell_id_hex: "deadbeef".to_owned(),
+                cell_seed_hex: "c0ffee".to_owned(),
+                signer_public_hex: "aa11".to_owned(),
+                signer_secret_hex: "bb22".to_owned(),
+            }),
+            ..ClientConfig::default()
+        };
+        let text = cfg.to_yaml().expect("serialize");
+        // On-disk keys are kebab-case (matches the exporter + docs).
+        assert!(text.contains("cell-id-hex:"), "kebab-case keys: {text}");
+        assert!(
+            text.contains("signer-secret-hex:"),
+            "kebab-case keys: {text}"
+        );
+        let again = ClientConfig::parse(&text, Path::new("id.yaml")).expect("reparse");
+        assert_eq!(cfg, again, "identity block survives serialize -> parse");
+        // A merged higher layer's identity block wins wholesale.
+        let base = ClientConfig::parse("cell: pillar\n", Path::new("lo")).expect("lo");
+        assert_eq!(base.merge(cfg.clone()).identity, cfg.identity);
     }
 
     #[test]

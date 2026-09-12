@@ -57,6 +57,13 @@ pub enum ConnectError {
     MissingEnv(&'static str),
     BadAddr(&'static str),
     BadHex(&'static str),
+    /// No `PILLAR_RESOURCE_OP_ADDR` env and no `identity:` block in any loaded
+    /// `config.yaml` — nothing tells the CLI where/how to connect. Run the
+    /// UI's "Download CLI config" (profile page) and drop the file at
+    /// `~/.config/pillar/config.yaml`.
+    MissingIdentity,
+    /// A `config.yaml` was present but could not be loaded/parsed.
+    Config(String),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -65,6 +72,11 @@ impl std::fmt::Display for ConnectError {
             ConnectError::MissingEnv(v) => write!(f, "missing required env var {v}"),
             ConnectError::BadAddr(v) => write!(f, "{v} is not a valid host:port"),
             ConnectError::BadHex(v) => write!(f, "{v} is not valid lowercase hex"),
+            ConnectError::MissingIdentity => f.write_str(
+                "no PILLAR_RESOURCE_OP_ADDR env and no identity: block in config.yaml — \
+                 download a CLI config from the portal profile page",
+            ),
+            ConnectError::Config(e) => write!(f, "loading config.yaml: {e}"),
         }
     }
 }
@@ -105,8 +117,7 @@ fn connect_from_env() -> Result<Connect, ConnectError> {
         decode_hex(&cell_id_hex).ok_or(ConnectError::BadHex("PILLAR_CELL_ID_HEX"))?,
     );
     let seed_hex = env("PILLAR_CELL_SEED_HEX")?;
-    let seed_bytes =
-        decode_hex(&seed_hex).ok_or(ConnectError::BadHex("PILLAR_CELL_SEED_HEX"))?;
+    let seed_bytes = decode_hex(&seed_hex).ok_or(ConnectError::BadHex("PILLAR_CELL_SEED_HEX"))?;
     let group = group_key_from_seed(&pillar_crypto::Seed::from_bytes(seed_bytes))
         .map_err(|_| ConnectError::BadHex("PILLAR_CELL_SEED_HEX"))?;
     let signer_hex = env("PILLAR_SIGNER_PUBLIC_HEX")?;
@@ -124,6 +135,58 @@ fn connect_from_env() -> Result<Connect, ConnectError> {
         signer,
         secret,
     })
+}
+
+/// Build a [`Connect`] from a loaded `config.yaml`'s `identity:` block (the
+/// UI-exported turnkey material). The layered search path is the standard
+/// [`pillar_client::ConfigDirs::from_env`] (`/etc/pillar` < XDG < `~/.pillar`)
+/// plus an explicit `$PILLAR_CONFIG`.
+fn connect_from_config() -> Result<Connect, ConnectError> {
+    let explicit = std::env::var("PILLAR_CONFIG")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let cfg = pillar_client::load(&pillar_client::ConfigDirs::from_env(), explicit.as_deref())
+        .map_err(|e| ConnectError::Config(e.to_string()))?;
+    let id = cfg.identity.ok_or(ConnectError::MissingIdentity)?;
+    let addr: SocketAddr = id
+        .addr
+        .parse()
+        .map_err(|_| ConnectError::BadAddr("identity.addr"))?;
+    let cell = CellId::from_bytes(
+        decode_hex(&id.cell_id_hex).ok_or(ConnectError::BadHex("identity.cell-id-hex"))?,
+    );
+    let seed_bytes =
+        decode_hex(&id.cell_seed_hex).ok_or(ConnectError::BadHex("identity.cell-seed-hex"))?;
+    let group = group_key_from_seed(&pillar_crypto::Seed::from_bytes(seed_bytes))
+        .map_err(|_| ConnectError::BadHex("identity.cell-seed-hex"))?;
+    let signer = SigningPublicKey::from_bytes(
+        decode_hex(&id.signer_public_hex)
+            .ok_or(ConnectError::BadHex("identity.signer-public-hex"))?,
+    );
+    let secret = SigningSecretKey::from_bytes(
+        decode_hex(&id.signer_secret_hex)
+            .ok_or(ConnectError::BadHex("identity.signer-secret-hex"))?,
+    );
+    Ok(Connect {
+        addr,
+        cell,
+        group,
+        signer,
+        secret,
+    })
+}
+
+/// Resolve connection material, preferring the explicit `PILLAR_*` environment
+/// (the advanced / test path) and otherwise reading the `identity:` block of a
+/// loaded `config.yaml` (the UI-exported turnkey path). The env override is
+/// selected iff `PILLAR_RESOURCE_OP_ADDR` is set, so an all-env invocation is
+/// byte-for-byte unchanged.
+fn connect() -> Result<Connect, ConnectError> {
+    if std::env::var("PILLAR_RESOURCE_OP_ADDR").is_ok() {
+        connect_from_env()
+    } else {
+        connect_from_config()
+    }
 }
 
 fn tiers(addr: SocketAddr) -> Vec<TierAddr> {
@@ -169,7 +232,7 @@ impl std::fmt::Display for SendError {
 /// [`SendError`] for a missing/malformed environment variable, an
 /// unreachable node, or a reply that fails to open/decode.
 pub fn send_op(op: &pillar_ops::ResourceOp) -> Result<(String, TransportKind), SendError> {
-    let conn = connect_from_env().map_err(SendError::Connect)?;
+    let conn = connect().map_err(SendError::Connect)?;
     let outcome = send_op_with_fallback(
         &tiers(conn.addr),
         op,
@@ -181,12 +244,15 @@ pub fn send_op(op: &pillar_ops::ResourceOp) -> Result<(String, TransportKind), S
     )
     .map_err(SendError::Transport)?;
     use pillar_wire::seal::{CellSeal, ContentSeal};
-    let aad = pillar_wire::PillarMessage::header_aad(outcome.response.visibility, &outcome.response.cell);
+    let aad =
+        pillar_wire::PillarMessage::header_aad(outcome.response.visibility, &outcome.response.cell);
     let plaintext = CellSeal
         .open(&conn.group, &outcome.response.body_sealed, &aad)
         .map_err(|_| SendError::UnsealAck)?;
     match Body::from_canonical_cbor(&plaintext) {
-        Ok(Body::Control(bytes)) => Ok((String::from_utf8_lossy(&bytes).into_owned(), outcome.tier)),
+        Ok(Body::Control(bytes)) => {
+            Ok((String::from_utf8_lossy(&bytes).into_owned(), outcome.tier))
+        }
         _ => Err(SendError::BadAckBody),
     }
 }

@@ -38,6 +38,21 @@ pub fn signing_keypair_from_seed(seed: &Seed) -> Result<(SigningPublicKey, Signi
     ))
 }
 
+/// Generate a FRESH, random ed25519 signing keypair, drawing 32 bytes of seed
+/// material from the OS CSPRNG (never derived from a user password). Used to
+/// mint a scoped, per-client signing credential — e.g. the `pillar` CLI key a
+/// node admits for the resource-op tier — so revoking that credential is
+/// independent of the user's own cell key.
+///
+/// # Errors
+/// Propagates any failure from [`signing_keypair_from_seed`].
+pub fn random_signing_keypair() -> Result<(SigningPublicKey, SigningSecretKey)> {
+    use rand_core::{OsRng, RngCore};
+    let mut seed_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut seed_bytes);
+    signing_keypair_from_seed(&Seed::from_bytes(seed_bytes.to_vec()))
+}
+
 /// Recover the ed25519 verifying (public) key that matches a raw 32-byte
 /// signing secret scalar seed. Used when a signing secret is recovered from
 /// at-rest custody (rather than derived from a name seed) and its matching

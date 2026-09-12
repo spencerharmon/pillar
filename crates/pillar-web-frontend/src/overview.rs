@@ -53,8 +53,28 @@ mod yew_impl {
     use crate::primitives::{Chart, ChartKind, StatCard};
     use crate::resources_console::parse_replicas;
     use crate::topology_console::{parse_topology_tree, parse_trust_edges};
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
+
+    /// Trigger a browser download of `content` as `filename` via a data-URL
+    /// anchor (a purely client-side file save; the config bytes already came
+    /// from the authenticated `POST /portal/profile/cli-config` response).
+    fn trigger_download(filename: &str, content: &str) {
+        let encoded = String::from(js_sys::encode_uri_component(content));
+        let data_url = format!("data:application/yaml;charset=utf-8,{encoded}");
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        let Ok(anchor) = doc.create_element("a") else {
+            return;
+        };
+        let _ = anchor.set_attribute("href", &data_url);
+        let _ = anchor.set_attribute("download", filename);
+        if let Ok(anchor) = anchor.dyn_into::<web_sys::HtmlElement>() {
+            anchor.click();
+        }
+    }
 
     /// The Overview section: the node status card plus a KPI band aggregated
     /// live from the observability, resource, topology, and trust endpoints.
@@ -121,6 +141,31 @@ mod yew_impl {
             });
         }
 
+        let download_cli_config = {
+            let (auth, toaster) = (auth.clone(), toaster.clone());
+            Callback::from(move |_: MouseEvent| {
+                let Some(token) = auth.token.clone() else {
+                    toaster.error("Log in to download a CLI config.");
+                    return;
+                };
+                let toaster = toaster.clone();
+                spawn_local(async move {
+                    match http("POST", "/portal/profile/cli-config", Some(&token)).await {
+                        Ok(r) if r.ok() => {
+                            trigger_download("config.yaml", &r.body);
+                            toaster.success(
+                                "Downloaded config.yaml — save to ~/.config/pillar/ and chmod 600 (it holds key material).",
+                            );
+                        }
+                        Ok(r) => {
+                            toaster.error(&format!("CLI config export failed ({}).", r.status))
+                        }
+                        Err(_) => toaster.error("CLI config export request failed."),
+                    }
+                });
+            })
+        };
+
         let bars: Vec<f64> = kpis.per_kind.iter().map(|(_, n)| *n as f64).collect();
 
         html! {
@@ -138,6 +183,11 @@ mod yew_impl {
                     </div>
                 }
                 <NodeStatusTile />
+                <div class="obs-panel">
+                    <h4>{ "CLI access" }</h4>
+                    <p>{ "Download a ready-to-use config.yaml for the pillar CLI, then run `pillar apply -f <manifest>`. It carries scoped key material — save it to ~/.config/pillar/config.yaml and `chmod 600`." }</p>
+                    <button class="ds-tab" onclick={download_cli_config}>{ "Download CLI config" }</button>
+                </div>
             </>
         }
     }

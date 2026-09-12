@@ -55,6 +55,14 @@ use crate::web_serve::WebAuthContext;
 /// [`crate::psl_udp_server::MAX_DATAGRAM`]).
 const MAX_DATAGRAM: usize = 60_000;
 
+/// The well-known default UDP port the resource-op pillar-UDP tier binds when
+/// no `PILLAR_RESOURCE_OP_UDP_BIND` override is given — adjacent to the web
+/// portal's `8642` (see [`crate::run::DEFAULT_WEB_PORT`]) and the libp2p peer
+/// `4001`. A `pillar apply` client dials this port by default (see
+/// `pillar_client` / the UI-exported `config.yaml`), so a fresh node is
+/// mutable over pillar-message with zero configuration.
+pub const DEFAULT_RESOURCE_OP_UDP_PORT: u16 = 8643;
+
 /// The domain separator this tier's ack seal uses — distinct from
 /// [`pillar_client::transport::STREAM_OP_SEAL_DOMAIN`] (the INBOUND op's
 /// seal domain) so an ack can never be replayed back in as if it were an
