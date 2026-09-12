@@ -3559,8 +3559,11 @@ name = "pillar-oidc"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "pillar-core",
  "pillar-crypto",
  "pillar-identity",
+ "pillar-rbac",
+ "pillar-wot-authority",
  "serde",
  "serde_json",
 ]

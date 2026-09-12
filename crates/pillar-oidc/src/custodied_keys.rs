@@ -25,10 +25,10 @@
 
 use std::collections::HashMap;
 
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
 use pillar_crypto::SigningPublicKey;
-use pillar_identity::login::{SignerBackend, verify_backend_signature};
+use pillar_identity::login::{verify_backend_signature, SignerBackend};
 use serde::{Deserialize, Serialize};
 
 /// Unix-seconds timestamp. Tests drive this directly so rotation-grace
@@ -294,10 +294,8 @@ impl SigningKeySet {
             typ: "JWT".to_string(),
             kid: current.kid.clone(),
         };
-        let header_b64 =
-            B64.encode(serde_json::to_vec(&header).expect("header always serializes"));
-        let payload_b64 =
-            B64.encode(serde_json::to_vec(claims).expect("claims always serialize"));
+        let header_b64 = B64.encode(serde_json::to_vec(&header).expect("header always serializes"));
+        let payload_b64 = B64.encode(serde_json::to_vec(claims).expect("claims always serialize"));
         let signing_input = format!("{header_b64}.{payload_b64}");
         // The backend never exposes key material here — only the opaque
         // signer-backend wire token, which itself carries a genuine
@@ -535,7 +533,8 @@ mod tests {
     }
 
     #[test]
-    fn rotating_to_a_duplicate_kid_is_refused() {        let now = 40_000;
+    fn rotating_to_a_duplicate_kid_is_refused() {
+        let now = 40_000;
         let mut keys = SigningKeySet::new(
             "kid-a",
             Box::new(FileKeyringBackend::new("a").unlocked()),
@@ -574,6 +573,9 @@ mod tests {
 
         keys.prune_expired(now + 10 + grace + 1); // now past grace
         assert!(!keys.by_kid.contains_key("kid-a"));
-        assert!(keys.by_kid.contains_key("kid-b"), "current key never pruned");
+        assert!(
+            keys.by_kid.contains_key("kid-b"),
+            "current key never pruned"
+        );
     }
 }

@@ -12,8 +12,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client_registry;
 pub mod custodied_keys;
 
+pub use client_registry::{
+    apply_op, authorize_oauth_write, authorize_redirect, introspect, list_consents,
+    oauth_write_capability, register_client, replay, validate_registration, ClientOp,
+    ClientRegistry, ClientRegistryError, ClientType, Consent, ConsentKey, GrantType, OAuthClient,
+    Token, OAUTH_WRITE_CAPABILITY,
+};
 pub use custodied_keys::{
     IdTokenClaims, JwksDocument, KeyRotationError, SigningKeySet, VerifyIdTokenError,
 };
