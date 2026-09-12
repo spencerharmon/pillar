@@ -35,6 +35,7 @@ pub mod cli_surface;
 pub mod cluster;
 pub mod defaults;
 pub mod health;
+pub mod iam_cli;
 pub mod identity_trust_cli;
 pub mod ingress_lb_udp;
 pub mod observability_ui;

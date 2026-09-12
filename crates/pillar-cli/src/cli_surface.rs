@@ -105,6 +105,18 @@ pub static VERBS: &[VerbSpec] = &[
         handler: identity_trust,
     },
     VerbSpec {
+        name: "role",
+        handler: iam_family,
+    },
+    VerbSpec {
+        name: "group",
+        handler: iam_family,
+    },
+    VerbSpec {
+        name: "oauth",
+        handler: iam_family,
+    },
+    VerbSpec {
         name: "login",
         handler: |_v, args| login(args),
     },
@@ -343,6 +355,9 @@ fn bootstrap(args: &[String]) -> ExitCode {
 
 /// `pillar login …`.
 fn login(args: &[String]) -> ExitCode {
+    if args.iter().any(|a| a == "--oidc") {
+        return login_oidc(args);
+    }
     match crate::bootstrap::login(args) {
         Ok(exports) => {
             print!("{exports}");
@@ -353,6 +368,101 @@ fn login(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `pillar login --oidc --issuer <url> --client-id <id> --redirect-uri <uri>
+/// --user <handle> --scope <s> [--scope <s> ...] --code-verifier <v>`: the
+/// CLI's oidc login ceremony over the real
+/// [`crate::iam_cli::oidc_login::run`] authorization-code + PKCE round trip.
+fn login_oidc(args: &[String]) -> ExitCode {
+    let mut issuer = None;
+    let mut client_id = None;
+    let mut redirect_uri = None;
+    let mut user = None;
+    let mut code_verifier = None;
+    let mut scopes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--oidc" => i += 1,
+            "--issuer" => {
+                issuer = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--client-id" => {
+                client_id = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--redirect-uri" => {
+                redirect_uri = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--user" => {
+                user = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--code-verifier" => {
+                code_verifier = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--scope" => {
+                if let Some(s) = args.get(i + 1) {
+                    scopes.insert(s.clone());
+                }
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown `pillar login --oidc` argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(issuer), Some(client_id), Some(redirect_uri), Some(user), Some(code_verifier)) =
+        (issuer, client_id, redirect_uri, user, code_verifier)
+    else {
+        eprintln!(
+            "usage: pillar login --oidc --issuer <url> --client-id <id> --redirect-uri <uri> \
+             --user <handle> --scope <s> [--scope <s> ...] --code-verifier <v>"
+        );
+        return ExitCode::from(2);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match crate::iam_cli::oidc_login::run(
+        &issuer,
+        &client_id,
+        &redirect_uri,
+        &user,
+        scopes,
+        &code_verifier,
+        now,
+    ) {
+        Ok(result) => {
+            println!("export PILLAR_ACCESS_TOKEN={}", result.access_token);
+            if let Some(id_token) = result.id_token {
+                println!("export PILLAR_ID_TOKEN={id_token}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pillar login --oidc: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar {role|group|oauth} …`.
+fn iam_family(verb: &str, _args: &[String]) -> ExitCode {
+    eprintln!(
+        "`pillar {verb} …` reads/acts over a live node's IAM roles/groups/oauth-client substrate \
+         via the pillar_cli::iam_cli library API (RoleCli/GroupCli/OauthCli): every mutation is a \
+         signed op gated on the shared RbacDecider, every write has a --dry-run decider preview, \
+         and `describe` renders the signer + authority + event CID."
+    );
+    eprintln!("Run `pillar --help` for the full verb list of this family.");
+    ExitCode::from(2)
 }
 
 /// `pillar webauthn register|login`.
