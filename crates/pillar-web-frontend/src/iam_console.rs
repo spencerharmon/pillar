@@ -338,13 +338,20 @@ pub fn sensitive_action_allowed(dry_run_body: &str) -> bool {
 #[cfg(feature = "yew")]
 pub use yew_impl::ChangePasswordPage;
 #[cfg(feature = "yew")]
-pub use yew_impl::{OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile};
+pub use yew_impl::{AccountHub, OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile};
 
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::*;
     use crate::auth::{use_auth, AuthAction, AuthContext};
-    use crate::portal::{body_lines, get_url, http, input_value, nonempty_lines, PendingButton};
+    use crate::components::{
+        use_toaster, Badge, Column, DataTable, Dialog, Drawer, Row, SecretReveal, Side, StatusPill,
+        TabItem, Tabs, Tone,
+    };
+    use crate::portal::{
+        body_lines, get_url, http, input_value, nonempty_lines, CredentialsTile, IdentityTile,
+        PendingButton, SessionsTile,
+    };
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
 
@@ -374,29 +381,183 @@ mod yew_impl {
         }
     }
 
-    /// Self-service Profile: `display_name`/`email` edit.
+    // -----------------------------------------------------------------
+    // Shared render helpers.
+    // -----------------------------------------------------------------
+
+    /// Render a comma-joined list as tone-neutral chips; an empty list renders
+    /// a muted em-dash so a cell is never blank.
+    fn chips(csv: &str) -> Html {
+        let items: Vec<&str> = csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.is_empty() {
+            return html! { <span class="cell-empty">{ "\u{2014}" }</span> };
+        }
+        html! {
+            <span class="chip-row">
+                { for items.into_iter().map(|c| html! { <Badge label={c.to_owned()} tone={Tone::Neutral} /> }) }
+            </span>
+        }
+    }
+
+    /// The predicted-effect caption shown in a confirm dialog: the shared
+    /// `dry-run` decider's ALLOW/DENY, surfaced as an inline guardrail so the
+    /// operator sees the server's verdict BEFORE firing (predicted == enforced).
+    fn predicted_caption(p: Option<bool>) -> Html {
+        match p {
+            Some(true) => html! { <p class="predict is-allow">{ "The server will allow this action." }</p> },
+            Some(false) => html! {
+                <p class="predict is-deny">
+                    { "Blocked \u{2014} the server would refuse this (for example, the last remaining \
+                       administrator cannot be disabled or have 2FA removed)." }
+                </p>
+            },
+            None => html! { <p class="predict">{ "Checking with the server\u{2026}" }</p> },
+        }
+    }
+
+    /// A dimmed modal backdrop wrapping a [`Dialog`] card.
+    fn modal(children: Html) -> Html {
+        html! { <div class="modal-backdrop"><Dialog>{ children }</Dialog></div> }
+    }
+
+    /// Read the current value of the `<select>` an event fired on.
+    fn select_value(e: &Event) -> String {
+        use wasm_bindgen::JsCast;
+        e.target()
+            .and_then(|t| t.dyn_into::<web_sys::HtmlSelectElement>().ok())
+            .map(|s| s.value())
+            .unwrap_or_default()
+    }
+
+    // ===================================================================
+    // Account hub (self-service): one tabbed page over the four folded
+    // self-service surfaces + a self password change.
+    // ===================================================================
+
+    /// The signed-in user's account hub — a single tabbed destination that
+    /// replaces the four separate sidebar entries (profile / security keys /
+    /// sessions / identity) with one "Account" page, plus a self-service
+    /// password change. Each tab mounts the existing capability tile verbatim,
+    /// so no self-service surface is lost — only re-homed under one roof.
+    #[function_component(AccountHub)]
+    pub fn account_hub() -> Html {
+        let tabs = vec![
+            TabItem { label: "Profile".into(), panel: html! { <ProfileTile /> } },
+            TabItem { label: "Password".into(), panel: html! { <PasswordTab /> } },
+            TabItem { label: "Security keys".into(), panel: html! { <CredentialsTile /> } },
+            TabItem { label: "Sessions".into(), panel: html! { <SessionsTile /> } },
+            TabItem { label: "Identity".into(), panel: html! { <IdentityTile /> } },
+        ];
+        html! {
+            <section class="account-hub" id="account-hub">
+                <h2 class="section-title">{ "Account" }</h2>
+                <p class="section-sub">{ "Manage your own profile, password, security keys, sessions, and identity." }</p>
+                <Tabs tabs={tabs} />
+            </section>
+        }
+    }
+
+    /// Self-service voluntary password change (distinct from the forced
+    /// interstitial): new password + confirmation, gated on a match, posting
+    /// the same reseal endpoint as the forced flow.
+    #[function_component(PasswordTab)]
+    pub fn password_tab() -> Html {
+        let auth = use_auth();
+        let toaster = use_toaster();
+        let pw = use_state(String::new);
+        let confirm = use_state(String::new);
+        let busy = use_state(|| false);
+
+        let on_pw = {
+            let pw = pw.clone();
+            Callback::from(move |e: InputEvent| pw.set(input_value(&e)))
+        };
+        let on_confirm = {
+            let confirm = confirm.clone();
+            Callback::from(move |e: InputEvent| confirm.set(input_value(&e)))
+        };
+
+        let mismatch = !confirm.is_empty() && *pw != *confirm;
+        let can_submit = !pw.trim().is_empty() && *pw == *confirm && !*busy;
+
+        let submit = {
+            let (auth, toaster, pw, confirm, busy) = (
+                auth.clone(),
+                toaster.clone(),
+                pw.clone(),
+                confirm.clone(),
+                busy.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                if pw.trim().is_empty() || *pw != *confirm || *busy {
+                    return;
+                }
+                let token = auth.token.clone().unwrap_or_default();
+                let body = body_lines(&[&token, pw.trim()]);
+                let (toaster, pw, confirm, busy) =
+                    (toaster.clone(), pw.clone(), confirm.clone(), busy.clone());
+                busy.set(true);
+                spawn_local(async move {
+                    match http("POST", "/portal/users/reset-password", Some(&body)).await {
+                        Ok(r) if r.ok() => {
+                            toaster.success("Password changed.");
+                            pw.set(String::new());
+                            confirm.set(String::new());
+                        }
+                        Ok(r) => toaster.error(&format!("Could not change password: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not change password: the request failed."),
+                    }
+                    busy.set(false);
+                });
+            })
+        };
+
+        html! {
+            <div class="tile" id="password-tab">
+                <h3>{ "Change password" }</h3>
+                <label for="self-pw-input">{ "New password" }</label>
+                <input id="self-pw-input" type="password" value={(*pw).clone()} oninput={on_pw} />
+                <label for="self-pw-confirm">{ "Confirm new password" }</label>
+                <input id="self-pw-confirm" type="password" value={(*confirm).clone()} oninput={on_confirm} />
+                if mismatch {
+                    <p class="msg err">{ "The two passwords do not match." }</p>
+                }
+                <div class="tile-actions">
+                    <button type="button" id="self-pw-btn" disabled={!can_submit} onclick={submit}>
+                        { if *busy { "Working\u{2026}" } else { "Change password" } }
+                    </button>
+                </div>
+            </div>
+        }
+    }
+
+    // ===================================================================
+    // Profile (self-service): display name / email.
+    // ===================================================================
+
+    /// Self-service Profile: display name / email, with the account status
+    /// shown as a pill.
     #[function_component(ProfileTile)]
     pub fn profile_tile() -> Html {
         let auth = use_auth();
+        let toaster = use_toaster();
         let view = use_state(ProfileView::default);
         let display_name = use_state(String::new);
         let email = use_state(String::new);
-        let msg = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
 
         {
-            let auth = auth.clone();
-            let view = view.clone();
-            let display_name = display_name.clone();
-            let email = email.clone();
+            let (auth, view, display_name, email) =
+                (auth.clone(), view.clone(), display_name.clone(), email.clone());
             use_effect_with(auth.token.clone(), move |_| {
                 if let Some(token) = auth.token.clone() {
-                    let (view, display_name, email) =
-                        (view.clone(), display_name.clone(), email.clone());
+                    let (view, display_name, email) = (view.clone(), display_name.clone(), email.clone());
                     spawn_local(async move {
-                        if let Ok(r) =
-                            http("GET", &get_url("/portal/profile", &token, &[]), None).await
-                        {
+                        if let Ok(r) = http("GET", &get_url("/portal/profile", &token, &[]), None).await {
                             if r.ok() {
                                 let parsed = parse_profile(&r.body);
                                 display_name.set(parsed.display_name.clone());
@@ -419,10 +580,10 @@ mod yew_impl {
             Callback::from(move |e: InputEvent| email.set(input_value(&e)))
         };
         let save = {
-            let (auth, busy, msg, display_name, email) = (
+            let (auth, toaster, busy, display_name, email) = (
                 auth.clone(),
+                toaster.clone(),
                 busy.clone(),
-                msg.clone(),
                 display_name.clone(),
                 email.clone(),
             );
@@ -432,58 +593,87 @@ mod yew_impl {
                 }
                 let token = auth.token.clone().unwrap_or_default();
                 let body = profile_update_wire(&token, &display_name, &email);
-                let (busy, msg) = (busy.clone(), msg.clone());
+                let (toaster, busy) = (toaster.clone(), busy.clone());
                 busy.set(true);
                 spawn_local(async move {
-                    if let Ok(r) = http("PUT", "/portal/profile", Some(&body)).await {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
+                    match http("PUT", "/portal/profile", Some(&body)).await {
+                        Ok(r) if r.ok() => toaster.success("Profile saved."),
+                        Ok(r) => toaster.error(&format!("Could not save profile: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not save profile: the request failed."),
                     }
                     busy.set(false);
                 });
             })
         };
 
+        let status = if view.status.is_empty() { "Unknown".to_owned() } else { view.status.clone() };
         html! {
             <div class="tile" id="profile-tile">
-                <h3>{ "Profile" }</h3>
-                <p id="profile-status">{ format!("Status: {}", if view.status.is_empty() { "-" } else { &view.status }) }</p>
+                <div class="tile-head">
+                    <h3>{ "Profile" }</h3>
+                    <StatusPill status={status} />
+                </div>
+                if !view.handle.is_empty() {
+                    <p class="tile-meta" id="profile-handle">{ format!("Signed in as {}", view.handle) }</p>
+                }
                 <label for="profile-name-input">{ "Display name" }</label>
                 <input id="profile-name-input" type="text" value={(*display_name).clone()} oninput={on_name} />
                 <label for="profile-email-input">{ "Email" }</label>
-                <input id="profile-email-input" type="text" value={(*email).clone()} oninput={on_email} />
-                <PendingButton id="profile-save-btn" label="Save profile" busy={*busy} onclick={save} />
-                { message_line("profile-msg", &msg) }
+                <input id="profile-email-input" type="email" value={(*email).clone()} oninput={on_email} />
+                <div class="tile-actions">
+                    <PendingButton id="profile-save-btn" label="Save profile" busy={*busy} onclick={save} />
+                </div>
             </div>
         }
     }
 
-    /// Admin Users: invite/list/disable/enable/reset-password/require-
-    /// password-change, each sensitive act gated behind a predicted-effect
-    /// dry-run (see [`super::sensitive_action_allowed`]).
+    // ===================================================================
+    // Users (admin): directory table -> detail drawer with row actions,
+    // invite dialog with one-time temp-password reveal.
+    // ===================================================================
+
+    /// A queued sensitive user action, staged into a confirm dialog with a
+    /// dry-run prediction before it fires.
+    #[derive(Clone, PartialEq)]
+    struct UserAction {
+        handle: String,
+        path: &'static str,
+        dry: &'static str,
+        title: &'static str,
+        confirm_label: &'static str,
+        desc: String,
+        reveals_secret: bool,
+    }
+
+    /// Admin user directory. A best-in-class list→detail flow: a filterable
+    /// [`DataTable`] with a status pill and role chips per row; clicking a row
+    /// (or its Manage action) opens a detail [`Drawer`] whose lifecycle
+    /// actions (disable / enable / reset password / require change) each stage
+    /// a confirm dialog gated on the shared decider's dry-run prediction. An
+    /// invite opens a dialog and, on success, reveals the one-time temporary
+    /// password via [`SecretReveal`].
     #[function_component(UsersTile)]
     pub fn users_tile() -> Html {
         let auth = use_auth();
-        let rows = use_state(Vec::<UserRow>::new);
+        let toaster = use_toaster();
+        let users = use_state(Vec::<UserRow>::new);
+        let selected = use_state(|| None::<UserRow>);
+        let invite_open = use_state(|| false);
         let handle = use_state(String::new);
         let email = use_state(String::new);
-        let target = use_state(String::new);
+        let pending = use_state(|| None::<UserAction>);
         let predicted = use_state(|| None::<bool>);
-        let msg = use_state(|| None::<(String, bool)>);
+        let secret = use_state(|| None::<(String, String)>);
         let busy = use_state(|| false);
 
         let refresh = {
-            let auth = auth.clone();
-            let rows = rows.clone();
+            let (auth, users) = (auth.clone(), users.clone());
             Callback::from(move |_: ()| {
-                let Some(token) = auth.token.clone() else {
-                    return;
-                };
-                let (auth, rows) = (auth.clone(), rows.clone());
+                let Some(token) = auth.token.clone() else { return };
+                let (auth, users) = (auth.clone(), users.clone());
                 spawn_local(async move {
-                    if let Some(lines) =
-                        get_lines(auth, get_url("/portal/users", &token, &[])).await
-                    {
-                        rows.set(parse_user_rows(&lines.join("\n")));
+                    if let Some(lines) = get_lines(auth, get_url("/portal/users", &token, &[])).await {
+                        users.set(parse_user_rows(&lines.join("\n")));
                     }
                 });
             })
@@ -496,6 +686,149 @@ mod yew_impl {
             });
         }
 
+        // Build the table rows (handle / status / roles / password state).
+        let rows: Vec<Row> = users
+            .iter()
+            .map(|u| {
+                vec![
+                    u.handle.clone(),
+                    u.status.clone(),
+                    u.roles.join(","),
+                    if u.force_password_change { "Must change".to_owned() } else { "OK".to_owned() },
+                ]
+            })
+            .collect();
+
+        let render_cell = Callback::from(|(col, val): (usize, String)| -> Html {
+            match col {
+                1 => html! { <StatusPill status={val} /> },
+                2 => chips(&val),
+                3 => {
+                    let tone = if val == "Must change" { Tone::Warning } else { Tone::Success };
+                    html! { <Badge label={val} tone={tone} /> }
+                }
+                _ => html! { { val } },
+            }
+        });
+
+        let select_by_handle = {
+            let (users, selected) = (users.clone(), selected.clone());
+            move |h: &str| {
+                if let Some(u) = users.iter().find(|u| u.handle == h) {
+                    selected.set(Some(u.clone()));
+                }
+            }
+        };
+        let on_row_click = {
+            let select_by_handle = select_by_handle.clone();
+            Callback::from(move |row: Row| {
+                if let Some(h) = row.first() {
+                    select_by_handle(h);
+                }
+            })
+        };
+        let row_actions = {
+            let select_by_handle = select_by_handle.clone();
+            Callback::from(move |row: Row| -> Html {
+                let h = row.first().cloned().unwrap_or_default();
+                let select = select_by_handle.clone();
+                let onclick = Callback::from(move |_: MouseEvent| select(&h));
+                html! { <button type="button" class="row-action" onclick={onclick}>{ "Manage" }</button> }
+            })
+        };
+
+        // Stage a sensitive action: open the confirm dialog and fetch its
+        // dry-run prediction.
+        let stage = {
+            let (auth, pending, predicted) = (auth.clone(), pending.clone(), predicted.clone());
+            move |act: UserAction| {
+                predicted.set(None);
+                pending.set(Some(act.clone()));
+                let (auth, predicted) = (auth.clone(), predicted.clone());
+                spawn_local(async move {
+                    let token = auth.token.clone().unwrap_or_default();
+                    let url = get_url(act.dry, &token, &[("handle", &act.handle)]);
+                    if let Ok(r) = http("GET", &url, None).await {
+                        predicted.set(Some(sensitive_action_allowed(&r.body)));
+                    } else {
+                        predicted.set(Some(false));
+                    }
+                });
+            }
+        };
+
+        // Fire a non-sensitive enable directly (still enforced server-side).
+        let enable = {
+            let (auth, toaster, busy, refresh) = (auth.clone(), toaster.clone(), busy.clone(), refresh.clone());
+            move |h: String| {
+                let token = auth.token.clone().unwrap_or_default();
+                let body = user_target_wire(&token, &h);
+                let (toaster, busy, refresh) = (toaster.clone(), busy.clone(), refresh.clone());
+                busy.set(true);
+                spawn_local(async move {
+                    match http("POST", "/portal/users/enable", Some(&body)).await {
+                        Ok(r) if r.ok() => toaster.success("User enabled."),
+                        Ok(r) => toaster.error(&format!("Could not enable: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not enable: the request failed."),
+                    }
+                    refresh.emit(());
+                    busy.set(false);
+                });
+            }
+        };
+
+        let confirm = {
+            let (auth, toaster, pending, predicted, secret, busy, refresh, selected) = (
+                auth.clone(),
+                toaster.clone(),
+                pending.clone(),
+                predicted.clone(),
+                secret.clone(),
+                busy.clone(),
+                refresh.clone(),
+                selected.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                let Some(act) = (*pending).clone() else { return };
+                if *busy || !matches!(*predicted, Some(true)) {
+                    return;
+                }
+                let token = auth.token.clone().unwrap_or_default();
+                let body = user_target_wire(&token, &act.handle);
+                let (toaster, pending, secret, busy, refresh, selected) = (
+                    toaster.clone(),
+                    pending.clone(),
+                    secret.clone(),
+                    busy.clone(),
+                    refresh.clone(),
+                    selected.clone(),
+                );
+                busy.set(true);
+                spawn_local(async move {
+                    match http("POST", act.path, Some(&body)).await {
+                        Ok(r) if r.ok() => {
+                            if act.reveals_secret {
+                                secret.set(Some(("Temporary password".to_owned(), r.body.trim().to_owned())));
+                            } else {
+                                toaster.success("Done.");
+                            }
+                            selected.set(None);
+                            refresh.emit(());
+                        }
+                        Ok(r) => toaster.error(&format!("Refused: {}", r.body.trim())),
+                        Err(_) => toaster.error("The request failed."),
+                    }
+                    pending.set(None);
+                    busy.set(false);
+                });
+            })
+        };
+        let cancel = {
+            let pending = pending.clone();
+            Callback::from(move |_: MouseEvent| pending.set(None))
+        };
+
+        // Invite handlers.
         let on_handle = {
             let handle = handle.clone();
             Callback::from(move |e: InputEvent| handle.set(input_value(&e)))
@@ -504,23 +837,24 @@ mod yew_impl {
             let email = email.clone();
             Callback::from(move |e: InputEvent| email.set(input_value(&e)))
         };
-        let on_target = {
-            let target = target.clone();
-            let predicted = predicted.clone();
-            Callback::from(move |e: InputEvent| {
-                target.set(input_value(&e));
-                predicted.set(None);
+        let open_invite = {
+            let (invite_open, handle, email, secret) = (invite_open.clone(), handle.clone(), email.clone(), secret.clone());
+            Callback::from(move |_: MouseEvent| {
+                handle.set(String::new());
+                email.set(String::new());
+                secret.set(None);
+                invite_open.set(true);
             })
         };
-
-        let invite = {
-            let (auth, busy, msg, refresh, handle, email) = (
+        let do_invite = {
+            let (auth, toaster, busy, refresh, handle, email, secret) = (
                 auth.clone(),
+                toaster.clone(),
                 busy.clone(),
-                msg.clone(),
                 refresh.clone(),
                 handle.clone(),
                 email.clone(),
+                secret.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 if *busy || handle.trim().is_empty() {
@@ -528,281 +862,309 @@ mod yew_impl {
                 }
                 let token = auth.token.clone().unwrap_or_default();
                 let body = invite_user_wire(&token, handle.trim(), email.trim());
-                let (busy, msg, refresh) = (busy.clone(), msg.clone(), refresh.clone());
+                let (toaster, busy, refresh, secret) = (toaster.clone(), busy.clone(), refresh.clone(), secret.clone());
                 busy.set(true);
                 spawn_local(async move {
-                    if let Ok(r) = http("POST", "/portal/users/invite", Some(&body)).await {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
-                        if r.ok() {
+                    match http("POST", "/portal/users/invite", Some(&body)).await {
+                        Ok(r) if r.ok() => {
+                            secret.set(Some(("Temporary password".to_owned(), r.body.trim().to_owned())));
                             refresh.emit(());
                         }
+                        Ok(r) => toaster.error(&format!("Could not invite: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not invite: the request failed."),
                     }
                     busy.set(false);
                 });
             })
         };
-
-        // Check the predicted effect of the currently-typed target handle for
-        // the given sensitive act path, WITHOUT firing it.
-        let check_predicted = {
-            let (auth, target, predicted) = (auth.clone(), target.clone(), predicted.clone());
-            move |path: &'static str| {
-                let (auth, target, predicted) = (auth.clone(), target.clone(), predicted.clone());
-                Callback::from(move |_: MouseEvent| {
-                    let token = auth.token.clone().unwrap_or_default();
-                    let t = (*target).clone();
-                    let predicted = predicted.clone();
-                    spawn_local(async move {
-                        let url = get_url(path, &token, &[("handle", &t)]);
-                        if let Ok(r) = http("GET", &url, None).await {
-                            predicted.set(Some(sensitive_action_allowed(&r.body)));
-                        }
-                    });
-                })
-            }
+        let close_invite = {
+            let (invite_open, secret) = (invite_open.clone(), secret.clone());
+            Callback::from(move |_: MouseEvent| {
+                invite_open.set(false);
+                secret.set(None);
+            })
         };
-
-        let fire_sensitive = {
-            let (auth, busy, msg, refresh, target, predicted) = (
-                auth.clone(),
-                busy.clone(),
-                msg.clone(),
-                refresh.clone(),
-                target.clone(),
-                predicted.clone(),
-            );
-            move |path: &'static str| {
-                let (auth, busy, msg, refresh, target, predicted) = (
-                    auth.clone(),
-                    busy.clone(),
-                    msg.clone(),
-                    refresh.clone(),
-                    target.clone(),
-                    predicted.clone(),
-                );
-                Callback::from(move |_: MouseEvent| {
-                    if *busy || !matches!(*predicted, Some(true)) || target.trim().is_empty() {
-                        return;
-                    }
-                    let token = auth.token.clone().unwrap_or_default();
-                    let body = user_target_wire(&token, target.trim());
-                    let (busy, msg, refresh, predicted) = (
-                        busy.clone(),
-                        msg.clone(),
-                        refresh.clone(),
-                        predicted.clone(),
-                    );
-                    busy.set(true);
-                    spawn_local(async move {
-                        if let Ok(r) = http("POST", path, Some(&body)).await {
-                            msg.set(Some((r.body.trim().to_owned(), r.ok())));
-                            if r.ok() {
-                                refresh.emit(());
-                            }
-                        }
-                        predicted.set(None);
-                        busy.set(false);
-                    });
-                })
-            }
+        let dismiss_secret = {
+            let secret = secret.clone();
+            Callback::from(move |_: MouseEvent| secret.set(None))
         };
 
         html! {
-            <div class="tile" id="users-tile">
-                <h3>{ "Users" }</h3>
-                <div id="user-list">
-                    { for rows.iter().map(|u| html! {
-                        <p class="user-row">
-                            { format!(
-                                "{} status={} force_password_change={} roles={}",
-                                u.handle, u.status, u.force_password_change, u.roles.join(",")
-                            ) }
-                        </p>
-                    }) }
+            <section class="tile" id="users-tile">
+                <div class="tile-head">
+                    <h3>{ "Users" }</h3>
+                    <button type="button" id="user-invite-open" class="btn-primary" onclick={open_invite}>
+                        { "Invite user" }
+                    </button>
                 </div>
-                <label for="user-invite-handle">{ "Invite" }</label>
-                <input id="user-invite-handle" type="text" placeholder="handle"
-                    value={(*handle).clone()} oninput={on_handle} />
-                <input id="user-invite-email" type="text" placeholder="email"
-                    value={(*email).clone()} oninput={on_email} />
-                <PendingButton id="user-invite-btn" label="Invite" busy={*busy} onclick={invite} />
+                <DataTable
+                    columns={vec![
+                        Column::text("Handle"),
+                        Column::text("Status"),
+                        Column::unsortable("Roles"),
+                        Column::text("Password"),
+                    ]}
+                    rows={rows}
+                    page_size={12}
+                    render_cell={render_cell}
+                    row_actions={row_actions}
+                    on_row_click={on_row_click}
+                    empty_label={"No users yet — invite one to get started."}
+                />
 
-                <label for="user-target-handle">{ "Target handle (disable/enable/reset/require-change)" }</label>
-                <input id="user-target-handle" type="text" value={(*target).clone()} oninput={on_target} />
-                <button type="button" id="user-check-disable"
-                    onclick={check_predicted("/portal/users/disable/dry-run")}>
-                    { "Check disable" }
-                </button>
-                <PendingButton id="user-disable-btn" label="Disable" busy={*busy}
-                    onclick={fire_sensitive("/portal/users/disable")} />
-                <PendingButton id="user-enable-btn" label="Enable" busy={*busy}
-                    onclick={fire_sensitive("/portal/users/enable")} />
-                <PendingButton id="user-reset-btn" label="Reset password" busy={*busy}
-                    onclick={fire_sensitive("/portal/users/reset-password")} />
-                <PendingButton id="user-require-change-btn" label="Require password change" busy={*busy}
-                    onclick={fire_sensitive("/portal/users/require-password-change")} />
-                <p id="user-predicted">
-                    { match *predicted {
-                        Some(true) => "predicted: ALLOW".to_owned(),
-                        Some(false) => "predicted: DENY".to_owned(),
-                        None => "predicted: (not checked)".to_owned(),
-                    } }
+                // Detail drawer for the selected user.
+                <Drawer open={selected.is_some()} side={Side::Right}
+                    on_close={{ let selected = selected.clone(); Callback::from(move |_: MouseEvent| selected.set(None)) }}>
+                    if let Some(u) = (*selected).clone() {
+                        { user_detail(&u, stage.clone(), enable.clone()) }
+                    }
+                </Drawer>
+
+                // Confirm dialog for a staged sensitive action.
+                if let Some(act) = (*pending).clone() {
+                    { modal(html! {
+                        <>
+                            <h3>{ act.title }</h3>
+                            <p>{ act.desc.clone() }</p>
+                            { predicted_caption(*predicted) }
+                            <div class="dialog-actions">
+                                <button type="button" class="btn-ghost" onclick={cancel.clone()}>{ "Cancel" }</button>
+                                <button type="button" class="btn-danger" id="user-action-confirm"
+                                    disabled={!matches!(*predicted, Some(true)) || *busy}
+                                    onclick={confirm.clone()}>
+                                    { if *busy { "Working\u{2026}" } else { act.confirm_label } }
+                                </button>
+                            </div>
+                        </>
+                    }) }
+                }
+
+                // Invite dialog (+ one-time secret reveal on success).
+                if *invite_open {
+                    { modal(html! {
+                        <>
+                            <h3>{ "Invite user" }</h3>
+                            if let Some((label, value)) = (*secret).clone() {
+                                <p>{ "The account was created. Share this one-time password with the user." }</p>
+                                <SecretReveal label={label} secret={value} />
+                                <div class="dialog-actions">
+                                    <button type="button" class="btn-primary" onclick={close_invite.clone()}>{ "Done" }</button>
+                                </div>
+                            } else {
+                                <label for="user-invite-handle">{ "Handle" }</label>
+                                <input id="user-invite-handle" type="text" placeholder="handle"
+                                    value={(*handle).clone()} oninput={on_handle} />
+                                <label for="user-invite-email">{ "Email" }</label>
+                                <input id="user-invite-email" type="email" placeholder="email"
+                                    value={(*email).clone()} oninput={on_email} />
+                                <div class="dialog-actions">
+                                    <button type="button" class="btn-ghost" onclick={close_invite.clone()}>{ "Cancel" }</button>
+                                    <PendingButton id="user-invite-btn" label="Send invite" busy={*busy} onclick={do_invite} />
+                                </div>
+                            }
+                        </>
+                    }) }
+                }
+
+                // A reset-password reveal (outside the invite flow).
+                if !*invite_open {
+                    if let Some((label, value)) = (*secret).clone() {
+                        { modal(html! {
+                            <>
+                                <h3>{ "Temporary password" }</h3>
+                                <p>{ "Share this one-time password with the user; they must change it at next sign-in." }</p>
+                                <SecretReveal label={label} secret={value} />
+                                <div class="dialog-actions">
+                                    <button type="button" class="btn-primary" onclick={dismiss_secret}>{ "Done" }</button>
+                                </div>
+                            </>
+                        }) }
+                    }
+                }
+            </section>
+        }
+    }
+
+    /// The user detail drawer body: identity summary + the lifecycle action
+    /// buttons, each staging a confirm dialog (or firing enable directly).
+    fn user_detail(
+        u: &UserRow,
+        stage: impl Fn(UserAction) + Clone + 'static,
+        enable: impl Fn(String) + Clone + 'static,
+    ) -> Html {
+        let disabled = u.status.eq_ignore_ascii_case("disabled");
+        let h = u.handle.clone();
+
+        let on_disable = {
+            let (stage, h) = (stage.clone(), h.clone());
+            Callback::from(move |_: MouseEvent| stage(UserAction {
+                handle: h.clone(),
+                path: "/portal/users/disable",
+                dry: "/portal/users/disable/dry-run",
+                title: "Disable user",
+                confirm_label: "Disable",
+                desc: format!("Disable {} — they will be signed out and cannot sign in until re-enabled.", h),
+                reveals_secret: false,
+            }))
+        };
+        let on_reset = {
+            let (stage, h) = (stage.clone(), h.clone());
+            Callback::from(move |_: MouseEvent| stage(UserAction {
+                handle: h.clone(),
+                path: "/portal/users/reset-password",
+                dry: "/portal/users/reset-password/dry-run",
+                title: "Reset password",
+                confirm_label: "Reset password",
+                desc: format!("Issue a new one-time password for {} (their registered security keys are preserved).", h),
+                reveals_secret: true,
+            }))
+        };
+        let on_require = {
+            let (stage, h) = (stage.clone(), h.clone());
+            Callback::from(move |_: MouseEvent| stage(UserAction {
+                handle: h.clone(),
+                path: "/portal/users/require-password-change",
+                dry: "/portal/users/require-password-change/dry-run",
+                title: "Require password change",
+                confirm_label: "Require change",
+                desc: format!("Force {} to set a new password at their next sign-in.", h),
+                reveals_secret: false,
+            }))
+        };
+        let on_enable = {
+            let (enable, h) = (enable.clone(), h.clone());
+            Callback::from(move |_: MouseEvent| enable(h.clone()))
+        };
+
+        html! {
+            <div class="drawer-body" id="user-detail">
+                <div class="tile-head">
+                    <h3>{ u.handle.clone() }</h3>
+                    <StatusPill status={u.status.clone()} />
+                </div>
+                <dl class="detail-list">
+                    <dt>{ "Roles" }</dt>
+                    <dd>{ chips(&u.roles.join(",")) }</dd>
+                    <dt>{ "Password" }</dt>
+                    <dd>{ if u.force_password_change { "Change required at next sign-in" } else { "OK" } }</dd>
+                </dl>
+                <div class="drawer-actions">
+                    if disabled {
+                        <button type="button" class="btn-primary" id="user-enable-btn" onclick={on_enable}>{ "Enable" }</button>
+                    } else {
+                        <button type="button" class="btn-danger" id="user-disable-btn" onclick={on_disable}>{ "Disable" }</button>
+                    }
+                    <button type="button" id="user-reset-btn" onclick={on_reset}>{ "Reset password" }</button>
+                    <button type="button" id="user-require-btn" onclick={on_require}>{ "Require password change" }</button>
+                </div>
+                <p class="drawer-note">
+                    { "Managing this user's security keys and role assignments is available once the \
+                       admin credential and role-assignment endpoints land." }
                 </p>
-                { message_line("user-msg", &msg) }
             </div>
         }
     }
 
-    /// Admin Roles & Groups: create a role, create a group, attach a role to
-    /// a group.
+    // ===================================================================
+    // Roles & Groups (admin): two focused object tabs.
+    // ===================================================================
+
+    /// The documented IAM administrative capabilities, offered as a checkbox
+    /// picker when defining a role (a free-text field remains for any other
+    /// capability the deployment defines).
+    const KNOWN_CAPS: &[&str] = &[
+        "iam:users:write",
+        "iam:roles:write",
+        "iam:groups:write",
+        "iam:credentials:manage",
+    ];
+
+    /// Admin roles + managed groups, split into two focused tabs (each an
+    /// object table with an inline creator) instead of one stacked form dump.
     #[function_component(RolesGroupsTile)]
     pub fn roles_groups_tile() -> Html {
+        let tabs = vec![
+            TabItem { label: "Roles".into(), panel: html! { <RolesPanel /> } },
+            TabItem { label: "Groups".into(), panel: html! { <GroupsPanel /> } },
+        ];
+        html! {
+            <section class="tile" id="roles-groups-tile">
+                <h3>{ "Roles & Groups" }</h3>
+                <Tabs tabs={tabs} />
+            </section>
+        }
+    }
+
+    #[function_component(RolesPanel)]
+    fn roles_panel() -> Html {
         let auth = use_auth();
-        let role_rows = use_state(Vec::<RoleRow>::new);
-        let group_rows = use_state(Vec::<GroupRow>::new);
-        let role_name = use_state(String::new);
-        let role_caps = use_state(String::new);
-        let group_name = use_state(String::new);
-        let attach_group = use_state(String::new);
-        let attach_role = use_state(String::new);
-        let msg = use_state(|| None::<(String, bool)>);
+        let toaster = use_toaster();
+        let roles = use_state(Vec::<RoleRow>::new);
+        let name = use_state(String::new);
+        let checked = use_state(Vec::<String>::new);
+        let extra = use_state(String::new);
         let busy = use_state(|| false);
 
         let refresh = {
-            let auth = auth.clone();
-            let role_rows = role_rows.clone();
-            let group_rows = group_rows.clone();
+            let (auth, roles) = (auth.clone(), roles.clone());
             Callback::from(move |_: ()| {
-                let Some(token) = auth.token.clone() else {
-                    return;
-                };
-                let (auth1, role_rows) = (auth.clone(), role_rows.clone());
-                let token1 = token.clone();
+                let Some(token) = auth.token.clone() else { return };
+                let (auth, roles) = (auth.clone(), roles.clone());
                 spawn_local(async move {
-                    if let Some(lines) =
-                        get_lines(auth1, get_url("/portal/roles", &token1, &[])).await
-                    {
-                        role_rows.set(parse_role_rows(&lines.join("\n")));
-                    }
-                });
-                let (auth2, group_rows, token2) = (auth.clone(), group_rows.clone(), token.clone());
-                spawn_local(async move {
-                    if let Some(lines) =
-                        get_lines(auth2, get_url("/portal/groups", &token2, &[])).await
-                    {
-                        group_rows.set(parse_group_rows(&lines.join("\n")));
+                    if let Some(lines) = get_lines(auth, get_url("/portal/roles", &token, &[])).await {
+                        roles.set(parse_role_rows(&lines.join("\n")));
                     }
                 });
             })
         };
         {
             let refresh = refresh.clone();
-            use_effect_with(auth.token.clone(), move |_| {
-                refresh.emit(());
-                || ()
-            });
+            use_effect_with(auth.token.clone(), move |_| { refresh.emit(()); || () });
         }
 
-        let on_role_name = {
-            let role_name = role_name.clone();
-            Callback::from(move |e: InputEvent| role_name.set(input_value(&e)))
-        };
-        let on_role_caps = {
-            let role_caps = role_caps.clone();
-            Callback::from(move |e: InputEvent| role_caps.set(input_value(&e)))
-        };
-        let create_role = {
-            let (auth, busy, msg, refresh, role_name, role_caps) = (
-                auth.clone(),
-                busy.clone(),
-                msg.clone(),
-                refresh.clone(),
-                role_name.clone(),
-                role_caps.clone(),
-            );
-            Callback::from(move |_: MouseEvent| {
-                if *busy || role_name.trim().is_empty() {
-                    return;
-                }
-                let token = auth.token.clone().unwrap_or_default();
-                let body = create_role_wire(&token, role_name.trim(), role_caps.trim());
-                let (busy, msg, refresh) = (busy.clone(), msg.clone(), refresh.clone());
-                busy.set(true);
-                spawn_local(async move {
-                    if let Ok(r) = http("POST", "/portal/roles/create", Some(&body)).await {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
-                        if r.ok() {
-                            refresh.emit(());
-                        }
-                    }
-                    busy.set(false);
-                });
-            })
-        };
+        let rows: Vec<Row> = roles
+            .iter()
+            .map(|r| vec![r.name.clone(), r.capabilities.join(","), r.capabilities.len().to_string()])
+            .collect();
+        let render_cell = Callback::from(|(col, val): (usize, String)| -> Html {
+            if col == 1 { chips(&val) } else { html! { { val } } }
+        });
 
-        let on_group_name = {
-            let group_name = group_name.clone();
-            Callback::from(move |e: InputEvent| group_name.set(input_value(&e)))
+        let on_name = { let name = name.clone(); Callback::from(move |e: InputEvent| name.set(input_value(&e))) };
+        let on_extra = { let extra = extra.clone(); Callback::from(move |e: InputEvent| extra.set(input_value(&e))) };
+        let toggle_cap = {
+            let checked = checked.clone();
+            move |cap: &'static str| {
+                let checked = checked.clone();
+                Callback::from(move |_: MouseEvent| {
+                    let mut next = (*checked).clone();
+                    if let Some(i) = next.iter().position(|c| c == cap) { next.remove(i); } else { next.push(cap.to_owned()); }
+                    checked.set(next);
+                })
+            }
         };
-        let create_group = {
-            let (auth, busy, msg, refresh, group_name) = (
-                auth.clone(),
-                busy.clone(),
-                msg.clone(),
-                refresh.clone(),
-                group_name.clone(),
+        let create = {
+            let (auth, toaster, busy, refresh, name, checked, extra) = (
+                auth.clone(), toaster.clone(), busy.clone(), refresh.clone(), name.clone(), checked.clone(), extra.clone(),
             );
             Callback::from(move |_: MouseEvent| {
-                if *busy || group_name.trim().is_empty() {
-                    return;
-                }
+                if *busy || name.trim().is_empty() { return; }
+                let mut caps: Vec<String> = (*checked).clone();
+                caps.extend(extra.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned));
                 let token = auth.token.clone().unwrap_or_default();
-                let body = create_group_wire(&token, group_name.trim());
-                let (busy, msg, refresh) = (busy.clone(), msg.clone(), refresh.clone());
+                let body = create_role_wire(&token, name.trim(), &caps.join(","));
+                let (toaster, busy, refresh, name, checked, extra) =
+                    (toaster.clone(), busy.clone(), refresh.clone(), name.clone(), checked.clone(), extra.clone());
                 busy.set(true);
                 spawn_local(async move {
-                    if let Ok(r) = http("POST", "/portal/groups/create", Some(&body)).await {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
-                        if r.ok() {
+                    match http("POST", "/portal/roles/create", Some(&body)).await {
+                        Ok(r) if r.ok() => {
+                            toaster.success("Role created.");
+                            name.set(String::new()); checked.set(Vec::new()); extra.set(String::new());
                             refresh.emit(());
                         }
-                    }
-                    busy.set(false);
-                });
-            })
-        };
-
-        let on_attach_group = {
-            let attach_group = attach_group.clone();
-            Callback::from(move |e: InputEvent| attach_group.set(input_value(&e)))
-        };
-        let on_attach_role = {
-            let attach_role = attach_role.clone();
-            Callback::from(move |e: InputEvent| attach_role.set(input_value(&e)))
-        };
-        let attach = {
-            let (auth, busy, msg, refresh, attach_group, attach_role) = (
-                auth.clone(),
-                busy.clone(),
-                msg.clone(),
-                refresh.clone(),
-                attach_group.clone(),
-                attach_role.clone(),
-            );
-            Callback::from(move |_: MouseEvent| {
-                if *busy || attach_group.trim().is_empty() || attach_role.trim().is_empty() {
-                    return;
-                }
-                let token = auth.token.clone().unwrap_or_default();
-                let body = attach_role_wire(&token, attach_group.trim(), attach_role.trim());
-                let (busy, msg, refresh) = (busy.clone(), msg.clone(), refresh.clone());
-                busy.set(true);
-                spawn_local(async move {
-                    if let Ok(r) = http("POST", "/portal/groups/attach-role", Some(&body)).await {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
-                        if r.ok() {
-                            refresh.emit(());
-                        }
+                        Ok(r) => toaster.error(&format!("Could not create role: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not create role: the request failed."),
                     }
                     busy.set(false);
                 });
@@ -810,246 +1172,404 @@ mod yew_impl {
         };
 
         html! {
-            <div class="tile" id="roles-groups-tile">
-                <h3>{ "Roles & Groups" }</h3>
-                <div id="role-list">
-                    { for role_rows.iter().map(|r| html! {
-                        <p class="role-row">{ format!("{} capabilities={}", r.name, r.capabilities.join(",")) }</p>
-                    }) }
+            <div class="object-panel" id="roles-panel">
+                <DataTable
+                    columns={vec![Column::text("Role"), Column::unsortable("Capabilities"), Column::numeric("Count")]}
+                    rows={rows}
+                    render_cell={render_cell}
+                    empty_label={"No roles defined yet."}
+                />
+                <div class="creator">
+                    <h4>{ "Create role" }</h4>
+                    <label for="role-name-input">{ "Name" }</label>
+                    <input id="role-name-input" type="text" placeholder="name" value={(*name).clone()} oninput={on_name} />
+                    <div class="check-grid">
+                        { for KNOWN_CAPS.iter().map(|cap| {
+                            let on = checked.iter().any(|c| c == *cap);
+                            let onclick = toggle_cap(cap);
+                            html! {
+                                <button type="button" class={classes!("check-pill", on.then_some("is-on"))} onclick={onclick}>
+                                    { if on { "\u{2713} " } else { "" } }{ *cap }
+                                </button>
+                            }
+                        }) }
+                    </div>
+                    <label for="role-caps-extra">{ "Additional capabilities (comma-separated)" }</label>
+                    <input id="role-caps-extra" type="text" placeholder="resource:apply, obs:read"
+                        value={(*extra).clone()} oninput={on_extra} />
+                    <div class="tile-actions">
+                        <PendingButton id="role-create-btn" label="Create role" busy={*busy} onclick={create} />
+                    </div>
                 </div>
-                <div id="group-list">
-                    { for group_rows.iter().map(|g| html! {
-                        <p class="group-row">{ format!("{} roles={}", g.name, g.roles.join(",")) }</p>
-                    }) }
-                </div>
-                <label for="role-name-input">{ "Create role" }</label>
-                <input id="role-name-input" type="text" placeholder="name"
-                    value={(*role_name).clone()} oninput={on_role_name} />
-                <input id="role-caps-input" type="text" placeholder="capabilities (csv)"
-                    value={(*role_caps).clone()} oninput={on_role_caps} />
-                <PendingButton id="role-create-btn" label="Create role" busy={*busy} onclick={create_role} />
-
-                <label for="group-name-input">{ "Create group" }</label>
-                <input id="group-name-input" type="text" placeholder="name"
-                    value={(*group_name).clone()} oninput={on_group_name} />
-                <PendingButton id="group-create-btn" label="Create group" busy={*busy} onclick={create_group} />
-
-                <label for="attach-group-input">{ "Attach role to group" }</label>
-                <input id="attach-group-input" type="text" placeholder="group"
-                    value={(*attach_group).clone()} oninput={on_attach_group} />
-                <input id="attach-role-input" type="text" placeholder="role"
-                    value={(*attach_role).clone()} oninput={on_attach_role} />
-                <PendingButton id="attach-role-btn" label="Attach" busy={*busy} onclick={attach} />
-                { message_line("roles-groups-msg", &msg) }
             </div>
         }
     }
 
-    /// Admin OAuth Clients: list, register, and revoke a `(handle, client)`
-    /// consent — revoking a consent is a sensitive act gated behind a
-    /// predicted-effect dry-run.
+    #[function_component(GroupsPanel)]
+    fn groups_panel() -> Html {
+        let auth = use_auth();
+        let toaster = use_toaster();
+        let groups = use_state(Vec::<GroupRow>::new);
+        let roles = use_state(Vec::<RoleRow>::new);
+        let name = use_state(String::new);
+        let attach_group = use_state(String::new);
+        let attach_role = use_state(String::new);
+        let busy = use_state(|| false);
+
+        let refresh = {
+            let (auth, groups, roles) = (auth.clone(), groups.clone(), roles.clone());
+            Callback::from(move |_: ()| {
+                let Some(token) = auth.token.clone() else { return };
+                let (a1, groups, t1) = (auth.clone(), groups.clone(), token.clone());
+                spawn_local(async move {
+                    if let Some(lines) = get_lines(a1, get_url("/portal/groups", &t1, &[])).await {
+                        groups.set(parse_group_rows(&lines.join("\n")));
+                    }
+                });
+                let (a2, roles, t2) = (auth.clone(), roles.clone(), token.clone());
+                spawn_local(async move {
+                    if let Some(lines) = get_lines(a2, get_url("/portal/roles", &t2, &[])).await {
+                        roles.set(parse_role_rows(&lines.join("\n")));
+                    }
+                });
+            })
+        };
+        {
+            let refresh = refresh.clone();
+            use_effect_with(auth.token.clone(), move |_| { refresh.emit(()); || () });
+        }
+
+        let rows: Vec<Row> = groups
+            .iter()
+            .map(|g| vec![g.name.clone(), g.roles.join(","), g.roles.len().to_string()])
+            .collect();
+        let render_cell = Callback::from(|(col, val): (usize, String)| -> Html {
+            if col == 1 { chips(&val) } else { html! { { val } } }
+        });
+
+        let on_name = { let name = name.clone(); Callback::from(move |e: InputEvent| name.set(input_value(&e))) };
+        let on_attach_group = { let g = attach_group.clone(); Callback::from(move |e: Event| g.set(select_value(&e))) };
+        let on_attach_role = { let r = attach_role.clone(); Callback::from(move |e: Event| r.set(select_value(&e))) };
+
+        let create = {
+            let (auth, toaster, busy, refresh, name) = (auth.clone(), toaster.clone(), busy.clone(), refresh.clone(), name.clone());
+            Callback::from(move |_: MouseEvent| {
+                if *busy || name.trim().is_empty() { return; }
+                let token = auth.token.clone().unwrap_or_default();
+                let body = create_group_wire(&token, name.trim());
+                let (toaster, busy, refresh, name) = (toaster.clone(), busy.clone(), refresh.clone(), name.clone());
+                busy.set(true);
+                spawn_local(async move {
+                    match http("POST", "/portal/groups/create", Some(&body)).await {
+                        Ok(r) if r.ok() => { toaster.success("Group created."); name.set(String::new()); refresh.emit(()); }
+                        Ok(r) => toaster.error(&format!("Could not create group: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not create group: the request failed."),
+                    }
+                    busy.set(false);
+                });
+            })
+        };
+        let attach = {
+            let (auth, toaster, busy, refresh, attach_group, attach_role) = (
+                auth.clone(), toaster.clone(), busy.clone(), refresh.clone(), attach_group.clone(), attach_role.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                if *busy || attach_group.is_empty() || attach_role.is_empty() { return; }
+                let token = auth.token.clone().unwrap_or_default();
+                let body = attach_role_wire(&token, &attach_group, &attach_role);
+                let (toaster, busy, refresh) = (toaster.clone(), busy.clone(), refresh.clone());
+                busy.set(true);
+                spawn_local(async move {
+                    match http("POST", "/portal/groups/attach-role", Some(&body)).await {
+                        Ok(r) if r.ok() => { toaster.success("Role attached to group."); refresh.emit(()); }
+                        Ok(r) => toaster.error(&format!("Could not attach role: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not attach role: the request failed."),
+                    }
+                    busy.set(false);
+                });
+            })
+        };
+
+        html! {
+            <div class="object-panel" id="groups-panel">
+                <DataTable
+                    columns={vec![Column::text("Group"), Column::unsortable("Attached roles"), Column::numeric("Count")]}
+                    rows={rows}
+                    render_cell={render_cell}
+                    empty_label={"No groups defined yet."}
+                />
+                <div class="creator">
+                    <h4>{ "Create group" }</h4>
+                    <label for="group-name-input">{ "Name" }</label>
+                    <input id="group-name-input" type="text" placeholder="name" value={(*name).clone()} oninput={on_name} />
+                    <div class="tile-actions">
+                        <PendingButton id="group-create-btn" label="Create group" busy={*busy} onclick={create} />
+                    </div>
+                    <h4>{ "Attach a role to a group" }</h4>
+                    <label for="attach-group-select">{ "Group" }</label>
+                    <select id="attach-group-select" onchange={on_attach_group}>
+                        <option value="" selected={attach_group.is_empty()}>{ "Select a group\u{2026}" }</option>
+                        { for groups.iter().map(|g| html! {
+                            <option value={g.name.clone()} selected={*attach_group == g.name}>{ g.name.clone() }</option>
+                        }) }
+                    </select>
+                    <label for="attach-role-select">{ "Role" }</label>
+                    <select id="attach-role-select" onchange={on_attach_role}>
+                        <option value="" selected={attach_role.is_empty()}>{ "Select a role\u{2026}" }</option>
+                        { for roles.iter().map(|r| html! {
+                            <option value={r.name.clone()} selected={*attach_role == r.name}>{ r.name.clone() }</option>
+                        }) }
+                    </select>
+                    <div class="tile-actions">
+                        <PendingButton id="attach-role-btn" label="Attach role" busy={*busy} onclick={attach} />
+                    </div>
+                </div>
+            </div>
+        }
+    }
+
+    // ===================================================================
+    // OAuth clients (admin): client registry + consents, two tabs.
+    // ===================================================================
+
+    /// Admin OAuth client registry, split into a Clients tab (registry table +
+    /// register dialog with one-time client-secret reveal) and a Consents tab
+    /// (revoke a `(client, user)` consent behind a dry-run-gated confirm).
     #[function_component(OAuthClientsTile)]
     pub fn oauth_clients_tile() -> Html {
+        let tabs = vec![
+            TabItem { label: "Clients".into(), panel: html! { <OAuthClientsPanel /> } },
+            TabItem { label: "Consents".into(), panel: html! { <OAuthConsentsPanel /> } },
+        ];
+        html! {
+            <section class="tile" id="oauth-clients-tile">
+                <h3>{ "OAuth Clients" }</h3>
+                <Tabs tabs={tabs} />
+            </section>
+        }
+    }
+
+    #[function_component(OAuthClientsPanel)]
+    fn oauth_clients_panel() -> Html {
         let auth = use_auth();
-        let rows = use_state(Vec::<OAuthClientRow>::new);
+        let toaster = use_toaster();
+        let rows_state = use_state(Vec::<OAuthClientRow>::new);
+        let dialog_open = use_state(|| false);
         let client_type = use_state(|| "Confidential".to_owned());
         let redirect_uri = use_state(String::new);
         let scopes = use_state(String::new);
-        let revoke_client = use_state(String::new);
-        let revoke_handle = use_state(String::new);
-        let predicted = use_state(|| None::<bool>);
-        let msg = use_state(|| None::<(String, bool)>);
+        let secret = use_state(|| None::<String>);
         let busy = use_state(|| false);
 
         let refresh = {
-            let auth = auth.clone();
-            let rows = rows.clone();
+            let (auth, rows_state) = (auth.clone(), rows_state.clone());
             Callback::from(move |_: ()| {
-                let Some(token) = auth.token.clone() else {
-                    return;
-                };
-                let (auth, rows) = (auth.clone(), rows.clone());
+                let Some(token) = auth.token.clone() else { return };
+                let (auth, rows_state) = (auth.clone(), rows_state.clone());
                 spawn_local(async move {
-                    if let Some(lines) =
-                        get_lines(auth, get_url("/portal/oauth/clients", &token, &[])).await
-                    {
-                        rows.set(parse_oauth_client_rows(&lines.join("\n")));
+                    if let Some(lines) = get_lines(auth, get_url("/portal/oauth/clients", &token, &[])).await {
+                        rows_state.set(parse_oauth_client_rows(&lines.join("\n")));
                     }
                 });
             })
         };
         {
             let refresh = refresh.clone();
-            use_effect_with(auth.token.clone(), move |_| {
-                refresh.emit(());
-                || ()
-            });
+            use_effect_with(auth.token.clone(), move |_| { refresh.emit(()); || () });
         }
 
-        let on_client_type = {
-            let client_type = client_type.clone();
-            Callback::from(move |e: InputEvent| client_type.set(input_value(&e)))
+        let rows: Vec<Row> = rows_state
+            .iter()
+            .map(|c| vec![c.client_id.clone(), c.client_type.clone(), c.scopes.join(","), c.redirect_uris.join(", ")])
+            .collect();
+        let render_cell = Callback::from(|(col, val): (usize, String)| -> Html {
+            if col == 2 { chips(&val) } else { html! { { val } } }
+        });
+
+        let on_type = { let t = client_type.clone(); Callback::from(move |e: Event| t.set(select_value(&e))) };
+        let on_redirect = { let r = redirect_uri.clone(); Callback::from(move |e: InputEvent| r.set(input_value(&e))) };
+        let on_scopes = { let s = scopes.clone(); Callback::from(move |e: InputEvent| s.set(input_value(&e))) };
+        let open = {
+            let (dialog_open, redirect_uri, scopes, secret) = (dialog_open.clone(), redirect_uri.clone(), scopes.clone(), secret.clone());
+            Callback::from(move |_: MouseEvent| {
+                redirect_uri.set(String::new()); scopes.set(String::new()); secret.set(None); dialog_open.set(true);
+            })
         };
-        let on_redirect_uri = {
-            let redirect_uri = redirect_uri.clone();
-            Callback::from(move |e: InputEvent| redirect_uri.set(input_value(&e)))
-        };
-        let on_scopes = {
-            let scopes = scopes.clone();
-            Callback::from(move |e: InputEvent| scopes.set(input_value(&e)))
+        let close = {
+            let (dialog_open, secret) = (dialog_open.clone(), secret.clone());
+            Callback::from(move |_: MouseEvent| { dialog_open.set(false); secret.set(None); })
         };
         let register = {
-            let (auth, busy, msg, refresh, client_type, redirect_uri, scopes) = (
-                auth.clone(),
-                busy.clone(),
-                msg.clone(),
-                refresh.clone(),
-                client_type.clone(),
-                redirect_uri.clone(),
-                scopes.clone(),
+            let (auth, toaster, busy, refresh, client_type, redirect_uri, scopes, secret) = (
+                auth.clone(), toaster.clone(), busy.clone(), refresh.clone(),
+                client_type.clone(), redirect_uri.clone(), scopes.clone(), secret.clone(),
             );
             Callback::from(move |_: MouseEvent| {
-                if *busy || redirect_uri.trim().is_empty() {
-                    return;
-                }
+                if *busy || redirect_uri.trim().is_empty() { return; }
                 let token = auth.token.clone().unwrap_or_default();
-                let body = register_client_wire(
-                    &token,
-                    client_type.trim(),
-                    redirect_uri.trim(),
-                    scopes.trim(),
-                );
-                let (busy, msg, refresh) = (busy.clone(), msg.clone(), refresh.clone());
+                let body = register_client_wire(&token, client_type.trim(), redirect_uri.trim(), scopes.trim());
+                let (toaster, busy, refresh, secret) = (toaster.clone(), busy.clone(), refresh.clone(), secret.clone());
                 busy.set(true);
                 spawn_local(async move {
-                    if let Ok(r) = http("POST", "/portal/oauth/clients/register", Some(&body)).await
-                    {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
-                        if r.ok() {
-                            refresh.emit(());
-                        }
+                    match http("POST", "/portal/oauth/clients/register", Some(&body)).await {
+                        Ok(r) if r.ok() => { secret.set(Some(r.body.trim().to_owned())); refresh.emit(()); }
+                        Ok(r) => toaster.error(&format!("Could not register client: {}", r.body.trim())),
+                        Err(_) => toaster.error("Could not register client: the request failed."),
                     }
-                    busy.set(false);
-                });
-            })
-        };
-
-        let on_revoke_client = {
-            let revoke_client = revoke_client.clone();
-            let predicted = predicted.clone();
-            Callback::from(move |e: InputEvent| {
-                revoke_client.set(input_value(&e));
-                predicted.set(None);
-            })
-        };
-        let on_revoke_handle = {
-            let revoke_handle = revoke_handle.clone();
-            let predicted = predicted.clone();
-            Callback::from(move |e: InputEvent| {
-                revoke_handle.set(input_value(&e));
-                predicted.set(None);
-            })
-        };
-        let check_revoke_predicted = {
-            let (auth, revoke_client, revoke_handle, predicted) = (
-                auth.clone(),
-                revoke_client.clone(),
-                revoke_handle.clone(),
-                predicted.clone(),
-            );
-            Callback::from(move |_: MouseEvent| {
-                let token = auth.token.clone().unwrap_or_default();
-                let (client, handle) = ((*revoke_client).clone(), (*revoke_handle).clone());
-                let predicted = predicted.clone();
-                spawn_local(async move {
-                    let url = get_url(
-                        "/portal/oauth/clients/revoke-consent/dry-run",
-                        &token,
-                        &[("client_id", &client), ("handle", &handle)],
-                    );
-                    if let Ok(r) = http("GET", &url, None).await {
-                        predicted.set(Some(sensitive_action_allowed(&r.body)));
-                    }
-                });
-            })
-        };
-        let revoke = {
-            let (auth, busy, msg, refresh, revoke_client, revoke_handle, predicted) = (
-                auth.clone(),
-                busy.clone(),
-                msg.clone(),
-                refresh.clone(),
-                revoke_client.clone(),
-                revoke_handle.clone(),
-                predicted.clone(),
-            );
-            Callback::from(move |_: MouseEvent| {
-                if *busy || !matches!(*predicted, Some(true)) {
-                    return;
-                }
-                let token = auth.token.clone().unwrap_or_default();
-                let body = revoke_consent_wire(&token, revoke_client.trim(), revoke_handle.trim());
-                let (busy, msg, refresh, predicted) = (
-                    busy.clone(),
-                    msg.clone(),
-                    refresh.clone(),
-                    predicted.clone(),
-                );
-                busy.set(true);
-                spawn_local(async move {
-                    if let Ok(r) =
-                        http("POST", "/portal/oauth/clients/revoke-consent", Some(&body)).await
-                    {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
-                        if r.ok() {
-                            refresh.emit(());
-                        }
-                    }
-                    predicted.set(None);
                     busy.set(false);
                 });
             })
         };
 
         html! {
-            <div class="tile" id="oauth-clients-tile">
-                <h3>{ "OAuth Clients" }</h3>
-                <div id="oauth-client-list">
-                    { for rows.iter().map(|c| html! {
-                        <p class="oauth-client-row">
-                            { format!(
-                                "{} type={} scopes={} redirect_uris={}",
-                                c.client_id, c.client_type, c.scopes.join(","), c.redirect_uris.join(",")
-                            ) }
-                        </p>
-                    }) }
+            <div class="object-panel" id="oauth-clients-panel">
+                <div class="tile-head">
+                    <span class="tile-meta">{ "Registered OAuth 2.1 / OIDC clients" }</span>
+                    <button type="button" id="oauth-register-open" class="btn-primary" onclick={open}>{ "Register client" }</button>
                 </div>
-                <label for="oauth-client-type-input">{ "Register client" }</label>
-                <input id="oauth-client-type-input" type="text" placeholder="Confidential|Public"
-                    value={(*client_type).clone()} oninput={on_client_type} />
-                <input id="oauth-client-redirect-input" type="text" placeholder="redirect_uri"
-                    value={(*redirect_uri).clone()} oninput={on_redirect_uri} />
-                <input id="oauth-client-scopes-input" type="text" placeholder="scopes (csv)"
-                    value={(*scopes).clone()} oninput={on_scopes} />
-                <PendingButton id="oauth-client-register-btn" label="Register" busy={*busy} onclick={register} />
+                <DataTable
+                    columns={vec![Column::text("Client ID"), Column::text("Type"), Column::unsortable("Scopes"), Column::unsortable("Redirect URIs")]}
+                    rows={rows}
+                    render_cell={render_cell}
+                    empty_label={"No clients registered yet."}
+                />
+                if *dialog_open {
+                    { modal(html! {
+                        <>
+                            <h3>{ "Register OAuth client" }</h3>
+                            if let Some(value) = (*secret).clone() {
+                                <p>{ "Client registered. Copy the client secret now." }</p>
+                                <SecretReveal label={"Client secret"} secret={value} />
+                                <div class="dialog-actions">
+                                    <button type="button" class="btn-primary" onclick={close.clone()}>{ "Done" }</button>
+                                </div>
+                            } else {
+                                <label for="oauth-type-select">{ "Client type" }</label>
+                                <select id="oauth-type-select" onchange={on_type}>
+                                    <option value="Confidential" selected={*client_type == "Confidential"}>{ "Confidential" }</option>
+                                    <option value="Public" selected={*client_type == "Public"}>{ "Public" }</option>
+                                </select>
+                                <label for="oauth-redirect-input">{ "Redirect URI" }</label>
+                                <input id="oauth-redirect-input" type="url" placeholder="https://app.example.com/callback"
+                                    value={(*redirect_uri).clone()} oninput={on_redirect} />
+                                <label for="oauth-scopes-input">{ "Scopes (comma-separated)" }</label>
+                                <input id="oauth-scopes-input" type="text" placeholder="openid, profile, email"
+                                    value={(*scopes).clone()} oninput={on_scopes} />
+                                <div class="dialog-actions">
+                                    <button type="button" class="btn-ghost" onclick={close.clone()}>{ "Cancel" }</button>
+                                    <PendingButton id="oauth-register-btn" label="Register" busy={*busy} onclick={register} />
+                                </div>
+                            }
+                        </>
+                    }) }
+                }
+            </div>
+        }
+    }
 
-                <label for="oauth-revoke-client-input">{ "Revoke consent" }</label>
-                <input id="oauth-revoke-client-input" type="text" placeholder="client_id"
-                    value={(*revoke_client).clone()} oninput={on_revoke_client} />
-                <input id="oauth-revoke-handle-input" type="text" placeholder="handle"
-                    value={(*revoke_handle).clone()} oninput={on_revoke_handle} />
-                <button type="button" id="oauth-revoke-check-btn" onclick={check_revoke_predicted}>
-                    { "Check revoke" }
-                </button>
-                <PendingButton id="oauth-revoke-btn" label="Revoke consent" busy={*busy} onclick={revoke} />
-                <p id="oauth-revoke-predicted">
-                    { match *predicted {
-                        Some(true) => "predicted: ALLOW".to_owned(),
-                        Some(false) => "predicted: DENY".to_owned(),
-                        None => "predicted: (not checked)".to_owned(),
-                    } }
-                </p>
-                { message_line("oauth-clients-msg", &msg) }
+    #[function_component(OAuthConsentsPanel)]
+    fn oauth_consents_panel() -> Html {
+        let auth = use_auth();
+        let toaster = use_toaster();
+        let clients = use_state(Vec::<OAuthClientRow>::new);
+        let client = use_state(String::new);
+        let handle = use_state(String::new);
+        let staged = use_state(|| false);
+        let predicted = use_state(|| None::<bool>);
+        let busy = use_state(|| false);
+
+        {
+            let (auth, clients) = (auth.clone(), clients.clone());
+            use_effect_with(auth.token.clone(), move |_| {
+                if let Some(token) = auth.token.clone() {
+                    let (auth, clients) = (auth.clone(), clients.clone());
+                    spawn_local(async move {
+                        if let Some(lines) = get_lines(auth, get_url("/portal/oauth/clients", &token, &[])).await {
+                            clients.set(parse_oauth_client_rows(&lines.join("\n")));
+                        }
+                    });
+                }
+                || ()
+            });
+        }
+
+        let on_client = { let c = client.clone(); Callback::from(move |e: Event| c.set(select_value(&e))) };
+        let on_handle = { let h = handle.clone(); Callback::from(move |e: InputEvent| h.set(input_value(&e))) };
+
+        let stage = {
+            let (auth, client, handle, staged, predicted) = (auth.clone(), client.clone(), handle.clone(), staged.clone(), predicted.clone());
+            Callback::from(move |_: MouseEvent| {
+                if client.is_empty() || handle.trim().is_empty() { return; }
+                predicted.set(None);
+                staged.set(true);
+                let (auth, client, handle, predicted) = (auth.clone(), client.clone(), handle.clone(), predicted.clone());
+                spawn_local(async move {
+                    let token = auth.token.clone().unwrap_or_default();
+                    let url = get_url("/portal/oauth/clients/revoke-consent/dry-run", &token,
+                        &[("client_id", &client), ("handle", handle.trim())]);
+                    if let Ok(r) = http("GET", &url, None).await {
+                        predicted.set(Some(sensitive_action_allowed(&r.body)));
+                    } else { predicted.set(Some(false)); }
+                });
+            })
+        };
+        let cancel = { let staged = staged.clone(); Callback::from(move |_: MouseEvent| staged.set(false)) };
+        let confirm = {
+            let (auth, toaster, client, handle, staged, predicted, busy) = (
+                auth.clone(), toaster.clone(), client.clone(), handle.clone(), staged.clone(), predicted.clone(), busy.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                if *busy || !matches!(*predicted, Some(true)) { return; }
+                let token = auth.token.clone().unwrap_or_default();
+                let body = revoke_consent_wire(&token, client.trim(), handle.trim());
+                let (toaster, staged, busy) = (toaster.clone(), staged.clone(), busy.clone());
+                busy.set(true);
+                spawn_local(async move {
+                    match http("POST", "/portal/oauth/clients/revoke-consent", Some(&body)).await {
+                        Ok(r) if r.ok() => toaster.success("Consent revoked."),
+                        Ok(r) => toaster.error(&format!("Refused: {}", r.body.trim())),
+                        Err(_) => toaster.error("The request failed."),
+                    }
+                    staged.set(false);
+                    busy.set(false);
+                });
+            })
+        };
+
+        html! {
+            <div class="object-panel" id="oauth-consents-panel">
+                <h4>{ "Revoke a user's consent for a client" }</h4>
+                <label for="consent-client-select">{ "Client" }</label>
+                <select id="consent-client-select" onchange={on_client}>
+                    <option value="" selected={client.is_empty()}>{ "Select a client\u{2026}" }</option>
+                    { for clients.iter().map(|c| html! {
+                        <option value={c.client_id.clone()} selected={*client == c.client_id}>{ c.client_id.clone() }</option>
+                    }) }
+                </select>
+                <label for="consent-handle-input">{ "User handle" }</label>
+                <input id="consent-handle-input" type="text" placeholder="handle" value={(*handle).clone()} oninput={on_handle} />
+                <div class="tile-actions">
+                    <button type="button" id="consent-revoke-open" class="btn-danger"
+                        disabled={client.is_empty() || handle.trim().is_empty()} onclick={stage}>
+                        { "Revoke consent" }
+                    </button>
+                </div>
+                if *staged {
+                    { modal(html! {
+                        <>
+                            <h3>{ "Revoke consent" }</h3>
+                            <p>{ format!("Revoke {}'s consent for client {}.", handle.trim(), *client) }</p>
+                            { predicted_caption(*predicted) }
+                            <div class="dialog-actions">
+                                <button type="button" class="btn-ghost" onclick={cancel}>{ "Cancel" }</button>
+                                <button type="button" class="btn-danger" id="consent-revoke-confirm"
+                                    disabled={!matches!(*predicted, Some(true)) || *busy} onclick={confirm}>
+                                    { if *busy { "Working\u{2026}" } else { "Revoke" } }
+                                </button>
+                            </div>
+                        </>
+                    }) }
+                }
             </div>
         }
     }

@@ -66,6 +66,10 @@ pub enum Route {
     /// Failure-domain / topology explorer.
     #[cfg_attr(feature = "yew", at("/topology"))]
     Topology,
+    /// The signed-in user's account hub (profile/password/keys/sessions/
+    /// identity as tabs).
+    #[cfg_attr(feature = "yew", at("/account"))]
+    Account,
     /// This user's identity, domains, enrollment.
     #[cfg_attr(feature = "yew", at("/identity"))]
     Identity,
@@ -126,6 +130,7 @@ impl Route {
                 | Route::ResourceDetail { .. }
                 | Route::Observability
                 | Route::Topology
+                | Route::Account
                 | Route::Identity
                 | Route::Members
                 | Route::Sessions
@@ -154,6 +159,7 @@ impl Route {
             Route::ResourceSets => Section::ResourceSets,
             Route::Observability => Section::Observability,
             Route::Topology => Section::Topology,
+            Route::Account => Section::Account,
             Route::Identity => Section::Identity,
             Route::Members => Section::Members,
             Route::Sessions => Section::Sessions,
@@ -459,5 +465,13 @@ mod tests {
         // still redirects to Login like any other protected route.
         let session = AuthSession::default();
         assert_eq!(guard(Route::ChangePassword, &session), Route::Login);
+    }
+
+    #[test]
+    fn account_route_is_a_protected_console_section() {
+        assert!(Route::Account.requires_auth());
+        assert_eq!(Route::Account.section(), Some(Section::Account));
+        let session = AuthSession::default();
+        assert_eq!(guard(Route::Account, &session), Route::Login);
     }
 }

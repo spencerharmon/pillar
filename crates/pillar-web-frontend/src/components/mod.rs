@@ -25,6 +25,7 @@ pub mod code_block;
 pub mod data_table;
 pub mod drawer;
 pub mod form;
+pub mod secret_reveal;
 pub mod stat_card;
 pub mod tabs;
 pub mod toast;
@@ -45,6 +46,7 @@ pub use code_block::{DiffKind, DiffLine};
 pub use data_table::{Column, Row, SortDir};
 pub use drawer::Side;
 pub use form::FieldRule;
+pub use secret_reveal::mask as mask_secret;
 pub use stat_card::Trend;
 pub use toast::{Level, Toast};
 pub use tree::{FlatRow, TreeNode};
@@ -64,6 +66,8 @@ pub use drawer::{Drawer, DrawerProps};
 pub use form::{FormField, FormFieldProps};
 #[cfg(feature = "yew")]
 pub use form::{FieldSet, FieldSetProps};
+#[cfg(feature = "yew")]
+pub use secret_reveal::{SecretReveal, SecretRevealProps};
 #[cfg(feature = "yew")]
 pub use stat_card::{StatCard, StatCardProps};
 #[cfg(feature = "yew")]

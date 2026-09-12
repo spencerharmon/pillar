@@ -21,8 +21,12 @@ pub enum NavGroup {
     Observability,
     /// Failure-domain / topology tree.
     Topology,
-    /// Identity, members, sessions, trust graph — the IAM surface.
-    Access,
+    /// The signed-in user's OWN account: profile, password, security keys,
+    /// sessions, identity. Self-service only.
+    Account,
+    /// Administering OTHER principals: users, roles, groups, OAuth clients,
+    /// trust graph. Gated on `iam:*` capabilities (enforced server-side).
+    Administration,
     /// Swarm membership + bootstrap requests — cluster-level admin.
     Cluster,
 }
@@ -35,19 +39,21 @@ impl NavGroup {
             NavGroup::Compute => "Compute",
             NavGroup::Observability => "Observability",
             NavGroup::Topology => "Topology",
-            NavGroup::Access => "Identity & Access",
+            NavGroup::Account => "Account",
+            NavGroup::Administration => "Administration",
             NavGroup::Cluster => "Cluster",
         }
     }
 
     /// The groups in sidebar render order.
     #[must_use]
-    pub const fn all() -> [NavGroup; 5] {
+    pub const fn all() -> [NavGroup; 6] {
         [
             NavGroup::Compute,
             NavGroup::Observability,
             NavGroup::Topology,
-            NavGroup::Access,
+            NavGroup::Account,
+            NavGroup::Administration,
             NavGroup::Cluster,
         ]
     }
@@ -69,6 +75,12 @@ pub enum Section {
     Observability,
     /// Failure-domain / topology explorer.
     Topology,
+    /// The signed-in user's OWN account hub: a single tabbed page over the
+    /// self-service surfaces (profile, password, security keys, sessions,
+    /// identity). Replaces four separate sidebar entries with one "Account"
+    /// destination — the folded sections stay routable (deep links) but are
+    /// hidden from the sidebar (see [`Section::in_sidebar`]).
+    Account,
     /// This user's identity, domains, enrollment.
     Identity,
     /// Cell members administration.
@@ -97,13 +109,14 @@ pub enum Section {
 impl Section {
     /// Every section in canonical (sidebar) order.
     #[must_use]
-    pub const fn all() -> [Section; 16] {
+    pub const fn all() -> [Section; 17] {
         [
             Section::Overview,
             Section::Resources,
             Section::ResourceSets,
             Section::Observability,
             Section::Topology,
+            Section::Account,
             Section::Identity,
             Section::Members,
             Section::Sessions,
@@ -129,6 +142,7 @@ impl Section {
             Section::ResourceSets => "/resource-sets",
             Section::Observability => "/observability",
             Section::Topology => "/topology",
+            Section::Account => "/account",
             Section::Identity => "/identity",
             Section::Members => "/members",
             Section::Sessions => "/sessions",
@@ -152,6 +166,7 @@ impl Section {
             Section::ResourceSets => "Resource Sets",
             Section::Observability => "Observability",
             Section::Topology => "Topology",
+            Section::Account => "Account",
             Section::Identity => "Identity",
             Section::Members => "Members",
             Section::Sessions => "Sessions",
@@ -176,6 +191,7 @@ impl Section {
             Section::ResourceSets => "❖",
             Section::Observability => "∿",
             Section::Topology => "⧉",
+            Section::Account => "⚙",
             Section::Identity => "⬡",
             Section::Members => "☰",
             Section::Sessions => "⏻",
@@ -198,17 +214,34 @@ impl Section {
             Section::ResourceSets => NavGroup::Compute,
             Section::Observability => NavGroup::Observability,
             Section::Topology => NavGroup::Topology,
-            Section::Identity
-            | Section::Members
+            // The signed-in user's own account (self-service).
+            Section::Account
+            | Section::Identity
             | Section::Sessions
             | Section::Credentials
+            | Section::Profile => NavGroup::Account,
+            // Administering other principals (capability-gated server-side).
+            Section::Members
             | Section::Trust
-            | Section::Profile
             | Section::Users
             | Section::RolesGroups
-            | Section::OAuthClients => NavGroup::Access,
+            | Section::OAuthClients => NavGroup::Administration,
             Section::Swarm | Section::Inbox => NavGroup::Cluster,
         }
+    }
+
+    /// Whether this section is shown as its OWN link in the sidebar. The four
+    /// self-service surfaces (`Profile`, `Identity`, `Sessions`,
+    /// `Credentials`) are folded into the single [`Section::Account`] hub as
+    /// tabs, so they are hidden here while remaining routable for deep links
+    /// (their `#[at(...)]` routes still render the tile standalone). Every
+    /// other section is a first-class sidebar entry.
+    #[must_use]
+    pub const fn in_sidebar(self) -> bool {
+        !matches!(
+            self,
+            Section::Profile | Section::Identity | Section::Sessions | Section::Credentials
+        )
     }
 }
 
@@ -223,7 +256,7 @@ mod yew_impl {
     use crate::attestation_custody_console::{AttestationWizard, CustodyWizard};
     use crate::auth::{use_auth, AuthAction};
     use crate::command_palette::CommandPalette;
-    use crate::iam_console::{OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile};
+    use crate::iam_console::{AccountHub, OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile};
     use crate::obs_console::ObservabilityConsole;
     use crate::overview::OverviewConsole;
     use crate::portal::{
@@ -292,7 +325,7 @@ mod yew_impl {
     fn render_group(group: NavGroup, active: Section) -> Html {
         let items: Vec<Section> = Section::all()
             .into_iter()
-            .filter(|s| s.group() == group)
+            .filter(|s| s.group() == group && s.in_sidebar())
             .collect();
         html! {
             <div class="console-navgroup">
@@ -331,6 +364,7 @@ mod yew_impl {
             Section::ResourceSets => html! { <ResourceSetsConsole /> },
             Section::Observability => html! { <ObservabilityConsole /> },
             Section::Topology => html! { <TopologyConsole /> },
+            Section::Account => html! { <AccountHub /> },
             Section::Identity => html! { <IdentityTile /> },
             Section::Members => html! { <MembersTile /> },
             Section::Sessions => html! { <SessionsTile /> },
@@ -362,6 +396,7 @@ mod yew_impl {
             Section::ResourceSets => Route::ResourceSets,
             Section::Observability => Route::Observability,
             Section::Topology => Route::Topology,
+            Section::Account => Route::Account,
             Section::Identity => Route::Identity,
             Section::Members => Route::Members,
             Section::Sessions => Route::Sessions,
@@ -416,6 +451,56 @@ mod tests {
     fn overview_is_the_first_section() {
         assert_eq!(Section::all()[0], Section::Overview);
         assert_eq!(Section::Overview.path(), "/overview");
+    }
+
+    #[test]
+    fn account_group_shows_only_the_hub_and_hides_the_folded_self_sections() {
+        // The four self-service surfaces are folded into the Account hub:
+        // grouped under Account but HIDDEN from the sidebar (still routable so
+        // their deep-link routes render the tile standalone).
+        for s in [
+            Section::Profile,
+            Section::Identity,
+            Section::Sessions,
+            Section::Credentials,
+        ] {
+            assert_eq!(s.group(), NavGroup::Account, "{s:?} must be in the Account group");
+            assert!(!s.in_sidebar(), "{s:?} must be hidden (folded into the Account hub)");
+        }
+        // The hub is the single visible Account entry.
+        assert_eq!(Section::Account.group(), NavGroup::Account);
+        assert!(Section::Account.in_sidebar());
+        let visible = Section::all()
+            .into_iter()
+            .filter(|s| s.group() == NavGroup::Account && s.in_sidebar())
+            .count();
+        assert_eq!(visible, 1, "the Account group must show exactly one sidebar link (the hub)");
+    }
+
+    #[test]
+    fn admin_sections_live_under_administration_and_are_visible() {
+        for s in [
+            Section::Users,
+            Section::RolesGroups,
+            Section::OAuthClients,
+            Section::Members,
+            Section::Trust,
+        ] {
+            assert_eq!(s.group(), NavGroup::Administration, "{s:?} must be an Administration section");
+            assert!(s.in_sidebar(), "{s:?} must be a first-class sidebar link");
+        }
+    }
+
+    /// Mount-audit (anti-facade DoD): the Account section must mount the
+    /// `AccountHub` (the tabbed self-service hub), so a future edit can never
+    /// silently drop it and strand the folded self-service tiles.
+    #[test]
+    fn console_mounts_the_account_hub_for_the_account_section() {
+        let src = include_str!("console.rs");
+        assert!(
+            src.contains("Section::Account => html! { <AccountHub /> }"),
+            "console.rs no longer mounts AccountHub for the Account section"
+        );
     }
 
     /// Mount-audit (anti-facade DoD): the Trust section must mount BOTH guided

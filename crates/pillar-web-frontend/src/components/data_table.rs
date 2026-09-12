@@ -136,7 +136,7 @@ pub fn page_count(total: usize, page_size: usize) -> usize {
     if page_size == 0 {
         return 1;
     }
-    ((total + page_size - 1) / page_size).max(1)
+    total.div_ceil(page_size).max(1)
 }
 
 /// The slice of `rows` visible on page `page` (0-based) at `page_size` rows per
@@ -179,6 +179,27 @@ mod yew_impl {
         /// Optional extra class on the wrapping element.
         #[prop_or_default]
         pub class: Classes,
+        /// Optional custom renderer for a cell, keyed by `(column_index,
+        /// cell_value)`. Returning `None` falls back to plain text. Lets a
+        /// caller render e.g. a status column as a [`super::StatusPill`] or a
+        /// roles column as chips instead of raw text, WITHOUT changing the
+        /// string-based sort/filter (which still runs over the underlying cell
+        /// text). Backward compatible: `None` keeps the plain-text table.
+        #[prop_or_default]
+        pub render_cell: Option<Callback<(usize, String), Html>>,
+        /// Optional trailing per-row actions cell (a `\u{22ee}`/button cluster).
+        /// Receives the full row so the caller can key the action on the row's
+        /// identifier cell. When set, an unsortable "" header column is appended.
+        #[prop_or_default]
+        pub row_actions: Option<Callback<Row, Html>>,
+        /// Optional row-click handler (receives the full row) — makes each row
+        /// selectable (e.g. to open a detail drawer). Adds `is-clickable`.
+        #[prop_or_default]
+        pub on_row_click: Option<Callback<Row>>,
+        /// The empty-state label shown when there are no rows to display
+        /// (before or after filtering). Defaults to "No rows.".
+        #[prop_or_default]
+        pub empty_label: Option<AttrValue>,
     }
 
     /// A sortable / filterable / paginated table over [`DataTableProps`]. Header
@@ -264,18 +285,50 @@ mod yew_impl {
             })
             .collect::<Html>();
 
-        let body = visible
-            .iter()
-            .map(|row| {
-                html! {
-                    <tr class="pillar-datatable__row">
-                        { for row.iter().map(|cell| html! {
-                            <td class="pillar-datatable__td">{ cell.clone() }</td>
-                        }) }
-                    </tr>
-                }
-            })
-            .collect::<Html>();
+        let total_cols = props.columns.len() + usize::from(props.row_actions.is_some());
+        let body = if visible.is_empty() {
+            let label = props
+                .empty_label
+                .clone()
+                .unwrap_or_else(|| AttrValue::from("No rows."));
+            html! {
+                <tr class="pillar-datatable__row is-empty">
+                    <td class="pillar-datatable__empty" colspan={total_cols.to_string()}>
+                        { label }
+                    </td>
+                </tr>
+            }
+        } else {
+            visible
+                .iter()
+                .map(|row| {
+                    let mut row_class = Classes::from("pillar-datatable__row");
+                    let onclick = props.on_row_click.as_ref().map(|cb| {
+                        row_class.push("is-clickable");
+                        let (cb, row) = (cb.clone(), row.clone());
+                        Callback::from(move |_: MouseEvent| cb.emit(row.clone()))
+                    });
+                    html! {
+                        <tr class={row_class} onclick={onclick}>
+                            { for row.iter().enumerate().map(|(ci, cell)| {
+                                let content = props
+                                    .render_cell
+                                    .as_ref()
+                                    .map(|r| r.emit((ci, cell.clone())))
+                                    .unwrap_or_else(|| html! { { cell.clone() } });
+                                html! { <td class="pillar-datatable__td">{ content }</td> }
+                            }) }
+                            if let Some(actions) = props.row_actions.as_ref() {
+                                <td class="pillar-datatable__td pillar-datatable__actions"
+                                    onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
+                                    { actions.emit(row.clone()) }
+                                </td>
+                            }
+                        </tr>
+                    }
+                })
+                .collect::<Html>()
+        };
 
         let mut wrap = Classes::from("pillar-datatable");
         wrap.extend(props.class.clone());
@@ -292,7 +345,11 @@ mod yew_impl {
                     />
                 }
                 <table class="pillar-datatable__table">
-                    <thead><tr>{ header }</tr></thead>
+                    <thead><tr>{ header }
+                        if props.row_actions.is_some() {
+                            <th class="pillar-datatable__th pillar-datatable__actions-th" aria-label="Actions"></th>
+                        }
+                    </tr></thead>
                     <tbody>{ body }</tbody>
                 </table>
                 if props.page_size > 0 && pages > 1 {

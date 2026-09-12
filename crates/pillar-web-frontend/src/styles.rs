@@ -764,6 +764,128 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
             font-size: 10px; fill: #f4f4f8; pointer-events: none;
             font-family: ui-monospace, monospace;
         }}
+
+        /* ===== Console primitives: DataTable / Badge / StatusPill / Tabs ===== */
+        .pillar-datatable {{ display: flex; flex-direction: column; gap: 0.6rem; }}
+        .pillar-datatable__filter {{ max-width: 20rem; }}
+        .pillar-datatable__table {{
+            width: 100%; border-collapse: collapse; font-size: 0.86rem;
+            background: {surface_raised}; border: 1px solid {border};
+            border-radius: {radius}; overflow: hidden;
+        }}
+        .pillar-datatable__th {{
+            text-align: left; padding: 0.55rem 0.7rem; color: {muted};
+            font-weight: 600; font-size: 0.76rem; text-transform: uppercase;
+            letter-spacing: 0.04em; border-bottom: 1px solid {border};
+            background: {surface_overlay}; user-select: none;
+        }}
+        .pillar-datatable__th.is-sortable {{ cursor: pointer; }}
+        .pillar-datatable__th.is-sortable:hover {{ color: {text}; }}
+        .pillar-datatable__td {{
+            padding: 0.5rem 0.7rem; border-bottom: 1px solid {border};
+            vertical-align: middle;
+        }}
+        .pillar-datatable__row:last-child .pillar-datatable__td {{ border-bottom: none; }}
+        .pillar-datatable__row.is-clickable {{ cursor: pointer; {transition} }}
+        .pillar-datatable__row.is-clickable:hover .pillar-datatable__td {{ background: {surface_overlay}; }}
+        .pillar-datatable__actions {{ text-align: right; white-space: nowrap; }}
+        .pillar-datatable__empty {{ padding: 1.5rem 0.7rem; text-align: center; color: {muted}; }}
+        .pillar-datatable__pager {{
+            display: flex; align-items: center; gap: 0.75rem; justify-content: flex-end;
+            font-size: 0.8rem; color: {muted};
+        }}
+        .pillar-datatable__pager button {{ padding: 0.3rem 0.7rem; background: {surface_overlay}; color: {text}; border-color: {border}; }}
+        .pillar-datatable__pager button:hover:not(:disabled) {{ border-color: {glow}; }}
+
+        .pillar-badge {{
+            display: inline-flex; align-items: center; gap: 0.3rem;
+            padding: 0.12rem 0.5rem; border-radius: 999px; font-size: 0.74rem;
+            font-weight: 600; line-height: 1.5; border: 1px solid {border};
+            background: {surface_overlay}; color: {text}; white-space: nowrap;
+        }}
+        .pillar-statuspill {{
+            display: inline-flex; align-items: center; gap: 0.4rem;
+            padding: 0.12rem 0.55rem 0.12rem 0.4rem; border-radius: 999px;
+            font-size: 0.76rem; font-weight: 600; border: 1px solid {border};
+            background: {surface_overlay}; color: {text}; white-space: nowrap;
+        }}
+        .pillar-statuspill__dot {{ width: 0.5rem; height: 0.5rem; border-radius: 50%; background: {muted}; }}
+        .pillar-badge.is-success, .pillar-statuspill.is-success {{ color: #7ee2b8; border-color: #1f6f52; background: rgba(46,160,116,0.14); }}
+        .pillar-statuspill.is-success .pillar-statuspill__dot {{ background: #35c790; }}
+        .pillar-badge.is-danger, .pillar-statuspill.is-danger {{ color: #ff9d9d; border-color: #7a2b30; background: rgba(200,60,66,0.16); }}
+        .pillar-statuspill.is-danger .pillar-statuspill__dot {{ background: #ef5b64; }}
+        .pillar-badge.is-warning, .pillar-statuspill.is-warning {{ color: #f2cf8b; border-color: #7a5c1f; background: rgba(196,148,44,0.16); }}
+        .pillar-statuspill.is-warning .pillar-statuspill__dot {{ background: #e0ad3f; }}
+        .pillar-badge.is-info, .pillar-statuspill.is-info {{ color: #a9c7ff; border-color: #2e4a86; background: rgba(64,110,200,0.16); }}
+        .pillar-statuspill.is-info .pillar-statuspill__dot {{ background: #5b8def; }}
+
+        .pillar-tabs__bar {{ display: flex; gap: 0.25rem; border-bottom: 1px solid {border}; margin-bottom: 1rem; }}
+        .pillar-tab {{
+            background: transparent; border: none; color: {muted}; font-weight: 600;
+            padding: 0.5rem 0.85rem; border-radius: 0; border-bottom: 2px solid transparent;
+            cursor: pointer; {transition}
+        }}
+        .pillar-tab:hover {{ color: {text}; background: transparent; transform: none; }}
+        .pillar-tab.is-active {{ color: {text}; border-bottom-color: {accent}; background: transparent; }}
+
+        /* ===== IAM console: heads, chips, drawers, dialogs, secret reveal ===== */
+        .section-title {{ margin: 0 0 0.15rem; }}
+        .section-sub {{ color: {muted}; margin: 0 0 1.25rem; font-size: 0.9rem; }}
+        .tile-head {{ display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.85rem; }}
+        .tile-head h3, .tile-head h4 {{ margin: 0; }}
+        .tile-meta {{ color: {muted}; font-size: 0.85rem; }}
+        .tile-actions {{ display: flex; gap: 0.5rem; margin-top: 0.85rem; }}
+        .chip-row {{ display: inline-flex; flex-wrap: wrap; gap: 0.3rem; }}
+        .cell-empty {{ color: {muted}; }}
+        .btn-primary {{ background: {accent}; border-color: {accent}; }}
+        .btn-ghost {{ background: transparent; color: {text}; border-color: {border}; }}
+        .btn-ghost:hover {{ background: {surface_overlay}; border-color: {glow}; }}
+        .btn-danger {{ background: #b83c42; border-color: #b83c42; color: #fff; }}
+        .btn-danger:hover:not(:disabled) {{ background: #cf4750; border-color: #cf4750; }}
+        .row-action {{ padding: 0.28rem 0.6rem; font-size: 0.78rem; background: {surface_overlay}; color: {text}; border-color: {border}; }}
+        .row-action:hover {{ border-color: {glow}; }}
+        .object-panel {{ display: flex; flex-direction: column; gap: 1.25rem; }}
+        .creator {{ border-top: 1px solid {border}; padding-top: 1rem; display: flex; flex-direction: column; gap: 0.35rem; }}
+        .creator h4 {{ margin: 0.5rem 0 0.25rem; }}
+        .check-grid {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.3rem 0; }}
+        .check-pill {{ background: {surface_overlay}; color: {muted}; border: 1px solid {border}; padding: 0.3rem 0.6rem; font-size: 0.78rem; font-weight: 600; border-radius: 999px; }}
+        .check-pill:hover {{ color: {text}; transform: none; border-color: {glow}; background: {surface_overlay}; }}
+        .check-pill.is-on {{ color: {text}; border-color: {accent}; background: rgba(90,110,220,0.18); }}
+        .detail-list {{ display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 1rem; margin: 0.75rem 0; }}
+        .detail-list dt {{ color: {muted}; font-size: 0.82rem; }}
+        .detail-list dd {{ margin: 0; }}
+        .drawer-body {{ display: flex; flex-direction: column; gap: 0.5rem; }}
+        .drawer-actions {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }}
+        .drawer-note {{ color: {muted}; font-size: 0.8rem; margin-top: 0.75rem; border-top: 1px solid {border}; padding-top: 0.75rem; }}
+
+        .modal-backdrop {{
+            position: fixed; inset: 0; z-index: 50; display: flex;
+            align-items: center; justify-content: center; padding: 1rem;
+            background: rgba(4,6,12,0.62);
+        }}
+        .dialog-actions {{ display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1.1rem; }}
+        .predict {{ font-size: 0.85rem; color: {muted}; margin: 0.5rem 0; }}
+        .predict.is-allow {{ color: #7ee2b8; }}
+        .predict.is-deny {{ color: #ff9d9d; }}
+
+        .pillar-secret-reveal {{
+            border: 1px solid {border}; border-radius: {radius}; padding: 0.85rem;
+            background: {surface_base}; margin: 0.75rem 0; display: flex; flex-direction: column; gap: 0.5rem;
+        }}
+        .pillar-secret-reveal__label {{ color: {muted}; font-size: 0.8rem; font-weight: 600; }}
+        .pillar-secret-reveal__row {{ display: flex; align-items: center; gap: 0.5rem; }}
+        .pillar-secret-reveal__value {{
+            flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.95rem; letter-spacing: 0.04em; padding: 0.4rem 0.6rem;
+            background: {surface_overlay}; border: 1px solid {border}; border-radius: 6px;
+            color: {text}; overflow-x: auto; white-space: nowrap;
+        }}
+        .pillar-secret-reveal__toggle, .pillar-secret-reveal__copy {{
+            padding: 0.35rem 0.7rem; font-size: 0.8rem; background: {surface_overlay};
+            color: {text}; border-color: {border};
+        }}
+        .pillar-secret-reveal__copy.copied {{ border-color: {accent}; color: {accent}; }}
+        .pillar-secret-reveal__warn {{ color: #f2cf8b; font-size: 0.78rem; }}
         "#,
         surface_base = theme.surface_base,
         surface_raised = theme.surface_raised,
