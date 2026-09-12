@@ -27,6 +27,7 @@ fn usage() -> &'static str {
      \x20 pillar bootstrap node|user --domain <D> [opts]       submit a node/user join request\n\
      \x20 pillar bootstrap request list|approve <id> [--domain D]  review/decide join requests\n\
      \x20 pillar login --domain <D> --user <id> [--password P]    print export PILLAR_DOMAIN/PILLAR_TOKEN\n\
+     \x20 pillar config export [--domain D] [--token T] [--out PATH]  mint+enroll a scoped CLI signing subkey over an authenticated session, save 0600\n\
      \x20 pillar webauthn register --user <handle> [--domain D] [--token T]  register a hardware credential (ctap-hid)\n\
      \x20 pillar webauthn login [--domain D] [--token T] --credential-id <id>  authenticate with a hardware credential (ctap-hid)\n\
      \x20 pillar session ls|show <id>|revoke <id>|revoke-all       server-side sessions (ls/show view; revoke acts)\n\

@@ -121,6 +121,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, args| login(args),
     },
     VerbSpec {
+        name: "config",
+        handler: |_v, args| crate::config_export::run(args),
+    },
+    VerbSpec {
         name: "domain",
         handler: cluster_stream,
     },

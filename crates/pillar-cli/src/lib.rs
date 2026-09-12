@@ -33,6 +33,7 @@ pub mod apply_over_pillar_message;
 pub mod bootstrap;
 pub mod cli_surface;
 pub mod cluster;
+pub mod config_export;
 pub mod defaults;
 pub mod health;
 pub mod iam_cli;
