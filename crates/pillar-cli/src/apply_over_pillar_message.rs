@@ -39,7 +39,7 @@
 //! - `PILLAR_SIGNER_SECRET_HEX` / `PILLAR_SIGNER_PUBLIC_HEX` — the caller's
 //!   ed25519 signing keypair, lowercase hex (required).
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
 
 use pillar_client::transport::{send_op_with_fallback, TierAddr};
@@ -107,11 +107,27 @@ fn env(name: &'static str) -> Result<String, ConnectError> {
     std::env::var(name).map_err(|_| ConnectError::MissingEnv(name))
 }
 
+/// Resolve a `host:port` (or `ip:port`) endpoint to a concrete [`SocketAddr`],
+/// so a `config.yaml` / env value may carry a DNS name (e.g.
+/// `pillar.example.com:8644` — the UI-exported endpoint) rather than only a
+/// literal IP. Prefers an IPv4 result when a name resolves to both families
+/// (the resource-op hostPort is IPv4), else the first address returned.
+fn resolve_addr(s: &str, field: &'static str) -> Result<SocketAddr, ConnectError> {
+    let addrs: Vec<SocketAddr> = s
+        .to_socket_addrs()
+        .map_err(|_| ConnectError::BadAddr(field))?
+        .collect();
+    addrs
+        .iter()
+        .copied()
+        .find(SocketAddr::is_ipv4)
+        .or_else(|| addrs.first().copied())
+        .ok_or(ConnectError::BadAddr(field))
+}
+
 fn connect_from_env() -> Result<Connect, ConnectError> {
     let addr_s = env("PILLAR_RESOURCE_OP_ADDR")?;
-    let addr: SocketAddr = addr_s
-        .parse()
-        .map_err(|_| ConnectError::BadAddr("PILLAR_RESOURCE_OP_ADDR"))?;
+    let addr = resolve_addr(&addr_s, "PILLAR_RESOURCE_OP_ADDR")?;
     let cell_id_hex = env("PILLAR_CELL_ID_HEX")?;
     let cell = CellId::from_bytes(
         decode_hex(&cell_id_hex).ok_or(ConnectError::BadHex("PILLAR_CELL_ID_HEX"))?,
@@ -148,10 +164,7 @@ fn connect_from_config() -> Result<Connect, ConnectError> {
     let cfg = pillar_client::load(&pillar_client::ConfigDirs::from_env(), explicit.as_deref())
         .map_err(|e| ConnectError::Config(e.to_string()))?;
     let id = cfg.identity.ok_or(ConnectError::MissingIdentity)?;
-    let addr: SocketAddr = id
-        .addr
-        .parse()
-        .map_err(|_| ConnectError::BadAddr("identity.addr"))?;
+    let addr = resolve_addr(&id.addr, "identity.addr")?;
     let cell = CellId::from_bytes(
         decode_hex(&id.cell_id_hex).ok_or(ConnectError::BadHex("identity.cell-id-hex"))?,
     );
@@ -344,5 +357,32 @@ pub fn delete(args: &[String]) -> ExitCode {
             eprintln!("pillar delete: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_addr;
+
+    #[test]
+    fn resolve_addr_accepts_a_literal_ip_port() {
+        let a = resolve_addr("127.0.0.1:8644", "test").expect("ip:port resolves");
+        assert_eq!(a.port(), 8644);
+        assert!(a.ip().is_loopback());
+    }
+
+    #[test]
+    fn resolve_addr_resolves_a_dns_name() {
+        // `localhost` is guaranteed resolvable without network access, standing
+        // in for the UI-exported `pillar.<domain>:8644` endpoint (a DNS name,
+        // not a literal IP) — the case that regressed turnkey apply.
+        let a = resolve_addr("localhost:8644", "test").expect("hostname resolves");
+        assert_eq!(a.port(), 8644);
+        assert!(a.ip().is_loopback());
+    }
+
+    #[test]
+    fn resolve_addr_rejects_an_unparseable_endpoint() {
+        assert!(resolve_addr("not a socket addr", "test").is_err());
     }
 }
