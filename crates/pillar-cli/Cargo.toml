@@ -36,6 +36,7 @@ pillar-ops = { path = "../pillar-ops" }
 pillar-client = { path = "../pillar-client" }
 pillar-crypto = { path = "../pillar-crypto", default-features = false }
 pillar-iam = { path = "../pillar-iam" }
+getrandom = "0.2"
 pillar-oidc = { path = "../pillar-oidc" }
 libp2p = { version = "0.56", features = ["ed25519"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

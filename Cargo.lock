@@ -3271,6 +3271,7 @@ dependencies = [
  "base64 0.22.1",
  "ciborium",
  "futures",
+ "getrandom 0.2.17",
  "libp2p",
  "pillar-bootstrap",
  "pillar-cells",

@@ -674,6 +674,81 @@ impl NodeCustodyVerifier {
             .put_offer(identifier, handle, cid, record, offer);
     }
 
+    /// Re-seal an ALREADY-provisioned offer's operational key under a NEW
+    /// password, keeping the SAME key-distribution ledger admission record and
+    /// CID (only the password that unlocks the inner layer changes). The
+    /// operational-key `secret` is unchanged — so [`Self::admit`] keeps
+    /// resolving+unlocking the offer, now under `new_password`. Used by a self
+    /// password change / admin reset (`crates/pillar-cli/src/web_serve.rs`): the
+    /// caller re-reads [`Self::provisioned_offer_parts`] afterwards to journal
+    /// the new sealed ciphertext. `false` if `identifier` has no provisioned
+    /// offer to re-seal.
+    pub fn reseal_offer(
+        &mut self,
+        identifier: &str,
+        subkey: NodeSubkey,
+        new_password: &str,
+        secret: &str,
+    ) -> bool {
+        let Some(cid) = self.cell_db.resolve_cid(identifier).cloned() else {
+            return false;
+        };
+        let Some(record) = self.cell_db.record_for(identifier).cloned() else {
+            return false;
+        };
+        let handle = self
+            .cell_db
+            .handle_for(identifier)
+            .unwrap_or(identifier)
+            .to_owned();
+        let this_node = self.node_key.node().clone();
+        let offer = SealedOffer::seal(
+            subkey.clone(),
+            new_password,
+            secret,
+            &self.node_key,
+            std::iter::once(this_node),
+        );
+        // The public operational-key verifier is derived from `secret` (which
+        // is unchanged), so this re-insert is idempotent — kept for parity with
+        // the provision/restore paths.
+        self.registered.insert(
+            subkey.clone(),
+            RegisteredOperationalKey::register(subkey, "", secret),
+        );
+        self.cell_db
+            .put_offer(identifier, handle, cid, record, offer);
+        true
+    }
+
+    /// Replay counterpart of [`Self::reseal_offer`]: replace an already-admitted
+    /// offer's node-sealed ciphertext with the journaled `node_sealed` bytes
+    /// VERBATIM (no password, no re-admission — the record is already admitted
+    /// by the offer's original restore). `false` if `identifier` has no offer.
+    pub fn restore_offer_blob(
+        &mut self,
+        identifier: &str,
+        subkey: NodeSubkey,
+        node_sealed: Vec<u8>,
+    ) -> bool {
+        let Some(cid) = self.cell_db.resolve_cid(identifier).cloned() else {
+            return false;
+        };
+        let Some(record) = self.cell_db.record_for(identifier).cloned() else {
+            return false;
+        };
+        let handle = self
+            .cell_db
+            .handle_for(identifier)
+            .unwrap_or(identifier)
+            .to_owned();
+        let this_node = self.node_key.node().clone();
+        let offer = SealedOffer::from_sealed_parts(subkey, node_sealed, std::iter::once(this_node));
+        self.cell_db
+            .put_offer(identifier, handle, cid, record, offer);
+        true
+    }
+
     /// The persisted parts of the offer provisioned for `identifier`, if any:
     /// its `(cid, handle, node-sealed ciphertext)` — the durable material the
     /// portal journals so a restarted node can [`Self::restore_offer`] it

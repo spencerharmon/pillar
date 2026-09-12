@@ -251,3 +251,58 @@ secret), never embedded in the node source.
    registered 2FA credentials preserved (operator-confirmed).
 7. Admin management of others' security keys (§5).
 8. Frontend: Profile, Users, Roles & Groups sections; forced-change router guard.
+
+## 11. Implementation: the HTTP bridge & offer-based authentication
+
+The `pillar-iam` state machine is bridged to the web portal in
+`crates/pillar-cli/src/web_serve.rs`. Design points that refine §2 to the
+**operator-directed** decision to reuse the node-custody offer machinery for
+login (never a parallel password-admit path):
+
+- **One auth path.** An invited user logs in through the SAME node-custody
+  `/login` path the bootstrap first user uses. `iam_invite` (a) folds a
+  `pillar_iam::UserOp::Invite` into the `users` map, (b) admits the user's
+  deterministic operational subkey for login (`admit_subject_login_only`), and
+  (c) provisions a node-sealed operational-key offer sealed under the invitee's
+  initial/temporary password (`NodeCustodyVerifier::provision_offer`). There is
+  no `pillar-iam` `SealedOperationalKey` in the live web path — the offer IS the
+  password-sealed credential.
+- **Journaled + replayed.** Each IAM mutation is one `PortalOp`
+  (`InviteUser`/`UserProfileSet`/`UserStatusSet`/`UserRequireChange`/
+  `UserPasswordSet`/`UserPasskeyEnrolled`), carrying the re-sealed offer
+  ciphertext where relevant, so a restart rehydrates the record AND the offer
+  (`restore_offer`/`restore_offer_blob`) and the user still logs in.
+- **Self password change reuses the offer.** `POST /portal/users/reset-password`
+  with body `<token>\n<new_password>` re-seals the caller's offer under the new
+  password (`NodeCustodyVerifier::reseal_offer` — same admitted record, new
+  password wrapping) and clears `force_password_change`. It is
+  **session-authenticated**: the login already proved knowledge of the current
+  password, so §2.1's "prove the current password" is satisfied by the admitted
+  session rather than a re-entry (the redesigned console collects only the new
+  password). The same endpoint, with `<token>\n<target_handle>` naming ANOTHER
+  existing user, is the `iam:users:write`-gated admin reset (§2.5A): it issues a
+  fresh one-time temp password, re-forces the change, and preserves the
+  target's WebAuthn credentials (the credential registry is independent of the
+  offer).
+- **Containment is enforced server-side.** Every capability-gated IAM write
+  routes through `iam_caller_gate`, which calls `pillar_iam::admit_gated_action`
+  for the caller and refuses (`403 password-change-required` /
+  `403 passkey-enrollment-required`) while the caller carries an outstanding
+  required action — the `ForcedChangeContained`/`RequiredPasskeyContained`
+  invariants realised at the HTTP boundary. Own-profile read/edit and own
+  password change stay exempt.
+- **Endpoints.** `GET /portal/users`, `POST /portal/users/invite` (Keycloak
+  options: `<token>\n<handle>\n<email>` plus optional
+  `<initial_password>\n<force_password_change>\n<require_passkey>` — empty
+  password ⇒ node-generated one-time temp password, returned once),
+  `GET`/`PUT /portal/profile`, `POST /portal/users/reset-password`.
+- **Temp passwords** are 128-bit OS-random (`getrandom`); the node's nonce ids
+  are a counter and are never used as a secret.
+
+Known follow-ups (not blockers): the portal authorizes any WoT-admitted subject
+through the shared catch-all policy, so an invited user's fine-grained
+per-role capability gating rides that existing coarse model (unchanged by this
+work); `disable`/`enable`/`require-password-change` + their dry-run predictions
+and the required-passkey clear on WebAuthn enrol are wired in the pillar-iam
+core and journalled ops but their dedicated portal routes land in the next
+phase.

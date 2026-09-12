@@ -326,6 +326,14 @@ pub struct WebAuthContext {
     /// This cell's members and their roles — the user/member management UI's
     /// substrate. `(handle -> role)`.
     members: BTreeMap<String, String>,
+    /// The IAM user records (`pillar_iam`) — the substrate for the redesigned
+    /// Users/Account console surface (`GET /portal/users`, `/portal/users/invite`,
+    /// `/portal/profile`). Rebuilt on boot by folding the journaled IAM
+    /// `PortalOp`s through `pillar_iam::apply_op`, exactly like `members`.
+    /// Distinct from `members`: `members` is the legacy handle->role view the
+    /// existing tiles still read; `users` carries the full lifecycle record
+    /// (status, forced-change / required-passkey onboarding actions, profile).
+    users: BTreeMap<String, pillar_iam::UserRecord>,
     /// The server-side, per-principal [`SessionRegistry`] (ROI "Web portal /
     /// UI rework: Session management UI") — the session-management panel's
     /// substrate: lists every ADMITTED-login-token's principal's active
@@ -667,6 +675,62 @@ enum PortalOp {
         name: String,
         spec: String,
     },
+    /// IAM: an admin invite of a NEW user (the Keycloak-style create). Carries
+    /// the `pillar_iam` record fields (including the two optional onboarding
+    /// required actions) PLUS the node-sealed operational-key offer ciphertext
+    /// (sealed under the invitee's initial/temp password) so a restart
+    /// re-registers the SAME offer and the invited user can still log in
+    /// through the existing node-custody `/login` path. Folded through
+    /// `pillar_iam::apply_op` + `NodeCustodyVerifier::restore_offer` (the SAME
+    /// machinery bootstrap's first user uses — never a parallel auth path).
+    InviteUser {
+        handle: String,
+        display_name: String,
+        email: String,
+        force_password_change: bool,
+        require_passkey_enrollment: bool,
+        sealed_offer: Vec<u8>,
+        at: u64,
+    },
+    /// IAM: a self/admin profile edit (display name + email) on an existing
+    /// record — durable counterpart of [`WebAuthContext::iam_set_profile`].
+    UserProfileSet {
+        handle: String,
+        display_name: String,
+        email: String,
+        at: u64,
+    },
+    /// IAM: an admin lifecycle status change (disable/enable). `status` is the
+    /// `pillar_iam::UserStatus` rendered as `"Active"|"Disabled"|"Invited"`.
+    UserStatusSet {
+        handle: String,
+        status: String,
+        at: u64,
+    },
+    /// IAM: an admin "require a password change at next login" — sets the
+    /// record's forced-change onboarding action.
+    UserRequireChange {
+        handle: String,
+        at: u64,
+    },
+    /// IAM: a password (re)seal — a self change (`force_password_change =
+    /// false`) or an admin reset (`force_password_change = true`). Re-provisions
+    /// the node-sealed offer under the new password (reusing the offer
+    /// machinery) and sets the record's forced-change flag to the carried
+    /// value; `sealed_offer` is the re-sealed ciphertext, restored verbatim on
+    /// replay so the NEW password (not the invite temp) admits after a restart.
+    UserPasswordSet {
+        handle: String,
+        sealed_offer: Vec<u8>,
+        force_password_change: bool,
+        at: u64,
+    },
+    /// IAM: the invited user's required passkey was enrolled — clears the
+    /// required-passkey onboarding action (`pillar_iam::UserOp::PasskeyEnrolled`).
+    UserPasskeyEnrolled {
+        handle: String,
+        at: u64,
+    },
 }
 
 /// The first user's operational subkey id — deterministic from the handle, so a
@@ -689,6 +753,28 @@ fn bootstrap_offer_cid(handle: &str) -> Cid {
 /// the live seal and the restart-time verifier re-registration derive it here.
 fn bootstrap_secret(handle: &str) -> String {
     format!("operational-key-material-{handle}")
+}
+
+/// Render a [`pillar_iam::UserStatus`] as the stable wire token the
+/// `GET /portal/users` / `GET /portal/profile` responses use (and that
+/// [`iam_status_from_str`] parses back on replay).
+fn iam_status_str(status: pillar_iam::UserStatus) -> &'static str {
+    match status {
+        pillar_iam::UserStatus::Invited => "Invited",
+        pillar_iam::UserStatus::Active => "Active",
+        pillar_iam::UserStatus::Disabled => "Disabled",
+    }
+}
+
+/// Parse a wire status token back into a [`pillar_iam::UserStatus`]; `None` for
+/// an unrecognized token (a journaled op is never written with one).
+fn iam_status_from_str(status: &str) -> Option<pillar_iam::UserStatus> {
+    match status {
+        "Invited" => Some(pillar_iam::UserStatus::Invited),
+        "Active" => Some(pillar_iam::UserStatus::Active),
+        "Disabled" => Some(pillar_iam::UserStatus::Disabled),
+        _ => None,
+    }
 }
 
 /// A thread-shared handle to the node's live scheduler runtime: the running
@@ -865,6 +951,7 @@ impl WebAuthContext {
             }),
             domain_cells: BTreeMap::new(),
             members: BTreeMap::new(),
+            users: BTreeMap::new(),
             session_registry: SessionRegistry::new(),
             session_clock: 0,
             trust: TrustStore::new(owner_for_trust),
@@ -1256,6 +1343,89 @@ impl WebAuthContext {
             }
             PortalOp::SaveObservabilityDashboard { signer, name, spec } => {
                 let _ = self.save_observability_dashboard(&signer, &name, &spec);
+            }
+            PortalOp::InviteUser {
+                handle,
+                display_name,
+                email,
+                force_password_change,
+                require_passkey_enrollment,
+                sealed_offer,
+                at,
+            } => {
+                // Rebuild the record, re-admit the login subkey, and restore
+                // the node-sealed offer verbatim (no password) — the invited
+                // user logs in exactly as before the restart.
+                if let Ok(op) = pillar_iam::invite_user(
+                    &self.users,
+                    &handle,
+                    display_name,
+                    email,
+                    force_password_change,
+                    require_passkey_enrollment,
+                    at,
+                ) {
+                    pillar_iam::apply_op(&mut self.users, op);
+                }
+                let subkey = bootstrap_subkey(&handle);
+                self.admit_subject_login_only(subkey.node_id());
+                self.iam_restore_offer(&handle, sealed_offer);
+            }
+            PortalOp::UserProfileSet {
+                handle,
+                display_name,
+                email,
+                at,
+            } => {
+                pillar_iam::apply_op(
+                    &mut self.users,
+                    pillar_iam::UserOp::ProfileUpdate {
+                        handle,
+                        display_name,
+                        email,
+                        at,
+                    },
+                );
+            }
+            PortalOp::UserStatusSet { handle, status, at } => {
+                if let Some(status) = iam_status_from_str(&status) {
+                    pillar_iam::apply_op(
+                        &mut self.users,
+                        pillar_iam::UserOp::StatusChange { handle, status, at },
+                    );
+                }
+            }
+            PortalOp::UserRequireChange { handle, at } => {
+                pillar_iam::apply_op(
+                    &mut self.users,
+                    pillar_iam::UserOp::RequireChange { handle, at },
+                );
+            }
+            PortalOp::UserPasswordSet {
+                handle,
+                sealed_offer,
+                force_password_change,
+                at,
+            } => {
+                let op = if force_password_change {
+                    pillar_iam::UserOp::RequireChange {
+                        handle: handle.clone(),
+                        at,
+                    }
+                } else {
+                    pillar_iam::UserOp::PasswordChanged {
+                        handle: handle.clone(),
+                        at,
+                    }
+                };
+                pillar_iam::apply_op(&mut self.users, op);
+                self.iam_restore_offer_blob(&handle, sealed_offer);
+            }
+            PortalOp::UserPasskeyEnrolled { handle, at } => {
+                pillar_iam::apply_op(
+                    &mut self.users,
+                    pillar_iam::UserOp::PasskeyEnrolled { handle, at },
+                );
             }
         }
     }
@@ -2217,6 +2387,295 @@ impl WebAuthContext {
         existed
     }
 
+    /// Read access to the IAM user records — the `GET /portal/users` and
+    /// `GET /portal/profile` substrate.
+    #[must_use]
+    pub fn iam_users(&self) -> &BTreeMap<String, pillar_iam::UserRecord> {
+        &self.users
+    }
+
+    /// Read-only `--dry-run` preview of the `iam:users:write` admin gate for
+    /// `subject`: the SAME `pillar_rbac` decider [`Self::perform_signed_act`]
+    /// enforces, WITHOUT signing or appending anything — so a console dry-run
+    /// prediction equals the enforced decision by construction.
+    #[must_use]
+    pub fn iam_predict_users_write(&self, subject: &NodeId) -> bool {
+        let policies = [PolicyEvent {
+            target: PolicyTarget::ResourceClass(ResourceClass::All),
+            capability: RbacCapability::from(pillar_iam::IAM_USERS_WRITE_CAPABILITY),
+            depth_threshold: 0,
+        }];
+        let decider = RbacDecider::new(&self.authority, &policies, &[]);
+        decider.decide(&RbacRequest::new(
+            subject.clone(),
+            RbacCapability::from(pillar_iam::IAM_USERS_WRITE_CAPABILITY),
+        )) == Decision::Allow
+    }
+
+    /// Drop every live bearer session whose admitted handle is `handle` — the
+    /// `DisabledNeverActive` half of a disable: an existing session is revoked
+    /// (fails closed on its next check) the moment the account is disabled.
+    fn iam_revoke_user_sessions(&mut self, handle: &str) {
+        let targets: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.handle == handle)
+            .map(|(t, s)| (s.subject.to_string(), t.clone()))
+            .collect();
+        for (principal, token) in targets {
+            let _ = self.revoke_session(&principal, &token);
+        }
+    }
+
+    /// A monotone logical stamp for IAM record timestamps, journaled INTO each
+    /// op so replay reconstructs the identical `created_at`/`updated_at`
+    /// (never recomputed from a wall clock that would drift on replay).
+    fn iam_now(&mut self) -> u64 {
+        let t = self.session_clock;
+        self.session_clock += 1;
+        t
+    }
+
+    /// Live-provision the invited/reset user's node-sealed operational-key
+    /// offer under `password` (the SAME `provision_offer` machinery the
+    /// bootstrap first-user uses) and return the sealed ciphertext to journal,
+    /// so a restart re-registers the identical offer via [`Self::iam_restore_offer`].
+    fn iam_provision_offer(&mut self, handle: &str, password: &str) -> Vec<u8> {
+        let subkey = bootstrap_subkey(handle);
+        let cid = bootstrap_offer_cid(handle);
+        let secret = bootstrap_secret(handle);
+        self.provision_offer(
+            handle.to_owned(),
+            handle.to_owned(),
+            cid,
+            subkey,
+            password,
+            &secret,
+        );
+        self.verifier
+            .provisioned_offer_parts(handle)
+            .map(|(_, _, sealed)| sealed)
+            .unwrap_or_default()
+    }
+
+    /// Replay counterpart of [`Self::iam_provision_offer`]: restore the SAME
+    /// node-sealed offer from its journaled ciphertext without the password.
+    fn iam_restore_offer(&mut self, handle: &str, sealed: Vec<u8>) {
+        let subkey = bootstrap_subkey(handle);
+        let cid = bootstrap_offer_cid(handle);
+        let secret = bootstrap_secret(handle);
+        self.verifier.restore_offer(
+            handle.to_owned(),
+            handle.to_owned(),
+            cid,
+            subkey,
+            &secret,
+            sealed,
+        );
+    }
+
+    /// Live re-seal of an already-provisioned offer under `new_password` (a self
+    /// password change / admin reset): the offer stays admitted, only its
+    /// password wrapping changes. Returns the new sealed ciphertext to journal.
+    fn iam_reseal_offer(&mut self, handle: &str, new_password: &str) -> Vec<u8> {
+        let subkey = bootstrap_subkey(handle);
+        let secret = bootstrap_secret(handle);
+        self.verifier
+            .reseal_offer(handle, subkey, new_password, &secret);
+        self.verifier
+            .provisioned_offer_parts(handle)
+            .map(|(_, _, sealed)| sealed)
+            .unwrap_or_default()
+    }
+
+    /// Replay counterpart of [`Self::iam_reseal_offer`]: replace the offer's
+    /// node-sealed blob verbatim (the record is already admitted by the
+    /// invite's replay).
+    fn iam_restore_offer_blob(&mut self, handle: &str, sealed: Vec<u8>) {
+        let subkey = bootstrap_subkey(handle);
+        self.verifier.restore_offer_blob(handle, subkey, sealed);
+    }
+
+    /// Admin invite of a NEW IAM user (`iam:users:write`-gated by the caller):
+    /// create the `pillar_iam` record with the two Keycloak-style optional
+    /// required actions, admit the user's operational subkey for login, and
+    /// provision its node-sealed offer under `password` so it can immediately
+    /// log in through the existing node-custody `/login` path. Signed act:
+    /// the caller already passed [`Self::perform_signed_act`].
+    ///
+    /// # Errors
+    /// [`pillar_iam::InviteError::AlreadyExists`] if `handle` already has a
+    /// record (invite is create-only).
+    #[allow(clippy::too_many_arguments)]
+    pub fn iam_invite(
+        &mut self,
+        handle: &str,
+        display_name: String,
+        email: String,
+        force_password_change: bool,
+        require_passkey_enrollment: bool,
+        password: &str,
+        at: u64,
+    ) -> Result<(), pillar_iam::InviteError> {
+        let op = pillar_iam::invite_user(
+            &self.users,
+            handle,
+            display_name.clone(),
+            email.clone(),
+            force_password_change,
+            require_passkey_enrollment,
+            at,
+        )?;
+        pillar_iam::apply_op(&mut self.users, op);
+        let subkey = bootstrap_subkey(handle);
+        self.admit_subject_login_only(subkey.node_id());
+        let sealed_offer = self.iam_provision_offer(handle, password);
+        self.record(&PortalOp::InviteUser {
+            handle: handle.to_owned(),
+            display_name,
+            email,
+            force_password_change,
+            require_passkey_enrollment,
+            sealed_offer,
+            at,
+        });
+        Ok(())
+    }
+
+    /// Self/admin profile edit (display name + email). `false` if `handle` has
+    /// no record.
+    pub fn iam_set_profile(
+        &mut self,
+        handle: &str,
+        display_name: String,
+        email: String,
+        at: u64,
+    ) -> bool {
+        if !self.users.contains_key(handle) {
+            return false;
+        }
+        pillar_iam::apply_op(
+            &mut self.users,
+            pillar_iam::UserOp::ProfileUpdate {
+                handle: handle.to_owned(),
+                display_name: display_name.clone(),
+                email: email.clone(),
+                at,
+            },
+        );
+        self.record(&PortalOp::UserProfileSet {
+            handle: handle.to_owned(),
+            display_name,
+            email,
+            at,
+        });
+        true
+    }
+
+    /// Admin lifecycle status change (disable/enable). `false` if unknown.
+    pub fn iam_set_status(
+        &mut self,
+        handle: &str,
+        status: pillar_iam::UserStatus,
+        at: u64,
+    ) -> bool {
+        if !self.users.contains_key(handle) {
+            return false;
+        }
+        pillar_iam::apply_op(
+            &mut self.users,
+            pillar_iam::UserOp::StatusChange {
+                handle: handle.to_owned(),
+                status,
+                at,
+            },
+        );
+        self.record(&PortalOp::UserStatusSet {
+            handle: handle.to_owned(),
+            status: iam_status_str(status).to_owned(),
+            at,
+        });
+        true
+    }
+
+    /// Admin "require a password change at next login". `false` if unknown.
+    pub fn iam_require_change(&mut self, handle: &str, at: u64) -> bool {
+        if !self.users.contains_key(handle) {
+            return false;
+        }
+        pillar_iam::apply_op(
+            &mut self.users,
+            pillar_iam::UserOp::RequireChange {
+                handle: handle.to_owned(),
+                at,
+            },
+        );
+        self.record(&PortalOp::UserRequireChange {
+            handle: handle.to_owned(),
+            at,
+        });
+        true
+    }
+
+    /// (Re)seal a user's offer under `new_password` and set the record's
+    /// forced-change flag: `force = false` for a self password change (clears
+    /// the onboarding forced-change action), `force = true` for an admin reset
+    /// (re-forces). Reuses the offer machinery so login keeps working. `false`
+    /// if `handle` has no record.
+    pub fn iam_set_password(
+        &mut self,
+        handle: &str,
+        new_password: &str,
+        force: bool,
+        at: u64,
+    ) -> bool {
+        if !self.users.contains_key(handle) {
+            return false;
+        }
+        let sealed_offer = self.iam_reseal_offer(handle, new_password);
+        let op = if force {
+            pillar_iam::UserOp::RequireChange {
+                handle: handle.to_owned(),
+                at,
+            }
+        } else {
+            pillar_iam::UserOp::PasswordChanged {
+                handle: handle.to_owned(),
+                at,
+            }
+        };
+        pillar_iam::apply_op(&mut self.users, op);
+        self.record(&PortalOp::UserPasswordSet {
+            handle: handle.to_owned(),
+            sealed_offer,
+            force_password_change: force,
+            at,
+        });
+        true
+    }
+
+    /// Clear the required-passkey onboarding action once the user's first
+    /// credential registers. No-op if `handle` has no record or no such action.
+    pub fn iam_passkey_enrolled(&mut self, handle: &str, at: u64) {
+        if self
+            .users
+            .get(handle)
+            .is_some_and(|r| r.require_passkey_enrollment)
+        {
+            pillar_iam::apply_op(
+                &mut self.users,
+                pillar_iam::UserOp::PasskeyEnrolled {
+                    handle: handle.to_owned(),
+                    at,
+                },
+            );
+            self.record(&PortalOp::UserPasskeyEnrolled {
+                handle: handle.to_owned(),
+                at,
+            });
+        }
+    }
+
     /// The portal's single real signed-action gate: authorize `actor` for
     /// `capability` through the SAME `pillar_rbac` WoT/RBAC decider the CLI
     /// acts use (see `pillar-cli::Platform::apply`) — a subject reachable
@@ -3113,11 +3572,12 @@ impl WebAuthContext {
         "REPLICAS 0".to_owned()
     }
 
-    /// Test-only: admit `subject` into the LOGIN custody authority ONLY (so it
-    /// can log in) WITHOUT granting it any resource-plane authority — the
-    /// resource decider then refuses its acts. Chains at level 0 (farthest
-    /// from the root) so even the login authority barely admits it.
-    #[cfg(test)]
+    /// Admit `subject` into the LOGIN custody authority ONLY (so it can log
+    /// in) WITHOUT granting it any resource-plane authority — the resource
+    /// decider then refuses its acts. Chains at level 0 (farthest from the
+    /// root) so even the login authority barely admits it. Used both by the
+    /// test harness and by [`Self::iam_invite`] to make an invited IAM user
+    /// login-capable through the existing node-custody `/login` path.
     pub fn admit_subject_login_only(&mut self, subject: NodeId) {
         let root = self.authority.owner().clone();
         self.authority.issue_edge(root, subject, 0);
@@ -4232,6 +4692,72 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: PathMatch::Exact("/portal/users"),
+        handler: |ctx, _peer, request| dispatch_users_view(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/users/invite"),
+        handler: dispatch_users_invite,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/users/reset-password"),
+        handler: dispatch_users_reset_password,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/users/disable"),
+        handler: |ctx, peer, request| {
+            dispatch_users_lifecycle(ctx, peer, request, UserLifecycleAction::Disable)
+        },
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/users/enable"),
+        handler: |ctx, peer, request| {
+            dispatch_users_lifecycle(ctx, peer, request, UserLifecycleAction::Enable)
+        },
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/users/require-password-change"),
+        handler: |ctx, peer, request| {
+            dispatch_users_lifecycle(ctx, peer, request, UserLifecycleAction::RequireChange)
+        },
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/users/disable/dry-run"),
+        handler: |ctx, _peer, request| dispatch_users_action_dry_run(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/users/enable/dry-run"),
+        handler: |ctx, _peer, request| dispatch_users_action_dry_run(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/users/require-password-change/dry-run"),
+        handler: |ctx, _peer, request| dispatch_users_action_dry_run(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/users/reset-password/dry-run"),
+        handler: |ctx, _peer, request| dispatch_users_action_dry_run(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/profile"),
+        handler: |ctx, _peer, request| dispatch_profile_view(ctx, request),
+    },
+    RouteSpec {
+        method: "PUT",
+        path: PathMatch::Exact("/portal/profile"),
+        handler: dispatch_profile_update,
+    },
+    RouteSpec {
+        method: "GET",
         path: PathMatch::Exact("/portal/sessions"),
         handler: |ctx, _peer, request| dispatch_sessions_view(ctx, request),
     },
@@ -5184,6 +5710,380 @@ fn dispatch_members_role(ctx: &mut WebAuthContext, request: &HttpRequest) -> Htt
         text_response(200, "OK", format!("MEMBER {handle} ROLE {role}"))
     } else {
         text_response(404, "Not Found", "DENIED unknown-member".to_owned())
+    }
+}
+
+/// Resolve a session token to the caller's IAM handle (the `users`-map key):
+/// the invited/bootstrapped handle the node-custody offer was provisioned
+/// under, carried on the admitted [`NodeCustodySession`]. `None` if the token
+/// is not an admitted session.
+fn iam_caller_handle(ctx: &WebAuthContext, token: &str) -> Option<String> {
+    ctx.sessions.get(token).map(|s| s.handle.clone())
+}
+
+/// A cryptographically-random one-time temporary password (128 bits, hex).
+/// Drawn from OS randomness — the node's nonce ids are a counter, never a
+/// secret. `Err(())` ONLY if the OS RNG itself fails (surfaced as `500`, never
+/// a weak or empty fallback).
+fn generate_temp_password() -> Result<String, ()> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|_| ())?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Containment gate for a capability-gated IAM act by `handle`: refuse while
+/// the caller carries an outstanding onboarding required action (forced
+/// password change / required passkey). A caller with no IAM record (a
+/// bootstrapped, pre-`users`-map principal) is never contained.
+fn iam_caller_gate(ctx: &WebAuthContext, handle: &str) -> Result<(), HttpResponse> {
+    if !ctx.iam_users().contains_key(handle) {
+        return Ok(());
+    }
+    match pillar_iam::admit_gated_action(
+        ctx.iam_users(),
+        handle,
+        pillar_iam::GatedAction::Other,
+        0,
+        None,
+    ) {
+        Ok(()) | Err(pillar_iam::AdmitError::UnknownUser) => Ok(()),
+        Err(pillar_iam::AdmitError::PasswordChangeRequired) => Err(text_response(
+            403,
+            "Forbidden",
+            "DENIED password-change-required".to_owned(),
+        )),
+        Err(pillar_iam::AdmitError::PasskeyEnrollmentRequired) => Err(text_response(
+            403,
+            "Forbidden",
+            "DENIED passkey-enrollment-required".to_owned(),
+        )),
+    }
+}
+
+/// List IAM users: `GET /portal/users?token=...`. One line per user:
+/// `<handle> status=<s> force_password_change=<bool> roles=<r1,r2,...>` — the
+/// exact framing the redesigned Users tile parses (`parse_user_rows`).
+fn dispatch_users_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let mut body = String::new();
+    for (handle, rec) in ctx.iam_users() {
+        let roles = rec.roles.iter().cloned().collect::<Vec<_>>().join(",");
+        body.push_str(&format!(
+            "{handle} status={} force_password_change={} roles={roles}\n",
+            iam_status_str(rec.status),
+            rec.force_password_change
+        ));
+    }
+    text_response(200, "OK", body)
+}
+
+/// Admin invite of a NEW user: `POST /portal/users/invite`, body
+/// `<token>\n<handle>\n<email>` and OPTIONALLY three more Keycloak-style option
+/// lines `<initial_password>\n<force_password_change>\n<require_passkey>`. When
+/// the password line is empty/absent the node generates a one-time temporary
+/// password and RETURNS it (revealed once to the admin); `force_password_change`
+/// defaults ON (only an explicit `false` disables it) and `require_passkey`
+/// defaults OFF (only an explicit `true` enables it). Gated through
+/// [`WebAuthContext::perform_signed_act`] on `iam:users:write` — the SAME
+/// WoT/RBAC decider every other portal write uses.
+fn dispatch_users_invite(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    let email = lines.next().unwrap_or("").trim();
+    let pw_line = lines.next().unwrap_or("").trim();
+    let force_line = lines.next().unwrap_or("").trim();
+    let passkey_line = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    let Some(session) = session else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if handle.is_empty() {
+        return text_response(400, "Bad Request", "MISSING handle".to_owned());
+    }
+    if let Some(caller) = iam_caller_handle(ctx, token) {
+        if let Err(resp) = iam_caller_gate(ctx, &caller) {
+            return resp;
+        }
+    }
+    // Keycloak-style options: force-change defaults ON (only "false" disables),
+    // require-passkey defaults OFF (only "true" enables).
+    let force_password_change = force_line != "false";
+    let require_passkey = passkey_line == "true";
+    let (password, _generated) = if pw_line.is_empty() {
+        match generate_temp_password() {
+            Ok(p) => (p, true),
+            Err(()) => {
+                return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned())
+            }
+        }
+    } else {
+        (pw_line.to_owned(), false)
+    };
+    let actor = session.subject.clone();
+    if ctx
+        .perform_signed_act(&actor, "iam:users:write", &format!("USER-INVITE {handle}"))
+        .is_err()
+    {
+        return text_response(
+            403,
+            "Forbidden",
+            format!("REFUSED unauthorized actor {actor} for iam:users:write"),
+        );
+    }
+    let at = ctx.iam_now();
+    match ctx.iam_invite(
+        handle,
+        handle.to_owned(),
+        email.to_owned(),
+        force_password_change,
+        require_passkey,
+        &password,
+        at,
+    ) {
+        Ok(()) => text_response(200, "OK", password),
+        Err(pillar_iam::InviteError::AlreadyExists) => {
+            text_response(409, "Conflict", "DENIED already-exists".to_owned())
+        }
+    }
+}
+
+/// Self profile read: `GET /portal/profile?token=...`. Renders
+/// `PROFILE handle=<h> display_name=<n> email=<e> status=<s>
+/// force_password_change=<bool>` for the caller's own record. A bootstrapped
+/// (pre-`users`-map) principal renders a minimal active profile keyed on its
+/// login handle rather than fabricating a record.
+fn dispatch_profile_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(handle) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let body = match ctx.iam_users().get(&handle) {
+        Some(rec) => format!(
+            "PROFILE handle={} display_name={} email={} status={} force_password_change={}",
+            rec.handle,
+            rec.display_name,
+            rec.email,
+            iam_status_str(rec.status),
+            rec.force_password_change
+        ),
+        None => format!(
+            "PROFILE handle={handle} display_name={handle} email= status=Active force_password_change=false"
+        ),
+    };
+    text_response(200, "OK", body)
+}
+
+/// Self profile edit: `PUT /portal/profile`, body
+/// `<token>\n<display_name>\n<email>`. Always permitted for the caller's own
+/// record even while contained (`OwnProfile`).
+fn dispatch_profile_update(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let display_name = lines.next().unwrap_or("").trim();
+    let email = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(handle) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let at = ctx.iam_now();
+    if ctx.iam_set_profile(&handle, display_name.to_owned(), email.to_owned(), at) {
+        text_response(
+            200,
+            "OK",
+            format!("PROFILE handle={handle} display_name={display_name} email={email}"),
+        )
+    } else {
+        text_response(404, "Not Found", "DENIED no-profile".to_owned())
+    }
+}
+
+/// Password (re)set: `POST /portal/users/reset-password`. The redesigned
+/// console overloads this one endpoint for two acts, disambiguated by the
+/// second body field:
+///   * SELF change — body `<token>\n<new_password>` (the field is NOT another
+///     user's handle): re-seals the caller's own offer under the new password
+///     and clears the forced-change onboarding action (the way OUT of
+///     containment). Session-authenticated (the login already proved password
+///     knowledge); permitted while contained (`OwnPasswordChange`).
+///   * ADMIN reset — body `<token>\n<target_handle>` (the field names ANOTHER
+///     existing user): `iam:users:write`-gated; issues a NEW one-time temporary
+///     password for the target, re-forces their change, and RETURNS the temp
+///     password (revealed once). Registered WebAuthn credentials are untouched.
+fn dispatch_users_reset_password(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let field2 = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    let Some(session) = session else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if field2.is_empty() {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    }
+    let is_admin_reset = field2 != caller && ctx.iam_users().contains_key(field2);
+    if is_admin_reset {
+        if let Err(resp) = iam_caller_gate(ctx, &caller) {
+            return resp;
+        }
+        let actor = session.subject.clone();
+        if ctx
+            .perform_signed_act(&actor, "iam:users:write", &format!("USER-RESET {field2}"))
+            .is_err()
+        {
+            return text_response(
+                403,
+                "Forbidden",
+                format!("REFUSED unauthorized actor {actor} for iam:users:write"),
+            );
+        }
+        let temp = match generate_temp_password() {
+            Ok(p) => p,
+            Err(()) => {
+                return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned())
+            }
+        };
+        let at = ctx.iam_now();
+        if ctx.iam_set_password(field2, &temp, true, at) {
+            text_response(200, "OK", temp)
+        } else {
+            text_response(404, "Not Found", "DENIED unknown-user".to_owned())
+        }
+    } else {
+        // Self password change: field2 is the caller's NEW password.
+        if !ctx.iam_users().contains_key(&caller) {
+            return text_response(409, "Conflict", "DENIED no-self-record".to_owned());
+        }
+        let at = ctx.iam_now();
+        if ctx.iam_set_password(&caller, field2, false, at) {
+            text_response(200, "OK", "PASSWORD-CHANGED".to_owned())
+        } else {
+            text_response(404, "Not Found", "DENIED no-profile".to_owned())
+        }
+    }
+}
+
+/// Which single-target admin lifecycle act a `/portal/users/{...}` route drives.
+#[derive(Clone, Copy, Debug)]
+enum UserLifecycleAction {
+    Disable,
+    Enable,
+    RequireChange,
+}
+
+/// The `--dry-run` preview shared by every single-target admin user act
+/// (`GET /portal/users/{disable,enable,require-password-change,reset-password}/dry-run?token=&handle=`):
+/// the PREDICTED `iam:users:write` decision for the caller, rendered
+/// `PREDICTED ALLOW|DENY` — the SAME decider the enforced act runs, so
+/// predicted == enforced.
+fn dispatch_users_action_dry_run(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let predicted = ctx.iam_predict_users_write(&session.subject);
+    text_response(
+        200,
+        "OK",
+        format!("PREDICTED {}", if predicted { "ALLOW" } else { "DENY" }),
+    )
+}
+
+/// A single-target admin lifecycle act (`POST /portal/users/{disable,enable,
+/// require-password-change}`, body `<token>\n<handle>`), gated on
+/// `iam:users:write`. `disable` also revokes the target's live sessions
+/// (`DisabledNeverActive`); `enable` restores `Active`; `require-password-change`
+/// sets the forced-change onboarding action.
+fn dispatch_users_lifecycle(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+    action: UserLifecycleAction,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let handle = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    let Some(session) = session else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if handle.is_empty() {
+        return text_response(400, "Bad Request", "MISSING handle".to_owned());
+    }
+    if let Some(caller) = iam_caller_handle(ctx, token) {
+        if let Err(resp) = iam_caller_gate(ctx, &caller) {
+            return resp;
+        }
+    }
+    let actor = session.subject.clone();
+    if ctx
+        .perform_signed_act(
+            &actor,
+            "iam:users:write",
+            &format!("USER-{action:?} {handle}"),
+        )
+        .is_err()
+    {
+        return text_response(
+            403,
+            "Forbidden",
+            format!("REFUSED unauthorized actor {actor} for iam:users:write"),
+        );
+    }
+    let at = ctx.iam_now();
+    let ok = match action {
+        UserLifecycleAction::Disable => {
+            let ok = ctx.iam_set_status(handle, pillar_iam::UserStatus::Disabled, at);
+            if ok {
+                ctx.iam_revoke_user_sessions(handle);
+            }
+            ok
+        }
+        UserLifecycleAction::Enable => {
+            ctx.iam_set_status(handle, pillar_iam::UserStatus::Active, at)
+        }
+        UserLifecycleAction::RequireChange => ctx.iam_require_change(handle, at),
+    };
+    if ok {
+        text_response(200, "OK", format!("USER {handle} {action:?}"))
+    } else {
+        text_response(404, "Not Found", "DENIED unknown-user".to_owned())
     }
 }
 
@@ -6202,6 +7102,12 @@ fn dispatch_webauthn_register_finish(
                 created_at: record.created_at,
             });
             let cred_b64 = pillar_crypto::webauthn::base64url_encode(&record.credential_id);
+            // If the caller was invited with a REQUIRED passkey, enrolling their
+            // first credential clears that onboarding action (un-contains them).
+            if let Some(handle) = iam_caller_handle(ctx, token) {
+                let at = ctx.iam_now();
+                ctx.iam_passkey_enrolled(&handle, at);
+            }
             text_response(200, "OK", format!("REGISTERED {cred_b64}"))
         }
         Err(e) => webauthn_rp_error(&e),
@@ -6477,6 +7383,16 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
     {
         Ok(session) => {
             let handle = session.handle.clone();
+            // Disabled accounts never obtain a session (`DisabledNeverActive`),
+            // even though their node-sealed offer still unlocks — the IAM status
+            // gate refuses admission before any session is minted.
+            if ctx
+                .iam_users()
+                .get(&handle)
+                .is_some_and(|r| r.status == pillar_iam::UserStatus::Disabled)
+            {
+                return text_response(403, "Forbidden", "DENIED account-disabled".to_owned());
+            }
             // 2FA ENFORCEMENT: if this user (keyed on the STABLE admitted
             // subject, robust to which identifier form was typed) has an
             // ENROLLED WebAuthn credential, a password alone is NOT enough. Park
@@ -7186,6 +8102,278 @@ mod tests {
             act_resp.body.contains("EXERCISED-AUTHORITY"),
             "got: {}",
             act_resp.body
+        );
+    }
+
+    // Log `identifier` in with `password` and return the admitted session
+    // token (drives GET /nonce then POST /login). Panics on a non-200 login so
+    // a test failure points at the login, not a later assertion.
+    fn login_token(ctx: &mut WebAuthContext, identifier: &str, password: &str) -> String {
+        let nonce = get(ctx, "/nonce");
+        assert_eq!(nonce.status, 200, "nonce: {}", nonce.body);
+        let id: u64 = nonce
+            .body
+            .split_whitespace()
+            .nth(1)
+            .expect("nonce id")
+            .parse()
+            .expect("nonce id parses");
+        let resp = post(ctx, "/login", &format!("{identifier}\n{password}\n{id}"));
+        assert_eq!(resp.status, 200, "login {identifier}: {}", resp.body);
+        resp.session_token.expect("a session token")
+    }
+
+    // The Keycloak-style create flow end to end: an admin invites a new user;
+    // the user is persisted + listed as Invited/forced-change; the node
+    // GENERATES a one-time temp password and returns it; the invited user logs
+    // in with it through the SAME node-custody /login path (reusing the offer
+    // machinery); their profile shows the forced change; a self password
+    // change clears it and re-seals the offer under the new password.
+    #[test]
+    fn invite_creates_a_login_capable_user_who_can_escape_forced_change() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+
+        // Invite bob (no options → forced-change ON by default, temp password
+        // generated).
+        let invite = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\nbob\nbob@example.com"),
+        );
+        assert_eq!(invite.status, 200, "invite: {}", invite.body);
+        let temp = invite.body.trim().to_owned();
+        assert!(
+            !temp.is_empty(),
+            "invite must reveal a one-time temp password"
+        );
+
+        // Listed as Invited with forced change.
+        let list = get(&mut ctx, &format!("/portal/users?token={admin}"));
+        assert_eq!(list.status, 200);
+        assert!(
+            list.body
+                .contains("bob status=Invited force_password_change=true"),
+            "users list: {}",
+            list.body
+        );
+
+        // Bob logs in with the temp password (offer reuse — no parallel auth).
+        let bob = login_token(&mut ctx, "bob", &temp);
+
+        // Bob's profile shows the forced change.
+        let prof = get(&mut ctx, &format!("/portal/profile?token={bob}"));
+        assert_eq!(prof.status, 200);
+        assert!(
+            prof.body.contains("handle=bob") && prof.body.contains("force_password_change=true"),
+            "bob profile: {}",
+            prof.body
+        );
+
+        // A forced/contained user cannot perform an admin act.
+        let contained = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{bob}\neve\neve@example.com"),
+        );
+        assert_eq!(
+            contained.status, 403,
+            "contained user must be refused: {}",
+            contained.body
+        );
+
+        // Bob completes a self password change (field2 is his NEW password,
+        // not another handle) → clears forced change.
+        let change = post(
+            &mut ctx,
+            "/portal/users/reset-password",
+            &format!("{bob}\nbobs-strong-new-password"),
+        );
+        assert_eq!(change.status, 200, "self change: {}", change.body);
+        let prof2 = get(&mut ctx, &format!("/portal/profile?token={bob}"));
+        assert!(
+            prof2.body.contains("force_password_change=false"),
+            "forced change must be cleared: {}",
+            prof2.body
+        );
+
+        // The NEW password now admits (the offer was re-sealed under it).
+        let _bob2 = login_token(&mut ctx, "bob", "bobs-strong-new-password");
+    }
+
+    // Keycloak option: "require password change = off" yields an immediately
+    // usable account (no forced change), and an admin-set initial password is
+    // honoured verbatim.
+    #[test]
+    fn invite_with_forced_change_off_and_admin_set_password() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+
+        // handle\nemail\npassword\nforce(false)\npasskey(false)
+        let invite = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\ncarol\ncarol@example.com\ncarol-initial-pw\nfalse\nfalse"),
+        );
+        assert_eq!(invite.status, 200, "invite: {}", invite.body);
+
+        let list = get(&mut ctx, &format!("/portal/users?token={admin}"));
+        assert!(
+            list.body
+                .contains("carol status=Invited force_password_change=false"),
+            "carol must not be forced: {}",
+            list.body
+        );
+        // Logs in with the admin-set password and is NOT contained.
+        let carol = login_token(&mut ctx, "carol", "carol-initial-pw");
+        let prof = get(&mut ctx, &format!("/portal/profile?token={carol}"));
+        assert!(
+            prof.body.contains("force_password_change=false"),
+            "carol profile: {}",
+            prof.body
+        );
+    }
+
+    #[test]
+    fn invite_is_refused_unauthenticated_and_on_duplicate() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        // Unauthenticated (bad token) invite is refused.
+        let bad = post(
+            &mut ctx,
+            "/portal/users/invite",
+            "bad-token\nbob\nbob@example.com",
+        );
+        assert!(
+            bad.status == 401 || bad.status == 403,
+            "got {}: {}",
+            bad.status,
+            bad.body
+        );
+
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+        let ok = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\nbob\nbob@example.com"),
+        );
+        assert_eq!(ok.status, 200);
+        // Second invite of the same handle conflicts.
+        let dup = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\nbob\nbob@example.com"),
+        );
+        assert_eq!(
+            dup.status, 409,
+            "duplicate invite must conflict: {}",
+            dup.body
+        );
+    }
+
+    // Admin reset re-provisions a NEW temp password for another user and
+    // re-forces their change (disambiguated from a self change because field2
+    // names an existing OTHER user).
+    #[test]
+    fn admin_reset_issues_a_new_temp_password_and_reforces() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+        let invite = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\ndan\ndan@example.com\ndan-pw\nfalse\nfalse"),
+        );
+        assert_eq!(invite.status, 200);
+        // Admin resets dan (field2 = "dan", an existing OTHER user).
+        let reset = post(
+            &mut ctx,
+            "/portal/users/reset-password",
+            &format!("{admin}\ndan"),
+        );
+        assert_eq!(reset.status, 200, "admin reset: {}", reset.body);
+        let new_temp = reset.body.trim().to_owned();
+        assert!(!new_temp.is_empty() && new_temp != "dan-pw");
+        // dan is re-forced and the NEW temp admits.
+        let list = get(&mut ctx, &format!("/portal/users?token={admin}"));
+        assert!(
+            list.body
+                .contains("dan status=Invited force_password_change=true"),
+            "dan re-forced: {}",
+            list.body
+        );
+        let _dan = login_token(&mut ctx, "dan", &new_temp);
+    }
+
+    // Disable revokes the account (login refused, `DisabledNeverActive`), enable
+    // restores it, and require-password-change re-forces the onboarding gate —
+    // each dry-run predicts the enforced `iam:users:write` decision.
+    #[test]
+    fn disable_enable_and_require_change_lifecycle() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+        let invite = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\nfay\nfay@example.com\nfay-pw\nfalse\nfalse"),
+        );
+        assert_eq!(invite.status, 200);
+        // Fay can log in while active.
+        let _fay = login_token(&mut ctx, "fay", "fay-pw");
+
+        // Dry-run predicts ALLOW for the admin.
+        let dry = get(
+            &mut ctx,
+            &format!("/portal/users/disable/dry-run?token={admin}&handle=fay"),
+        );
+        assert_eq!(dry.body.trim(), "PREDICTED ALLOW", "dry-run: {}", dry.body);
+
+        // Disable fay → login now refused.
+        let dis = post(&mut ctx, "/portal/users/disable", &format!("{admin}\nfay"));
+        assert_eq!(dis.status, 200, "disable: {}", dis.body);
+        let list = get(&mut ctx, &format!("/portal/users?token={admin}"));
+        assert!(
+            list.body.contains("fay status=Disabled"),
+            "fay disabled: {}",
+            list.body
+        );
+        let nonce = get(&mut ctx, "/nonce");
+        let id: u64 = nonce
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let refused = post(&mut ctx, "/login", &format!("fay\nfay-pw\n{id}"));
+        assert_eq!(
+            refused.status, 403,
+            "disabled login must be refused: {}",
+            refused.body
+        );
+        assert!(
+            refused.body.contains("account-disabled"),
+            "got: {}",
+            refused.body
+        );
+
+        // Enable → login works again.
+        let en = post(&mut ctx, "/portal/users/enable", &format!("{admin}\nfay"));
+        assert_eq!(en.status, 200, "enable: {}", en.body);
+        let _fay2 = login_token(&mut ctx, "fay", "fay-pw");
+
+        // Require password change → forced flag set.
+        let req = post(
+            &mut ctx,
+            "/portal/users/require-password-change",
+            &format!("{admin}\nfay"),
+        );
+        assert_eq!(req.status, 200, "require-change: {}", req.body);
+        let list2 = get(&mut ctx, &format!("/portal/users?token={admin}"));
+        assert!(
+            list2
+                .body
+                .contains("fay status=Active force_password_change=true"),
+            "fay re-forced: {}",
+            list2.body
         );
     }
 

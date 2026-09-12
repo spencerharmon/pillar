@@ -128,10 +128,28 @@ pub fn parse_user_rows(body: &str) -> Vec<UserRow> {
     out
 }
 
-/// `POST /portal/users/invite` body: `<token>\n<handle>\n<email>`.
+/// `POST /portal/users/invite` body:
+/// `<token>\n<handle>\n<email>\n<initial_password>\n<force_password_change>\n<require_passkey>`.
+/// An empty `initial_password` line makes the node generate + reveal a one-time
+/// temporary password; `force_password_change`/`require_passkey` are `"true"`/
+/// `"false"` (Keycloak-style required actions — force-change defaults on).
 #[must_use]
-pub fn invite_user_wire(token: &str, handle: &str, email: &str) -> String {
-    crate::portal::body_lines(&[token, handle, email])
+pub fn invite_user_wire(
+    token: &str,
+    handle: &str,
+    email: &str,
+    initial_password: &str,
+    force_password_change: bool,
+    require_passkey: bool,
+) -> String {
+    crate::portal::body_lines(&[
+        token,
+        handle,
+        email,
+        initial_password,
+        if force_password_change { "true" } else { "false" },
+        if require_passkey { "true" } else { "false" },
+    ])
 }
 
 /// `POST /portal/users/{disable,enable,reset-password,
@@ -661,6 +679,10 @@ mod yew_impl {
         let invite_open = use_state(|| false);
         let handle = use_state(String::new);
         let email = use_state(String::new);
+        // Keycloak-style invite options.
+        let password = use_state(String::new);
+        let force_change = use_state(|| true);
+        let require_passkey = use_state(|| false);
         let pending = use_state(|| None::<UserAction>);
         let predicted = use_state(|| None::<bool>);
         let secret = use_state(|| None::<(String, String)>);
@@ -837,17 +859,40 @@ mod yew_impl {
             let email = email.clone();
             Callback::from(move |e: InputEvent| email.set(input_value(&e)))
         };
+        let on_password = {
+            let password = password.clone();
+            Callback::from(move |e: InputEvent| password.set(input_value(&e)))
+        };
+        let on_force_change = {
+            let force_change = force_change.clone();
+            Callback::from(move |_: MouseEvent| force_change.set(!*force_change))
+        };
+        let on_require_passkey = {
+            let require_passkey = require_passkey.clone();
+            Callback::from(move |_: MouseEvent| require_passkey.set(!*require_passkey))
+        };
         let open_invite = {
-            let (invite_open, handle, email, secret) = (invite_open.clone(), handle.clone(), email.clone(), secret.clone());
+            let (invite_open, handle, email, secret, password, force_change, require_passkey) = (
+                invite_open.clone(),
+                handle.clone(),
+                email.clone(),
+                secret.clone(),
+                password.clone(),
+                force_change.clone(),
+                require_passkey.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
                 handle.set(String::new());
                 email.set(String::new());
+                password.set(String::new());
+                force_change.set(true);
+                require_passkey.set(false);
                 secret.set(None);
                 invite_open.set(true);
             })
         };
         let do_invite = {
-            let (auth, toaster, busy, refresh, handle, email, secret) = (
+            let (auth, toaster, busy, refresh, handle, email, secret, password, force_change, require_passkey) = (
                 auth.clone(),
                 toaster.clone(),
                 busy.clone(),
@@ -855,19 +900,36 @@ mod yew_impl {
                 handle.clone(),
                 email.clone(),
                 secret.clone(),
+                password.clone(),
+                force_change.clone(),
+                require_passkey.clone(),
             );
             Callback::from(move |_: MouseEvent| {
                 if *busy || handle.trim().is_empty() {
                     return;
                 }
                 let token = auth.token.clone().unwrap_or_default();
-                let body = invite_user_wire(&token, handle.trim(), email.trim());
+                let admin_set = !password.trim().is_empty();
+                let body = invite_user_wire(
+                    &token,
+                    handle.trim(),
+                    email.trim(),
+                    password.trim(),
+                    *force_change,
+                    *require_passkey,
+                );
                 let (toaster, busy, refresh, secret) = (toaster.clone(), busy.clone(), refresh.clone(), secret.clone());
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/users/invite", Some(&body)).await {
                         Ok(r) if r.ok() => {
-                            secret.set(Some(("Temporary password".to_owned(), r.body.trim().to_owned())));
+                            // Reveal the temp password ONLY when the node
+                            // generated one (no admin-set initial password).
+                            if admin_set {
+                                toaster.success("User invited.");
+                            } else {
+                                secret.set(Some(("Temporary password".to_owned(), r.body.trim().to_owned())));
+                            }
                             refresh.emit(());
                         }
                         Ok(r) => toaster.error(&format!("Could not invite: {}", r.body.trim())),
@@ -957,6 +1019,20 @@ mod yew_impl {
                                 <label for="user-invite-email">{ "Email" }</label>
                                 <input id="user-invite-email" type="email" placeholder="email"
                                     value={(*email).clone()} oninput={on_email} />
+                                <label for="user-invite-password">{ "Initial password (optional)" }</label>
+                                <input id="user-invite-password" type="password"
+                                    placeholder="leave blank to generate a one-time password"
+                                    value={(*password).clone()} oninput={on_password} />
+                                <label class="check-pill">
+                                    <input id="user-invite-force" type="checkbox"
+                                        checked={*force_change} onclick={on_force_change} />
+                                    { " Require password change on first login" }
+                                </label>
+                                <label class="check-pill">
+                                    <input id="user-invite-passkey" type="checkbox"
+                                        checked={*require_passkey} onclick={on_require_passkey} />
+                                    { " Require a passkey before the account is usable" }
+                                </label>
                                 <div class="dialog-actions">
                                     <button type="button" class="btn-ghost" onclick={close_invite.clone()}>{ "Cancel" }</button>
                                     <PendingButton id="user-invite-btn" label="Send invite" busy={*busy} onclick={do_invite} />
@@ -1686,8 +1762,12 @@ mod tests {
     #[test]
     fn invite_and_target_wires_carry_the_token_first() {
         assert_eq!(
-            invite_user_wire("tok", "alice", "a@x.com"),
-            "tok\nalice\na@x.com"
+            invite_user_wire("tok", "alice", "a@x.com", "", true, false),
+            "tok\nalice\na@x.com\n\ntrue\nfalse"
+        );
+        assert_eq!(
+            invite_user_wire("tok", "bob", "b@x.com", "pw", false, true),
+            "tok\nbob\nb@x.com\npw\nfalse\ntrue"
         );
         assert_eq!(user_target_wire("tok", "alice"), "tok\nalice");
     }
