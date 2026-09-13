@@ -11838,10 +11838,16 @@ mod tests {
         static WASM_TEXT: OnceLock<String> = OnceLock::new();
         WASM_TEXT.get_or_init(|| {
             let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-            let frontend_dir = manifest_dir
-                .parent()
-                .expect("crates/ parent")
-                .join("pillar-frontend");
+            let crates_dir = manifest_dir.parent().expect("crates/ parent");
+            let frontend_dir = crates_dir.join("pillar-frontend");
+            // pillar-frontend is a workspace member (see the root Cargo.toml's
+            // `members` comment), so `cargo build` here resolves the *shared*
+            // workspace-root `target/` dir -- never a per-crate
+            // `crates/pillar-frontend/target/` -- regardless of `current_dir`.
+            // Looking for the artifact under the frontend crate's own `target/`
+            // is therefore always a miss on a workspace checkout; look under
+            // the workspace root instead.
+            let workspace_root = crates_dir.parent().expect("repo root");
             let status = std::process::Command::new(env!("CARGO"))
                 .args(["build", "--target", "wasm32-unknown-unknown"])
                 .current_dir(&frontend_dir)
@@ -11856,8 +11862,8 @@ mod tests {
                 status.success(),
                 "pillar-frontend failed to build for wasm32-unknown-unknown"
             );
-            let wasm_path =
-                frontend_dir.join("target/wasm32-unknown-unknown/debug/pillar_frontend.wasm");
+            let wasm_path = workspace_root
+                .join("target/wasm32-unknown-unknown/debug/pillar_frontend.wasm");
             let bytes = std::fs::read(&wasm_path).unwrap_or_else(|e| {
                 panic!("failed to read built wasm at {}: {e}", wasm_path.display())
             });
