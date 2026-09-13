@@ -210,10 +210,7 @@ fn cli_apply_and_delete_mutate_the_live_default_resource_set_over_pillar_udp_wit
     // one-time concern.
     let create_cell = node.post("/bootstrap/create-cell", "cell-genesis");
     assert_eq!(create_cell.status, 200, "create-cell: {}", create_cell.body);
-    let create_user = node.post(
-        "/bootstrap/create-user",
-        &format!("{HANDLE}\n{PASSWORD}"),
-    );
+    let create_user = node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
     assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
 
     let signer_seed = pillar_crypto::Seed::from_bytes(b"cli-apply-e2e-test-signer".to_vec());
@@ -234,7 +231,10 @@ fn cli_apply_and_delete_mutate_the_live_default_resource_set_over_pillar_udp_wit
     );
     std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
     std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(signer_public.as_bytes()),
+    );
     std::env::set_var(
         "PILLAR_SIGNER_SECRET_HEX",
         hex_encode(signer_secret.as_bytes()),
@@ -246,13 +246,48 @@ fn cli_apply_and_delete_mutate_the_live_default_resource_set_over_pillar_udp_wit
          spec signalKind string: Metric\n\
          spec window integer: 2592000\n";
 
-    let (ack, tier) = apply_manifest_text(manifest_text).expect("apply over pillar-UDP succeeds");
-    assert!(ack.starts_with("OK"), "apply ack: {ack}");
+    let acks = apply_manifest_text(manifest_text).expect("apply over pillar-UDP succeeds");
+    assert_eq!(acks.len(), 1, "single-document manifest => one apply");
+    assert!(acks[0].ack.starts_with("OK"), "apply ack: {}", acks[0].ack);
     assert_eq!(
-        tier,
+        acks[0].tier,
         pillar_client::TransportKind::PillarUdp,
         "must ride pillar-UDP, never a REST/HTTPS fallback"
     );
+
+    // A MULTI-document manifest (the `# ---`-separated shape `pillar defaults`
+    // emits) must apply EVERY resource, not just the last — the regression this
+    // fixes, where all documents collapsed into a single CRD.
+    let multi = "# --- a ---\n\
+         apiVersion: pillar.dev/v1\n\
+         kind: RetentionPolicy\n\
+         name: multi-metrics\n\
+         spec signalKind string: Metric\n\
+         spec window integer: 2592000\n\
+         \n\
+         # --- b ---\n\
+         apiVersion: pillar.dev/v1\n\
+         kind: RetentionPolicy\n\
+         name: multi-logs\n\
+         spec signalKind string: Log\n\
+         spec window integer: 604800\n\
+         \n\
+         # --- c ---\n\
+         apiVersion: pillar.dev/v1\n\
+         kind: RetentionPolicy\n\
+         name: multi-traces\n\
+         spec signalKind string: TraceSpan\n\
+         spec window integer: 259200\n";
+    let macks = apply_manifest_text(multi).expect("multi-document apply succeeds");
+    assert_eq!(macks.len(), 3, "three documents => three applies");
+    for a in &macks {
+        assert!(a.ack.starts_with("OK"), "{}: {}", a.label, a.ack);
+        assert_eq!(a.tier, pillar_client::TransportKind::PillarUdp);
+    }
+    let names: std::collections::BTreeSet<_> = macks.iter().map(|a| a.label.as_str()).collect();
+    assert!(names.contains("RetentionPolicy/multi-metrics"));
+    assert!(names.contains("RetentionPolicy/multi-logs"));
+    assert!(names.contains("RetentionPolicy/multi-traces"));
 
     // --- Prove the RetentionPolicy really landed in the Default
     // ResourceSet's materialized view, over the SAME HTTP describe route

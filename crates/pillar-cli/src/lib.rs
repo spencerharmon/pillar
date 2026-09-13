@@ -591,6 +591,58 @@ pub fn parse_crd(text: &str) -> Result<Crd, TextError> {
     })
 }
 
+/// Parse a MULTI-document manifest into one [`Crd`] per resource.
+///
+/// The pillar text manifest ([`to_text`] / `pillar defaults`) emits each
+/// resource as its own document, conventionally separated by a `# ---` comment.
+/// Because those separators are only comments (and a human may drop them), a
+/// document boundary is taken at each `apiVersion:` header line: every resource
+/// begins with one, and no `label`/`spec` line can start with `apiVersion:`, so
+/// the split is unambiguous. Any leading/trailing comment-or-blank chunk (e.g. a
+/// dangling `# ---` separator) is skipped. Each document is parsed with
+/// [`parse_crd`], so a malformed line fails the whole batch BEFORE anything is
+/// applied (atomic parse).
+///
+/// # Errors
+/// The first [`parse_crd`] error encountered, or [`TextError::MissingHeader`]
+/// (`apiVersion`) if the input contains no resource at all.
+pub fn parse_crds(text: &str) -> Result<Vec<Crd>, TextError> {
+    fn is_header(line: &str) -> bool {
+        line.trim_start().starts_with("apiVersion:")
+    }
+    fn only_comments_or_blank(doc: &str) -> bool {
+        doc.lines().all(|l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with('#')
+        })
+    }
+
+    let mut docs: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for raw_line in text.lines() {
+        if is_header(raw_line) && current.lines().any(is_header) {
+            docs.push(std::mem::take(&mut current));
+        }
+        current.push_str(raw_line);
+        current.push('\n');
+    }
+    if !current.is_empty() {
+        docs.push(current);
+    }
+
+    let mut crds = Vec::new();
+    for doc in docs {
+        if only_comments_or_blank(&doc) {
+            continue;
+        }
+        crds.push(parse_crd(&doc)?);
+    }
+    if crds.is_empty() {
+        return Err(TextError::MissingHeader("apiVersion"));
+    }
+    Ok(crds)
+}
+
 // ---------------------------------------------------------------------------
 // kustomize (text overlay) — a base plus additive name-prefix, labels, and
 // spec patches, rendered to the shared text format.
@@ -942,6 +994,54 @@ mod tests {
         let crd = route_crd("default").with_spec("blackhole", Value::Boolean(false));
         let text = to_text(&crd);
         assert_eq!(parse_crd(&text), Ok(crd));
+    }
+
+    #[test]
+    fn parse_crds_splits_a_multi_document_bundle() {
+        // The `# ---`-separated shape `pillar defaults` emits: three resources
+        // in one file must parse to three CRDs, not collapse into the last.
+        let text = "# --- metrics-default (bundle v1) ---\n\
+             apiVersion: pillar.dev/v1\n\
+             kind: RetentionPolicy\n\
+             name: metrics-default\n\
+             label pillar.dev/managed-by: defaults\n\
+             spec signalKind string: Metric\n\
+             spec window integer: 2592000\n\
+             \n\
+             # --- logs-default (bundle v1) ---\n\
+             apiVersion: pillar.dev/v1\n\
+             kind: RetentionPolicy\n\
+             name: logs-default\n\
+             spec signalKind string: Log\n\
+             spec window integer: 604800\n\
+             \n\
+             # --- traces-default (bundle v1) ---\n\
+             apiVersion: pillar.dev/v1\n\
+             kind: RetentionPolicy\n\
+             name: traces-default\n\
+             spec signalKind string: TraceSpan\n\
+             spec window integer: 259200\n";
+        let crds = parse_crds(text).expect("multi-document bundle parses");
+        let names: Vec<_> = crds.iter().map(|c| c.metadata.name.as_str()).collect();
+        assert_eq!(names, ["metrics-default", "logs-default", "traces-default"]);
+        assert_eq!(crds[0].spec.get("window"), Some(&Value::Integer(2_592_000)));
+        assert_eq!(crds[2].spec.get("window"), Some(&Value::Integer(259_200)));
+    }
+
+    #[test]
+    fn parse_crds_handles_a_single_document_without_separators() {
+        let text = to_text(&route_crd("solo"));
+        let crds = parse_crds(&text).expect("single document parses");
+        assert_eq!(crds.len(), 1);
+        assert_eq!(crds[0].metadata.name, "solo");
+    }
+
+    #[test]
+    fn parse_crds_rejects_an_empty_or_comment_only_input() {
+        assert_eq!(
+            parse_crds("# just a comment\n\n"),
+            Err(TextError::MissingHeader("apiVersion"))
+        );
     }
 
     #[test]

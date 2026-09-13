@@ -380,11 +380,12 @@ fn a_profile_exported_persisted_config_applies_a_retention_policy_over_pillar_ud
          spec signalKind string: Metric\n\
          spec window integer: 2592000\n";
 
-    let (ack, tier) = apply_manifest_text(manifest_text)
+    let acks = apply_manifest_text(manifest_text)
         .expect("apply over the profile-exported, persisted turnkey config succeeds");
-    assert!(ack.starts_with("OK"), "apply ack: {ack}");
+    assert_eq!(acks.len(), 1);
+    assert!(acks[0].ack.starts_with("OK"), "apply ack: {}", acks[0].ack);
     assert_eq!(
-        tier,
+        acks[0].tier,
         pillar_client::TransportKind::PillarUdp,
         "the mutation must ride pillar-UDP via the turnkey config, never a REST fallback"
     );

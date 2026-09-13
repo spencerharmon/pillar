@@ -211,10 +211,7 @@ fn cli_config_export_mints_a_real_subkey_over_an_authenticated_session_persists_
     // --- One-time cell/user bootstrap (never the credential mint itself).
     let create_cell = node.post("/bootstrap/create-cell", "cell-genesis");
     assert_eq!(create_cell.status, 200, "create-cell: {}", create_cell.body);
-    let create_user = node.post(
-        "/bootstrap/create-user",
-        &format!("{HANDLE}\n{PASSWORD}"),
-    );
+    let create_user = node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
     assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
 
     // --- The credential mint under test: a REAL authenticated session,
@@ -266,11 +263,12 @@ fn cli_config_export_mints_a_real_subkey_over_an_authenticated_session_persists_
          spec signalKind string: Metric\n\
          spec window integer: 2592000\n";
 
-    let (ack, tier) = apply_manifest_text(manifest_text)
+    let acks = apply_manifest_text(manifest_text)
         .expect("apply over the exported, persisted CLI config succeeds");
-    assert!(ack.starts_with("OK"), "apply ack: {ack}");
+    assert_eq!(acks.len(), 1);
+    assert!(acks[0].ack.starts_with("OK"), "apply ack: {}", acks[0].ack);
     assert_eq!(
-        tier,
+        acks[0].tier,
         pillar_client::TransportKind::PillarUdp,
         "must ride pillar-UDP via the persisted turnkey config, never a REST fallback"
     );

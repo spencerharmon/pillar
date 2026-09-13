@@ -270,16 +270,38 @@ pub fn send_op(op: &pillar_ops::ResourceOp) -> Result<(String, TransportKind), S
     }
 }
 
-/// Parse `text` as a manifest and send it as a `ResourceOp::Apply` over
-/// pillar-message (see [`send_op`]). This is the pure core `pillar apply -f`
-/// wraps with argv parsing + `ExitCode` translation — a test calls this
-/// directly to assert on the real outcome.
+/// One resource's apply outcome within a (possibly multi-document) manifest.
+pub struct AppliedAck {
+    /// The resource's `kind/name`, for a per-document report line.
+    pub label: String,
+    /// The node's acknowledgement string (starts with `OK` on success).
+    pub ack: String,
+    /// The transport tier the op was accepted over.
+    pub tier: TransportKind,
+}
+
+/// Parse `text` as a (possibly multi-document) manifest and send EACH resource
+/// as its own `ResourceOp::Apply` over pillar-message (see [`send_op`]). This is
+/// the pure core `pillar apply -f` wraps with argv parsing + `ExitCode`
+/// translation — a test calls this directly to assert on the real outcome.
+///
+/// Parsing is atomic: a malformed document fails the whole batch BEFORE any op
+/// is sent. Sending is sequential; the first transport failure aborts and is
+/// returned (resources already accepted by the node stay applied — upsert
+/// semantics, so a re-run is safe).
 ///
 /// # Errors
-/// A parse error string for a malformed manifest; else [`SendError`].
-pub fn apply_manifest_text(text: &str) -> Result<(String, TransportKind), String> {
-    let crd = crate::parse_crd(text).map_err(|e| e.to_string())?;
-    send_op(&pillar_ops::ResourceOp::Apply { crd }).map_err(|e| e.to_string())
+/// A parse error string for a malformed manifest; else the first [`SendError`].
+pub fn apply_manifest_text(text: &str) -> Result<Vec<AppliedAck>, String> {
+    let crds = crate::parse_crds(text).map_err(|e| e.to_string())?;
+    let mut acks = Vec::with_capacity(crds.len());
+    for crd in crds {
+        let label = format!("{}/{}", crd.kind, crd.metadata.name);
+        let (ack, tier) =
+            send_op(&pillar_ops::ResourceOp::Apply { crd }).map_err(|e| e.to_string())?;
+        acks.push(AppliedAck { label, ack, tier });
+    }
+    Ok(acks)
 }
 
 /// Parse `addr` as `kind/name` and send it as a `ResourceOp::Delete` over
@@ -322,9 +344,15 @@ pub fn apply(args: &[String]) -> ExitCode {
         }
     };
     match apply_manifest_text(&text) {
-        Ok((ack, tier)) => {
-            println!("{ack} (via {tier:?})");
-            if ack.starts_with("OK") {
+        Ok(acks) => {
+            let mut all_ok = true;
+            for a in &acks {
+                println!("{}: {} (via {:?})", a.label, a.ack, a.tier);
+                if !a.ack.starts_with("OK") {
+                    all_ok = false;
+                }
+            }
+            if all_ok {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
