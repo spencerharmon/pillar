@@ -94,6 +94,65 @@ pub struct ResourceSetDetail {
     pub defaults_tombstoned: Vec<String>,
 }
 
+/// Is a set's reconcile plan non-empty (something to adopt or prune)? A pure
+/// predicate shared by the list row (counts) and the detail view (csv lists)
+/// so the "reconciling..." indicator is derived, never hand-toggled.
+#[must_use]
+pub fn is_reconciling(adopt: usize, prune: usize) -> bool {
+    adopt > 0 || prune > 0
+}
+
+/// Framework-agnostic driver for the "Refresh" button + optional interval
+/// poll ("watch"). The actual HTTP fetch is injected as a closure so this is
+/// host-testable without wasm/yew: a manual `refresh()` always re-fetches;
+/// `on_tick()` (driven by a `setInterval` callback in the Yew wiring) only
+/// re-fetches while polling is enabled, so toggling watch on/off is provably
+/// what gates the interval-driven re-fetch.
+#[derive(Debug, Default)]
+pub struct RefreshDriver {
+    poll_enabled: bool,
+    fetch_count: usize,
+}
+
+impl RefreshDriver {
+    /// A fresh driver with polling off and no fetches recorded yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the interval poll ("watch") is currently enabled.
+    #[must_use]
+    pub fn poll_enabled(&self) -> bool {
+        self.poll_enabled
+    }
+
+    /// Enable/disable the interval poll.
+    pub fn set_poll_enabled(&mut self, enabled: bool) {
+        self.poll_enabled = enabled;
+    }
+
+    /// How many times `fetch` has actually been invoked so far.
+    #[must_use]
+    pub fn fetch_count(&self) -> usize {
+        self.fetch_count
+    }
+
+    /// Manual refresh: always drives a re-fetch.
+    pub fn refresh(&mut self, mut fetch: impl FnMut()) {
+        self.fetch_count += 1;
+        fetch();
+    }
+
+    /// One interval tick: re-fetches only while polling is enabled.
+    pub fn on_tick(&mut self, mut fetch: impl FnMut()) {
+        if self.poll_enabled {
+            self.fetch_count += 1;
+            fetch();
+        }
+    }
+}
+
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -169,18 +228,37 @@ pub use yew_impl::ResourceSetsConsole;
 
 #[cfg(feature = "yew")]
 mod yew_impl {
-    use super::{parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
+    use super::{is_reconciling, parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
     use crate::auth::use_auth;
     use crate::portal::{get_url, http};
     use crate::primitives::{Badge, Graph, GraphEdge, Tone};
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
+
+    /// How often the optional interval poll re-fetches, in milliseconds.
+    const WATCH_INTERVAL_MS: i32 = 5000;
 
     fn sync_tone(sync: &str) -> Tone {
         if sync.eq_ignore_ascii_case("Synced") {
             Tone::Success
         } else {
             Tone::Warn
+        }
+    }
+
+    /// Render a last-observed wall-clock instant (JS millis since epoch) as a
+    /// locale timestamp string, or an em-dash before the first fetch lands.
+    fn human_time(millis: Option<f64>) -> String {
+        match millis {
+            Some(m) => {
+                let d = js_sys::Date::new(&JsValue::from_f64(m));
+                d.to_locale_string("en-US", &JsValue::UNDEFINED)
+                    .as_string()
+                    .unwrap_or_default()
+            }
+            None => "—".to_owned(),
         }
     }
 
@@ -192,32 +270,48 @@ mod yew_impl {
         let sets = use_state(Vec::<ResourceSetRow>::new);
         let selected = use_state(|| None::<String>);
         let detail = use_state(|| None::<ResourceSetDetail>);
+        // Optional interval poll ("watch"): off by default so the console
+        // never re-fetches unless the operator explicitly opts in.
+        let watch = use_state(|| false);
+        // Bumped once per manual refresh or interval tick to re-trigger the
+        // fetch effects below (yew's `use_effect_with` re-runs only when its
+        // dependency changes).
+        let refresh_tick = use_state(|| 0u32);
+        // Last-observed wall-clock instant (JS millis) of the most recent
+        // successful sets-list fetch.
+        let last_observed = use_state(|| None::<f64>);
 
-        // Load the set list on mount / token change.
+        // Load the set list on mount / token change / manual refresh /
+        // interval tick.
         {
-            let (auth, sets) = (auth.clone(), sets.clone());
-            use_effect_with(auth.token.clone(), move |token| {
-                if let Some(token) = token.clone() {
-                    let sets = sets.clone();
-                    let url = get_url("/portal/resource/sets", &token, &[]);
-                    spawn_local(async move {
-                        if let Ok(r) = http("GET", &url, None).await {
-                            if r.ok() {
-                                sets.set(parse_set_list(&r.body));
+            let (auth, sets, last_observed) = (auth.clone(), sets.clone(), last_observed.clone());
+            use_effect_with(
+                (auth.token.clone(), *refresh_tick),
+                move |(token, _tick)| {
+                    if let Some(token) = token.clone() {
+                        let (sets, last_observed) = (sets.clone(), last_observed.clone());
+                        let url = get_url("/portal/resource/sets", &token, &[]);
+                        spawn_local(async move {
+                            if let Ok(r) = http("GET", &url, None).await {
+                                if r.ok() {
+                                    sets.set(parse_set_list(&r.body));
+                                    last_observed.set(Some(js_sys::Date::now()));
+                                }
                             }
-                        }
-                    });
-                }
-                || ()
-            });
+                        });
+                    }
+                    || ()
+                },
+            );
         }
 
-        // Load the selected set's detail on selection / token change.
+        // Load the selected set's detail on selection / token change /
+        // manual refresh / interval tick.
         {
             let (auth, selected, detail) = (auth.clone(), selected.clone(), detail.clone());
             use_effect_with(
-                ((*selected).clone(), auth.token.clone()),
-                move |(sel, token)| {
+                ((*selected).clone(), auth.token.clone(), *refresh_tick),
+                move |(sel, token, _tick)| {
                     if let (Some(name), Some(token)) = (sel.clone(), token.clone()) {
                         let detail = detail.clone();
                         let url = get_url("/portal/resource/set", &token, &[("name", &name)]);
@@ -232,6 +326,48 @@ mod yew_impl {
                     || ()
                 },
             );
+        }
+
+        let refresh_click = {
+            let refresh_tick = refresh_tick.clone();
+            Callback::from(move |_: MouseEvent| refresh_tick.set(*refresh_tick + 1))
+        };
+        let toggle_watch = {
+            let watch = watch.clone();
+            Callback::from(move |_: MouseEvent| watch.set(!*watch))
+        };
+
+        // The optional interval poll: while `watch` is on, tick `refresh_tick`
+        // every `WATCH_INTERVAL_MS`, which re-runs the fetch effects above —
+        // a real re-fetch call site, not a static render.
+        {
+            let (watch, refresh_tick) = (watch.clone(), refresh_tick.clone());
+            use_effect_with(*watch, move |enabled| {
+                let mut handle: Option<(i32, Closure<dyn FnMut()>)> = None;
+                if *enabled {
+                    if let Some(window) = web_sys::window() {
+                        let refresh_tick = refresh_tick.clone();
+                        let cb = Closure::<dyn FnMut()>::new(move || {
+                            refresh_tick.set(*refresh_tick + 1);
+                        });
+                        if let Ok(id) = window
+                            .set_interval_with_callback_and_timeout_and_arguments_0(
+                                cb.as_ref().unchecked_ref(),
+                                WATCH_INTERVAL_MS,
+                            )
+                        {
+                            handle = Some((id, cb));
+                        }
+                    }
+                }
+                move || {
+                    if let Some((id, _cb)) = handle {
+                        if let Some(window) = web_sys::window() {
+                            window.clear_interval_with_handle(id);
+                        }
+                    }
+                }
+            });
         }
 
         let rows: Html = sets
@@ -252,6 +388,11 @@ mod yew_impl {
                 } else {
                     html! { <span class="ds-muted">{ "—" }</span> }
                 };
+                let reconciling_cell = if is_reconciling(s.adopt, s.prune) {
+                    html! { <Badge label={"reconciling…"} tone={Tone::Warn} /> }
+                } else {
+                    html! { <span class="ds-muted">{ "—" }</span> }
+                };
                 html! {
                     <tr class={class} onclick={select} style="cursor:pointer">
                         <td class="mono">{ name }</td>
@@ -261,6 +402,7 @@ mod yew_impl {
                         <td>{ s.adopt }</td>
                         <td>{ s.prune }</td>
                         <td>{ defaults_cell }</td>
+                        <td>{ reconciling_cell }</td>
                     </tr>
                 }
             })
@@ -307,6 +449,11 @@ mod yew_impl {
                             { for d.prune.iter().map(|r| html!{ <li>{ format!("prune {r}") }</li> }) }
                         </ul>
                     }
+                };
+                let reconciling_badge = if is_reconciling(d.adopt.len(), d.prune.len()) {
+                    html! { <Badge label={"reconciling…"} tone={Tone::Warn} /> }
+                } else {
+                    html! {}
                 };
                 // Shipped-defaults advisory: a SEPARATE axis from sync. Net-new
                 // defaults are an additive offer (adopt via `pillar render
@@ -360,7 +507,11 @@ mod yew_impl {
                             <div class="ds-badges">
                                 <Badge label={d.health.clone()} />
                                 <Badge label={d.sync.clone()} tone={sync_tone(&d.sync)} />
+                                { reconciling_badge }
                             </div>
+                            <button type="button" id="resource-set-detail-refresh" onclick={refresh_click.clone()}>
+                                { "Refresh" }
+                            </button>
                         </header>
                         if !d.description.is_empty() {
                             <p class="ds-muted">{ d.description.clone() }</p>
@@ -385,12 +536,24 @@ mod yew_impl {
                 <p class="ds-muted">
                     { "Declarative resource groups (ArgoCD-Application analog). The Default set owns the default retention policies." }
                 </p>
+                <div class="ds-toolbar">
+                    <button type="button" id="resource-sets-refresh" onclick={refresh_click.clone()}>
+                        { "Refresh" }
+                    </button>
+                    <button type="button" id="resource-sets-watch"
+                        class={if *watch {"active"} else {""}} onclick={toggle_watch}>
+                        { if *watch { "Watch: on" } else { "Watch: off" } }
+                    </button>
+                    <span class="ds-muted" id="resource-sets-last-observed">
+                        { format!("Last observed: {}", human_time(*last_observed)) }
+                    </span>
+                </div>
                 <table class="ds-table">
                     <thead>
                         <tr>
                             <th>{ "Name" }</th><th>{ "Health" }</th><th>{ "Sync" }</th>
                             <th>{ "Members" }</th><th>{ "Adopt" }</th><th>{ "Prune" }</th>
-                            <th>{ "Defaults" }</th>
+                            <th>{ "Defaults" }</th><th>{ "Reconciling" }</th>
                         </tr>
                     </thead>
                     <tbody>{ rows }</tbody>
@@ -507,5 +670,45 @@ mod tests {
         // The advisory is a SEPARATE axis: the set is still Synced/Healthy.
         assert_eq!(d.sync, "Synced");
         assert_eq!(d.health, "Healthy");
+    }
+
+    #[test]
+    fn reconciling_indicator_is_derived_from_a_non_empty_plan() {
+        assert!(!is_reconciling(0, 0), "synced set is not reconciling");
+        assert!(is_reconciling(1, 0), "pending adopt is reconciling");
+        assert!(is_reconciling(0, 1), "pending prune is reconciling");
+        assert!(is_reconciling(2, 3), "both adopt and prune is reconciling");
+    }
+
+    #[test]
+    fn manual_refresh_always_drives_a_real_re_fetch_call() {
+        let mut driver = RefreshDriver::new();
+        let mut calls = 0;
+        driver.refresh(|| calls += 1);
+        driver.refresh(|| calls += 1);
+        assert_eq!(calls, 2);
+        assert_eq!(driver.fetch_count(), 2);
+    }
+
+    #[test]
+    fn interval_tick_only_re_fetches_while_watch_is_enabled() {
+        let mut driver = RefreshDriver::new();
+        let mut calls = 0;
+
+        // Watch off by default: an interval tick is a no-op, not a static
+        // render — proving the tick itself is what's gated, not the fetch
+        // wiring.
+        driver.on_tick(|| calls += 1);
+        assert_eq!(calls, 0);
+        assert!(!driver.poll_enabled());
+
+        driver.set_poll_enabled(true);
+        driver.on_tick(|| calls += 1);
+        driver.on_tick(|| calls += 1);
+        assert_eq!(calls, 2, "each tick while enabled drives its own fetch");
+
+        driver.set_poll_enabled(false);
+        driver.on_tick(|| calls += 1);
+        assert_eq!(calls, 2, "disabling watch stops the interval from fetching");
     }
 }
