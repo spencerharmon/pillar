@@ -494,6 +494,163 @@ pub fn describe(args: &[String]) -> ExitCode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Control ops (`pillar_ops::ControlOp`) over the SAME sealed resource-op tier.
+// The first family is `member`; each new family adds a thin client wrap here
+// and a signer-gated handler node-side (see `web_serve::WebAuthContext`).
+// ---------------------------------------------------------------------------
+
+/// Send a [`pillar_ops::ControlOp`] over pillar-message and return the node's
+/// decoded ack text (`"OK <detail>"` / `"ERR <reason>"`) plus the tier that
+/// answered. The control-op sibling of [`send_op`] — identical dial/seal/sign/
+/// open path, only the op class (and its seal domain) differ.
+///
+/// # Errors
+/// [`SendError`] for a missing/malformed environment, an unreachable node, or a
+/// reply that fails to open/decode.
+pub fn send_control_op(op: &pillar_ops::ControlOp) -> Result<(String, TransportKind), SendError> {
+    let conn = connect().map_err(SendError::Connect)?;
+    let outcome = pillar_client::transport::send_control_op_with_fallback(
+        &tiers(conn.addr),
+        op,
+        &conn.group,
+        conn.cell.clone(),
+        conn.signer,
+        &conn.secret,
+        Visibility::Cell,
+    )
+    .map_err(SendError::Transport)?;
+    use pillar_wire::seal::{CellSeal, ContentSeal};
+    let aad =
+        pillar_wire::PillarMessage::header_aad(outcome.response.visibility, &outcome.response.cell);
+    let plaintext = CellSeal
+        .open(&conn.group, &outcome.response.body_sealed, &aad)
+        .map_err(|_| SendError::UnsealAck)?;
+    match Body::from_canonical_cbor(&plaintext) {
+        Ok(Body::Control(bytes)) => {
+            Ok((String::from_utf8_lossy(&bytes).into_owned(), outcome.tier))
+        }
+        _ => Err(SendError::BadAckBody),
+    }
+}
+
+/// Send a control op and unwrap its ack to the payload text, mapping an `ERR`
+/// ack to `Err`. Mirrors [`read_op`] for the control-op class.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason (unauthorized signer,
+/// not-found, …) with the `ERR ` prefix stripped.
+fn control_op(op: &pillar_ops::ControlOp) -> Result<String, String> {
+    let (ack, _tier) = send_control_op(op).map_err(|e| e.to_string())?;
+    if let Some(payload) = ack.strip_prefix("OK ") {
+        Ok(payload.to_owned())
+    } else if ack == "OK" {
+        Ok(String::new())
+    } else {
+        Err(ack.strip_prefix("ERR ").unwrap_or(&ack).to_owned())
+    }
+}
+
+/// List the cell's members over pillar-message. The pure core `pillar member
+/// ls` wraps.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason.
+pub fn list_members() -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::Members(pillar_ops::MembersOp::List))
+}
+
+/// Add or invite a member with a role over pillar-message. The pure core
+/// `pillar member add` wraps.
+///
+/// # Errors
+/// A transport error string, or the node's refusal (unauthorized actor for
+/// `portal:members:write`).
+pub fn add_member(handle: &str, role: &str) -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::Members(
+        pillar_ops::MembersOp::Add {
+            handle: handle.to_owned(),
+            role: role.to_owned(),
+        },
+    ))
+}
+
+/// Change an existing member's role over pillar-message. The pure core `pillar
+/// member role` wraps.
+///
+/// # Errors
+/// A transport error string, or the node's refusal (unauthorized actor, or an
+/// unknown member).
+pub fn set_member_role(handle: &str, role: &str) -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::Members(
+        pillar_ops::MembersOp::SetRole {
+            handle: handle.to_owned(),
+            role: role.to_owned(),
+        },
+    ))
+}
+
+/// `pillar member {ls | add <handle> [role] | role <handle> <role>}`: manage
+/// this cell's membership over the sealed resource-op tier (no HTTP).
+pub fn member(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("ls") | Some("list") => match list_members() {
+            Ok(text) => {
+                if text.trim().is_empty() {
+                    eprintln!("no members");
+                } else {
+                    print!("{text}");
+                    if !text.ends_with('\n') {
+                        println!();
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("pillar member ls: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("add") => {
+            let Some(handle) = args.get(1) else {
+                eprintln!("usage: pillar member add <handle> [role]");
+                return ExitCode::from(2);
+            };
+            let role = args.get(2).map(String::as_str).unwrap_or("member");
+            match add_member(handle, role) {
+                Ok(text) => {
+                    println!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("pillar member add: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("role") => {
+            let (Some(handle), Some(role)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: pillar member role <handle> <role>");
+                return ExitCode::from(2);
+            };
+            match set_member_role(handle, role) {
+                Ok(text) => {
+                    println!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("pillar member role: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: pillar member {{ls | add <handle> [role] | role <handle> <role>}}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;

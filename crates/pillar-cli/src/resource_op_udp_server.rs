@@ -194,43 +194,63 @@ fn handle_datagram(
         Ok(b) => b,
         Err(_) => return ack_message(keys, false, "BAD-BODY"),
     };
-    let payload = match body {
-        Body::StreamOp(bytes) => bytes,
-        _ => return ack_message(keys, false, "NOT-A-STREAM-OP"),
-    };
-    let op = match pillar_ops::ResourceOp::decode(&payload) {
-        Ok(op) => op,
-        Err(e) => return ack_message(keys, false, &format!("MALFORMED-OP {e}")),
-    };
-    // 3. Authorize + apply — the subject is the AUTHENTICATED signer (the
-    //    exact same derivation `pillar_net::client_ingest::signer_subject`
-    //    uses), never anything the producer merely claims.
+    // 3. Decode + dispatch by op class. `Body::StreamOp` carries a
+    //    `ResourceOp` (streamdb CRUD); `Body::ControlOp` carries a typed
+    //    `ControlOp` (members/sessions/trust/…). Both derive the subject from
+    //    the AUTHENTICATED signer (never anything the producer claims), the
+    //    exact same `signer_subject` derivation.
     let actor = pillar_net::client_ingest::signer_subject(&msg);
-    let mut guard = match ctx.lock() {
-        Ok(g) => g,
-        Err(_) => return ack_message(keys, false, "POISONED-CONTEXT"),
-    };
-    // Reads are VIEWS (emit no event); dispatch them to the member-gated view
-    // methods BEFORE the write-apply path. A get's ack carries the CRD-YAML
-    // payload (or a `---`-joined stream) as its `OK <detail>` text; a describe's
-    // carries the provenance detail.
-    match &op {
-        pillar_ops::ResourceOp::Get { kind, name } => {
-            match guard.resource_op_get(&actor, kind, name.as_deref()) {
-                Ok(payload) => ack_message(keys, true, &payload),
-                Err(e) => ack_message(keys, false, &format!("{e}")),
+    match body {
+        Body::StreamOp(payload) => {
+            let op = match pillar_ops::ResourceOp::decode(&payload) {
+                Ok(op) => op,
+                Err(e) => return ack_message(keys, false, &format!("MALFORMED-OP {e}")),
+            };
+            let mut guard = match ctx.lock() {
+                Ok(g) => g,
+                Err(_) => return ack_message(keys, false, "POISONED-CONTEXT"),
+            };
+            // Reads are VIEWS (emit no event); dispatch them to the member-gated
+            // view methods BEFORE the write-apply path. A get's ack carries the
+            // CRD-YAML payload (or a `---`-joined stream) as its `OK <detail>`
+            // text; a describe's carries the provenance detail.
+            match &op {
+                pillar_ops::ResourceOp::Get { kind, name } => {
+                    match guard.resource_op_get(&actor, kind, name.as_deref()) {
+                        Ok(payload) => ack_message(keys, true, &payload),
+                        Err(e) => ack_message(keys, false, &format!("{e}")),
+                    }
+                }
+                pillar_ops::ResourceOp::Describe { kind, name } => {
+                    match guard.resource_op_describe(&actor, kind, name) {
+                        Ok(payload) => ack_message(keys, true, &payload),
+                        Err(e) => ack_message(keys, false, &format!("{e}")),
+                    }
+                }
+                _ => match guard.resource_op_apply(&actor, &op) {
+                    Ok(event) => ack_message(keys, true, &event),
+                    Err(e) => ack_message(keys, false, &format!("{e}")),
+                },
             }
         }
-        pillar_ops::ResourceOp::Describe { kind, name } => {
-            match guard.resource_op_describe(&actor, kind, name) {
-                Ok(payload) => ack_message(keys, true, &payload),
-                Err(e) => ack_message(keys, false, &format!("{e}")),
+        Body::ControlOp(payload) => {
+            let op = match pillar_ops::ControlOp::decode(&payload) {
+                Ok(op) => op,
+                Err(e) => return ack_message(keys, false, &format!("MALFORMED-OP {e}")),
+            };
+            let mut guard = match ctx.lock() {
+                Ok(g) => g,
+                Err(_) => return ack_message(keys, false, "POISONED-CONTEXT"),
+            };
+            // The handler is uniform across read/act: it member-gates reads and
+            // capability-gates acts internally, returning the ack detail or a
+            // refusal reason.
+            match guard.control_op(&actor, &op) {
+                Ok(detail) => ack_message(keys, true, &detail),
+                Err(reason) => ack_message(keys, false, &reason),
             }
         }
-        _ => match guard.resource_op_apply(&actor, &op) {
-            Ok(event) => ack_message(keys, true, &event),
-            Err(e) => ack_message(keys, false, &format!("{e}")),
-        },
+        _ => ack_message(keys, false, "NOT-A-STREAM-OP"),
     }
 }
 
@@ -316,6 +336,73 @@ mod tests {
         };
         let text = String::from_utf8(text).expect("utf8");
         assert!(text.starts_with("ERR BAD-SIGNATURE"), "{text}");
+    }
+
+    /// Seal a `ControlOp` exactly the way `pillar-client::transport::
+    /// seal_control_op` does (inline so this crate's tests need no
+    /// `pillar-client` dev-dep) — its own seal domain, `Body::ControlOp`.
+    fn seal_control_op(
+        op: &pillar_ops::ControlOp,
+        cell: &CellId,
+        group: &CellGroupKey,
+        signer: SigningPublicKey,
+        secret: &SigningSecretKey,
+    ) -> PillarMessage {
+        let payload = op.encode().expect("encode control op");
+        let body = Body::ControlOp(payload);
+        let plaintext = body.to_canonical_cbor().expect("encode body");
+        let aad = PillarMessage::header_aad(Visibility::Cell, cell);
+        let body_sealed = CellSeal
+            .seal(group, &plaintext, b"pillar-cli/control-op-v1", &aad)
+            .expect("seal");
+        let signature =
+            pillar_crypto::sign::sign(secret, &PillarMessage::signing_material(&body_sealed))
+                .expect("sign");
+        PillarMessage::new(
+            signer,
+            signature,
+            Visibility::Cell,
+            cell.clone(),
+            body_sealed,
+        )
+    }
+
+    /// A `ControlOp` DISPATCHES over the wire (proving the `Body::ControlOp`
+    /// arm is wired) and a member view is gated fail-closed: a signer that is
+    /// not a recognized cell member is refused, no state leaks.
+    #[test]
+    fn a_control_op_from_an_unadmitted_signer_is_refused_fail_closed() {
+        let keys = ResourceOpServerKeys::derive(test_keys().0, test_keys().1);
+        let (cell, group) = test_keys();
+        let (signer, secret) =
+            principal_from_seed(&Seed::from_bytes(b"client-c".to_vec())).expect("principal");
+        let op = pillar_ops::ControlOp::Members(pillar_ops::MembersOp::List);
+        let msg = seal_control_op(&op, &cell, &group, signer.signing, &secret.signing);
+        let reply = handle_datagram(
+            &msg.to_canonical_cbor().expect("encode"),
+            &Arc::new(Mutex::new(WebAuthContext::new(
+                "https://test",
+                pillar_core::NodeId::from("pillar-node"),
+                "secret",
+                pillar_core::NodeId::from("pillar-node"),
+                16,
+            ))),
+            &keys,
+        )
+        .expect("an ack is always produced for a decodable envelope");
+        let opened = CellSeal
+            .open(
+                &keys.group,
+                &reply.body_sealed,
+                &PillarMessage::header_aad(reply.visibility, &reply.cell),
+            )
+            .expect("open ack");
+        let Body::Control(text) = Body::from_canonical_cbor(&opened).expect("decode ack body")
+        else {
+            panic!("ack body must be Control");
+        };
+        let text = String::from_utf8(text).expect("utf8");
+        assert!(text.starts_with("ERR unauthorized"), "{text}");
     }
 
     #[test]

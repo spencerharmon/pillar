@@ -155,6 +155,90 @@ impl ResourceOp {
     }
 }
 
+/// The codec version prefixed to every encoded [`ControlOp`] payload. Kept
+/// SEPARATE from [`OP_CODEC_VERSION`] so the two op families evolve
+/// independently.
+pub const CONTROL_OP_CODEC_VERSION: u8 = 1;
+
+/// The typed CLI **control-op** vocabulary: one arm per command family. Where
+/// [`ResourceOp`] models streamdb CRUD (rides [`pillar_wire::Body::StreamOp`]),
+/// a `ControlOp` drives the node's portal/authority substrate (members, trust,
+/// sessions, IAM, cluster, obs, …) over the SAME sealed, signed resource-op UDP
+/// tier — it rides `Body::ControlOp`. The set grows one typed arm per family as
+/// each CLI family is wired to the wire; a node decodes only the arms this build
+/// understands and rejects the rest, so the vocabulary can extend without a
+/// codec bump. Wasm-safe (serde only), like the rest of this crate, so the
+/// browser client can build the identical typed op.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlOp {
+    /// Cell-membership management (`pillar member …`).
+    Members(MembersOp),
+}
+
+/// Portal-member management ops (`pillar member ls|add|role`). A `List` is a
+/// VIEW (emits no event); `Add`/`SetRole` are signed acts gated on the
+/// `portal:members:write` capability of the AUTHENTICATED signer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum MembersOp {
+    /// List the cell's members and their roles.
+    List,
+    /// Add or invite a member with a role.
+    Add {
+        /// The member handle.
+        handle: String,
+        /// The role to grant (e.g. `member`, `admin`).
+        role: String,
+    },
+    /// Change an existing member's role.
+    SetRole {
+        /// The member handle.
+        handle: String,
+        /// The new role.
+        role: String,
+    },
+}
+
+impl ControlOp {
+    /// Encode to a control-op payload: a single [`CONTROL_OP_CODEC_VERSION`]
+    /// byte followed by the canonical JSON of the op. Deterministic, like
+    /// [`ResourceOp::encode`].
+    ///
+    /// # Errors
+    /// [`OpCodecError::Encode`] if serialization fails.
+    pub fn encode(&self) -> Result<Vec<u8>, OpCodecError> {
+        let json = serde_json::to_vec(self).map_err(|e| OpCodecError::Encode(e.to_string()))?;
+        let mut out = Vec::with_capacity(1 + json.len());
+        out.push(CONTROL_OP_CODEC_VERSION);
+        out.extend_from_slice(&json);
+        Ok(out)
+    }
+
+    /// Decode a control-op payload produced by [`Self::encode`], checking the
+    /// leading codec-version byte.
+    ///
+    /// # Errors
+    /// [`OpCodecError::Empty`] on an empty payload;
+    /// [`OpCodecError::UnsupportedVersion`] on an unknown codec version;
+    /// [`OpCodecError::Decode`] if the body is not a well-formed [`ControlOp`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, OpCodecError> {
+        let (&version, rest) = bytes.split_first().ok_or(OpCodecError::Empty)?;
+        if version != CONTROL_OP_CODEC_VERSION {
+            return Err(OpCodecError::UnsupportedVersion(version));
+        }
+        serde_json::from_slice(rest).map_err(|e| OpCodecError::Decode(e.to_string()))
+    }
+
+    /// Whether this op is a read-only VIEW (the node serves it from live state
+    /// and emits no signed event) — the wire dispatcher routes reads through the
+    /// member-gated view path and acts through the capability-gated act path.
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        matches!(self, ControlOp::Members(MembersOp::List))
+    }
+}
+
 /// A fault encoding or decoding a [`ResourceOp`] payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpCodecError {
@@ -317,5 +401,47 @@ mod tests {
             ResourceOp::decode(&bytes),
             Err(OpCodecError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn control_op_members_round_trips_and_classifies_read_vs_act() {
+        let list = ControlOp::Members(MembersOp::List);
+        let bytes = list.encode().expect("encode");
+        assert_eq!(bytes[0], CONTROL_OP_CODEC_VERSION, "version-prefixed");
+        assert_eq!(ControlOp::decode(&bytes).expect("decode"), list);
+        assert!(list.is_read(), "member ls is a view");
+
+        let add = ControlOp::Members(MembersOp::Add {
+            handle: "alice".into(),
+            role: "admin".into(),
+        });
+        assert_eq!(
+            ControlOp::decode(&add.encode().expect("encode")).expect("decode"),
+            add
+        );
+        assert!(!add.is_read(), "member add is a signed act");
+
+        let set = ControlOp::Members(MembersOp::SetRole {
+            handle: "bob".into(),
+            role: "member".into(),
+        });
+        assert_eq!(
+            ControlOp::decode(&set.encode().expect("encode")).expect("decode"),
+            set
+        );
+        assert!(!set.is_read());
+    }
+
+    #[test]
+    fn control_op_rejects_empty_and_unknown_version() {
+        assert_eq!(ControlOp::decode(&[]), Err(OpCodecError::Empty));
+        let mut bytes = ControlOp::Members(MembersOp::List)
+            .encode()
+            .expect("encode");
+        bytes[0] = 0xFE;
+        assert_eq!(
+            ControlOp::decode(&bytes),
+            Err(OpCodecError::UnsupportedVersion(0xFE))
+        );
     }
 }

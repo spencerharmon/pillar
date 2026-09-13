@@ -45,6 +45,7 @@ fn usage() -> &'static str {
      \x20 pillar revoke trust|grant|key|attest <ref>               authority-reducing acts (identity_trust_cli::RevokeCli)\n\
      \x20 pillar audit <cid>                                      proof chain + sentence (identity_trust_cli::AuditCli)\n\
      \x20 pillar describe <kind>/<name>             one resource + its envelope provenance, over pillar-message\n\
+     \x20 pillar member ls|add <handle> [role]|role <handle> <role>   manage cell membership over pillar-message (typed ControlOp; no HTTP)\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar secrets-audit-rotation-mfa          seal/read a secret, signed-audit + forged-key rejection, key rotation, step-up MFA\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\

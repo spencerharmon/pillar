@@ -31,7 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use pillar_crypto::{Ciphertext, CellId, Signature, SigningPublicKey, SurfaceVersion};
+use pillar_crypto::{CellId, Ciphertext, Signature, SigningPublicKey, SurfaceVersion};
 
 use crate::store::{Cid, Visibility};
 
@@ -170,6 +170,12 @@ pub enum Body {
     /// A libp2p control message (opsync/antientropy/blob/gossip), wrapped so
     /// it too rides the envelope.
     Control(Vec<u8>),
+    /// A typed CLI **control op** (`pillar_ops::ControlOp`: members, sessions,
+    /// trust, IAM, cluster, obs, …) carried over the sealed resource-op tier.
+    /// Distinct from [`Self::Control`] (libp2p transport control) and
+    /// [`Self::StreamOp`] (streamdb CRUD) so the node dispatches each op class
+    /// on its own tag. The payload is a `ControlOp::encode` byte string.
+    ControlOp(Vec<u8>),
 }
 
 impl Body {
@@ -309,8 +315,8 @@ impl PillarMessage {
         version
             .check_supported(PILLAR_MESSAGE_MIN_SUPPORTED, PILLAR_MESSAGE_MAX_SUPPORTED)
             .map_err(|_| EnvelopeError::UnsupportedVersion(version))?;
-        let visibility =
-            vis_from_u8(wire.visibility).ok_or(EnvelopeError::UnknownVisibility(wire.visibility))?;
+        let visibility = vis_from_u8(wire.visibility)
+            .ok_or(EnvelopeError::UnknownVisibility(wire.visibility))?;
         Ok(PillarMessage {
             version,
             signer: SigningPublicKey::from_bytes(wire.signer),
@@ -355,7 +361,8 @@ mod tests {
         let (signer, secret) =
             signing_keypair_from_seed(&Seed::from_bytes(signer_seed.as_bytes().to_vec()))
                 .expect("keygen");
-        let signature = sign(&secret, &PillarMessage::signing_material(&body_sealed)).expect("sign");
+        let signature =
+            sign(&secret, &PillarMessage::signing_material(&body_sealed)).expect("sign");
 
         PillarMessage::new(signer, signature, Visibility::Cell, cell, body_sealed)
     }
@@ -375,7 +382,10 @@ mod tests {
         // Two independent encodings of the same logical value produce the
         // SAME bytes -> the same Cid on every node (ContentAddressStable).
         let encoded_again = msg.to_canonical_cbor().expect("encode again");
-        assert_eq!(encoded, encoded_again, "canonical encoding is deterministic");
+        assert_eq!(
+            encoded, encoded_again,
+            "canonical encoding is deterministic"
+        );
         assert_eq!(
             msg.cid().expect("cid"),
             PillarMessage::from_canonical_cbor(&encoded_again)
@@ -418,8 +428,7 @@ mod tests {
         let body = Body::Signal(b"observability signal".to_vec());
         let msg = build_message(&body, "cell-a", "author-a");
 
-        let group =
-            group_key_from_seed(&Seed::from_bytes(b"cell-a".to_vec())).expect("cell key");
+        let group = group_key_from_seed(&Seed::from_bytes(b"cell-a".to_vec())).expect("cell key");
         let aad = PillarMessage::header_aad(msg.visibility, &msg.cell);
         let opened = CellSeal.open(&group, &msg.body_sealed, &aad).expect("open");
         let decoded_body = Body::from_canonical_cbor(&opened).expect("decode body");

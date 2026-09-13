@@ -3525,6 +3525,82 @@ impl WebAuthContext {
         }
     }
 
+    /// Dispatch a typed [`pillar_ops::ControlOp`] arriving over the sealed
+    /// resource-op tier (the control-op sibling of [`Self::resource_op_apply`]).
+    /// `actor` is the AUTHENTICATED signer subject (from
+    /// [`pillar_net::client_ingest::signer_subject`]), never anything the
+    /// producer claims. Reads are member-gated (the signer must be reachable in
+    /// this cell's WoT authority graph); acts run through the SAME capability
+    /// decider ([`Self::perform_signed_act`]) the HTTP handlers use, so the wire
+    /// path is neither weaker nor stronger than the web path. Returns the ack
+    /// detail on success, or `Err(reason)` the caller renders as `ERR <reason>`.
+    pub fn control_op(
+        &mut self,
+        actor: &NodeId,
+        op: &pillar_ops::ControlOp,
+    ) -> Result<String, String> {
+        match op {
+            pillar_ops::ControlOp::Members(m) => self.members_op(actor, m),
+        }
+    }
+
+    /// Serve a [`pillar_ops::MembersOp`] over the control-op tier. `List` is a
+    /// member-gated VIEW; `Add`/`SetRole` are `portal:members:write`-gated acts
+    /// that journal the SAME [`PortalOp::AddMember`]/[`PortalOp::SetMemberRole`]
+    /// records the `POST /portal/members/*` routes do (via
+    /// [`Self::add_member`]/[`Self::set_member_role`]).
+    fn members_op(&mut self, actor: &NodeId, op: &pillar_ops::MembersOp) -> Result<String, String> {
+        match op {
+            pillar_ops::MembersOp::List => {
+                if self.authority.reachable_depth(actor).is_none() {
+                    return Err("unauthorized: signer is not a recognized cell member".to_owned());
+                }
+                let mut out = String::new();
+                for (handle, role) in self.members() {
+                    out.push_str(handle);
+                    out.push('\t');
+                    out.push_str(role);
+                    out.push('\n');
+                }
+                Ok(out)
+            }
+            pillar_ops::MembersOp::Add { handle, role } => {
+                if handle.is_empty() {
+                    return Err("missing handle".to_owned());
+                }
+                let role = if role.is_empty() {
+                    "member"
+                } else {
+                    role.as_str()
+                };
+                let payload = format!("MEMBER-ADD {handle} {role}");
+                match self.perform_signed_act(actor, "portal:members:write", &payload) {
+                    Ok(event) => {
+                        self.add_member(handle, role);
+                        Ok(format!("MEMBER {handle} ROLE {role} EVENT-CID {}", event.0))
+                    }
+                    Err(a) => Err(format!("unauthorized actor {a} for portal:members:write")),
+                }
+            }
+            pillar_ops::MembersOp::SetRole { handle, role } => {
+                if handle.is_empty() || role.is_empty() {
+                    return Err("missing handle or role".to_owned());
+                }
+                if !self.members().contains_key(handle) {
+                    return Err(format!("no such member {handle}"));
+                }
+                let payload = format!("MEMBER-ROLE {handle} {role}");
+                match self.perform_signed_act(actor, "portal:members:write", &payload) {
+                    Ok(event) => {
+                        self.set_member_role(handle, role);
+                        Ok(format!("MEMBER {handle} ROLE {role} EVENT-CID {}", event.0))
+                    }
+                    Err(a) => Err(format!("unauthorized actor {a} for portal:members:write")),
+                }
+            }
+        }
+    }
+
     /// Serve a resource-plane VIEW over the resource-op tier (`pillar get`):
     /// emits NO event. `name` `None` lists every object of `kind` as a
     /// `---`-separated CRD-YAML stream; `Some` renders that one object's CRD
@@ -5561,7 +5637,10 @@ fn dispatch_resource_rollback(ctx: &mut WebAuthContext, request: &HttpRequest) -
     let predicted = ctx.resource_dry_run(&actor);
     match ctx.resource_rollback(&actor, kind, &name, &manifest_ref) {
         Ok(cid) => {
-            debug_assert!(predicted, "an authorized rollback must have predicted ALLOW");
+            debug_assert!(
+                predicted,
+                "an authorized rollback must have predicted ALLOW"
+            );
             text_response(
                 200,
                 "OK",
@@ -8172,12 +8251,8 @@ mod tests {
 
         // Declare an explicit ResourceSet whose one member (Job/nightly) does
         // NOT exist on the plane -> it is Missing and gets a REASON tail.
-        let set = Crd::new(
-            &ctx.resource_api,
-            "ResourceSet",
-            CrdMetadata::new("web"),
-        )
-        .with_spec("members", CrdValue::String("Job/nightly".into()));
+        let set = Crd::new(&ctx.resource_api, "ResourceSet", CrdMetadata::new("web"))
+            .with_spec("members", CrdValue::String("Job/nightly".into()));
         {
             let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
             plane
@@ -8192,7 +8267,9 @@ mod tests {
             "missing member carries the additive REASON tail: {detail}"
         );
         assert!(
-            detail.contains("REASON declared member Job/nightly is absent from the live resource plane"),
+            detail.contains(
+                "REASON declared member Job/nightly is absent from the live resource plane"
+            ),
             "reason message names the absent member: {detail}"
         );
 
@@ -8200,17 +8277,11 @@ mod tests {
         let rp = Crd::new(
             &ctx.resource_api,
             "RetentionPolicy",
-            CrdMetadata::new("web-metrics")
-                .with_label("pillar.dev/resource-set", "web"),
+            CrdMetadata::new("web-metrics").with_label("pillar.dev/resource-set", "web"),
         )
         .with_spec("signalKind", CrdValue::String("Metric".into()))
         .with_spec("window", CrdValue::Integer(600));
-        let set2 = Crd::new(
-            &ctx.resource_api,
-            "ResourceSet",
-            CrdMetadata::new("web"),
-        )
-        .with_spec(
+        let set2 = Crd::new(&ctx.resource_api, "ResourceSet", CrdMetadata::new("web")).with_spec(
             "members",
             CrdValue::String("RetentionPolicy/web-metrics".into()),
         );
@@ -8263,11 +8334,10 @@ mod tests {
         )
         .with_spec("signalKind", CrdValue::String("Metric".into()))
         .with_spec("window", CrdValue::Integer(600));
-        let set = Crd::new(&ctx.resource_api, "ResourceSet", CrdMetadata::new("web"))
-            .with_spec(
-                "members",
-                CrdValue::String("RetentionPolicy/web-metrics".into()),
-            );
+        let set = Crd::new(&ctx.resource_api, "ResourceSet", CrdMetadata::new("web")).with_spec(
+            "members",
+            CrdValue::String("RetentionPolicy/web-metrics".into()),
+        );
         {
             let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
             plane
@@ -8285,8 +8355,7 @@ mod tests {
             "set-root node carries a health+sync token: {detail}"
         );
         assert!(
-            detail
-                .contains("NODE 1 RetentionPolicy/web-metrics HEALTH Healthy SYNC Synced"),
+            detail.contains("NODE 1 RetentionPolicy/web-metrics HEALTH Healthy SYNC Synced"),
             "member node carries a health+sync token: {detail}"
         );
         // Every NODE line has the token tail — none was left bare.
@@ -11585,7 +11654,12 @@ mod tests {
             assert_eq!(post(&mut ctx, "/portal/resource/apply", &body).status, 200);
         }
         assert_eq!(
-            post(&mut ctx, "/portal/resource/scale", &format!("{token}\nweb\n5")).status,
+            post(
+                &mut ctx,
+                "/portal/resource/scale",
+                &format!("{token}\nweb\n5")
+            )
+            .status,
             200
         );
         let events_after = ctx.resource_event_count();
@@ -11603,18 +11677,30 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("REVISION "))
             .collect();
-        assert_eq!(rev_lines.len(), 3, "three changes -> three revisions: {}", hist.body);
+        assert_eq!(
+            rev_lines.len(),
+            3,
+            "three changes -> three revisions: {}",
+            hist.body
+        );
         // Pin the EXACT field grammar and ordinal ordering.
         for (i, line) in rev_lines.iter().enumerate() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             assert_eq!(parts[0], "REVISION");
-            assert_eq!(parts[1], i.to_string(), "ordinal is 0-based apply order: {line}");
+            assert_eq!(
+                parts[1],
+                i.to_string(),
+                "ordinal is 0-based apply order: {line}"
+            );
             assert_eq!(parts[2], "EVENT");
             assert!(!parts[3].is_empty(), "EVENT cid present: {line}");
             assert_eq!(parts[4], "SIGNER");
             assert!(!parts[5].is_empty(), "SIGNER present: {line}");
             assert_eq!(parts[6], "MANIFEST");
-            assert!(!parts[7].is_empty(), "MANIFEST content-hash present: {line}");
+            assert!(
+                !parts[7].is_empty(),
+                "MANIFEST content-hash present: {line}"
+            );
             assert_eq!(parts.len(), 8, "no trailing fields: {line}");
         }
         assert!(
@@ -11637,11 +11723,21 @@ mod tests {
 
         // Two revisions: v1 then v2. v1 is the rollback target.
         assert_eq!(
-            post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1")).status,
+            post(
+                &mut ctx,
+                "/portal/resource/apply",
+                &format!("{token}\nweb\napp:v1")
+            )
+            .status,
             200
         );
         assert_eq!(
-            post(&mut ctx, "/portal/resource/edit", &format!("{token}\nweb\napp:v2")).status,
+            post(
+                &mut ctx,
+                "/portal/resource/edit",
+                &format!("{token}\nweb\napp:v2")
+            )
+            .status,
             200
         );
         let hist = get(
@@ -11662,11 +11758,9 @@ mod tests {
         // For an AUTHORIZED actor the dry-run predicts ALLOW, so the rollback
         // issues: exactly one new event, and the workload returns to v1's image.
         assert!(
-            parse_predicted_allow(&get(
-                &mut ctx,
-                &format!("/portal/resource/dry-run?token={token}")
-            )
-            .body),
+            parse_predicted_allow(
+                &get(&mut ctx, &format!("/portal/resource/dry-run?token={token}")).body
+            ),
             "the authorized actor's dry-run must predict ALLOW"
         );
         let before = ctx.resource_event_count();
@@ -11701,7 +11795,11 @@ mod tests {
             &format!("{token}\nweb\ndeadbeef\nWorkload"),
         );
         assert_eq!(bad.status, 409, "got: {}", bad.body);
-        assert_eq!(ctx.resource_event_count(), before, "a failed rollback appends nothing");
+        assert_eq!(
+            ctx.resource_event_count(),
+            before,
+            "a failed rollback appends nothing"
+        );
     }
 
     // The dry-run gate the rollback rides: an UNAUTHORIZED session's dry-run
@@ -11713,11 +11811,21 @@ mod tests {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
         assert_eq!(
-            post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1")).status,
+            post(
+                &mut ctx,
+                "/portal/resource/apply",
+                &format!("{token}\nweb\napp:v1")
+            )
+            .status,
             200
         );
         assert_eq!(
-            post(&mut ctx, "/portal/resource/edit", &format!("{token}\nweb\napp:v2")).status,
+            post(
+                &mut ctx,
+                "/portal/resource/edit",
+                &format!("{token}\nweb\napp:v2")
+            )
+            .status,
             200
         );
         let hist = get(
@@ -11757,7 +11865,11 @@ mod tests {
         // The unauthorized dry-run predicts DENY...
         assert!(
             !parse_predicted_allow(
-                &get(&mut ctx, &format!("/portal/resource/dry-run?token={stranger}")).body
+                &get(
+                    &mut ctx,
+                    &format!("/portal/resource/dry-run?token={stranger}")
+                )
+                .body
             ),
             "the unauthorized actor's dry-run must predict DENY"
         );
@@ -12445,20 +12557,17 @@ mod tests {
             if let Some(workspace_root) = crates_dir.parent() {
                 candidates.push(workspace_root.join("target").join(REL));
             }
-            let wasm_path = candidates
-                .iter()
-                .find(|p| p.exists())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "built pillar-frontend wasm not found in any known target \
+            let wasm_path = candidates.iter().find(|p| p.exists()).unwrap_or_else(|| {
+                panic!(
+                    "built pillar-frontend wasm not found in any known target \
                          layout; looked in: {}",
-                        candidates
-                            .iter()
-                            .map(|p| p.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                });
+                    candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
             let bytes = std::fs::read(wasm_path).unwrap_or_else(|e| {
                 panic!("failed to read built wasm at {}: {e}", wasm_path.display())
             });
