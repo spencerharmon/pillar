@@ -20,7 +20,7 @@ fn usage() -> &'static str {
      \n\
      USAGE:\n\
      \x20 pillar apply -f <manifest.yaml>           validate, authorize, sign, emit a signed event (YAML/JSON; multi-doc & `kind: List` bundles)\n\
-     \x20 pillar get      <api> <kind> <name>       render a resource from the materialized view\n\
+     \x20 pillar get      <kind> [name]              read the live cell's materialized view over pillar-message (CRD YAML)\n\
      \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
      \x20 pillar ingress-lb-udp serve <manifest-file>   bind a real UDP LB dataplane (Frontend/Route/LoadBalancerPolicy) on a VIP and forward datagrams; prints `vip=<ip:port>`\n\
      \x20 pillar bootstrap cell <name> --user <handle> [opts]  combined single-step cell+user bootstrap\n\
@@ -44,7 +44,7 @@ fn usage() -> &'static str {
      \x20 pillar caps [<user>]                                    effective capability set (identity_trust_cli::CapsCli)\n\
      \x20 pillar revoke trust|grant|key|attest <ref>               authority-reducing acts (identity_trust_cli::RevokeCli)\n\
      \x20 pillar audit <cid>                                      proof chain + sentence (identity_trust_cli::AuditCli)\n\
-     \x20 pillar describe <api> <kind> <name>       render a resource + its envelope provenance\n\
+     \x20 pillar describe <kind>/<name>             one resource + its envelope provenance, over pillar-message\n\
      \x20 pillar onboard                            run the keygen->signing->trust->policy sequence, asserting invariants\n\
      \x20 pillar secrets-audit-rotation-mfa          seal/read a secret, signed-audit + forged-key rejection, key rotation, step-up MFA\n\
      \x20 pillar render helm <template> [k=v ...]   fill a helm template, print manifest text\n\

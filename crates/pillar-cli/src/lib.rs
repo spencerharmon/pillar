@@ -69,7 +69,7 @@ use std::fmt;
 use pillar_core::NodeId;
 use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_manifest::{
-    Capability as ManifestCapability, ContentHash, Crd, Envelope, FieldType, Metadata, SchemaError,
+    Capability as ManifestCapability, ContentHash, Crd, Envelope, SchemaError,
     SchemaRegistry, Value,
 };
 use pillar_rbac::{
@@ -147,6 +147,24 @@ pub struct Applied {
     pub content_hash: ContentHash,
 }
 
+/// One entry of a resource's revision history: a prior applied manifest for a
+/// single [`ResourceKey`], recorded by exactly one signed event. Carries the
+/// provenance a `describe` surfaces for the record in force, but for EVERY
+/// prior record — the event CID that recorded it, the signer that authorized
+/// it, and the content-hash of the sealed manifest body. The content-hash is
+/// the "manifest ref" a rollback re-applies (see
+/// [`Platform::manifest_by_content_hash`]). Produced by [`Platform::history`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    /// The id of the signed event that recorded this revision.
+    pub event: EventId,
+    /// The subject that signed (authorized) this revision.
+    pub signer: String,
+    /// The content-hash of the sealed manifest body — the manifest ref a
+    /// rollback fetches and re-applies.
+    pub content_hash: ContentHash,
+}
+
 /// What a `--dry-run` preview of an apply-shaped act WOULD produce, computed
 /// by running the identical validate-then-authorize decision path
 /// [`Platform::apply`] uses (see [`Platform::preview`]) — WITHOUT sealing an
@@ -158,23 +176,6 @@ pub struct Applied {
 pub struct Previewed {
     /// The content-hash the sealed envelope would carry if applied for real.
     pub content_hash: ContentHash,
-}
-
-/// One prior revision of a resource, drawn from the append-only event log by
-/// [`Platform::history`]: the authorizing event CID, the signer that sealed
-/// that revision, the manifest's content-addressed hash (a stable ref a
-/// rollback re-applies), and the revision's spec `image` when present. Purely
-/// descriptive — carries no authority.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResourceRevision {
-    /// The log CID of the event that put this revision in force.
-    pub event_cid: String,
-    /// The subject that signed (authorized) this revision.
-    pub signer: String,
-    /// The content-addressed hash of the sealed manifest for this revision.
-    pub content_hash: String,
-    /// The revision's spec `image`, when the manifest declares one.
-    pub image: Option<String>,
 }
 
 /// The in-memory platform the CLI acts against: the schema registry, the
@@ -372,54 +373,45 @@ impl Platform {
             })
     }
 
-    /// The full **revision history** of a resource: one entry per prior apply
-    /// of `key`, OLDEST first, drawn from the append-only event log (not just
-    /// the latest-wins view). Each entry carries the authorizing event CID, the
-    /// signer that sealed that revision, the manifest's content-hash (its
-    /// content-addressed ref), and the revision's spec `image` when present.
-    /// A pure read — folding this NEVER writes back. Empty when no manifest for
-    /// `key` was ever applied.
+    /// The full REVISION HISTORY of one resource: every prior applied
+    /// manifest for `(api_version, kind, name)`, in apply order (oldest
+    /// first), drawn purely from the log/store. Each [`Revision`] carries the
+    /// event CID that recorded it, the signer that authorized it, and the
+    /// content-hash of the sealed manifest body (the "manifest ref" a rollback
+    /// re-applies). A pure read: computing it mutates nothing. The LAST entry
+    /// is the record currently in force (matching [`Self::event_cid`]).
     #[must_use]
-    pub fn history(&self, key: &ResourceKey) -> Vec<ResourceRevision> {
-        self.applied
-            .iter()
-            .zip(self.applied_events.iter())
-            .filter_map(|(hash, ev)| {
-                let env = self.store.get(hash)?;
-                if ResourceKey::of(env.body()) != *key {
-                    return None;
-                }
-                let body = env.render();
-                let image = body.spec.get("image").and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                });
-                Some(ResourceRevision {
-                    event_cid: ev.0.to_string(),
-                    signer: env.signer().to_owned(),
-                    content_hash: env.content_hash().to_string(),
-                    image,
-                })
-            })
-            .collect()
+    pub fn history(&self, api_version: &str, kind: &str, name: &str) -> Vec<Revision> {
+        let want = ResourceKey {
+            api_version: api_version.to_owned(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        };
+        let mut out = Vec::new();
+        for (hash, ev) in self.applied.iter().zip(self.applied_events.iter()) {
+            let Some(env) = self.store.get(hash) else {
+                continue;
+            };
+            if ResourceKey::of(env.body()) != want {
+                continue;
+            }
+            out.push(Revision {
+                event: ev.clone(),
+                signer: env.signer().to_owned(),
+                content_hash: hash.clone(),
+            });
+        }
+        out
     }
 
-    /// The CRD body of a PRIOR revision of `key`, identified by the `event_cid`
-    /// that put it in force — the manifest a rollback re-applies. Returns
-    /// `None` when no applied revision of `key` carries that event CID. A pure
-    /// read: resolving a historical manifest NEVER writes back.
+    /// Fetch the sealed manifest body (`Crd`) of a prior revision by its
+    /// content-hash — the "manifest ref" [`Self::history`] lists. Returns
+    /// `None` if no manifest with that content-hash is stored. A pure read:
+    /// a rollback renders this body and re-applies it through the SAME signed
+    /// [`Self::apply`] path (dry-run gated) as any other change.
     #[must_use]
-    pub fn manifest_at_event(&self, key: &ResourceKey, event_cid: &str) -> Option<Crd> {
-        self.applied
-            .iter()
-            .zip(self.applied_events.iter())
-            .find_map(|(hash, ev)| {
-                if ev.0.to_string() != event_cid {
-                    return None;
-                }
-                let env = self.store.get(hash)?;
-                (ResourceKey::of(env.body()) == *key).then(|| env.render())
-            })
+    pub fn manifest_by_content_hash(&self, content_hash: &ContentHash) -> Option<Crd> {
+        self.store.get(content_hash).map(Envelope::render)
     }
 
     fn describe_impl(&self, api_version: &str, kind: &str, name: &str) -> Option<String> {
@@ -684,7 +676,7 @@ impl std::error::Error for RenderError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pillar_manifest::{Schema, SchemaRegistry};
+    use pillar_manifest::{FieldType, Metadata, Schema, SchemaRegistry};
     use pillar_rbac::{default_resource_class_policies, Capability as RbacCapability};
 
     const OWNER: &str = "OWNER-FPR";

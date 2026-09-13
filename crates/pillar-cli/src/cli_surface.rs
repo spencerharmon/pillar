@@ -194,11 +194,11 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "get",
-        handler: live_platform_guidance,
+        handler: |_v, args| crate::apply_over_pillar_message::get(args),
     },
     VerbSpec {
         name: "describe",
-        handler: live_platform_guidance,
+        handler: |_v, args| crate::apply_over_pillar_message::describe(args),
     },
     VerbSpec {
         name: "explain",
@@ -238,16 +238,6 @@ fn obs() -> ExitCode {
          pillar_cli::observability_ui::ObservabilityBuilders library API."
     );
     eprintln!("Run `pillar --help` for the full `obs` verb list.");
-    ExitCode::from(2)
-}
-
-fn live_platform_guidance(verb: &str, _args: &[String]) -> ExitCode {
-    // These verbs act over a live, persistent platform, which this
-    // demonstration shell does not host. The library `Platform` API is
-    // the authoritative entry point; print guidance rather than fake
-    // success.
-    eprintln!("`pillar {verb}` operates over a live platform via the pillar_cli library API.");
-    eprintln!("Use `pillar render …` to produce manifest text, and the library to apply it.");
     ExitCode::from(2)
 }
 

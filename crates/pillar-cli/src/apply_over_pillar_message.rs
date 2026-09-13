@@ -389,6 +389,111 @@ pub fn delete(args: &[String]) -> ExitCode {
     }
 }
 
+/// Send a read-only [`pillar_ops::ResourceOp`] (`Get`/`Describe`) and return
+/// the node's materialized-view payload — the text the ack carries after its
+/// `OK ` status prefix (see `resource_op_udp_server::ack_message`). A node
+/// refusal (`ERR <reason>`) is returned as an `Err(<reason>)`.
+///
+/// # Errors
+/// The stringified [`SendError`] for a transport/connection fault, or the
+/// node's refusal reason for a `ERR` ack.
+fn read_op(op: &pillar_ops::ResourceOp) -> Result<String, String> {
+    let (ack, _tier) = send_op(op).map_err(|e| e.to_string())?;
+    if let Some(payload) = ack.strip_prefix("OK ") {
+        Ok(payload.to_owned())
+    } else if ack == "OK" {
+        Ok(String::new())
+    } else {
+        Err(ack.strip_prefix("ERR ").unwrap_or(&ack).to_owned())
+    }
+}
+
+/// Read the live cell's materialized view of `kind` over pillar-message. `name`
+/// `None` lists every object as a `---`-separated CRD-YAML stream; `Some`
+/// renders that one object's CRD YAML. The pure core `pillar get` wraps.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason (unauthorized signer,
+/// not-found).
+pub fn get_resource(kind: &str, name: Option<&str>) -> Result<String, String> {
+    read_op(&pillar_ops::ResourceOp::Get {
+        kind: kind.to_owned(),
+        name: name.map(ToOwned::to_owned),
+    })
+}
+
+/// Describe one resource over pillar-message: full detail INCLUDING provenance
+/// (signer, authorizing capability, event CID). The pure core `pillar describe`
+/// wraps.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason.
+pub fn describe_resource(kind: &str, name: &str) -> Result<String, String> {
+    read_op(&pillar_ops::ResourceOp::Describe {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+    })
+}
+
+/// `pillar get <kind> [name]`: read the live cell's materialized resource view
+/// over pillar-message and print each matching resource as CRD YAML.
+pub fn get(args: &[String]) -> ExitCode {
+    let Some(kind) = args.first() else {
+        eprintln!("usage: pillar get <kind> [name]");
+        return ExitCode::from(2);
+    };
+    let name = args.get(1).map(String::as_str);
+    match get_resource(kind, name) {
+        Ok(text) => {
+            if text.trim().is_empty() {
+                eprintln!("no {kind} resources");
+            } else {
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pillar get: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar describe <kind>/<name>` (or `<kind> <name>`): print one resource's
+/// full detail (incl. provenance) from the live view over pillar-message.
+pub fn describe(args: &[String]) -> ExitCode {
+    let (kind, name) = match args {
+        [one] => match one.split_once('/') {
+            Some((k, n)) if !k.is_empty() && !n.is_empty() => (k.to_owned(), n.to_owned()),
+            _ => {
+                eprintln!("usage: pillar describe <kind>/<name>");
+                return ExitCode::from(2);
+            }
+        },
+        [k, n] => (k.clone(), n.clone()),
+        _ => {
+            eprintln!("usage: pillar describe <kind>/<name>");
+            return ExitCode::from(2);
+        }
+    };
+    match describe_resource(&kind, &name) {
+        Ok(text) => {
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pillar describe: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;

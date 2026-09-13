@@ -1408,7 +1408,13 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         tracing::info!("pillar peer self-metrics producer disabled via PILLAR_DISABLE_METRICS");
     }
     let metrics_enabled = std::env::var(ENV_DISABLE_METRICS).is_err();
-    let mut self_metrics_tick: u64 = 0;
+    // The observability tick axis is REAL elapsed seconds since this instant,
+    // so a PSL `range:`/`correlate:` window (both denominated in seconds)
+    // filters and groups by real wall-clock duration. Previously this was a
+    // bare per-sample counter incremented once per interval, which made every
+    // seconds-denominated range clause a no-op (e.g. `range: now-1d` subtracted
+    // 86 400 from a counter of a few dozen, saturating the window start to 0).
+    let obs_epoch = std::time::Instant::now();
     let mut self_metrics_interval = tokio::time::interval(SELF_METRICS_INTERVAL);
     self_metrics_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1498,6 +1504,10 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     // substrate below — each emit locks it internally and the
                     // std::Mutex is non-reentrant, so holding `sub` across
                     // these calls would deadlock.
+                    // Stamp this sample at REAL elapsed seconds — the query
+                    // time axis is seconds, so range/correlate windows mean
+                    // real durations.
+                    let self_metrics_tick = obs_epoch.elapsed().as_secs();
                     obs_clock.advance_to(self_metrics_tick);
                     {
                         use pillar_core::ObserverHook;
@@ -1551,7 +1561,6 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     );
                     tracing::debug!(count = written, tick = self_metrics_tick, "pillar peer ingested self metrics");
                 }
-                self_metrics_tick += 1;
             }
             _ = scheduler_interval.tick() => {
                 // One REAL wall-clock scheduler tick: reap any real child that
@@ -1687,19 +1696,29 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     // trace the log/trace signal kinds back to a genuine
                     // workload emission (the gossip event this node handled).
                     {
+                        // Stamp this handled event at REAL elapsed seconds so it
+                        // orders and range-filters by wall-clock, independent of
+                        // the periodic self-metrics sampler; anchor its tick to
+                        // wall-clock so the read path can render a timestamp.
+                        let ev_tick = obs_epoch.elapsed().as_secs();
+                        let now_millis = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
                         let mut sub = live_obs.lock().expect("live observability lock");
+                        sub.anchor_wallclock(ev_tick, now_millis);
                         sub.record_log(
                             pillar_observability::LogLevel::Info,
                             format!("gossip event handled bytes={}", message.data.len()),
                             "federation",
-                            self_metrics_tick,
+                            ev_tick,
                         );
                         sub.record_span(
-                            format!("gossip-{self_metrics_tick}"),
-                            format!("handle-{self_metrics_tick}"),
+                            format!("gossip-{ev_tick}"),
+                            format!("handle-{ev_tick}"),
                             "handle_gossip_event",
                             "federation",
-                            self_metrics_tick,
+                            ev_tick,
                         );
                     }
                     // Every gossiped event-log message is an append-only op the

@@ -94,6 +94,65 @@ pub struct ResourceSetDetail {
     pub defaults_tombstoned: Vec<String>,
 }
 
+/// Is a set's reconcile plan non-empty (something to adopt or prune)? A pure
+/// predicate shared by the list row (counts) and the detail view (csv lists)
+/// so the "reconciling..." indicator is derived, never hand-toggled.
+#[must_use]
+pub fn is_reconciling(adopt: usize, prune: usize) -> bool {
+    adopt > 0 || prune > 0
+}
+
+/// Framework-agnostic driver for the "Refresh" button + optional interval
+/// poll ("watch"). The actual HTTP fetch is injected as a closure so this is
+/// host-testable without wasm/yew: a manual `refresh()` always re-fetches;
+/// `on_tick()` (driven by a `setInterval` callback in the Yew wiring) only
+/// re-fetches while polling is enabled, so toggling watch on/off is provably
+/// what gates the interval-driven re-fetch.
+#[derive(Debug, Default)]
+pub struct RefreshDriver {
+    poll_enabled: bool,
+    fetch_count: usize,
+}
+
+impl RefreshDriver {
+    /// A fresh driver with polling off and no fetches recorded yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the interval poll ("watch") is currently enabled.
+    #[must_use]
+    pub fn poll_enabled(&self) -> bool {
+        self.poll_enabled
+    }
+
+    /// Enable/disable the interval poll.
+    pub fn set_poll_enabled(&mut self, enabled: bool) {
+        self.poll_enabled = enabled;
+    }
+
+    /// How many times `fetch` has actually been invoked so far.
+    #[must_use]
+    pub fn fetch_count(&self) -> usize {
+        self.fetch_count
+    }
+
+    /// Manual refresh: always drives a re-fetch.
+    pub fn refresh(&mut self, mut fetch: impl FnMut()) {
+        self.fetch_count += 1;
+        fetch();
+    }
+
+    /// One interval tick: re-fetches only while polling is enabled.
+    pub fn on_tick(&mut self, mut fetch: impl FnMut()) {
+        if self.poll_enabled {
+            self.fetch_count += 1;
+            fetch();
+        }
+    }
+}
+
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -164,79 +223,22 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
     d
 }
 
-/// One prior revision of a resource, parsed from a `REVISION <i> EVENT <cid>
-/// SIGNER <s> HASH <h> IMAGE <img>` line of `GET /portal/resource/history`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RevisionRow {
-    /// The positional index (0 = oldest revision).
-    pub index: usize,
-    /// The authorizing event CID (a rollback re-applies this exact revision).
-    pub event_cid: String,
-    /// The subject that signed (authorized) the revision.
-    pub signer: String,
-    /// The content-addressed manifest hash for the revision.
-    pub hash: String,
-    /// The revision's spec `image` (`-` when the manifest declares none).
-    pub image: String,
-}
-
-/// The parsed change timeline of one resource: its `Kind/name` reference and
-/// its revisions (oldest first), from `GET /portal/resource/history`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RevisionHistory {
-    /// The `Kind/name` reference the timeline belongs to.
-    pub reference: String,
-    /// The prior revisions of the resource, oldest first.
-    pub revisions: Vec<RevisionRow>,
-}
-
-/// Parse the `GET /portal/resource/history` body: a `HISTORY <kind>/<name>
-/// COUNT <n>` header + one `REVISION <i> EVENT <cid> SIGNER <s> HASH <h> IMAGE
-/// <img>` line per prior apply. Unknown lines are ignored.
-#[must_use]
-pub fn parse_history(body: &str) -> RevisionHistory {
-    let mut h = RevisionHistory::default();
-    for line in body.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("HISTORY ") {
-            h.reference = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string();
-        } else if let Some(rest) = line.strip_prefix("REVISION ") {
-            let toks: Vec<&str> = rest.split_whitespace().collect();
-            // `<i> EVENT <cid> SIGNER <s> HASH <h> IMAGE <img>`
-            if toks.len() >= 9
-                && toks[1] == "EVENT"
-                && toks[3] == "SIGNER"
-                && toks[5] == "HASH"
-                && toks[7] == "IMAGE"
-            {
-                h.revisions.push(RevisionRow {
-                    index: toks[0].parse().unwrap_or(0),
-                    event_cid: toks[2].to_string(),
-                    signer: toks[4].to_string(),
-                    hash: toks[6].to_string(),
-                    image: toks[8].to_string(),
-                });
-            }
-        }
-    }
-    h
-}
-
 #[cfg(feature = "yew")]
 pub use yew_impl::ResourceSetsConsole;
+
 #[cfg(feature = "yew")]
 mod yew_impl {
-    use super::{parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
-    use super::{parse_history, RevisionHistory};
+    use super::{is_reconciling, parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
     use crate::auth::use_auth;
-    use crate::portal::{body_lines, get_url, http};
+    use crate::portal::{get_url, http};
     use crate::primitives::{Badge, Graph, GraphEdge, Tone};
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
+
+    /// How often the optional interval poll re-fetches, in milliseconds.
+    const WATCH_INTERVAL_MS: i32 = 5000;
 
     fn sync_tone(sync: &str) -> Tone {
         if sync.eq_ignore_ascii_case("Synced") {
@@ -246,162 +248,17 @@ mod yew_impl {
         }
     }
 
-    /// The **Revision history + rollback** panel: load a workload's change
-    /// timeline from `GET /portal/resource/history` (each row's authorizing
-    /// event CID + signer), and roll a resource back to a prior revision via
-    /// `POST /portal/resource/rollback` — a re-apply of that event's manifest
-    /// gated by the SAME dry-run + diff preview (`GET /portal/resource/dry-run`)
-    /// as any other apply. On rollback the history reloads so the new head is
-    /// visible.
-    #[function_component(RevisionHistoryPanel)]
-    pub fn revision_history_panel() -> Html {
-        let auth = use_auth();
-        let name = use_state(String::new);
-        let history = use_state(|| None::<RevisionHistory>);
-        let preview = use_state(String::new);
-
-        let on_name = {
-            let name = name.clone();
-            Callback::from(move |e: InputEvent| name.set(crate::portal::input_value(&e)))
-        };
-
-        let load = {
-            let (auth, name, history) = (auth.clone(), name.clone(), history.clone());
-            Callback::from(move |_: MouseEvent| {
-                if let (Some(token), n) = (auth.token.clone(), (*name).clone()) {
-                    if n.is_empty() {
-                        return;
-                    }
-                    let history = history.clone();
-                    let url = get_url(
-                        "/portal/resource/history",
-                        &token,
-                        &[("kind", "Workload"), ("name", &n)],
-                    );
-                    spawn_local(async move {
-                        if let Ok(r) = http("GET", &url, None).await {
-                            if r.ok() {
-                                history.set(Some(parse_history(&r.body)));
-                            } else {
-                                history.set(Some(RevisionHistory::default()));
-                            }
-                        }
-                    });
-                }
-            })
-        };
-
-        let rollback = {
-            let (auth, name, history, preview) =
-                (auth.clone(), name.clone(), history.clone(), preview.clone());
-            Callback::from(move |event_cid: String| {
-                if let (Some(token), n) = (auth.token.clone(), (*name).clone()) {
-                    if n.is_empty() {
-                        return;
-                    }
-                    let (history, preview) = (history.clone(), preview.clone());
-                    spawn_local(async move {
-                        // Gate the rollback on the SAME dry-run + diff preview
-                        // any apply uses: predict the decider decision first.
-                        let dry = get_url("/portal/resource/dry-run", &token, &[]);
-                        let predicted = match http("GET", &dry, None).await {
-                            Ok(r) if r.ok() => r.body,
-                            _ => String::new(),
-                        };
-                        preview.set(predicted.clone());
-                        if !predicted.contains("ALLOW") {
-                            return;
-                        }
-                        let body = body_lines(&[&token, &n, &event_cid]);
-                        if let Ok(r) = http("POST", "/portal/resource/rollback", Some(&body)).await {
-                            if r.ok() {
-                                // Reload the timeline so the rolled-back head shows.
-                                let url = get_url(
-                                    "/portal/resource/history",
-                                    &token,
-                                    &[("kind", "Workload"), ("name", &n)],
-                                );
-                                if let Ok(h) = http("GET", &url, None).await {
-                                    if h.ok() {
-                                        history.set(Some(parse_history(&h.body)));
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            })
-        };
-
-        let rows: Html = match &*history {
-            None => html! { <p class="ds-muted">{ "Enter a workload name and load its revision history." }</p> },
-            Some(h) if h.revisions.is_empty() => {
-                html! { <p class="ds-empty">{ "No prior revisions for that resource." }</p> }
+    /// Render a last-observed wall-clock instant (JS millis since epoch) as a
+    /// locale timestamp string, or an em-dash before the first fetch lands.
+    fn human_time(millis: Option<f64>) -> String {
+        match millis {
+            Some(m) => {
+                let d = js_sys::Date::new(&JsValue::from_f64(m));
+                d.to_locale_string("en-US", &JsValue::UNDEFINED)
+                    .as_string()
+                    .unwrap_or_default()
             }
-            Some(h) => {
-                let rows: Html = h
-                    .revisions
-                    .iter()
-                    .rev()
-                    .map(|rev| {
-                        let cid = rev.event_cid.clone();
-                        let do_rollback = {
-                            let (rollback, cid) = (rollback.clone(), cid.clone());
-                            Callback::from(move |_: MouseEvent| rollback.emit(cid.clone()))
-                        };
-                        html! {
-                            <tr>
-                                <td>{ rev.index }</td>
-                                <td class="mono">{ rev.event_cid.clone() }</td>
-                                <td class="mono">{ rev.signer.clone() }</td>
-                                <td class="mono">{ rev.image.clone() }</td>
-                                <td>
-                                    <button class="ds-btn" onclick={do_rollback}>{ "Roll back" }</button>
-                                </td>
-                            </tr>
-                        }
-                    })
-                    .collect();
-                html! {
-                    <table class="ds-table">
-                        <thead>
-                            <tr>
-                                <th>{ "Rev" }</th><th>{ "Event CID" }</th>
-                                <th>{ "Signer" }</th><th>{ "Image" }</th><th>{ "" }</th>
-                            </tr>
-                        </thead>
-                        <tbody>{ rows }</tbody>
-                    </table>
-                }
-            }
-        };
-
-        let preview_view = if preview.is_empty() {
-            html! {}
-        } else {
-            html! { <p class="ds-muted">{ format!("Dry-run: {}", *preview) }</p> }
-        };
-
-        html! {
-            <section class="ds-panel" id="revision-history">
-                <header class="ds-panel__head">
-                    <h3>{ "Revision history + rollback" }</h3>
-                </header>
-                <p class="ds-muted">
-                    { "Each signed change records its authorizing event CID + signer. Rollback re-applies a prior revision's manifest, gated by the same dry-run + diff preview as any apply." }
-                </p>
-                <div class="ds-field">
-                    <input
-                        class="ds-input"
-                        placeholder="workload name"
-                        value={(*name).clone()}
-                        oninput={on_name}
-                    />
-                    <button class="ds-btn" onclick={load}>{ "Load history" }</button>
-                </div>
-                { preview_view }
-                { rows }
-            </section>
+            None => "—".to_owned(),
         }
     }
 
@@ -413,32 +270,48 @@ mod yew_impl {
         let sets = use_state(Vec::<ResourceSetRow>::new);
         let selected = use_state(|| None::<String>);
         let detail = use_state(|| None::<ResourceSetDetail>);
+        // Optional interval poll ("watch"): off by default so the console
+        // never re-fetches unless the operator explicitly opts in.
+        let watch = use_state(|| false);
+        // Bumped once per manual refresh or interval tick to re-trigger the
+        // fetch effects below (yew's `use_effect_with` re-runs only when its
+        // dependency changes).
+        let refresh_tick = use_state(|| 0u32);
+        // Last-observed wall-clock instant (JS millis) of the most recent
+        // successful sets-list fetch.
+        let last_observed = use_state(|| None::<f64>);
 
-        // Load the set list on mount / token change.
+        // Load the set list on mount / token change / manual refresh /
+        // interval tick.
         {
-            let (auth, sets) = (auth.clone(), sets.clone());
-            use_effect_with(auth.token.clone(), move |token| {
-                if let Some(token) = token.clone() {
-                    let sets = sets.clone();
-                    let url = get_url("/portal/resource/sets", &token, &[]);
-                    spawn_local(async move {
-                        if let Ok(r) = http("GET", &url, None).await {
-                            if r.ok() {
-                                sets.set(parse_set_list(&r.body));
+            let (auth, sets, last_observed) = (auth.clone(), sets.clone(), last_observed.clone());
+            use_effect_with(
+                (auth.token.clone(), *refresh_tick),
+                move |(token, _tick)| {
+                    if let Some(token) = token.clone() {
+                        let (sets, last_observed) = (sets.clone(), last_observed.clone());
+                        let url = get_url("/portal/resource/sets", &token, &[]);
+                        spawn_local(async move {
+                            if let Ok(r) = http("GET", &url, None).await {
+                                if r.ok() {
+                                    sets.set(parse_set_list(&r.body));
+                                    last_observed.set(Some(js_sys::Date::now()));
+                                }
                             }
-                        }
-                    });
-                }
-                || ()
-            });
+                        });
+                    }
+                    || ()
+                },
+            );
         }
 
-        // Load the selected set's detail on selection / token change.
+        // Load the selected set's detail on selection / token change /
+        // manual refresh / interval tick.
         {
             let (auth, selected, detail) = (auth.clone(), selected.clone(), detail.clone());
             use_effect_with(
-                ((*selected).clone(), auth.token.clone()),
-                move |(sel, token)| {
+                ((*selected).clone(), auth.token.clone(), *refresh_tick),
+                move |(sel, token, _tick)| {
                     if let (Some(name), Some(token)) = (sel.clone(), token.clone()) {
                         let detail = detail.clone();
                         let url = get_url("/portal/resource/set", &token, &[("name", &name)]);
@@ -453,6 +326,48 @@ mod yew_impl {
                     || ()
                 },
             );
+        }
+
+        let refresh_click = {
+            let refresh_tick = refresh_tick.clone();
+            Callback::from(move |_: MouseEvent| refresh_tick.set(*refresh_tick + 1))
+        };
+        let toggle_watch = {
+            let watch = watch.clone();
+            Callback::from(move |_: MouseEvent| watch.set(!*watch))
+        };
+
+        // The optional interval poll: while `watch` is on, tick `refresh_tick`
+        // every `WATCH_INTERVAL_MS`, which re-runs the fetch effects above —
+        // a real re-fetch call site, not a static render.
+        {
+            let (watch, refresh_tick) = (watch.clone(), refresh_tick.clone());
+            use_effect_with(*watch, move |enabled| {
+                let mut handle: Option<(i32, Closure<dyn FnMut()>)> = None;
+                if *enabled {
+                    if let Some(window) = web_sys::window() {
+                        let refresh_tick = refresh_tick.clone();
+                        let cb = Closure::<dyn FnMut()>::new(move || {
+                            refresh_tick.set(*refresh_tick + 1);
+                        });
+                        if let Ok(id) = window
+                            .set_interval_with_callback_and_timeout_and_arguments_0(
+                                cb.as_ref().unchecked_ref(),
+                                WATCH_INTERVAL_MS,
+                            )
+                        {
+                            handle = Some((id, cb));
+                        }
+                    }
+                }
+                move || {
+                    if let Some((id, _cb)) = handle {
+                        if let Some(window) = web_sys::window() {
+                            window.clear_interval_with_handle(id);
+                        }
+                    }
+                }
+            });
         }
 
         let rows: Html = sets
@@ -473,6 +388,11 @@ mod yew_impl {
                 } else {
                     html! { <span class="ds-muted">{ "—" }</span> }
                 };
+                let reconciling_cell = if is_reconciling(s.adopt, s.prune) {
+                    html! { <Badge label={"reconciling…"} tone={Tone::Warn} /> }
+                } else {
+                    html! { <span class="ds-muted">{ "—" }</span> }
+                };
                 html! {
                     <tr class={class} onclick={select} style="cursor:pointer">
                         <td class="mono">{ name }</td>
@@ -482,6 +402,7 @@ mod yew_impl {
                         <td>{ s.adopt }</td>
                         <td>{ s.prune }</td>
                         <td>{ defaults_cell }</td>
+                        <td>{ reconciling_cell }</td>
                     </tr>
                 }
             })
@@ -528,6 +449,11 @@ mod yew_impl {
                             { for d.prune.iter().map(|r| html!{ <li>{ format!("prune {r}") }</li> }) }
                         </ul>
                     }
+                };
+                let reconciling_badge = if is_reconciling(d.adopt.len(), d.prune.len()) {
+                    html! { <Badge label={"reconciling…"} tone={Tone::Warn} /> }
+                } else {
+                    html! {}
                 };
                 // Shipped-defaults advisory: a SEPARATE axis from sync. Net-new
                 // defaults are an additive offer (adopt via `pillar render
@@ -581,7 +507,11 @@ mod yew_impl {
                             <div class="ds-badges">
                                 <Badge label={d.health.clone()} />
                                 <Badge label={d.sync.clone()} tone={sync_tone(&d.sync)} />
+                                { reconciling_badge }
                             </div>
+                            <button type="button" id="resource-set-detail-refresh" onclick={refresh_click.clone()}>
+                                { "Refresh" }
+                            </button>
                         </header>
                         if !d.description.is_empty() {
                             <p class="ds-muted">{ d.description.clone() }</p>
@@ -606,18 +536,29 @@ mod yew_impl {
                 <p class="ds-muted">
                     { "Declarative resource groups (ArgoCD-Application analog). The Default set owns the default retention policies." }
                 </p>
+                <div class="ds-toolbar">
+                    <button type="button" id="resource-sets-refresh" onclick={refresh_click.clone()}>
+                        { "Refresh" }
+                    </button>
+                    <button type="button" id="resource-sets-watch"
+                        class={if *watch {"active"} else {""}} onclick={toggle_watch}>
+                        { if *watch { "Watch: on" } else { "Watch: off" } }
+                    </button>
+                    <span class="ds-muted" id="resource-sets-last-observed">
+                        { format!("Last observed: {}", human_time(*last_observed)) }
+                    </span>
+                </div>
                 <table class="ds-table">
                     <thead>
                         <tr>
                             <th>{ "Name" }</th><th>{ "Health" }</th><th>{ "Sync" }</th>
                             <th>{ "Members" }</th><th>{ "Adopt" }</th><th>{ "Prune" }</th>
-                            <th>{ "Defaults" }</th>
+                            <th>{ "Defaults" }</th><th>{ "Reconciling" }</th>
                         </tr>
                     </thead>
                     <tbody>{ rows }</tbody>
                 </table>
                 { detail_view }
-                <RevisionHistoryPanel />
             </div>
         }
     }
@@ -626,36 +567,6 @@ mod yew_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_the_history_timeline_lines() {
-        let body = "HISTORY Workload/web COUNT 2\n\
-                    REVISION 0 EVENT cid-aaa SIGNER op-subkey-alice HASH h0 IMAGE app:v1\n\
-                    REVISION 1 EVENT cid-bbb SIGNER op-subkey-alice HASH h1 IMAGE app:v2\n\
-                    garbage line";
-        let h = parse_history(body);
-        assert_eq!(h.reference, "Workload/web");
-        assert_eq!(h.revisions.len(), 2);
-        assert_eq!(
-            h.revisions[0],
-            RevisionRow {
-                index: 0,
-                event_cid: "cid-aaa".into(),
-                signer: "op-subkey-alice".into(),
-                hash: "h0".into(),
-                image: "app:v1".into(),
-            }
-        );
-        assert_eq!(h.revisions[1].event_cid, "cid-bbb");
-        assert_eq!(h.revisions[1].image, "app:v2");
-    }
-
-    #[test]
-    fn history_with_no_revisions_parses_empty() {
-        let h = parse_history("HISTORY Workload/absent COUNT 0\n");
-        assert_eq!(h.reference, "Workload/absent");
-        assert!(h.revisions.is_empty());
-    }
 
     #[test]
     fn parses_the_set_list_lines() {
@@ -759,5 +670,45 @@ mod tests {
         // The advisory is a SEPARATE axis: the set is still Synced/Healthy.
         assert_eq!(d.sync, "Synced");
         assert_eq!(d.health, "Healthy");
+    }
+
+    #[test]
+    fn reconciling_indicator_is_derived_from_a_non_empty_plan() {
+        assert!(!is_reconciling(0, 0), "synced set is not reconciling");
+        assert!(is_reconciling(1, 0), "pending adopt is reconciling");
+        assert!(is_reconciling(0, 1), "pending prune is reconciling");
+        assert!(is_reconciling(2, 3), "both adopt and prune is reconciling");
+    }
+
+    #[test]
+    fn manual_refresh_always_drives_a_real_re_fetch_call() {
+        let mut driver = RefreshDriver::new();
+        let mut calls = 0;
+        driver.refresh(|| calls += 1);
+        driver.refresh(|| calls += 1);
+        assert_eq!(calls, 2);
+        assert_eq!(driver.fetch_count(), 2);
+    }
+
+    #[test]
+    fn interval_tick_only_re_fetches_while_watch_is_enabled() {
+        let mut driver = RefreshDriver::new();
+        let mut calls = 0;
+
+        // Watch off by default: an interval tick is a no-op, not a static
+        // render — proving the tick itself is what's gated, not the fetch
+        // wiring.
+        driver.on_tick(|| calls += 1);
+        assert_eq!(calls, 0);
+        assert!(!driver.poll_enabled());
+
+        driver.set_poll_enabled(true);
+        driver.on_tick(|| calls += 1);
+        driver.on_tick(|| calls += 1);
+        assert_eq!(calls, 2, "each tick while enabled drives its own fetch");
+
+        driver.set_poll_enabled(false);
+        driver.on_tick(|| calls += 1);
+        assert_eq!(calls, 2, "disabling watch stops the interval from fetching");
     }
 }

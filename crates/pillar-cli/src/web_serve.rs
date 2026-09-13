@@ -173,7 +173,9 @@ use pillar_web::{authorize_nonloopback_signing_action, bind_web};
 use pillar_wot_authority::{FencedActor, WotAuthority};
 
 use crate::observability_ui::ObservabilityBuilders;
-use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
+use crate::resource::{
+    is_tombstone, Address, ResourceError, ResourcePlane, ResourceReadError, Selector,
+};
 use crate::resourceset::{
     build_graph, collect_resourcesets, defaults_advisory_for_view, member_origin, member_statuses,
     owned_live, plan_reconcile, roll_up_health, MemberHealth, MemberRef, DEFAULT_RESOURCE_SET,
@@ -3178,76 +3180,84 @@ impl WebAuthContext {
             .describe(&self.resource_api, kind, name)
     }
 
-    /// `history <kind>/<name>` (VIEW): the per-resource change timeline drawn
-    /// from the append-only event log — one `REVISION <i> EVENT <cid> SIGNER
-    /// <s> HASH <h> IMAGE <img>` line per prior apply (OLDEST first, index 0),
-    /// preceded by a `HISTORY <kind>/<name> COUNT <n>` header. Each signed
-    /// change already records its authorizing event CID + signer; this simply
-    /// surfaces every one of them, not just the latest-wins record `describe`
-    /// shows. `None` when no manifest for `kind/name` was ever applied. Signs
-    /// nothing — a pure read over the log.
+    /// The REVISION HISTORY (VIEW) of one resource: every prior applied
+    /// manifest for `kind/name`, oldest first, one
+    /// `REVISION <n> EVENT <cid> SIGNER <signer> MANIFEST <content-hash>` line
+    /// each, plus an `EVENTS <count>` trailer proving the view emitted nothing.
+    /// `<n>` is the 0-based revision ordinal (a stable timeline position — the
+    /// event log carries no wall-clock stamp); the LAST line is the record in
+    /// force. `MANIFEST` is the manifest ref a rollback re-applies. `None`
+    /// when the resource has no applied manifest at all. Signs nothing.
     #[must_use]
     pub fn resource_history(&self, kind: &str, name: &str) -> Option<String> {
-        let key = crate::ResourceKey {
-            api_version: self.resource_api.clone(),
-            kind: kind.to_owned(),
-            name: name.to_owned(),
-        };
-        let revisions = self.resource_platform.history(&key);
+        let revisions = self
+            .resource_platform
+            .history(&self.resource_api, kind, name);
         if revisions.is_empty() {
             return None;
         }
         let mut out = String::new();
-        out.push_str(&format!(
-            "HISTORY {kind}/{name} COUNT {}\n",
-            revisions.len()
-        ));
-        for (i, rev) in revisions.iter().enumerate() {
+        for (ordinal, rev) in revisions.iter().enumerate() {
             out.push_str(&format!(
-                "REVISION {i} EVENT {} SIGNER {} HASH {} IMAGE {}\n",
-                rev.event_cid,
-                rev.signer,
-                rev.content_hash,
-                rev.image.as_deref().unwrap_or("-"),
+                "REVISION {ordinal} EVENT {} SIGNER {} MANIFEST {}\n",
+                rev.event.0, rev.signer, rev.content_hash,
             ));
         }
+        out.push_str(&format!("EVENTS {}\n", self.resource_event_count()));
         Some(out)
     }
 
-    /// `rollback <name> --to-event <cid>` (ACT): re-apply a PRIOR revision's
-    /// exact manifest (resolved from the event log by its authorizing event
-    /// CID) as ONE fresh signed apply through the SAME decider-gated
-    /// [`ResourcePlane::apply`] path every other resource act rides — so a
-    /// rollback is authorized (and dry-run-predicted) identically to a normal
-    /// apply, never a privileged side-door. The prior manifest MUST exist for
-    /// `WORKLOAD_KIND`/`name` at `event_cid`, else [`ResourceError::NotFound`].
-    /// Returns the new event CID on success.
+    /// ROLLBACK (ACT): re-apply a PRIOR revision's sealed manifest — named by
+    /// its `MANIFEST <content-hash>` ref from [`Self::resource_history`] —
+    /// through the EXACT SAME signed, dry-run-gated act path
+    /// ([`Self::resource_apply`]) as any other workload change. A rollback is
+    /// therefore not a privileged rewind: it emits ONE new decider-authorized
+    /// signed event whose body is byte-identical to the chosen prior revision,
+    /// and it CANNOT issue unless the decider would ALLOW that actor the act
+    /// (an unauthorized rollback appends nothing, exactly like an unauthorized
+    /// apply). Returns the new event CID on success.
+    ///
+    /// # Errors
+    /// [`ResourceError`] if the content-hash names no stored revision of
+    /// `kind/name`, or the underlying signed apply is refused (unauthorized)
+    /// or fails.
     pub fn resource_rollback(
         &mut self,
         actor: &NodeId,
+        kind: &str,
         name: &str,
-        event_cid: &str,
+        manifest_ref: &str,
     ) -> Result<String, ResourceError> {
-        let key = crate::ResourceKey {
-            api_version: self.resource_api.clone(),
-            kind: WORKLOAD_KIND.to_owned(),
-            name: name.to_owned(),
+        // Resolve the requested revision AMONG THIS resource's own history —
+        // a rollback may only re-apply a prior manifest of the SAME kind/name,
+        // never an arbitrary stored body.
+        let revisions = self
+            .resource_platform
+            .history(&self.resource_api, kind, name);
+        let Some(rev) = revisions
+            .iter()
+            .find(|r| r.content_hash.to_string() == manifest_ref)
+        else {
+            return Err(ResourceError::NotFound(Address::new(kind, name)));
         };
-        let Some(body) = self.resource_platform.manifest_at_event(&key, event_cid) else {
-            return Err(ResourceError::NotFound(Address::new(WORKLOAD_KIND, name)));
+        let Some(body) = self
+            .resource_platform
+            .manifest_by_content_hash(&rev.content_hash)
+        else {
+            return Err(ResourceError::NotFound(Address::new(kind, name)));
         };
-        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
-        let applied = plane
-            .apply(actor, RESOURCE_CAP, body)
-            .map(|applied| format!("{}", applied.event.0))?;
-        self.drive_reconcile(name);
-        self.record(&PortalOp::ResourceApply {
-            actor: actor.to_string(),
-            name: name.to_owned(),
-            image: format!("rollback@{event_cid}"),
-            replicas: 1,
-        });
-        Ok(applied)
+        // Extract the prior revision's declared fields and re-apply through the
+        // signed act path (which itself runs the dry-run decider and drives the
+        // reconcile). This is a Workload rollback: image + replicas.
+        let image = match body.spec.get("image") {
+            Some(CrdValue::String(s)) => s.clone(),
+            _ => "app:v1".to_owned(),
+        };
+        let replicas = match body.spec.get("replicas") {
+            Some(CrdValue::Integer(n)) => *n,
+            _ => 1,
+        };
+        self.resource_apply(actor, name, &image, replicas)
     }
 
     /// Every ResourceSet the resource plane knows, one status line each:
@@ -3469,7 +3479,108 @@ impl WebAuthContext {
                     &Address::new(kind.clone(), name.clone()),
                 )
                 .map(|applied| applied.event.0.to_string()),
+            pillar_ops::ResourceOp::Get { .. } | pillar_ops::ResourceOp::Describe { .. } => {
+                // Reads are VIEWS: they never reach the write plane. The
+                // resource-op tier dispatches them to `resource_op_get` /
+                // `resource_op_describe` BEFORE this write path, so a read
+                // arriving here is a caller bug, not a mutation to authorize.
+                Err(ResourceError::UnroutableRead)
+            }
         }
+    }
+
+    /// Serve a resource-plane VIEW over the resource-op tier (`pillar get`):
+    /// emits NO event. `name` `None` lists every object of `kind` as a
+    /// `---`-separated CRD-YAML stream; `Some` renders that one object's CRD
+    /// YAML. Member-gated fail-closed: the authenticated signer must be
+    /// reachable in this cell's WoT authority graph — the same bar the web
+    /// read tier's session enforces — or the read is refused.
+    ///
+    /// # Errors
+    /// [`ResourceReadError::Unauthorized`] for an unrecognized signer;
+    /// [`ResourceReadError::NotFound`] when a named object does not exist;
+    /// [`ResourceReadError::Serialize`] if a CRD fails to serialize to YAML.
+    pub fn resource_op_get(
+        &self,
+        actor: &NodeId,
+        kind: &str,
+        name: Option<&str>,
+    ) -> Result<String, ResourceReadError> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err(ResourceReadError::Unauthorized);
+        }
+        let mut docs = Vec::new();
+        for (key, env) in self.resource_platform.view() {
+            if key.api_version != self.resource_api || key.kind != kind {
+                continue;
+            }
+            // Skip tombstones: a `delete` leaves a soft-delete marker
+            // (`pillar.dev/deleted=true`) in the view rather than removing the
+            // object. `get` shows only LIVE resources, exactly as `kubectl get`
+            // never lists a deleted object.
+            if is_tombstone(env.body()) {
+                continue;
+            }
+            if let Some(want) = name {
+                if key.name != want {
+                    continue;
+                }
+            }
+            let yaml = env
+                .body()
+                .to_yaml()
+                .map_err(|e| ResourceReadError::Serialize(e.to_string()))?;
+            docs.push(yaml);
+        }
+        if name.is_some() && docs.is_empty() {
+            return Err(ResourceReadError::NotFound {
+                kind: kind.to_owned(),
+                name: name.unwrap_or_default().to_owned(),
+            });
+        }
+        // Each `to_yaml()` document already ends in a newline; join with a
+        // `---` line so the result is a valid multi-document YAML stream that
+        // `pillar apply -f` / `Crd::from_documents` round-trips.
+        Ok(docs.join("---\n"))
+    }
+
+    /// Serve a single resource's DESCRIBE over the resource-op tier
+    /// (`pillar describe`): the full detail INCLUDING provenance (the signer,
+    /// authorizing capability, and event CID of the record in force). A VIEW:
+    /// emits no event; member-gated exactly like [`Self::resource_op_get`].
+    ///
+    /// # Errors
+    /// [`ResourceReadError::Unauthorized`] for an unrecognized signer;
+    /// [`ResourceReadError::NotFound`] when the object does not exist.
+    pub fn resource_op_describe(
+        &self,
+        actor: &NodeId,
+        kind: &str,
+        name: &str,
+    ) -> Result<String, ResourceReadError> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err(ResourceReadError::Unauthorized);
+        }
+        // A tombstoned object is not live — describe treats it as absent, so a
+        // deleted resource 404s rather than rendering stale provenance.
+        let live = self.resource_platform.view().into_iter().any(|(k, env)| {
+            k.api_version == self.resource_api
+                && k.kind == kind
+                && k.name == name
+                && !is_tombstone(env.body())
+        });
+        if !live {
+            return Err(ResourceReadError::NotFound {
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            });
+        }
+        self.resource_platform
+            .describe(&self.resource_api, kind, name)
+            .ok_or_else(|| ResourceReadError::NotFound {
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            })
     }
 
     /// Admit `subject` as a WoT-authoritative resource-op signer at full
@@ -5361,10 +5472,11 @@ fn dispatch_resource_describe(ctx: &WebAuthContext, request: &HttpRequest) -> Ht
 }
 
 /// `history`: `GET /portal/resource/history?token=<s>&kind=<k>&name=<n>`.
-/// Requires an admitted session; renders the per-resource change timeline
-/// (`HISTORY … COUNT n` header + one `REVISION i EVENT <cid> SIGNER <s> HASH
-/// <h> IMAGE <img>` line per prior apply, oldest first) from the event log.
-/// Signs nothing. 404 when no manifest for `kind/name` was ever applied.
+/// Requires an admitted session; renders the resource's full REVISION HISTORY
+/// — one `REVISION <n> EVENT <cid> SIGNER <signer> MANIFEST <content-hash>`
+/// line per prior applied manifest (oldest first, the last in force), plus an
+/// `EVENTS <count>` trailer proving the view emitted nothing. A VIEW: signs
+/// nothing. 404 when the resource has no applied manifest.
 fn dispatch_resource_history(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let token = query_value(&request.path, "token").unwrap_or("");
     if ctx.login_session_for(token).is_none() {
@@ -5380,32 +5492,38 @@ fn dispatch_resource_history(ctx: &WebAuthContext, request: &HttpRequest) -> Htt
     }
 }
 
-/// `rollback`: `POST /portal/resource/rollback` with body `<token>\n<name>\n
-/// <event-cid>`. Re-applies the PRIOR revision named by `<event-cid>` through
-/// the SAME decider-gated signed apply path every act rides — so a rollback
-/// is authorized and dry-run-predicted identically to any other apply, and an
-/// unauthorized rollback appends nothing (403). The response carries `EVENT
-/// <cid>` and the new event count so a caller can assert exactly one event.
+/// ROLLBACK (ACT): `POST /portal/resource/rollback` with body
+/// `<token>\n<name>\n<manifest-ref>[\n<kind>]`. Re-applies the prior revision
+/// named by its `MANIFEST <content-hash>` ref (from
+/// [`dispatch_resource_history`]) through the SAME signed, dry-run-gated act
+/// path as `apply` — so a rollback CANNOT issue unless the SAME decider would
+/// ALLOW that actor the act (the predicted dry-run decision is computed and
+/// asserted equal to the enforced one, exactly like [`dispatch_resource_act`]).
+/// On success carries `EVENT <cid>` + the new event count; an unauthorized
+/// rollback appends nothing (403).
 fn dispatch_resource_rollback(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
     let mut lines = request.body.lines();
     let token = lines.next().unwrap_or("").trim();
     let name = lines.next().unwrap_or("").trim().to_owned();
-    let event_cid = lines.next().unwrap_or("").trim().to_owned();
+    let manifest_ref = lines.next().unwrap_or("").trim().to_owned();
+    let kind = lines.next().unwrap_or("").trim();
+    let kind = if kind.is_empty() { WORKLOAD_KIND } else { kind };
     let Some(session) = ctx.login_session_for(token).cloned() else {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
     if name.is_empty() {
         return text_response(400, "Bad Request", "MISSING name".to_owned());
     }
-    if event_cid.is_empty() {
-        return text_response(400, "Bad Request", "MISSING event-cid".to_owned());
+    if manifest_ref.is_empty() {
+        return text_response(400, "Bad Request", "MISSING manifest".to_owned());
     }
     let actor = session.subject.clone();
     // The predicted decision (dry-run) MUST equal the enforced one — same
-    // decider, computed before acting and asserted after — so a rollback can
-    // never issue without a preceding ALLOW dry-run of that exact act.
+    // decider, computed before the act and asserted after (mirrors
+    // `dispatch_resource_act`): a rollback is a signed act, never a privileged
+    // rewind, so it is gated by the identical ALLOW/DENY the console previews.
     let predicted = ctx.resource_dry_run(&actor);
-    match ctx.resource_rollback(&actor, &name, &event_cid) {
+    match ctx.resource_rollback(&actor, kind, &name, &manifest_ref) {
         Ok(cid) => {
             debug_assert!(predicted, "an authorized rollback must have predicted ALLOW");
             text_response(
@@ -9237,6 +9355,12 @@ mod tests {
         assert_eq!(ctx.bootstrap().initial_user(), Some("spencer"));
     }
 
+    // `PREDICTED ALLOW` -> true, anything else -> false. The console's own
+    // dry-run gate reads this same body.
+    fn parse_predicted_allow(body: &str) -> bool {
+        body.trim() == "PREDICTED ALLOW"
+    }
+
     // Log alice in through the real HTTP handshake and return her session token.
     fn login_alice(ctx: &mut WebAuthContext) -> String {
         let nonce = get(ctx, "/nonce");
@@ -11245,6 +11369,232 @@ mod tests {
         assert_eq!(ctx.resource_event_count(), 4);
     }
 
+    // console-resourceset-revision-history-rollback: the `/portal/resource/history`
+    // read line's exact format is PINNED here (a real registered, reachable
+    // read whose body a reviewer can re-derive). A history VIEW emits NO event;
+    // each prior applied manifest is one
+    // `REVISION <n> EVENT <cid> SIGNER <signer> MANIFEST <content-hash>` line,
+    // oldest first, the last in force, closed by an `EVENTS <count>` trailer.
+    #[test]
+    fn resource_history_lists_prior_revisions_and_pins_the_line_format() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Unauthenticated history is refused (401), exactly like every read.
+        assert_eq!(
+            get(&mut ctx, "/portal/resource/history?token=nope&name=web").status,
+            401
+        );
+        // A resource with no applied manifest yet -> 404 (never a fabricated
+        // empty timeline).
+        assert_eq!(
+            get(
+                &mut ctx,
+                &format!("/portal/resource/history?token={token}&kind=Workload&name=web")
+            )
+            .status,
+            404
+        );
+
+        // Three signed changes to `web`: apply, edit, scale.
+        for body in [
+            format!("{token}\nweb\napp:v1"),
+            format!("{token}\nweb\napp:v2"),
+        ] {
+            assert_eq!(post(&mut ctx, "/portal/resource/apply", &body).status, 200);
+        }
+        assert_eq!(
+            post(&mut ctx, "/portal/resource/scale", &format!("{token}\nweb\n5")).status,
+            200
+        );
+        let events_after = ctx.resource_event_count();
+
+        let hist = get(
+            &mut ctx,
+            &format!("/portal/resource/history?token={token}&kind=Workload&name=web"),
+        );
+        assert_eq!(hist.status, 200, "got: {}", hist.body);
+        // A history read signs nothing.
+        assert_eq!(ctx.resource_event_count(), events_after);
+
+        let rev_lines: Vec<&str> = hist
+            .body
+            .lines()
+            .filter(|l| l.starts_with("REVISION "))
+            .collect();
+        assert_eq!(rev_lines.len(), 3, "three changes -> three revisions: {}", hist.body);
+        // Pin the EXACT field grammar and ordinal ordering.
+        for (i, line) in rev_lines.iter().enumerate() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(parts[0], "REVISION");
+            assert_eq!(parts[1], i.to_string(), "ordinal is 0-based apply order: {line}");
+            assert_eq!(parts[2], "EVENT");
+            assert!(!parts[3].is_empty(), "EVENT cid present: {line}");
+            assert_eq!(parts[4], "SIGNER");
+            assert!(!parts[5].is_empty(), "SIGNER present: {line}");
+            assert_eq!(parts[6], "MANIFEST");
+            assert!(!parts[7].is_empty(), "MANIFEST content-hash present: {line}");
+            assert_eq!(parts.len(), 8, "no trailing fields: {line}");
+        }
+        assert!(
+            hist.body.contains(&format!("EVENTS {events_after}")),
+            "history closes with the event-count trailer: {}",
+            hist.body
+        );
+    }
+
+    // console-resourceset-revision-history-rollback: a rollback re-applies a
+    // prior revision's sealed manifest through the SAME signed act path as any
+    // apply — it emits exactly ONE new decider-authorized event, and it CANNOT
+    // issue unless the SAME decider would ALLOW that actor (an unauthorized
+    // rollback is refused 403 and appends nothing). This is the host state-
+    // machine test the anti-facade DoD requires.
+    #[test]
+    fn resource_rollback_routes_through_the_signed_act_path_and_is_dry_run_gated() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+
+        // Two revisions: v1 then v2. v1 is the rollback target.
+        assert_eq!(
+            post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1")).status,
+            200
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/resource/edit", &format!("{token}\nweb\napp:v2")).status,
+            200
+        );
+        let hist = get(
+            &mut ctx,
+            &format!("/portal/resource/history?token={token}&kind=Workload&name=web"),
+        );
+        let first = hist
+            .body
+            .lines()
+            .find(|l| l.starts_with("REVISION 0 "))
+            .expect("a first revision");
+        let v1_manifest = first
+            .split_whitespace()
+            .last()
+            .expect("MANIFEST content-hash")
+            .to_owned();
+
+        // For an AUTHORIZED actor the dry-run predicts ALLOW, so the rollback
+        // issues: exactly one new event, and the workload returns to v1's image.
+        assert!(
+            parse_predicted_allow(&get(
+                &mut ctx,
+                &format!("/portal/resource/dry-run?token={token}")
+            )
+            .body),
+            "the authorized actor's dry-run must predict ALLOW"
+        );
+        let before = ctx.resource_event_count();
+        let rolled = post(
+            &mut ctx,
+            "/portal/resource/rollback",
+            &format!("{token}\nweb\n{v1_manifest}\nWorkload"),
+        );
+        assert_eq!(rolled.status, 200, "got: {}", rolled.body);
+        assert!(rolled.body.starts_with("EVENT "), "got: {}", rolled.body);
+        assert_eq!(
+            ctx.resource_event_count(),
+            before + 1,
+            "a rollback is one signed act -> one event"
+        );
+        // The rollback re-applied v1's manifest: describe now shows app:v1.
+        let desc = get(
+            &mut ctx,
+            &format!("/portal/resource/describe?token={token}&kind=Workload&name=web"),
+        );
+        assert!(
+            desc.body.contains("app:v1"),
+            "rollback re-applied the prior revision's manifest: {}",
+            desc.body
+        );
+
+        // A rollback naming an unknown manifest ref is refused (409), no event.
+        let before = ctx.resource_event_count();
+        let bad = post(
+            &mut ctx,
+            "/portal/resource/rollback",
+            &format!("{token}\nweb\ndeadbeef\nWorkload"),
+        );
+        assert_eq!(bad.status, 409, "got: {}", bad.body);
+        assert_eq!(ctx.resource_event_count(), before, "a failed rollback appends nothing");
+    }
+
+    // The dry-run gate the rollback rides: an UNAUTHORIZED session's dry-run
+    // predicts DENY and its rollback is refused 403 without appending anything —
+    // a rollback can never issue on a change the decider would not ALLOW.
+    #[test]
+    fn resource_rollback_cannot_issue_for_an_unauthorized_actor() {
+        // First, an authorized actor seeds two revisions of `web`.
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        assert_eq!(
+            post(&mut ctx, "/portal/resource/apply", &format!("{token}\nweb\napp:v1")).status,
+            200
+        );
+        assert_eq!(
+            post(&mut ctx, "/portal/resource/edit", &format!("{token}\nweb\napp:v2")).status,
+            200
+        );
+        let hist = get(
+            &mut ctx,
+            &format!("/portal/resource/history?token={token}&kind=Workload&name=web"),
+        );
+        let v1_manifest = hist
+            .body
+            .lines()
+            .find(|l| l.starts_with("REVISION 0 "))
+            .and_then(|l| l.split_whitespace().last())
+            .expect("MANIFEST content-hash")
+            .to_owned();
+
+        // A login-only (unauthorized-to-act) session: its dry-run predicts DENY,
+        // and the rollback of that exact manifest is refused, signing nothing.
+        let subkey = NodeSubkey::from("op-subkey-stranger");
+        ctx.admit_subject_login_only(subkey.node_id());
+        ctx.provision_offer(
+            "stranger@pillar",
+            "Stranger",
+            Cid::from("cid-stranger"),
+            subkey.clone(),
+            PASSWORD,
+            SECRET,
+        );
+        let nonce = get(&mut ctx, "/nonce");
+        let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
+        let login = post(
+            &mut ctx,
+            "/login",
+            &format!("stranger@pillar\n{PASSWORD}\n{nonce_id}"),
+        );
+        assert_eq!(login.status, 200, "got: {}", login.body);
+        let stranger = login.session_token.expect("session token");
+
+        // The unauthorized dry-run predicts DENY...
+        assert!(
+            !parse_predicted_allow(
+                &get(&mut ctx, &format!("/portal/resource/dry-run?token={stranger}")).body
+            ),
+            "the unauthorized actor's dry-run must predict DENY"
+        );
+        // ...so the rollback cannot issue.
+        let before = ctx.resource_event_count();
+        let refused = post(
+            &mut ctx,
+            "/portal/resource/rollback",
+            &format!("{stranger}\nweb\n{v1_manifest}\nWorkload"),
+        );
+        assert_eq!(refused.status, 403, "got: {}", refused.body);
+        assert_eq!(
+            ctx.resource_event_count(),
+            before,
+            "an unauthorized rollback appends nothing"
+        );
+    }
+
     // scheduler-apply-admission-registration: a `CronJob` manifest applied
     // through the REAL production admission route (`POST
     // /portal/resource/cronjob/apply`) — NOT the `PILLAR_TEST_CRONJOB` rig
@@ -11504,221 +11854,6 @@ mod tests {
             )
             .status,
             401
-        );
-    }
-
-    // console-resourceset-revision-history-rollback: the per-resource change
-    // timeline is a REAL registered, reachable read line whose format is
-    // pinned here, and rollback re-applies a prior revision's manifest through
-    // the SAME dry-run-gated signed act path any other apply rides.
-    #[test]
-    fn resource_history_lists_prior_revisions_and_rollback_reapplies_a_prior_manifest() {
-        let (mut ctx, _subkey) = provisioned_ctx();
-        let token = login_alice(&mut ctx);
-
-        // Unauthenticated history is refused.
-        assert_eq!(
-            get(
-                &mut ctx,
-                "/portal/resource/history?token=nope&kind=Workload&name=web"
-            )
-            .status,
-            401
-        );
-
-        // Two signed changes to the same resource: apply v1, then edit → v2.
-        let applied = post(
-            &mut ctx,
-            "/portal/resource/apply",
-            &format!("{token}\nweb\napp:v1"),
-        );
-        assert_eq!(applied.status, 200, "got: {}", applied.body);
-        let edited = post(
-            &mut ctx,
-            "/portal/resource/edit",
-            &format!("{token}\nweb\napp:v2"),
-        );
-        assert_eq!(edited.status, 200, "got: {}", edited.body);
-        assert_eq!(ctx.resource_event_count(), 2, "two signed changes");
-
-        // history is a VIEW (signs nothing) and pins the line format: a
-        // `HISTORY <ref> COUNT <n>` header + one `REVISION <i> EVENT <cid>
-        // SIGNER <s> HASH <h> IMAGE <img>` line per prior apply, oldest first.
-        let before = ctx.resource_event_count();
-        let hist = get(
-            &mut ctx,
-            &format!("/portal/resource/history?token={token}&kind=Workload&name=web"),
-        );
-        assert_eq!(hist.status, 200, "got: {}", hist.body);
-        assert_eq!(
-            ctx.resource_event_count(),
-            before,
-            "a history view signs nothing"
-        );
-        let lines: Vec<&str> = hist.body.lines().collect();
-        assert_eq!(
-            lines[0], "HISTORY Workload/web COUNT 2",
-            "pinned header: {}",
-            hist.body
-        );
-        assert!(
-            lines[1].starts_with("REVISION 0 EVENT ")
-                && lines[1].contains(" SIGNER ")
-                && lines[1].contains(" HASH ")
-                && lines[1].contains(" IMAGE app:v1"),
-            "pinned rev 0 line: {}",
-            hist.body
-        );
-        assert!(
-            lines[2].starts_with("REVISION 1 EVENT ")
-                && lines[2].contains(" IMAGE app:v2"),
-            "pinned rev 1 line: {}",
-            hist.body
-        );
-        // The signer of each revision is the admitted portal subject.
-        assert!(
-            lines[1].contains("op-subkey-alice"),
-            "signer provenance: {}",
-            hist.body
-        );
-
-        // Pull the authorizing event CID of the v1 revision (oldest) to roll
-        // back to.
-        let v1_event = lines[1]
-            .split_whitespace()
-            .nth(3)
-            .expect("REVISION 0 EVENT <cid>")
-            .to_owned();
-
-        // A rollback to the v1 revision re-applies through the SAME signed act
-        // path — it emits exactly ONE more signed event, and the live view now
-        // reflects the rolled-back image (app:v1), proving it is a real
-        // re-apply, not a bookkeeping edit.
-        let before = ctx.resource_event_count();
-        let rolled = post(
-            &mut ctx,
-            "/portal/resource/rollback",
-            &format!("{token}\nweb\n{v1_event}"),
-        );
-        assert_eq!(rolled.status, 200, "authorized rollback: {}", rolled.body);
-        assert!(rolled.body.starts_with("EVENT "), "got: {}", rolled.body);
-        assert_eq!(
-            ctx.resource_event_count(),
-            before + 1,
-            "a rollback is one signed act, one event"
-        );
-        let desc = get(
-            &mut ctx,
-            &format!("/portal/resource/describe?token={token}&kind=Workload&name=web"),
-        );
-        assert!(
-            desc.body.contains("image: app:v1"),
-            "the live manifest rolled back to app:v1: {}",
-            desc.body
-        );
-
-        // A rollback naming an unknown event is a 409 and appends nothing.
-        let before = ctx.resource_event_count();
-        let bad = post(
-            &mut ctx,
-            "/portal/resource/rollback",
-            &format!("{token}\nweb\nno-such-event"),
-        );
-        assert_eq!(bad.status, 409, "unknown revision refused: {}", bad.body);
-        assert_eq!(
-            ctx.resource_event_count(),
-            before,
-            "a refused rollback appends nothing"
-        );
-
-        // history has no record for an unknown resource → 404.
-        assert_eq!(
-            get(
-                &mut ctx,
-                &format!("/portal/resource/history?token={token}&kind=Workload&name=absent")
-            )
-            .status,
-            404
-        );
-    }
-
-    // console-resourceset-revision-history-rollback: a rollback cannot issue
-    // without a preceding ALLOW dry-run of that exact act — an UNAUTHORIZED
-    // session (whose dry-run predicts DENY) is refused and appends nothing,
-    // exactly like any other signed act (the same dry-run gate).
-    #[test]
-    fn rollback_cannot_issue_without_a_preceding_allow_dry_run() {
-        // First, an AUTHORIZED actor produces a revision to roll back to.
-        let (mut ctx, _subkey) = provisioned_ctx();
-        let token = login_alice(&mut ctx);
-        let applied = post(
-            &mut ctx,
-            "/portal/resource/apply",
-            &format!("{token}\nweb\napp:v1"),
-        );
-        assert_eq!(applied.status, 200, "got: {}", applied.body);
-        let hist = get(
-            &mut ctx,
-            &format!("/portal/resource/history?token={token}&kind=Workload&name=web"),
-        );
-        let v1_event = hist
-            .body
-            .lines()
-            .nth(1)
-            .and_then(|l| l.split_whitespace().nth(3))
-            .expect("REVISION 0 EVENT <cid>")
-            .to_owned();
-
-        // Now an UNAUTHORIZED session (logs in via custody, but the decider
-        // refuses its resource acts): its dry-run predicts DENY, so the SAME
-        // gate that refuses an apply refuses the rollback — 403, no event.
-        let subkey = NodeSubkey::from("op-subkey-stranger");
-        ctx.admit_subject_login_only(subkey.node_id());
-        ctx.provision_offer(
-            "stranger@pillar",
-            "Stranger",
-            Cid::from("cid-stranger"),
-            subkey.clone(),
-            PASSWORD,
-            SECRET,
-        );
-        let nonce = get(&mut ctx, "/nonce");
-        let nonce_id = nonce.body.split_whitespace().nth(1).unwrap().to_owned();
-        let login = post(
-            &mut ctx,
-            "/login",
-            &format!("stranger@pillar\n{PASSWORD}\n{nonce_id}"),
-        );
-        assert_eq!(login.status, 200, "got: {}", login.body);
-        let stranger_token = login.session_token.expect("session token");
-
-        // The unauthorized session's dry-run predicts DENY.
-        let preview = get(
-            &mut ctx,
-            &format!("/portal/resource/dry-run?token={stranger_token}"),
-        );
-        assert!(
-            preview.body.contains("PREDICTED DENY"),
-            "unauthorized dry-run predicts DENY: {}",
-            preview.body
-        );
-
-        // So the rollback is refused and signs nothing (predicted==enforced).
-        let before = ctx.resource_event_count();
-        let refused = post(
-            &mut ctx,
-            "/portal/resource/rollback",
-            &format!("{stranger_token}\nweb\n{v1_event}"),
-        );
-        assert_eq!(
-            refused.status, 403,
-            "a rollback without an ALLOW dry-run is refused: {}",
-            refused.body
-        );
-        assert_eq!(
-            ctx.resource_event_count(),
-            before,
-            "a refused rollback appends nothing"
         );
     }
 
@@ -12094,21 +12229,17 @@ mod tests {
         static WASM_TEXT: OnceLock<String> = OnceLock::new();
         WASM_TEXT.get_or_init(|| {
             let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-            let frontend_dir = manifest_dir
-                .parent()
-                .expect("crates/ parent")
-                .join("pillar-frontend");
-            // Build into a target dir LOCAL to the frontend crate. pillar-frontend
-            // is a workspace member, so a bare `cargo build` would emit into the
-            // shared workspace `target/` (which this test cannot address portably);
-            // pinning `--target-dir` here lands the wasm at the exact path we read
-            // below, independent of workspace layout or a `CARGO_TARGET_DIR` in the
-            // environment.
-            let target_dir = frontend_dir.join("target");
+            let crates_dir = manifest_dir.parent().expect("crates/ parent");
+            let frontend_dir = crates_dir.join("pillar-frontend");
+            // `pillar-frontend` builds for wasm32. It may be laid out EITHER as a
+            // standalone crate (its own `target/` under the crate dir) OR — as it
+            // is today — as a root-workspace MEMBER, whose build output lands in
+            // the SHARED workspace `target/`. Build it and then locate the
+            // produced artifact across both layouts (and an explicit
+            // `CARGO_TARGET_DIR`), so this DoD check is robust to the workspace
+            // topology rather than hard-coding one `target/` path.
             let status = std::process::Command::new(env!("CARGO"))
                 .args(["build", "--target", "wasm32-unknown-unknown"])
-                .arg("--target-dir")
-                .arg(&target_dir)
                 .current_dir(&frontend_dir)
                 .status()
                 .expect(
@@ -12121,9 +12252,33 @@ mod tests {
                 status.success(),
                 "pillar-frontend failed to build for wasm32-unknown-unknown"
             );
-            let wasm_path =
-                target_dir.join("wasm32-unknown-unknown/debug/pillar_frontend.wasm");
-            let bytes = std::fs::read(&wasm_path).unwrap_or_else(|e| {
+            const REL: &str = "wasm32-unknown-unknown/debug/pillar_frontend.wasm";
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+                candidates.push(std::path::Path::new(&dir).join(REL));
+            }
+            // Standalone-crate layout: `crates/pillar-frontend/target/…`.
+            candidates.push(frontend_dir.join("target").join(REL));
+            // Workspace-member layout: the shared `<workspace-root>/target/…`
+            // (the workspace root is the parent of `crates/`).
+            if let Some(workspace_root) = crates_dir.parent() {
+                candidates.push(workspace_root.join("target").join(REL));
+            }
+            let wasm_path = candidates
+                .iter()
+                .find(|p| p.exists())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "built pillar-frontend wasm not found in any known target \
+                         layout; looked in: {}",
+                        candidates
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+            let bytes = std::fs::read(wasm_path).unwrap_or_else(|e| {
                 panic!("failed to read built wasm at {}: {e}", wasm_path.display())
             });
             String::from_utf8_lossy(&bytes).into_owned()
@@ -12214,21 +12369,8 @@ mod tests {
                 "/portal/resource/get",
                 "/portal/resource/apply",
                 "/portal/resource/dry-run",
-            ],
-        );
-    }
-
-    #[test]
-    fn ui_confirms_revision_history_rollback_panel() {
-        // The revision-history panel is mounted and reachable: its compiled
-        // wasm embeds the history read line, the rollback act line, AND the
-        // dry-run line that gates the rollback (same gate as any apply).
-        assert_ui_wires(
-            "revision-history-rollback",
-            &[
                 "/portal/resource/history",
                 "/portal/resource/rollback",
-                "/portal/resource/dry-run",
             ],
         );
     }
@@ -12247,18 +12389,16 @@ mod tests {
 
     #[test]
     fn ui_confirms_observability_panel() {
-        // The MOUNTED observability console (crate::obs_console::Observability
-        // Console, reached via the router `Shell`/`ConsoleView`) wires the live
-        // `/portal/obs/live/*` API — NOT the legacy `/portal/obs/{explore,query,
-        // dashboard}` tile, which lived on the retired single-page `Portal`
-        // component and is dead-code-eliminated from the wasm. Assert the
-        // endpoints the app actually mounts.
         assert_ui_wires(
             "observability",
             &[
+                // The obs console was migrated to the live-store surface
+                // (`/portal/obs/live/*`); the old `/portal/obs/{explore,query}`
+                // needles no longer name the mounted, reachable UI. Pin the
+                // endpoints the compiled console actually fetches today.
                 "/portal/obs/live/kinds",
+                "/portal/obs/live/query",
                 "/portal/obs/live/dashboard",
-                "/portal/obs/live/recording",
             ],
         );
     }

@@ -463,24 +463,41 @@ fn parse_duration_seconds(s: &str) -> Result<u64, PslError> {
     Ok(num * mult)
 }
 
-/// Split `s` at the first occurrence of any of `keywords`, returning
-/// `(before, Some(matched_keyword_and_rest))` or `(s, None)` if none occur.
+/// Split `s` at the first **top-level, clause-boundary** occurrence of any of
+/// `keywords`, returning `(before, Some(matched_keyword_and_rest))` or
+/// `(s, None)` if none occur.
+///
+/// A keyword only splits when it is NOT nested inside `(`/`)` or `{`/`}`, NOT
+/// inside a double-quoted value, AND sits at a clause boundary (start of `s`
+/// or immediately after whitespace). This prevents a keyword *substring* from
+/// misrouting the parse — e.g. a quoted match value `message =~ "in range: x"`,
+/// a keyword inside a `select(...)` predicate list, or a larger word such as
+/// `somewhere:` / `arrange:` that merely CONTAINS `where:` / `range:`.
 fn split_at_first_keyword<'a>(
     s: &'a str,
     keywords: &[&'a str],
 ) -> (&'a str, Option<(&'a str, &'a str)>) {
-    let mut best: Option<(usize, &str)> = None;
-    for kw in keywords {
-        if let Some(idx) = s.find(kw) {
-            if best.map(|(bi, _)| idx < bi).unwrap_or(true) {
-                best = Some((idx, kw));
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    // Start-of-string counts as a clause boundary.
+    let mut prev_ws = true;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_quote = !in_quote,
+            '(' | '{' if !in_quote => depth += 1,
+            ')' | '}' if !in_quote => depth -= 1,
+            _ if depth == 0 && !in_quote && prev_ws => {
+                for kw in keywords {
+                    if s[i..].starts_with(kw) {
+                        return (&s[..i], Some((kw, &s[i + kw.len()..])));
+                    }
+                }
             }
+            _ => {}
         }
+        prev_ws = c.is_whitespace();
     }
-    match best {
-        Some((idx, kw)) => (&s[..idx], Some((kw, &s[idx + kw.len()..]))),
-        None => (s, None),
-    }
+    (s, None)
 }
 
 /// Parse a `select:` body: a comma-separated list of `kind[(predicates)]`.
@@ -639,12 +656,17 @@ fn parse_correlate(body: &str) -> Result<CorrelateSpec, PslError> {
 fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
+    let mut in_quote = false;
     let mut start = 0usize;
     for (i, c) in s.char_indices() {
         match c {
-            '(' | '{' => depth += 1,
-            ')' | '}' => depth -= 1,
-            c if c == sep && depth == 0 => {
+            // A double-quoted value is opaque: neither `sep` nor bracket depth
+            // inside it affects the split, so `message =~ "a, b"` stays ONE
+            // predicate and a quoted `)` never unbalances the depth counter.
+            '"' => in_quote = !in_quote,
+            '(' | '{' if !in_quote => depth += 1,
+            ')' | '}' if !in_quote => depth -= 1,
+            c if c == sep && depth == 0 && !in_quote => {
                 out.push(&s[start..i]);
                 start = i + c.len_utf8();
             }
@@ -719,11 +741,13 @@ pub struct CorrelationGroup {
 /// `query.correlate` is set — group the matched anchor-kind signals with
 /// their real-`CorrelationIndex`-linked peers within the declared window.
 ///
-/// Returns the matched signal ids in content-address order when there is no
-/// `correlate` clause (`groups` empty, `matched` populated); when `correlate`
-/// is set, `groups` carries one [`CorrelationGroup`] per matched anchor
-/// signal (content-address ordered) and `matched` is still the full matched
-/// set (every selected/filtered signal, regardless of kind).
+/// Returns the matched signal ids in **chronological (write-tick) order**,
+/// ties broken by content address, when there is no `correlate` clause
+/// (`groups` empty, `matched` populated); when `correlate` is set, `groups`
+/// carries one [`CorrelationGroup`] per matched anchor signal (content-address
+/// ordered) and `matched` is still the full matched set (every
+/// selected/filtered signal, regardless of kind), also chronologically
+/// ordered.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PslResult {
     /// Every signal matching `select`/`where`/`range`, regardless of kind.
@@ -736,7 +760,10 @@ pub struct PslResult {
 /// Parse a log signal's payload into its whitespace-separated `field=value`
 /// tokens (the log producer's `level=<l> msg=<m> @<tick>` shape). The `msg`
 /// token captures the REST of the line after `msg=` so a multi-word message
-/// (`msg=connection timeout to peer`) is one field, not several.
+/// (`msg=connection timeout to peer`) is one field, not several — but the
+/// trailing ` @<tick>` wall-clock marker the producer appends is stripped, so
+/// `message = <exact>` (Eq) compares against the human message ALONE, never a
+/// value contaminated by the tick suffix.
 fn payload_fields(payload: &[u8]) -> std::collections::BTreeMap<String, String> {
     let mut fields = std::collections::BTreeMap::new();
     let Ok(text) = std::str::from_utf8(payload) else {
@@ -749,7 +776,7 @@ fn payload_fields(payload: &[u8]) -> std::collections::BTreeMap<String, String> 
         let key = rest[..eq].trim();
         let after = &rest[eq + 1..];
         if key == "msg" {
-            fields.insert("msg".to_string(), after.trim().to_string());
+            fields.insert("msg".to_string(), strip_tick_suffix(after.trim()).to_string());
             break;
         }
         // Value runs up to the next whitespace.
@@ -763,6 +790,16 @@ fn payload_fields(payload: &[u8]) -> std::collections::BTreeMap<String, String> 
         rest = tail.trim_start();
     }
     fields
+}
+
+/// Strip the producer's trailing ` @<digits>` wall-clock/tick marker from a
+/// message value. Only a genuine ` @<all-digits>` tail is removed; a message
+/// that merely ends in `@something-non-numeric` is left untouched.
+fn strip_tick_suffix(msg: &str) -> &str {
+    match msg.rsplit_once(" @") {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => msg,
+    }
 }
 
 /// A signal satisfies a predicate when it holds against the signal's labels
@@ -828,7 +865,16 @@ pub fn execute(
         matched.insert(signal.id());
     }
 
-    let matched_vec: Vec<SignalId> = matched.iter().cloned().collect();
+    // Matched ids in CHRONOLOGICAL order (by write tick), ties broken by the
+    // content address, so a log/query view renders oldest-to-newest instead of
+    // in content-hash order. `BTreeSet` above only de-duplicates; it does NOT
+    // impose the read order.
+    let mut matched_vec: Vec<SignalId> = matched.iter().cloned().collect();
+    matched_vec.sort_by(|a, b| {
+        let ta = store.write_tick_of(a).unwrap_or(0);
+        let tb = store.write_tick_of(b).unwrap_or(0);
+        ta.cmp(&tb).then_with(|| a.cmp(b))
+    });
 
     let groups = match query.correlate {
         None => Vec::new(),
@@ -912,11 +958,15 @@ pub struct AggregateRow {
 }
 
 /// Extract a signal's numeric value: the LAST whitespace-separated token of
-/// its payload parsed as an `f64` (e.g. `ingest_bandwidth 42` -> `42.0`).
-/// A payload with no parseable trailing number contributes nothing.
+/// its payload that is NOT the producer's ` @<tick>` marker, parsed as an
+/// `f64` (e.g. `ingest_bandwidth 42 @199000` -> `42.0`). A payload with no
+/// parseable numeric token contributes nothing.
 fn signal_value(signal: &crate::block::Signal) -> Option<f64> {
     let text = std::str::from_utf8(signal.payload()).ok()?;
-    text.split_whitespace().last()?.parse::<f64>().ok()
+    text.split_whitespace()
+        .rfind(|t| !t.starts_with('@'))?
+        .parse::<f64>()
+        .ok()
 }
 
 /// Apply a numeric [`Aggregate`] to the signals `execute` matched for
@@ -1115,7 +1165,7 @@ mod tests {
         let metric_id = store
             .write_labeled(
                 SignalKind::Metric,
-                b"ingest_bandwidth 42".to_vec(),
+                b"ingest_bandwidth 42 @199000".to_vec(),
                 metric_labels,
                 199_000,
             )
@@ -1137,7 +1187,7 @@ mod tests {
         let log_in_window = store
             .write_labeled(
                 SignalKind::Log,
-                b"level=info msg=served".to_vec(),
+                b"level=info msg=served @199001".to_vec(),
                 log_labels.clone(),
                 199_001,
             )
@@ -1157,7 +1207,7 @@ mod tests {
         let log_out_of_window = store
             .write_labeled(
                 SignalKind::Log,
-                b"level=info msg=late".to_vec(),
+                b"level=info msg=late @199100".to_vec(),
                 log_labels.clone(),
                 199_100,
             )
@@ -1177,7 +1227,7 @@ mod tests {
         let noise_log = store
             .write_labeled(
                 SignalKind::Log,
-                b"level=info msg=noise".to_vec(),
+                b"level=info msg=noise @199001".to_vec(),
                 wrong_cell,
                 199_001,
             )
@@ -1198,7 +1248,7 @@ mod tests {
         store
             .write_labeled(
                 SignalKind::Metric,
-                b"unrelated 1".to_vec(),
+                b"unrelated 1 @199001".to_vec(),
                 wrong_name,
                 199_001,
             )
@@ -1211,7 +1261,7 @@ mod tests {
         store
             .write_labeled(
                 SignalKind::Log,
-                b"level=info msg=ancient".to_vec(),
+                b"level=info msg=ancient @1".to_vec(),
                 old_labels,
                 1,
             )
@@ -1307,7 +1357,8 @@ mod tests {
             store
                 .write_labeled(
                     SignalKind::Metric,
-                    format!("latency {value}").into_bytes(),
+                    // Real metric-producer payload shape: `<name> <value> @<tick>`.
+                    format!("latency {value} @{tick}").into_bytes(),
                     labels,
                     tick,
                 )
@@ -1432,28 +1483,32 @@ mod tests {
         // the remainder of the line, matching the producer's real shape where
         // the human message trails), with the structured `field.x` token
         // ahead of it.
+        // Real log-producer payload shape: `level=<l> ... msg=<m> @<tick>`.
+        // `msg=` is written LAST (it greedily consumes the remainder of the
+        // line up to the ` @<tick>` marker), with the structured `field.x`
+        // token ahead of it.
         let err_timeout = store.write(
             SignalKind::Log,
-            b"level=error field.x=alpha msg=connection timeout to peer".to_vec(),
+            b"level=error field.x=alpha msg=connection timeout to peer @10".to_vec(),
             10,
         );
         // A second error log, message contains "timeout" too — also matches.
         let err_timeout_2 = store.write(
             SignalKind::Log,
-            b"level=error field.x=beta msg=upstream timeout after retry".to_vec(),
+            b"level=error field.x=beta msg=upstream timeout after retry @11".to_vec(),
             11,
         );
         // An error log WITHOUT "timeout" — matches level but not the message.
         let err_other = store.write(
             SignalKind::Log,
-            b"level=error field.x=gamma msg=disk full".to_vec(),
+            b"level=error field.x=gamma msg=disk full @12".to_vec(),
             12,
         );
         // An info log that DOES contain "timeout" — matches the message but
         // not level=error.
         let info_timeout = store.write(
             SignalKind::Log,
-            b"level=info field.x=alpha msg=timeout warning suppressed".to_vec(),
+            b"level=info field.x=alpha msg=timeout warning suppressed @13".to_vec(),
             13,
         );
 
@@ -1479,8 +1534,8 @@ mod tests {
             .expect("log filter query must parse");
 
         let result = execute(&query, &store, &index, 100);
-        let mut expected = vec![err_timeout.clone(), err_timeout_2.clone()];
-        expected.sort();
+        // Chronological (write-tick) order: err_timeout(10) before err_timeout_2(11).
+        let expected = vec![err_timeout.clone(), err_timeout_2.clone()];
         assert_eq!(result.matched, expected);
         assert!(
             !result.matched.contains(&err_other),
@@ -1505,11 +1560,11 @@ mod tests {
             .expect("field filter query must parse");
 
         let result = execute(&query, &store, &index, 100);
-        let mut expected = vec![err_timeout.clone(), info_timeout.clone()];
-        expected.sort();
+        // Chronological (write-tick) order: err_timeout(10) before info_timeout(13).
+        let expected = vec![err_timeout.clone(), info_timeout.clone()];
         assert_eq!(
             result.matched, expected,
-            "only the two field.x=alpha logs match",
+            "only the two field.x=alpha logs match, oldest first",
         );
     }
 
@@ -1625,5 +1680,154 @@ mod tests {
             !result.matched.contains(&after),
             "post-window signal excluded"
         );
+    }
+
+    /// Regression (ordering bug): `execute` returns `matched` in chronological
+    /// write-tick order, NOT content-address/hash order. Signals are written
+    /// in a deliberately non-chronological, non-hash sequence and must come
+    /// back oldest-first.
+    #[test]
+    fn matched_is_returned_in_chronological_write_tick_order() {
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+        let mk = |store: &mut TimeseriesStore, n: u64, tick: u64| {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert("cell".to_string(), "c".to_string());
+            store
+                .write_labeled(
+                    SignalKind::Log,
+                    format!("level=info msg=event-{n} @{tick}").into_bytes(),
+                    labels,
+                    tick,
+                )
+                .expect("log write is never downsampled")
+        };
+        // Write out of order: ticks 300, 100, 500, 200, 400.
+        let t300 = mk(&mut store, 3, 300);
+        let t100 = mk(&mut store, 1, 100);
+        let t500 = mk(&mut store, 5, 500);
+        let t200 = mk(&mut store, 2, 200);
+        let t400 = mk(&mut store, 4, 400);
+
+        let query = parse("select: logs(cell = c) range: now-1000s").expect("parses");
+        let result = execute(&query, &store, &index, 1000);
+        assert_eq!(
+            result.matched,
+            vec![t100, t200, t300, t400, t500],
+            "matched must be chronological (oldest first), not hash order"
+        );
+    }
+
+    /// Regression (msg `@tick` pollution): a `message = <exact>` (Eq) filter
+    /// matches a real log whose payload carries the producer's trailing
+    /// ` @<tick>` marker — the marker is stripped before the Eq compare, so the
+    /// human message alone is matched. A substring `=~` filter still matches
+    /// too. Without the strip, Eq would compare against `served @199001` and
+    /// never match.
+    #[test]
+    fn log_message_eq_matches_despite_trailing_tick_marker() {
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("cell".to_string(), "c".to_string());
+        let served = store
+            .write_labeled(
+                SignalKind::Log,
+                b"level=info msg=served @199001".to_vec(),
+                labels,
+                199_001,
+            )
+            .expect("log write is never downsampled");
+
+        let eq = parse("select: logs(message = served) range: now-1d").expect("parses");
+        let eq_res = execute(&eq, &store, &index, 200_000);
+        assert_eq!(eq_res.matched, vec![served.clone()], "exact message Eq matches");
+
+        let m = parse("select: logs(message =~ served) range: now-1d").expect("parses");
+        let m_res = execute(&m, &store, &index, 200_000);
+        assert_eq!(m_res.matched, vec![served], "substring Match matches too");
+    }
+
+    /// Regression (quoted-comma splitting): a double-quoted predicate value
+    /// containing a comma stays ONE predicate — the comma is not a top-level
+    /// separator inside quotes. Holds in both a `select(...)` list and a
+    /// `where:` list.
+    #[test]
+    fn quoted_value_with_comma_is_a_single_predicate() {
+        let q = parse(r#"select: logs(message =~ "a, b, c") range: now-1h"#).expect("parses");
+        assert_eq!(q.selects.len(), 1);
+        assert_eq!(
+            q.selects[0].predicates,
+            vec![Predicate::matches("message", "a, b, c")],
+            "the quoted comma value is one predicate, not three"
+        );
+
+        let w = parse(r#"select: logs where: message =~ "x, y" range: now-1h"#).expect("parses");
+        assert_eq!(
+            w.where_predicates,
+            vec![Predicate::matches("message", "x, y")],
+        );
+    }
+
+    /// Regression (keyword-substring misrouting): a quoted match value that
+    /// CONTAINS the `range:`/`correlate:`/`where:` clause keywords (and a
+    /// comma) does not fracture the parse — the real clause boundaries are the
+    /// top-level, unquoted ones. Proves `split_at_first_keyword` respects
+    /// quotes and paren depth.
+    #[test]
+    fn clause_keyword_inside_a_quoted_value_does_not_misroute() {
+        let q = parse(
+            r#"select: logs(message =~ "range: prod, correlate: off, where: any") range: now-2h correlate: { window: 5s, anchor: logs }"#,
+        )
+        .expect("the quoted keywords must not misroute the parse");
+
+        assert_eq!(
+            q.selects[0].predicates,
+            vec![Predicate::matches(
+                "message",
+                "range: prod, correlate: off, where: any"
+            )],
+        );
+        assert_eq!(q.range, TimeRange::seconds(7200));
+        assert_eq!(
+            q.correlate,
+            Some(CorrelateSpec {
+                window_seconds: 5,
+                anchor: SignalKind::Log,
+            }),
+        );
+    }
+
+    /// Regression (metric value `@tick` contamination): `signal_value`-backed
+    /// aggregation reads the numeric value from a real metric payload of the
+    /// producer's `<name> <value> @<tick>` shape — the trailing `@<tick>` token
+    /// is ignored, not mistaken for the (unparseable) value. Without the fix
+    /// `sum` is 0 and `topk` empty.
+    #[test]
+    fn aggregation_reads_value_from_real_metric_payload_with_tick_marker() {
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+        let now = 10_000;
+        let mut write = |value: i64, tick: u64| {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert("cell".to_string(), "c".to_string());
+            store
+                .write_labeled(
+                    SignalKind::Metric,
+                    format!("bandwidth {value} @{tick}").into_bytes(),
+                    labels,
+                    tick,
+                )
+                .expect("metric write is never downsampled");
+        };
+        write(10, now - 3);
+        write(30, now - 2);
+        write(20, now - 1);
+        let query = parse("select: metrics(cell = c) range: now-100s").expect("parses");
+
+        let sum = aggregate(&query, &store, &index, now, Aggregate::Sum, &[]);
+        assert!((sum[0].values[0] - 60.0).abs() < 1e-9, "got {:?}", sum[0].values);
+        let topk = aggregate(&query, &store, &index, now, Aggregate::TopK(2), &[]);
+        assert_eq!(topk[0].values, vec![30.0, 20.0]);
     }
 }

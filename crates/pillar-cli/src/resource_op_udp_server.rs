@@ -210,9 +210,27 @@ fn handle_datagram(
         Ok(g) => g,
         Err(_) => return ack_message(keys, false, "POISONED-CONTEXT"),
     };
-    match guard.resource_op_apply(&actor, &op) {
-        Ok(event) => ack_message(keys, true, &event),
-        Err(e) => ack_message(keys, false, &format!("{e}")),
+    // Reads are VIEWS (emit no event); dispatch them to the member-gated view
+    // methods BEFORE the write-apply path. A get's ack carries the CRD-YAML
+    // payload (or a `---`-joined stream) as its `OK <detail>` text; a describe's
+    // carries the provenance detail.
+    match &op {
+        pillar_ops::ResourceOp::Get { kind, name } => {
+            match guard.resource_op_get(&actor, kind, name.as_deref()) {
+                Ok(payload) => ack_message(keys, true, &payload),
+                Err(e) => ack_message(keys, false, &format!("{e}")),
+            }
+        }
+        pillar_ops::ResourceOp::Describe { kind, name } => {
+            match guard.resource_op_describe(&actor, kind, name) {
+                Ok(payload) => ack_message(keys, true, &payload),
+                Err(e) => ack_message(keys, false, &format!("{e}")),
+            }
+        }
+        _ => match guard.resource_op_apply(&actor, &op) {
+            Ok(event) => ack_message(keys, true, &event),
+            Err(e) => ack_message(keys, false, &format!("{e}")),
+        },
     }
 }
 
@@ -248,12 +266,16 @@ mod tests {
         let body_sealed = CellSeal
             .seal(group, &plaintext, b"pillar-streamdb/stream-op-v1", &aad)
             .expect("seal");
-        let signature = pillar_crypto::sign::sign(
-            secret,
-            &PillarMessage::signing_material(&body_sealed),
+        let signature =
+            pillar_crypto::sign::sign(secret, &PillarMessage::signing_material(&body_sealed))
+                .expect("sign");
+        PillarMessage::new(
+            signer,
+            signature,
+            Visibility::Cell,
+            cell.clone(),
+            body_sealed,
         )
-        .expect("sign");
-        PillarMessage::new(signer, signature, Visibility::Cell, cell.clone(), body_sealed)
     }
 
     #[test]
@@ -269,21 +291,27 @@ mod tests {
         let mut msg = seal_op(&op, &cell, &group, signer.signing, &secret.signing);
         // Corrupt the signature.
         msg.signature = pillar_crypto::Signature::from_bytes(vec![0u8; 64]);
-        let reply =
-            handle_datagram(&msg.to_canonical_cbor().expect("encode"), &Arc::new(Mutex::new(
-                WebAuthContext::new(
-                    "https://test",
-                    pillar_core::NodeId::from("pillar-node"),
-                    "secret",
-                    pillar_core::NodeId::from("pillar-node"),
-                    16,
-                ),
-            )), &keys)
-            .expect("an ack is always produced for a decodable envelope");
+        let reply = handle_datagram(
+            &msg.to_canonical_cbor().expect("encode"),
+            &Arc::new(Mutex::new(WebAuthContext::new(
+                "https://test",
+                pillar_core::NodeId::from("pillar-node"),
+                "secret",
+                pillar_core::NodeId::from("pillar-node"),
+                16,
+            ))),
+            &keys,
+        )
+        .expect("an ack is always produced for a decodable envelope");
         let opened = CellSeal
-            .open(&keys.group, &reply.body_sealed, &PillarMessage::header_aad(reply.visibility, &reply.cell))
+            .open(
+                &keys.group,
+                &reply.body_sealed,
+                &PillarMessage::header_aad(reply.visibility, &reply.cell),
+            )
             .expect("open ack");
-        let Body::Control(text) = Body::from_canonical_cbor(&opened).expect("decode ack body") else {
+        let Body::Control(text) = Body::from_canonical_cbor(&opened).expect("decode ack body")
+        else {
             panic!("ack body must be Control");
         };
         let text = String::from_utf8(text).expect("utf8");
