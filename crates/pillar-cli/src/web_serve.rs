@@ -177,8 +177,9 @@ use crate::resource::{
     is_tombstone, Address, ResourceError, ResourcePlane, ResourceReadError, Selector,
 };
 use crate::resourceset::{
-    build_graph, collect_resourcesets, defaults_advisory_for_view, member_origin, member_statuses,
-    owned_live, plan_reconcile, roll_up_health, MemberHealth, MemberRef, DEFAULT_RESOURCE_SET,
+    build_depth_graph, collect_resourcesets, defaults_advisory_for_view, member_origin,
+    member_statuses, owned_live, plan_reconcile, roll_up_health, MemberHealth, MemberRef,
+    ReplicaNode, DEFAULT_RESOURCE_SET,
 };
 use crate::Platform;
 use pillar_manifest::{
@@ -3326,7 +3327,25 @@ impl WebAuthContext {
         let health = roll_up_health(&healths);
         let owned = owned_live(&view, &spec);
         let plan = plan_reconcile(&spec.members, &owned);
-        let graph = build_graph(&spec.name, &statuses);
+        // The layered depth graph descends every Workload member into its live
+        // replicas (the /portal/resource/replicas oracle's model) and stamps a
+        // per-node health+sync token on each node. Replica observations come from
+        // the shared reconciler; when none is wired the graph is a plain
+        // set->member star (no descent), exactly as before.
+        let replicas: Vec<ReplicaNode> = self
+            .workload_reconciler
+            .as_ref()
+            .and_then(|shared| shared.lock().ok().map(|mut r| r.observe_all()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| ReplicaNode {
+                workload: o.workload,
+                node: o.node,
+                pid: o.pid,
+                port: o.port,
+            })
+            .collect();
+        let graph = build_depth_graph(&spec.name, &statuses, &replicas, plan.sync_status());
 
         let mut out = Vec::new();
         out.push(format!("SET {}", spec.name));
@@ -3400,8 +3419,17 @@ impl WebAuthContext {
             out.push(format!("DEFAULT-EDITED {}", edited.join(",")));
             out.push(format!("DEFAULT-TOMBSTONED {}", tombs.join(",")));
         }
-        for (i, label) in graph.nodes.iter().enumerate() {
-            out.push(format!("NODE {i} {label}"));
+        for (i, node) in graph.nodes.iter().enumerate() {
+            // ADDITIVE per-node token tail: `NODE <i> <label> HEALTH <h> SYNC <s>`.
+            // The label never contains a space (`<Kind>/<name>` / `Replica/...`),
+            // so an older consumer that reads only the label still parses; the
+            // tokens power the depth tree's per-node health+sync badges.
+            out.push(format!(
+                "NODE {i} {} HEALTH {} SYNC {}",
+                node.label,
+                node.health.as_str(),
+                node.sync.as_str(),
+            ));
         }
         for (from, to, label) in &graph.edges {
             out.push(format!("EDGE {from} {to} {label}"));
@@ -8208,6 +8236,66 @@ mod tests {
             !member_line.contains("REASON"),
             "a healthy member carries NO reason tail: {member_line}"
         );
+    }
+
+    // Pin the ADDITIVE per-node `NODE <i> <label> HEALTH <h> SYNC <s>` token
+    // wire format the depth tree consumes: every graph NODE line carries a
+    // two-axis health+sync token (the depth tree badges each node with it), and
+    // the label itself stays a single space-free token so an older consumer that
+    // reads only `<i> <label>` still parses. Locks the wire so the additive
+    // token can never silently regress.
+    #[test]
+    fn resourceset_detail_stamps_a_per_node_health_sync_token_on_every_node() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        let actor = ctx.identity_actor_for_test();
+
+        // A declared set whose one member is present -> Healthy, Synced.
+        let rp = Crd::new(
+            &ctx.resource_api,
+            "RetentionPolicy",
+            CrdMetadata::new("web-metrics").with_label("pillar.dev/resource-set", "web"),
+        )
+        .with_spec("signalKind", CrdValue::String("Metric".into()))
+        .with_spec("window", CrdValue::Integer(600));
+        let set = Crd::new(&ctx.resource_api, "ResourceSet", CrdMetadata::new("web"))
+            .with_spec(
+                "members",
+                CrdValue::String("RetentionPolicy/web-metrics".into()),
+            );
+        {
+            let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
+            plane
+                .apply(&actor, RESOURCE_CAP, rp)
+                .expect("owner applies retention policy");
+            plane
+                .apply(&actor, RESOURCE_CAP, set)
+                .expect("owner applies resource set");
+        }
+
+        let detail = ctx.resourceset_detail("web").expect("web set exists");
+        // Both the set root and the member node carry the per-node token.
+        assert!(
+            detail.contains("NODE 0 ResourceSet/web HEALTH Healthy SYNC Synced"),
+            "set-root node carries a health+sync token: {detail}"
+        );
+        assert!(
+            detail
+                .contains("NODE 1 RetentionPolicy/web-metrics HEALTH Healthy SYNC Synced"),
+            "member node carries a health+sync token: {detail}"
+        );
+        // Every NODE line has the token tail — none was left bare.
+        for line in detail.lines().filter(|l| l.starts_with("NODE ")) {
+            assert!(
+                line.contains(" HEALTH ") && line.contains(" SYNC "),
+                "every NODE line carries the per-node token: {line}"
+            );
+        }
     }
 
     // A GET carrying an explicit `X-Pillar-Api-Version` assertion.

@@ -86,6 +86,10 @@ pub struct ResourceSetDetail {
     pub prune: Vec<String>,
     /// Graph node labels, in emission order (node 0 is the set root).
     pub nodes: Vec<String>,
+    /// Per-node health axis, parallel to `nodes` (empty string if absent).
+    pub node_health: Vec<String>,
+    /// Per-node sync axis, parallel to `nodes` (empty string if absent).
+    pub node_sync: Vec<String>,
     /// Graph edges as `(from_index, to_index, label)`.
     pub edges: Vec<(usize, usize, String)>,
     /// Shipped-defaults advisory (Default set only) — a SEPARATE axis from sync.
@@ -242,9 +246,26 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
         } else if let Some(rest) = line.strip_prefix("SYNC ") {
             d.sync = rest.trim().to_string();
         } else if let Some(rest) = line.strip_prefix("NODE ") {
-            // `<i> <label>` — index is positional (nodes emitted in order).
-            if let Some((_idx, label)) = rest.split_once(' ') {
+            // `<i> <label> [HEALTH <h> SYNC <s>]` — index is positional (nodes
+            // emitted in order). The label is a single space-free token; the
+            // ADDITIVE `HEALTH <h> SYNC <s>` tail (present since the depth graph)
+            // powers per-node badges. Older bodies omit it -> empty tokens.
+            if let Some((_idx, rest)) = rest.split_once(' ') {
+                let (label, mut health, mut sync) = (rest, String::new(), String::new());
+                let label = if let Some((lbl, tail)) = label.split_once(" HEALTH ") {
+                    if let Some((h, s)) = tail.split_once(" SYNC ") {
+                        health = h.trim().to_string();
+                        sync = s.trim().to_string();
+                    } else {
+                        health = tail.trim().to_string();
+                    }
+                    lbl
+                } else {
+                    label
+                };
                 d.nodes.push(label.trim().to_string());
+                d.node_health.push(health);
+                d.node_sync.push(sync);
             }
         } else if let Some(rest) = line.strip_prefix("EDGE ") {
             // `<from> <to> <label>`
@@ -262,7 +283,52 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
 #[cfg(feature = "yew")]
 pub use yew_impl::ResourceSetsConsole;
 
+use crate::components::tree::TreeNode;
 use crate::primitives::Tone;
+
+/// Build the COLLAPSIBLE, layered depth tree the console renders from a parsed
+/// `ResourceSetDetail`'s flat graph (node 0 = the set root; edges run parent ->
+/// child). Each node's label carries its per-node health+sync token (`<label>
+/// — <health>/<sync>`) so the tree row shows the same two-axis signal the flat
+/// graph did, and the tree's expand/collapse gives ArgoCD-parity depth over the
+/// `ResourceSet -> Workload -> replica` chain. Pure (no `yew`), so the tree
+/// shape is host-tested independent of the render wiring. Returns the single
+/// root (node 0) or `None` when the graph is empty.
+#[must_use]
+pub fn depth_tree(d: &ResourceSetDetail) -> Option<TreeNode> {
+    if d.nodes.is_empty() {
+        return None;
+    }
+    // children[i] = the node indices i points at (parent -> child edges).
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); d.nodes.len()];
+    for (from, to, _label) in &d.edges {
+        if *from < d.nodes.len() && *to < d.nodes.len() {
+            children[*from].push(*to);
+        }
+    }
+    fn build(
+        idx: usize,
+        nodes: &[String],
+        health: &[String],
+        sync: &[String],
+        children: &[Vec<usize>],
+    ) -> TreeNode {
+        let label = &nodes[idx];
+        let h = health.get(idx).map(String::as_str).unwrap_or("");
+        let s = sync.get(idx).map(String::as_str).unwrap_or("");
+        let full = match (h.is_empty(), s.is_empty()) {
+            (false, false) => format!("{label} — {h}/{s}"),
+            (false, true) => format!("{label} — {h}"),
+            _ => label.clone(),
+        };
+        let kids = children[idx]
+            .iter()
+            .map(|c| build(*c, nodes, health, sync, children))
+            .collect();
+        TreeNode::branch(format!("rsnode-{idx}"), full, kids)
+    }
+    Some(build(0, &d.nodes, &d.node_health, &d.node_sync, &children))
+}
 
 /// FULL sync tone set (ArgoCD-parity), replacing the old binary Synced-vs-Warn:
 /// Synced -> Success, Progressing -> Info, OutOfSync -> Warn, Error -> Danger,
@@ -293,13 +359,14 @@ pub fn health_tone(health: &str) -> Tone {
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::{
-        health_tone, is_reconciling, parse_set_detail, parse_set_list, reconcile_request_body,
-        selected_subset, sync_tone, ResourceSetDetail, ResourceSetRow,
+        depth_tree, health_tone, is_reconciling, parse_set_detail, parse_set_list,
+        reconcile_request_body, selected_subset, sync_tone, ResourceSetDetail, ResourceSetRow,
     };
     use crate::auth::use_auth;
     use crate::components::data_table::{Column, DataTable, Row};
+    use crate::components::tree::Tree;
     use crate::portal::{get_url, http};
-    use crate::primitives::{Badge, DiffView, Graph, GraphEdge, Tone};
+    use crate::primitives::{Badge, DiffView, Tone};
     use crate::resources_console::{parse_act_result, parse_predicted, ChangeState};
     use std::collections::HashSet;
     use wasm_bindgen::closure::Closure;
@@ -725,14 +792,19 @@ mod yew_impl {
                 html! { <p class="ds-empty">{ "Select a resource set to view its graph." }</p> }
             }
             Some(d) => {
-                let graph_edges: Vec<GraphEdge> = d
-                    .edges
+                // The layered, collapsible depth tree (ArgoCD-parity), reusing
+                // the shipped Tree primitive — REPLACING the old fixed circle-
+                // layout star. Node 0 (the set root) and its Workload members
+                // are expanded by default so the ResourceSet -> Workload ->
+                // replica depth is visible at a glance; deeper/leaf nodes
+                // collapse. The tree lives inside a zoom/pan viewport.
+                let tree_root = depth_tree(d);
+                let default_expanded: Vec<String> = d
+                    .nodes
                     .iter()
-                    .map(|(from, to, label)| GraphEdge {
-                        from: *from,
-                        to: *to,
-                        label: label.clone(),
-                    })
+                    .enumerate()
+                    .filter(|(i, label)| *i == 0 || label.starts_with("Workload/"))
+                    .map(|(i, _)| format!("rsnode-{i}"))
                     .collect();
                 let member_rows: Html = d
                     .members
@@ -843,7 +915,13 @@ mod yew_impl {
                         if !d.description.is_empty() {
                             <p class="ds-muted">{ d.description.clone() }</p>
                         }
-                        <Graph nodes={d.nodes.clone()} edges={graph_edges} />
+                        <div class="ds-resource-tree ds-resource-tree--zoompan" role="group" aria-label="ResourceSet resource tree">
+                            if let Some(root) = tree_root.clone() {
+                                <Tree roots={vec![root]} default_expanded={default_expanded.clone()} />
+                            } else {
+                                <p class="ds-muted">{ "No resources in this set yet." }</p>
+                            }
+                        </div>
                         <h4>{ "Members" }</h4>
                         <table class="ds-table">
                             <thead><tr><th>{ "Resource" }</th><th>{ "Health" }</th><th>{ "Origin" }</th></tr></thead>
@@ -981,6 +1059,86 @@ mod tests {
         assert_eq!(d.nodes, vec!["ResourceSet/default".to_string()]);
         assert!(d.edges.is_empty());
         assert!(d.members.is_empty());
+    }
+
+    #[test]
+    fn parses_per_node_health_sync_tokens_and_builds_a_depth_tree() {
+        // The depth graph descends a Workload member into two replicas and
+        // stamps a per-node `HEALTH <h> SYNC <s>` token on every NODE line.
+        let body = "SET prod\n\
+                    HEALTH Healthy\n\
+                    SYNC Synced\n\
+                    NODE 0 ResourceSet/prod HEALTH Healthy SYNC Synced\n\
+                    NODE 1 Workload/web HEALTH Healthy SYNC Synced\n\
+                    NODE 2 Replica/web-192.0.2.10 HEALTH Healthy SYNC Synced\n\
+                    NODE 3 Replica/web-192.0.2.11 HEALTH Missing SYNC Synced\n\
+                    EDGE 0 1 Healthy\n\
+                    EDGE 1 2 Healthy\n\
+                    EDGE 1 3 Missing";
+        let d = parse_set_detail(body);
+        // Labels parse WITHOUT the token tail; the tokens land in the parallel
+        // per-node vectors.
+        assert_eq!(
+            d.nodes,
+            vec![
+                "ResourceSet/prod".to_string(),
+                "Workload/web".to_string(),
+                "Replica/web-192.0.2.10".to_string(),
+                "Replica/web-192.0.2.11".to_string(),
+            ]
+        );
+        assert_eq!(d.node_health, vec!["Healthy", "Healthy", "Healthy", "Missing"]);
+        assert_eq!(d.node_sync, vec!["Synced", "Synced", "Synced", "Synced"]);
+
+        // The collapsible depth tree: set root -> workload -> its two replicas.
+        let root = depth_tree(&d).expect("non-empty graph yields a root");
+        assert_eq!(root.id, "rsnode-0");
+        assert_eq!(root.label, "ResourceSet/prod — Healthy/Synced");
+        assert_eq!(root.children.len(), 1, "set root has the one Workload child");
+        let wl = &root.children[0];
+        assert_eq!(wl.label, "Workload/web — Healthy/Synced");
+        assert_eq!(wl.children.len(), 2, "workload descends into its 2 replicas");
+        assert_eq!(
+            wl.children[1].label,
+            "Replica/web-192.0.2.11 — Missing/Synced",
+            "the exited replica carries a Missing per-node token"
+        );
+    }
+
+    #[test]
+    fn depth_tree_is_none_for_an_empty_graph() {
+        let d = parse_set_detail("SET x\nHEALTH Empty\nSYNC Synced");
+        assert!(depth_tree(&d).is_none());
+    }
+
+    /// Mount-audit (anti-facade DoD): the ResourceSet detail must render its
+    /// resource tree through the SHIPPED `Tree` primitive as a real,
+    /// collapsible, layered depth view — NOT the old fixed circle-layout
+    /// `Graph` star. This asserts the component is mounted (referenced from the
+    /// console module), not orphaned.
+    #[test]
+    fn resource_tree_is_mounted_through_the_shipped_tree_primitive() {
+        let src = include_str!("resourcesets_console.rs");
+        assert!(
+            src.contains("use crate::components::tree::Tree;"),
+            "the console no longer imports the shipped Tree primitive"
+        );
+        assert!(
+            src.contains("<Tree roots={vec![root]}"),
+            "the depth tree is no longer mounted through the Tree component"
+        );
+        assert!(
+            src.contains("ds-resource-tree--zoompan"),
+            "the tree is no longer wrapped in a zoom/pan viewport"
+        );
+        // The fixed circle-layout Graph star is gone from the detail render:
+        // the console no longer imports the Graph/GraphEdge primitive at all.
+        // (Built by concatenation so this assertion's own text is not a match.)
+        let old_graph_import = format!("Badge, DiffView, {}, {}, Tone", "Graph", "GraphEdge");
+        assert!(
+            !src.contains(&old_graph_import),
+            "the fixed circle-layout Graph star must be replaced by the depth tree"
+        );
     }
 
     #[test]

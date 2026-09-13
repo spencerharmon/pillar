@@ -548,6 +548,25 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         .ds-graph__nlabel {{ fill: {text}; font-size: 11px; text-anchor: middle; }}
         .ds-graph__elabel {{ fill: {muted}; font-size: 9px; text-anchor: middle; }}
 
+        /* ---- ResourceSet depth tree (collapsible, layered) + zoom/pan viewport ---- */
+        .ds-resource-tree {{
+            border: 1px solid {border}; border-radius: {radius};
+            background-color: {surface_base}; padding: 0.5rem 0.25rem;
+            margin-bottom: 1rem;
+        }}
+        .ds-resource-tree--zoompan {{
+            max-height: 60vh; overflow: auto; resize: both;
+        }}
+        .pillar-tree {{ list-style: none; margin: 0; padding: 0; }}
+        .pillar-tree__row {{
+            display: flex; align-items: center; gap: 0.35rem;
+            padding: 0.2rem 0.5rem; cursor: pointer; white-space: nowrap;
+            padding-left: calc(0.5rem + var(--depth, 0) * 1.25rem);
+            border-radius: {radius};
+        }}
+        .pillar-tree__row:hover {{ background-color: {surface_raised}; }}
+        .pillar-tree__toggle {{ color: {muted}; font-size: 0.75rem; width: 1rem; }}
+
         /* ---- overview KPI band ---- */
         .ov-kpis {{
             display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));

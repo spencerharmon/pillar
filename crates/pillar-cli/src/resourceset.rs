@@ -306,6 +306,124 @@ pub fn build_graph(set_name: &str, members: &[MemberStatus]) -> ResourceGraph {
     ResourceGraph { nodes, edges }
 }
 
+/// The `Workload` kind string — a Deployment-like member whose live replicas the
+/// depth graph descends into (`ResourceSet -> Workload -> replica` chain).
+pub const WORKLOAD_KIND: &str = "Workload";
+
+/// One live replica of a Workload, as the depth graph consumes it. This is the
+/// projection of `crate::workload_reconcile::ReplicaObservation` the pure graph
+/// core needs — kept dependency-free here so the descent logic is host-testable
+/// without spinning a reconciler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaNode {
+    /// The workload this replica belongs to (matches a Workload member's name).
+    pub workload: String,
+    /// The placement node this replica landed on.
+    pub node: String,
+    /// The real OS pid (0 = exited, rendered Missing).
+    pub pid: u32,
+    /// The bound port.
+    pub port: u16,
+}
+
+impl ReplicaNode {
+    /// A replica's rolled-up health: a live pid is Healthy, an exited one
+    /// (`pid == 0`) is Missing.
+    #[must_use]
+    pub fn health(&self) -> MemberHealth {
+        if self.pid == 0 {
+            MemberHealth::Missing
+        } else {
+            MemberHealth::Healthy
+        }
+    }
+
+    /// The graph label for this replica leaf: `Replica/<workload>-<node>`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("Replica/{}-{}", self.workload, self.node)
+    }
+}
+
+/// A per-node token pair the console badges each depth-graph node with: a health
+/// axis (`Healthy`/`Degraded`/`Missing`) and a sync axis (`Synced`/`OutOfSync`).
+/// Additive over the flat graph — a flat consumer that ignores the tokens still
+/// renders the label alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphNode {
+    /// The node label (`ResourceSet/<n>`, `<Kind>/<name>`, or `Replica/...`).
+    pub label: String,
+    /// This node's rolled-up health.
+    pub health: MemberHealth,
+    /// This node's sync axis.
+    pub sync: SyncStatus,
+}
+
+/// The layered depth graph the ArgoCD-parity console renders: node 0 is the set,
+/// its member nodes follow, and a `Workload` member descends one level further
+/// into a leaf per live replica (`ResourceSet -> Workload -> replica`). Every
+/// node carries a per-node health+sync token. This SUPERSETS [`ResourceGraph`]:
+/// the same `(from,to,label)` edge shape, plus the descent edges and the token
+/// vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepthGraph {
+    /// Per-node label + health + sync, in emission order (node 0 = the set).
+    pub nodes: Vec<GraphNode>,
+    /// `(from_index, to_index, edge_label)` — set->member AND member->replica.
+    pub edges: Vec<(usize, usize, String)>,
+}
+
+/// Derive the layered depth graph for one set: descend every `Workload` member
+/// into its live replicas (looked up in `replicas` by workload name) and stamp a
+/// per-node health+sync token on each node. `sync` is the set's rolled-up sync
+/// status (shared by the set root and its members — a member is in sync with the
+/// set exactly when the set is); a replica leaf's sync mirrors its owning
+/// workload. A Workload with no observed replica is a childless member node (no
+/// synthetic leaf), so the graph never invents depth that isn't live.
+#[must_use]
+pub fn build_depth_graph(
+    set_name: &str,
+    members: &[MemberStatus],
+    replicas: &[ReplicaNode],
+    sync: SyncStatus,
+) -> DepthGraph {
+    let set_health = roll_up_health(&members.iter().map(|m| m.health).collect::<Vec<_>>());
+    let set_health = match set_health {
+        SetHealth::Healthy => MemberHealth::Healthy,
+        SetHealth::Empty => MemberHealth::Healthy,
+        SetHealth::Degraded => MemberHealth::Degraded,
+    };
+    let mut nodes = vec![GraphNode {
+        label: format!("ResourceSet/{set_name}"),
+        health: set_health,
+        sync,
+    }];
+    let mut edges: Vec<(usize, usize, String)> = Vec::new();
+    for m in members {
+        let member_idx = nodes.len();
+        nodes.push(GraphNode {
+            label: m.reference.to_string(),
+            health: m.health,
+            sync,
+        });
+        edges.push((0, member_idx, m.health.as_str().to_string()));
+        // Descend a Workload member into its live replicas.
+        if m.reference.kind == WORKLOAD_KIND {
+            for r in replicas.iter().filter(|r| r.workload == m.reference.name) {
+                let replica_idx = nodes.len();
+                let rh = r.health();
+                nodes.push(GraphNode {
+                    label: r.label(),
+                    health: rh,
+                    sync,
+                });
+                edges.push((member_idx, replica_idx, rh.as_str().to_string()));
+            }
+        }
+    }
+    DepthGraph { nodes, edges }
+}
+
 // ---------------------------------------------------------------------------
 // Resource-plane synthesis (SHARED by the web plane and the CLI).
 //
@@ -611,5 +729,98 @@ mod tests {
             g.edges,
             vec![(0, 1, "Healthy".to_string()), (0, 2, "Missing".to_string()),]
         );
+    }
+
+    #[test]
+    fn depth_graph_descends_a_workload_into_its_live_replicas() {
+        // A ResourceSet with a Workload member; two of its replicas are live
+        // (real pid) and one has exited (pid 0 -> Missing).
+        let members = vec![MemberStatus {
+            reference: MemberRef::new("Workload", "web"),
+            health: MemberHealth::Healthy,
+            reason: String::new(),
+        }];
+        let replicas = vec![
+            ReplicaNode {
+                workload: "web".into(),
+                node: "192.0.2.10".into(),
+                pid: 4242,
+                port: 8080,
+            },
+            ReplicaNode {
+                workload: "web".into(),
+                node: "192.0.2.11".into(),
+                pid: 0, // exited
+                port: 8080,
+            },
+            // A replica of a DIFFERENT workload must NOT attach to `web`.
+            ReplicaNode {
+                workload: "other".into(),
+                node: "192.0.2.12".into(),
+                pid: 99,
+                port: 9090,
+            },
+        ];
+        let g = build_depth_graph("prod", &members, &replicas, SyncStatus::Synced);
+
+        // node 0 = set, node 1 = the Workload member, nodes 2..=3 = its two
+        // replicas (the `other` workload's replica is NOT attached).
+        let labels: Vec<&str> = g.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "ResourceSet/prod",
+                "Workload/web",
+                "Replica/web-192.0.2.10",
+                "Replica/web-192.0.2.11",
+            ]
+        );
+        // Descent edges: set->workload, then workload->each replica.
+        assert_eq!(g.edges[0], (0, 1, "Healthy".to_string()));
+        assert_eq!(g.edges[1], (1, 2, "Healthy".to_string()));
+        assert_eq!(g.edges[2], (1, 3, "Missing".to_string()));
+
+        // Per-node health+sync token: the exited replica is Missing, the live
+        // one Healthy; every node carries the set's sync axis.
+        assert_eq!(g.nodes[2].health, MemberHealth::Healthy);
+        assert_eq!(g.nodes[3].health, MemberHealth::Missing);
+        assert!(g.nodes.iter().all(|n| n.sync == SyncStatus::Synced));
+        // A degraded replica degrades the set root's rolled-up health axis is
+        // driven by MEMBER health, not replicas — the Workload member here is
+        // Healthy, so the set root is Healthy.
+        assert_eq!(g.nodes[0].health, MemberHealth::Healthy);
+    }
+
+    #[test]
+    fn depth_graph_leaves_a_replica_less_workload_childless() {
+        let members = vec![MemberStatus {
+            reference: MemberRef::new("Workload", "idle"),
+            health: MemberHealth::Healthy,
+            reason: String::new(),
+        }];
+        // No replicas observed for `idle`.
+        let g = build_depth_graph("prod", &members, &[], SyncStatus::OutOfSync);
+        assert_eq!(g.nodes.len(), 2, "set + workload, no synthetic replica leaf");
+        assert_eq!(g.edges, vec![(0, 1, "Healthy".to_string())]);
+        assert!(g.nodes.iter().all(|n| n.sync == SyncStatus::OutOfSync));
+    }
+
+    #[test]
+    fn depth_graph_does_not_descend_a_non_workload_member() {
+        let members = vec![MemberStatus {
+            reference: MemberRef::new("RetentionPolicy", "metrics"),
+            health: MemberHealth::Healthy,
+            reason: String::new(),
+        }];
+        // A replica named the same as the policy must NOT attach to a
+        // non-Workload member.
+        let replicas = vec![ReplicaNode {
+            workload: "metrics".into(),
+            node: "192.0.2.10".into(),
+            pid: 1,
+            port: 1,
+        }];
+        let g = build_depth_graph("default", &members, &replicas, SyncStatus::Synced);
+        assert_eq!(g.nodes.len(), 2, "only set + policy, no replica descent");
     }
 }
