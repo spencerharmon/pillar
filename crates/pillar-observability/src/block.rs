@@ -337,6 +337,16 @@ pub struct TimeseriesStore {
     /// distinct from `expiry` (which is `write_tick + effective retention
     /// window`, not invertible in general once per-signal policies vary).
     write_ticks: BTreeMap<SignalId, u64>,
+    /// A strictly-monotonic append sequence per signal id: the ordinal of the
+    /// `write_labeled` call that first admitted it. Distinct from `write_tick`
+    /// (the producer's SECOND-granular logical clock, so many signals in one
+    /// second share a tick) — this disambiguates arrival order WITHIN a tick,
+    /// giving a total chronological order for display/query without a finer
+    /// logical clock. Grow-only, mirroring `write_ticks`.
+    write_seqs: BTreeMap<SignalId, u64>,
+    /// The next append sequence to hand out (increments once per newly
+    /// admitted id).
+    next_seq: u64,
     /// Downsample bookkeeping: per `(kind, downsample bucket key)` the tick of
     /// the last admitted representative, so a policy with a downsample interval
     /// admits at most one signal per bucket window (coarser aggregate).
@@ -360,6 +370,8 @@ impl TimeseriesStore {
             open: TimeseriesBlock::new(block_capacity),
             written: BTreeMap::new(),
             write_ticks: BTreeMap::new(),
+            write_seqs: BTreeMap::new(),
+            next_seq: 0,
             downsample_last: BTreeMap::new(),
         }
     }
@@ -456,6 +468,10 @@ impl TimeseriesStore {
         let expiry = signal.expiry;
         self.written.entry(id.clone()).or_insert(expiry);
         self.write_ticks.entry(id.clone()).or_insert(write_tick);
+        if !self.write_seqs.contains_key(&id) {
+            self.write_seqs.insert(id.clone(), self.next_seq);
+            self.next_seq += 1;
+        }
         if !self.open.admit(signal.clone()) {
             // Current block was sealed/full: retire it and open a fresh one.
             let full = std::mem::replace(&mut self.open, TimeseriesBlock::new(self.block_capacity));
@@ -529,11 +545,60 @@ impl TimeseriesStore {
     pub fn write_tick_of(&self, id: &SignalId) -> Option<u64> {
         self.write_ticks.get(id).copied()
     }
+
+    /// The append sequence a held/written signal was admitted at, if known —
+    /// the strictly-monotonic arrival ordinal used to break ties between
+    /// signals that share a (second-granular) `write_tick`, so a chronological
+    /// ordering is total and deterministic rather than falling back to the
+    /// content-addressed [`SignalId`] (which is effectively random w.r.t.
+    /// time).
+    #[must_use]
+    pub fn write_seq_of(&self, id: &SignalId) -> Option<u64> {
+        self.write_seqs.get(id).copied()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two signals admitted at the SAME (second-granular) write tick get
+    /// distinct, strictly-increasing append sequences, in call order — the
+    /// sub-second tie-break a chronological ordering relies on when a busy
+    /// producer stamps many signals within one logical second.
+    #[test]
+    fn write_seq_is_monotonic_and_breaks_write_tick_ties() {
+        let mut store = TimeseriesStore::new(8, 100);
+        // All three share write_tick = 7 (same logical second).
+        let a = store.write(SignalKind::Log, b"level=info msg=a @7".to_vec(), 7);
+        let b = store.write(SignalKind::Log, b"level=info msg=b @7".to_vec(), 7);
+        let c = store.write(SignalKind::Log, b"level=info msg=c @7".to_vec(), 7);
+
+        // Same tick for all…
+        assert_eq!(store.write_tick_of(&a), Some(7));
+        assert_eq!(store.write_tick_of(&b), Some(7));
+        assert_eq!(store.write_tick_of(&c), Some(7));
+        // …but strictly-increasing append sequence in call order.
+        let sa = store.write_seq_of(&a).expect("seq");
+        let sb = store.write_seq_of(&b).expect("seq");
+        let sc = store.write_seq_of(&c).expect("seq");
+        assert!(sa < sb && sb < sc, "append seq must follow arrival: {sa} {sb} {sc}");
+    }
+
+    /// A re-write of the SAME signal id does not burn a new append sequence
+    /// (the ordinal is fixed at first admission, mirroring `write_ticks`).
+    #[test]
+    fn write_seq_is_stable_across_rewrite_of_the_same_id() {
+        let mut store = TimeseriesStore::new(8, 100);
+        let a = store.write(SignalKind::Metric, b"x 1 @0".to_vec(), 0);
+        let first = store.write_seq_of(&a).expect("seq");
+        let b = store.write(SignalKind::Metric, b"y 2 @0".to_vec(), 0);
+        // Re-writing `a`'s identical payload yields the same id, same seq.
+        let a2 = store.write(SignalKind::Metric, b"x 1 @0".to_vec(), 0);
+        assert_eq!(a, a2);
+        assert_eq!(store.write_seq_of(&a), Some(first));
+        assert!(store.write_seq_of(&b).expect("seq") > first, "distinct id advances seq");
+    }
 
     /// A block seals exactly at its configured capacity and thereafter refuses
     /// new signals — immutability of a sealed block.

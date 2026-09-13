@@ -470,7 +470,8 @@ impl LiveObservabilitySubstrate {
 
     /// Every held signal of `kind`, rendered as a record — the explore view.
     pub fn explore(&self, kind: SignalKind) -> Vec<LiveRecord> {
-        self.store
+        let mut records: Vec<LiveRecord> = self
+            .store
             .held_signals()
             .filter(|s| s.kind() == kind)
             .map(|s| LiveRecord {
@@ -481,7 +482,23 @@ impl LiveObservabilitySubstrate {
                 labels: s.labels().clone(),
                 unix_millis: self.wallclock_for(self.store.write_tick_of(&s.id()).unwrap_or(0)),
             })
-            .collect()
+            .collect();
+        // Chronological (oldest-first): second-granular tick primary, the
+        // strictly-monotonic append sequence as the sub-second tie-break, so
+        // the explore dump reads in true arrival order rather than the store's
+        // content-hash iteration order.
+        records.sort_by(|a, b| {
+            a.tick
+                .cmp(&b.tick)
+                .then_with(|| {
+                    self.store
+                        .write_seq_of(&a.id)
+                        .unwrap_or(0)
+                        .cmp(&self.store.write_seq_of(&b.id).unwrap_or(0))
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        records
     }
 
     /// A [`MetadataIndex`] projected from the live store's currently-held

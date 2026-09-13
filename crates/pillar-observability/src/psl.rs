@@ -873,7 +873,19 @@ pub fn execute(
     matched_vec.sort_by(|a, b| {
         let ta = store.write_tick_of(a).unwrap_or(0);
         let tb = store.write_tick_of(b).unwrap_or(0);
-        ta.cmp(&tb).then_with(|| a.cmp(b))
+        // Primary: second-granular logical tick (the range/correlate axis).
+        // Tie-break: the strictly-monotonic append sequence, so signals that
+        // share a tick (many per second on a busy node) still read in true
+        // arrival order instead of content-hash order. `SignalId` remains the
+        // final, total-order backstop (never reached for distinct ids).
+        ta.cmp(&tb)
+            .then_with(|| {
+                store
+                    .write_seq_of(a)
+                    .unwrap_or(0)
+                    .cmp(&store.write_seq_of(b).unwrap_or(0))
+            })
+            .then_with(|| a.cmp(b))
     });
 
     let groups = match query.correlate {
@@ -1715,6 +1727,54 @@ mod tests {
             result.matched,
             vec![t100, t200, t300, t400, t500],
             "matched must be chronological (oldest first), not hash order"
+        );
+    }
+
+    /// Logs that share ONE (second-granular) write tick — the busy-node case a
+    /// second-resolution clock produces — still read in true arrival order,
+    /// broken by the store's monotonic append sequence, NOT the content-hash
+    /// `SignalId` order. This is the sub-second half of the ordering fix: the
+    /// write-tick sort alone leaves same-second signals in hash order.
+    #[test]
+    fn matched_breaks_same_tick_ties_by_arrival_not_content_hash() {
+        let mut store = TimeseriesStore::new(64, 1_000_000);
+        let index = CorrelationIndex::new();
+        let mk = |store: &mut TimeseriesStore, n: u64| {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert("cell".to_string(), "c".to_string());
+            // Every signal shares write_tick = 42 (one logical second).
+            store
+                .write_labeled(
+                    SignalKind::Log,
+                    format!("level=info msg=event-{n} @42").into_bytes(),
+                    labels,
+                    42,
+                )
+                .expect("log write is never downsampled")
+        };
+        // Admit in a fixed arrival order.
+        let e0 = mk(&mut store, 0);
+        let e1 = mk(&mut store, 1);
+        let e2 = mk(&mut store, 2);
+        let e3 = mk(&mut store, 3);
+        let e4 = mk(&mut store, 4);
+        let arrival = vec![e0, e1, e2, e3, e4];
+
+        // A content-hash (SignalId) ordering would almost surely differ from
+        // arrival order — assert the two are NOT identical so the test proves
+        // the tie-break does real work.
+        let mut hash_order = arrival.clone();
+        hash_order.sort();
+        assert_ne!(
+            hash_order, arrival,
+            "fixture must exercise a real hash-vs-arrival divergence"
+        );
+
+        let query = parse("select: logs(cell = c) range: now-1000s").expect("parses");
+        let result = execute(&query, &store, &index, 1000);
+        assert_eq!(
+            result.matched, arrival,
+            "same-tick signals must read in arrival (append-seq) order, not hash order"
         );
     }
 

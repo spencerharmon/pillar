@@ -163,3 +163,38 @@ fn quoted_value_with_comma_and_keywords_parses_and_queries() {
     assert_eq!(recs.len(), 1, "only the matching log, got {recs:?}");
     assert!(recs[0].payload.contains("range: prod, region eu"));
 }
+
+/// The busy-node case: MANY logs recorded within one second-granular tick (the
+/// resolution the real producer stamps) still come back in true arrival order
+/// over the live query path, not content-hash order. This is the sub-second
+/// half of the ordering fix — sorting by write tick alone leaves same-second
+/// logs in hash order.
+#[test]
+fn logs_within_one_second_read_in_arrival_order_not_hash_order() {
+    let mut sub = substrate();
+    // Ten distinct messages, ALL stamped at the same logical second (tick 100).
+    let messages: Vec<String> = (0..10).map(|i| format!("evt-{i:02}")).collect();
+    for m in &messages {
+        sub.record_log(LogLevel::Info, m.clone(), "itest", 100);
+    }
+
+    let query = parse_psl("select: logs range: now-1000s").expect("parses");
+    let got: Vec<String> = sub
+        .psl_query(&query, sub.latest_tick())
+        .into_iter()
+        .map(|r| {
+            // Recover the message from the `level=.. msg=.. @tick` payload.
+            r.payload
+                .split("msg=")
+                .nth(1)
+                .and_then(|s| s.split(" @").next())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        got, messages,
+        "same-second logs must read oldest-first in arrival order, got {got:?}"
+    );
+}
