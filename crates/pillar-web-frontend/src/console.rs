@@ -260,7 +260,8 @@ mod yew_impl {
     use crate::obs_console::ObservabilityConsole;
     use crate::overview::OverviewConsole;
     use crate::portal::{
-        CredentialsTile, IdentityTile, InboxTile, MembersTile, SessionsTile, SwarmTile,
+        CredentialsTile, IdentityTile, InboxTile, MembersTile, ObservabilityTile, SessionsTile,
+        SwarmTile,
     };
     use crate::resources_console::ResourcesConsole;
     use crate::resourcesets_console::ResourceSetsConsole;
@@ -362,7 +363,24 @@ mod yew_impl {
             Section::Overview => html! { <OverviewConsole /> },
             Section::Resources => html! { <ResourcesConsole /> },
             Section::ResourceSets => html! { <ResourceSetsConsole /> },
-            Section::Observability => html! { <ObservabilityConsole /> },
+            Section::Observability => html! {
+                <>
+                    // ObservabilityConsole is the live `/portal/obs/live/*`
+                    // console (schema-aware PSL query builder); ObservabilityTile
+                    // is the older explore/query/dashboard tile
+                    // (`/portal/obs/explore`, `/portal/obs/query`,
+                    // `/portal/obs/dashboard`) `web_serve.rs`'s
+                    // `ui_confirms_observability_panel` asserts is wired into
+                    // the UI. Mount both so neither capability regresses --
+                    // this tile was previously defined in `portal.rs` but
+                    // never actually mounted anywhere reachable from the
+                    // router, so the compiler correctly linker-gc'd its
+                    // strings out of the wasm build (see
+                    // `docs/bee-console-observability-tile-wasm-dce-bug-*.md`).
+                    <ObservabilityConsole />
+                    <ObservabilityTile />
+                </>
+            },
             Section::Topology => html! { <TopologyConsole /> },
             Section::Account => html! { <AccountHub /> },
             Section::Identity => html! { <IdentityTile /> },

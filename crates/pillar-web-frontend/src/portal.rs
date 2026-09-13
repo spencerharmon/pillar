@@ -612,7 +612,8 @@ pub(crate) use yew_impl::{http, input_value};
 // once here and reused verbatim by the shell.
 #[cfg(feature = "yew")]
 pub(crate) use yew_impl::{
-    CredentialsTile, IdentityTile, InboxTile, MembersTile, NodeStatusTile, SessionsTile, SwarmTile,
+    CredentialsTile, IdentityTile, InboxTile, MembersTile, NodeStatusTile, ObservabilityTile,
+    SessionsTile, SwarmTile,
 };
 
 #[cfg(feature = "yew")]
