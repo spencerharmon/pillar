@@ -164,14 +164,76 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
     d
 }
 
+/// One prior revision of a resource, parsed from a `REVISION <i> EVENT <cid>
+/// SIGNER <s> HASH <h> IMAGE <img>` line of `GET /portal/resource/history`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevisionRow {
+    /// The positional index (0 = oldest revision).
+    pub index: usize,
+    /// The authorizing event CID (a rollback re-applies this exact revision).
+    pub event_cid: String,
+    /// The subject that signed (authorized) the revision.
+    pub signer: String,
+    /// The content-addressed manifest hash for the revision.
+    pub hash: String,
+    /// The revision's spec `image` (`-` when the manifest declares none).
+    pub image: String,
+}
+
+/// The parsed change timeline of one resource: its `Kind/name` reference and
+/// its revisions (oldest first), from `GET /portal/resource/history`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevisionHistory {
+    /// The `Kind/name` reference the timeline belongs to.
+    pub reference: String,
+    /// The prior revisions of the resource, oldest first.
+    pub revisions: Vec<RevisionRow>,
+}
+
+/// Parse the `GET /portal/resource/history` body: a `HISTORY <kind>/<name>
+/// COUNT <n>` header + one `REVISION <i> EVENT <cid> SIGNER <s> HASH <h> IMAGE
+/// <img>` line per prior apply. Unknown lines are ignored.
+#[must_use]
+pub fn parse_history(body: &str) -> RevisionHistory {
+    let mut h = RevisionHistory::default();
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("HISTORY ") {
+            h.reference = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+        } else if let Some(rest) = line.strip_prefix("REVISION ") {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            // `<i> EVENT <cid> SIGNER <s> HASH <h> IMAGE <img>`
+            if toks.len() >= 9
+                && toks[1] == "EVENT"
+                && toks[3] == "SIGNER"
+                && toks[5] == "HASH"
+                && toks[7] == "IMAGE"
+            {
+                h.revisions.push(RevisionRow {
+                    index: toks[0].parse().unwrap_or(0),
+                    event_cid: toks[2].to_string(),
+                    signer: toks[4].to_string(),
+                    hash: toks[6].to_string(),
+                    image: toks[8].to_string(),
+                });
+            }
+        }
+    }
+    h
+}
+
 #[cfg(feature = "yew")]
 pub use yew_impl::ResourceSetsConsole;
-
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::{parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
+    use super::{parse_history, RevisionHistory};
     use crate::auth::use_auth;
-    use crate::portal::{get_url, http};
+    use crate::portal::{body_lines, get_url, http};
     use crate::primitives::{Badge, Graph, GraphEdge, Tone};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
@@ -181,6 +243,165 @@ mod yew_impl {
             Tone::Success
         } else {
             Tone::Warn
+        }
+    }
+
+    /// The **Revision history + rollback** panel: load a workload's change
+    /// timeline from `GET /portal/resource/history` (each row's authorizing
+    /// event CID + signer), and roll a resource back to a prior revision via
+    /// `POST /portal/resource/rollback` — a re-apply of that event's manifest
+    /// gated by the SAME dry-run + diff preview (`GET /portal/resource/dry-run`)
+    /// as any other apply. On rollback the history reloads so the new head is
+    /// visible.
+    #[function_component(RevisionHistoryPanel)]
+    pub fn revision_history_panel() -> Html {
+        let auth = use_auth();
+        let name = use_state(String::new);
+        let history = use_state(|| None::<RevisionHistory>);
+        let preview = use_state(String::new);
+
+        let on_name = {
+            let name = name.clone();
+            Callback::from(move |e: InputEvent| name.set(crate::portal::input_value(&e)))
+        };
+
+        let load = {
+            let (auth, name, history) = (auth.clone(), name.clone(), history.clone());
+            Callback::from(move |_: MouseEvent| {
+                if let (Some(token), n) = (auth.token.clone(), (*name).clone()) {
+                    if n.is_empty() {
+                        return;
+                    }
+                    let history = history.clone();
+                    let url = get_url(
+                        "/portal/resource/history",
+                        &token,
+                        &[("kind", "Workload"), ("name", &n)],
+                    );
+                    spawn_local(async move {
+                        if let Ok(r) = http("GET", &url, None).await {
+                            if r.ok() {
+                                history.set(Some(parse_history(&r.body)));
+                            } else {
+                                history.set(Some(RevisionHistory::default()));
+                            }
+                        }
+                    });
+                }
+            })
+        };
+
+        let rollback = {
+            let (auth, name, history, preview) =
+                (auth.clone(), name.clone(), history.clone(), preview.clone());
+            Callback::from(move |event_cid: String| {
+                if let (Some(token), n) = (auth.token.clone(), (*name).clone()) {
+                    if n.is_empty() {
+                        return;
+                    }
+                    let (history, preview) = (history.clone(), preview.clone());
+                    spawn_local(async move {
+                        // Gate the rollback on the SAME dry-run + diff preview
+                        // any apply uses: predict the decider decision first.
+                        let dry = get_url("/portal/resource/dry-run", &token, &[]);
+                        let predicted = match http("GET", &dry, None).await {
+                            Ok(r) if r.ok() => r.body,
+                            _ => String::new(),
+                        };
+                        preview.set(predicted.clone());
+                        if !predicted.contains("ALLOW") {
+                            return;
+                        }
+                        let body = body_lines(&[&token, &n, &event_cid]);
+                        if let Ok(r) = http("POST", "/portal/resource/rollback", Some(&body)).await {
+                            if r.ok() {
+                                // Reload the timeline so the rolled-back head shows.
+                                let url = get_url(
+                                    "/portal/resource/history",
+                                    &token,
+                                    &[("kind", "Workload"), ("name", &n)],
+                                );
+                                if let Ok(h) = http("GET", &url, None).await {
+                                    if h.ok() {
+                                        history.set(Some(parse_history(&h.body)));
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            })
+        };
+
+        let rows: Html = match &*history {
+            None => html! { <p class="ds-muted">{ "Enter a workload name and load its revision history." }</p> },
+            Some(h) if h.revisions.is_empty() => {
+                html! { <p class="ds-empty">{ "No prior revisions for that resource." }</p> }
+            }
+            Some(h) => {
+                let rows: Html = h
+                    .revisions
+                    .iter()
+                    .rev()
+                    .map(|rev| {
+                        let cid = rev.event_cid.clone();
+                        let do_rollback = {
+                            let (rollback, cid) = (rollback.clone(), cid.clone());
+                            Callback::from(move |_: MouseEvent| rollback.emit(cid.clone()))
+                        };
+                        html! {
+                            <tr>
+                                <td>{ rev.index }</td>
+                                <td class="mono">{ rev.event_cid.clone() }</td>
+                                <td class="mono">{ rev.signer.clone() }</td>
+                                <td class="mono">{ rev.image.clone() }</td>
+                                <td>
+                                    <button class="ds-btn" onclick={do_rollback}>{ "Roll back" }</button>
+                                </td>
+                            </tr>
+                        }
+                    })
+                    .collect();
+                html! {
+                    <table class="ds-table">
+                        <thead>
+                            <tr>
+                                <th>{ "Rev" }</th><th>{ "Event CID" }</th>
+                                <th>{ "Signer" }</th><th>{ "Image" }</th><th>{ "" }</th>
+                            </tr>
+                        </thead>
+                        <tbody>{ rows }</tbody>
+                    </table>
+                }
+            }
+        };
+
+        let preview_view = if preview.is_empty() {
+            html! {}
+        } else {
+            html! { <p class="ds-muted">{ format!("Dry-run: {}", *preview) }</p> }
+        };
+
+        html! {
+            <section class="ds-panel" id="revision-history">
+                <header class="ds-panel__head">
+                    <h3>{ "Revision history + rollback" }</h3>
+                </header>
+                <p class="ds-muted">
+                    { "Each signed change records its authorizing event CID + signer. Rollback re-applies a prior revision's manifest, gated by the same dry-run + diff preview as any apply." }
+                </p>
+                <div class="ds-field">
+                    <input
+                        class="ds-input"
+                        placeholder="workload name"
+                        value={(*name).clone()}
+                        oninput={on_name}
+                    />
+                    <button class="ds-btn" onclick={load}>{ "Load history" }</button>
+                </div>
+                { preview_view }
+                { rows }
+            </section>
         }
     }
 
@@ -396,6 +617,7 @@ mod yew_impl {
                     <tbody>{ rows }</tbody>
                 </table>
                 { detail_view }
+                <RevisionHistoryPanel />
             </div>
         }
     }
@@ -404,6 +626,36 @@ mod yew_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_history_timeline_lines() {
+        let body = "HISTORY Workload/web COUNT 2\n\
+                    REVISION 0 EVENT cid-aaa SIGNER op-subkey-alice HASH h0 IMAGE app:v1\n\
+                    REVISION 1 EVENT cid-bbb SIGNER op-subkey-alice HASH h1 IMAGE app:v2\n\
+                    garbage line";
+        let h = parse_history(body);
+        assert_eq!(h.reference, "Workload/web");
+        assert_eq!(h.revisions.len(), 2);
+        assert_eq!(
+            h.revisions[0],
+            RevisionRow {
+                index: 0,
+                event_cid: "cid-aaa".into(),
+                signer: "op-subkey-alice".into(),
+                hash: "h0".into(),
+                image: "app:v1".into(),
+            }
+        );
+        assert_eq!(h.revisions[1].event_cid, "cid-bbb");
+        assert_eq!(h.revisions[1].image, "app:v2");
+    }
+
+    #[test]
+    fn history_with_no_revisions_parses_empty() {
+        let h = parse_history("HISTORY Workload/absent COUNT 0\n");
+        assert_eq!(h.reference, "Workload/absent");
+        assert!(h.revisions.is_empty());
+    }
 
     #[test]
     fn parses_the_set_list_lines() {

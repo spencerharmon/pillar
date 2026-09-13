@@ -160,6 +160,23 @@ pub struct Previewed {
     pub content_hash: ContentHash,
 }
 
+/// One prior revision of a resource, drawn from the append-only event log by
+/// [`Platform::history`]: the authorizing event CID, the signer that sealed
+/// that revision, the manifest's content-addressed hash (a stable ref a
+/// rollback re-applies), and the revision's spec `image` when present. Purely
+/// descriptive — carries no authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceRevision {
+    /// The log CID of the event that put this revision in force.
+    pub event_cid: String,
+    /// The subject that signed (authorized) this revision.
+    pub signer: String,
+    /// The content-addressed hash of the sealed manifest for this revision.
+    pub content_hash: String,
+    /// The revision's spec `image`, when the manifest declares one.
+    pub image: Option<String>,
+}
+
 /// The in-memory platform the CLI acts against: the schema registry, the
 /// WoT/RBAC authority inputs, the content-addressed manifest store, and the
 /// append-only signed event log. `apply` is the ONLY mutator; `get`/`describe`
@@ -352,6 +369,56 @@ impl Platform {
             .find_map(|(hash, ev)| {
                 let env = self.store.get(hash)?;
                 (ResourceKey::of(env.body()) == *key).then_some(ev.clone())
+            })
+    }
+
+    /// The full **revision history** of a resource: one entry per prior apply
+    /// of `key`, OLDEST first, drawn from the append-only event log (not just
+    /// the latest-wins view). Each entry carries the authorizing event CID, the
+    /// signer that sealed that revision, the manifest's content-hash (its
+    /// content-addressed ref), and the revision's spec `image` when present.
+    /// A pure read — folding this NEVER writes back. Empty when no manifest for
+    /// `key` was ever applied.
+    #[must_use]
+    pub fn history(&self, key: &ResourceKey) -> Vec<ResourceRevision> {
+        self.applied
+            .iter()
+            .zip(self.applied_events.iter())
+            .filter_map(|(hash, ev)| {
+                let env = self.store.get(hash)?;
+                if ResourceKey::of(env.body()) != *key {
+                    return None;
+                }
+                let body = env.render();
+                let image = body.spec.get("image").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+                Some(ResourceRevision {
+                    event_cid: ev.0.to_string(),
+                    signer: env.signer().to_owned(),
+                    content_hash: env.content_hash().to_string(),
+                    image,
+                })
+            })
+            .collect()
+    }
+
+    /// The CRD body of a PRIOR revision of `key`, identified by the `event_cid`
+    /// that put it in force — the manifest a rollback re-applies. Returns
+    /// `None` when no applied revision of `key` carries that event CID. A pure
+    /// read: resolving a historical manifest NEVER writes back.
+    #[must_use]
+    pub fn manifest_at_event(&self, key: &ResourceKey, event_cid: &str) -> Option<Crd> {
+        self.applied
+            .iter()
+            .zip(self.applied_events.iter())
+            .find_map(|(hash, ev)| {
+                if ev.0.to_string() != event_cid {
+                    return None;
+                }
+                let env = self.store.get(hash)?;
+                (ResourceKey::of(env.body()) == *key).then(|| env.render())
             })
     }
 
