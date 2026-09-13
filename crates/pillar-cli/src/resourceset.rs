@@ -261,11 +261,24 @@ pub fn plan_reconcile(declared: &[MemberRef], owned_live: &[MemberRef]) -> Recon
     }
 }
 
-/// One member's rendered live status: its reference and observed health.
+/// One member's rendered live status: its reference, observed health, and — for
+/// a non-`Healthy` member — an optional human-readable REASON explaining the
+/// degradation (empty for a healthy member). The reason is an ADDITIVE,
+/// free-form advisory: it never affects the machine health/sync axes, it only
+/// gives the console a badge subtext/tooltip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberStatus {
     pub reference: MemberRef,
     pub health: MemberHealth,
+    /// Human-readable degradation reason (empty when `Healthy`).
+    pub reason: String,
+}
+
+/// The degradation reason for a member observed as `Missing`: it is declared by
+/// the set but absent from the live plane.
+#[must_use]
+pub fn missing_reason(reference: &MemberRef) -> String {
+    format!("declared member {reference} is absent from the live resource plane")
 }
 
 /// The node-link graph the console renders for a ResourceSet: node 0 is the set
@@ -376,13 +389,15 @@ pub fn member_statuses(view: &ResourceView, spec: &ResourceSetSpec) -> Vec<Membe
         .iter()
         .map(|m| {
             let present = view.keys().any(|k| k.kind == m.kind && k.name == m.name);
+            let (health, reason) = if present {
+                (MemberHealth::Healthy, String::new())
+            } else {
+                (MemberHealth::Missing, missing_reason(m))
+            };
             MemberStatus {
                 reference: m.clone(),
-                health: if present {
-                    MemberHealth::Healthy
-                } else {
-                    MemberHealth::Missing
-                },
+                health,
+                reason,
             }
         })
         .collect()
@@ -575,10 +590,12 @@ mod tests {
             MemberStatus {
                 reference: MemberRef::new("RetentionPolicy", "a"),
                 health: MemberHealth::Healthy,
+                reason: String::new(),
             },
             MemberStatus {
                 reference: MemberRef::new("Job", "b"),
                 health: MemberHealth::Missing,
+                reason: missing_reason(&MemberRef::new("Job", "b")),
             },
         ];
         let g = build_graph("default", &members);
