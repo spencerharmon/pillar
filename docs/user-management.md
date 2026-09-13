@@ -217,92 +217,99 @@ secret), never embedded in the node source.
    enrolment, or neither. (Design change 2026-09: this supersedes the former
    unconditional "Invited ⇒ force-change"; a forced change is now one optional
    required action, not a property of every invited user.)
-2. **Forced-change containment** (`ForcedChangeContained`): while
-   `force_password_change` is set, the only acts the user can perform are
-   changing their own password and reading their own profile; every other
-   capability-gated act is refused.
-3. **Required-passkey containment** (`RequiredPasskeyContained`): while
-   `require_passkey_enrollment` is set, the user likewise passes no capability
-   gate — they may only enrol the passkey (and touch their own profile /
-   password); the flag clears when the first credential registers.
-4. **Disabled ⇒ no admit**: a `Disabled` user never obtains a session, and
-   disabling revokes existing sessions.
-5. **Password change requires the current password** — except the admin
-   re-provision reset (§2.5A), which requires `iam:users:write` + step-up and
-   issues a new subkey.
-6. **Capability derivation**: a user's effective capabilities equal the union
+2. **Cryptographic containment** (`ContainedHoldsNoOpKey`, `OnboardingCannotSign`):
+   while EITHER required action is outstanding the user holds **no operational
+   key** — the operational offer is unminted (invite) or revoked
+   (require-change / admin-reset), so the key-distribution node has nothing to
+   delegate-sign with. Authority flows ONLY through that key, so a contained
+   ("onboarding") user passes **no** capability gate regardless of
+   roles/groups/session. This supersedes the former app-level
+   `ForcedChangeContained`/`RequiredPasskeyContained` policy checks, which are
+   now *derived consequences* of key absence (still model-checked, but the
+   enforcement is the missing signature, not an `if`). The password-change
+   dialog falls out: the only server-side-signable actions for a keyless
+   credential are the self-service onboarding ceremonies.
+3. **Disabled ⇒ keyless and no admit** (`DisabledHoldsNoOpKey`,
+   `DisabledNeverActive`): a `Disabled` user's operational node-seal admission
+   is revoked (it can sign nothing), never obtains a session, and disabling
+   revokes existing sessions. Enable re-admits the node-seal (no password
+   needed — only the outer node-seal is re-wrapped) iff no onboarding action is
+   owed.
+4. **Admin reset / require-change never needs the password**: the node holds
+   only the user-password-sealed escrow envelope and never records the
+   password, so it cannot reseal under a new one. Instead it **revokes** the
+   operational offer's node-seal (password-free) and requires an
+   ownership-proved rotation: the user unseals their prior (now-revoked) offer
+   with their current/temp password (proving ownership), then a fresh
+   operational key is minted+sealed under the newly chosen password. The old
+   password is dead (old key revoked; new key never sealed under it).
+5. **Capability derivation**: a user's effective capabilities equal the union
    over their roles and their groups' roles; revoking a role/group membership
    removes exactly the capabilities it contributed (no residual grant)
    (`NoAmbientAuthority`).
-7. **Last-key revoke needs confirmation** (already shipped): revoking a user's
+6. **Last-key revoke needs confirmation** (already shipped): revoking a user's
    sole credential requires explicit confirmation, but is always possible.
-8. **Admin credential management is capability-gated**: only a caller with
+7. **Admin credential management is capability-gated**: only a caller with
    `iam:credentials:manage` may list/revoke another user's keys; self-management
    is unchanged.
 
 ## 10. Phasing
-1. **Shipped**: last-key revoke with confirmation (§9.6).
-2. User record + self profile (name/email) + `SetProfile` + `/portal/profile`.
-3. Disable/enable + status gate in `admit` + session revocation.
-4. Roles + groups + group-roles + RBAC capability bridge + admin gating.
-5. Passwords: self-change (§2.1), invite+temp (§2.2), forced-change guard
-   (§2.4), rotation label (§2.3).
-6. Admin password reset re-provision (§2.5A) — new key under the new password,
-   registered 2FA credentials preserved (operator-confirmed).
-7. Admin management of others' security keys (§5).
-8. Frontend: Profile, Users, Roles & Groups sections; forced-change router guard.
+1. **Shipped**: last-key revoke with confirmation (§9.6); the Keycloak-style
+   invite options + record + self profile + disable/enable/require-change +
+   admin reset, first bridged as HTTP-with-app-gate (the 404 fix), now being
+   migrated onto the delegated-signing message API (§11–§12).
+2. **In progress (this work)**: cryptographic containment via delegated signing.
 
-## 11. Implementation: the HTTP bridge & offer-based authentication
+## 11. Implementation: delegated signing is the enforcement
 
-The `pillar-iam` state machine is bridged to the web portal in
-`crates/pillar-cli/src/web_serve.rs`. Design points that refine §2 to the
-**operator-directed** decision to reuse the node-custody offer machinery for
-login (never a parallel password-admit path):
+Authority to perform a cell op is the ability to **produce an accepted
+signature**, never an app-level policy `if`. Pillar's clients (the wasm UI, the
+CLI, any consumer of a cell service such as streamdb) **do not hold the signing
+key**: they authenticate, then a node that holds the key signs the op on their
+behalf and runs it through the SAME `pillar_net::client_ingest` authN(signature)
++ authZ(WoT/RBAC decider) path a key-holding client already uses. This is the
+generalization of the shipped node-custody login flow — which already signs the
+login *nonce* server-side with the unlocked operational key
+(`pillar_web::node_custody::sign_material`) — from "sign the nonce" to "sign any
+`ControlOp`". User-management ops are one subset of these authority-bearing ops,
+riding the same authority; they are NOT a privileged REST surface.
 
-- **One auth path.** An invited user logs in through the SAME node-custody
-  `/login` path the bootstrap first user uses. `iam_invite` (a) folds a
-  `pillar_iam::UserOp::Invite` into the `users` map, (b) admits the user's
-  deterministic operational subkey for login (`admit_subject_login_only`), and
-  (c) provisions a node-sealed operational-key offer sealed under the invitee's
-  initial/temporary password (`NodeCustodyVerifier::provision_offer`). There is
-  no `pillar-iam` `SealedOperationalKey` in the live web path — the offer IS the
-  password-sealed credential.
-- **Journaled + replayed.** Each IAM mutation is one `PortalOp`
-  (`InviteUser`/`UserProfileSet`/`UserStatusSet`/`UserRequireChange`/
-  `UserPasswordSet`/`UserPasskeyEnrolled`), carrying the re-sealed offer
-  ciphertext where relevant, so a restart rehydrates the record AND the offer
-  (`restore_offer`/`restore_offer_blob`) and the user still logs in.
-- **Self password change reuses the offer.** `POST /portal/users/reset-password`
-  with body `<token>\n<new_password>` re-seals the caller's offer under the new
-  password (`NodeCustodyVerifier::reseal_offer` — same admitted record, new
-  password wrapping) and clears `force_password_change`. It is
-  **session-authenticated**: the login already proved knowledge of the current
-  password, so §2.1's "prove the current password" is satisfied by the admitted
-  session rather than a re-entry (the redesigned console collects only the new
-  password). The same endpoint, with `<token>\n<target_handle>` naming ANOTHER
-  existing user, is the `iam:users:write`-gated admin reset (§2.5A): it issues a
-  fresh one-time temp password, re-forces the change, and preserves the
-  target's WebAuthn credentials (the credential registry is independent of the
-  offer).
-- **Containment is enforced server-side.** Every capability-gated IAM write
-  routes through `iam_caller_gate`, which calls `pillar_iam::admit_gated_action`
-  for the caller and refuses (`403 password-change-required` /
-  `403 passkey-enrollment-required`) while the caller carries an outstanding
-  required action — the `ForcedChangeContained`/`RequiredPasskeyContained`
-  invariants realised at the HTTP boundary. Own-profile read/edit and own
-  password change stay exempt.
-- **Endpoints.** `GET /portal/users`, `POST /portal/users/invite` (Keycloak
-  options: `<token>\n<handle>\n<email>` plus optional
-  `<initial_password>\n<force_password_change>\n<require_passkey>` — empty
-  password ⇒ node-generated one-time temp password, returned once),
-  `GET`/`PUT /portal/profile`, `POST /portal/users/reset-password`.
-- **Temp passwords** are 128-bit OS-random (`getrandom`); the node's nonce ids
-  are a counter and are never used as a secret.
+- **Delegated signing.** A client submits an **unsigned** op plus an auth proof
+  (its login session, plus a fresh single-use step-up token — `StepUpToken`,
+  one re-auth per sensitive signature, operator-directed). The
+  key-distribution node holding that user's operational key delegate-signs the
+  op body and ingests it. If the user is **keyless** (onboarding / reset /
+  disabled) there is no operational key to sign with, so the op cannot be
+  produced at all — the cryptographic containment of §9.2.
+- **Proxy / forward.** An HTTP or UDP ingest is usually not the key-holding KD
+  node (which typically has no public HTTP). The ingest forwards the
+  client-authenticated message as-is to the KD node; the KD node replies to the
+  client directly, or wraps its reply as a proxy request back through any node
+  that allows it (including the ingest). Single-node cells self-delegate (the
+  ingest IS the KD node); the forward path is exercised only cross-node.
+- **User-mgmt over the message API.** Invite / disable / enable /
+  require-change / reset / profile become `ControlOp` variants ingested through
+  `client_ingest` and authorized by the decider — the same tier `pillar member`
+  / `pillar session` already use. The former `/portal/users/*` HTTP handlers
+  become thin ingest/proxy fronts that delegate-sign; the `iam_caller_gate`
+  boolean is demoted to a belt-and-suspenders assertion, not the enforcement.
 
-Known follow-ups (not blockers): the portal authorizes any WoT-admitted subject
-through the shared catch-all policy, so an invited user's fine-grained
-per-role capability gating rides that existing coarse model (unchanged by this
-work); `disable`/`enable`/`require-password-change` + their dry-run predictions
-and the required-passkey clear on WebAuthn enrol are wired in the pillar-iam
-core and journalled ops but their dedicated portal routes land in the next
-phase.
+## 12. Onboarding vs operational credential
+
+Every created user is in exactly one cryptographic state:
+
+- **Onboarding** — holds only an *enrollment* credential unlocking the
+  self-service ceremonies (own password change, own passkey enrol, own profile
+  read); its operational offer is **unminted**. `opKey = FALSE`.
+- **Operational** — its operational offer is sealed under the user's own secret
+  and its node-seal is admitted, so the KD node can delegate-sign under the
+  user's role capabilities. `opKey = TRUE`.
+
+Transitions (all reuse the escrow / node-seal / KD-ledger primitives in
+`pillar-key-distribution` + `pillar-web::node_custody`): **Invite** →
+onboarding, or operational iff neither required action is attached (admin-set
+password seals the offer immediately); **CompletePasswordChange / EnrollPasskey**
+→ mint the operational key once the last required action clears; **RequireChange
+/ AdminReset** → revoke the operational node-seal (password-free) back to
+onboarding; **Disable** → revoke node-seal admission; **Enable** → re-admit iff
+no onboarding action is owed.
