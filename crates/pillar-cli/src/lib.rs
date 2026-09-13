@@ -69,7 +69,7 @@ use std::fmt;
 use pillar_core::NodeId;
 use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_manifest::{
-    Capability as ManifestCapability, ContentHash, Crd, Envelope, FieldType, Metadata, SchemaError,
+    Capability as ManifestCapability, ContentHash, Crd, Envelope, SchemaError,
     SchemaRegistry, Value,
 };
 use pillar_rbac::{
@@ -617,7 +617,7 @@ impl std::error::Error for RenderError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pillar_manifest::{Schema, SchemaRegistry};
+    use pillar_manifest::{FieldType, Metadata, Schema, SchemaRegistry};
     use pillar_rbac::{default_resource_class_policies, Capability as RbacCapability};
 
     const OWNER: &str = "OWNER-FPR";

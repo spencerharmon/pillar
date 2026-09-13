@@ -63,27 +63,62 @@ pub enum ResourceOp {
         /// The resource's `metadata.name`.
         name: String,
     },
+    /// Read the materialized resource view (a VIEW: the node emits NO event
+    /// and mutates nothing). `name` `None` lists every object of `kind` as a
+    /// `---`-separated CRD-YAML stream; `Some` renders that one object's CRD
+    /// YAML. Served over the same signed, sealed resource-op tier as the
+    /// mutations so `pillar get` reaches a live cell from anywhere the mutate
+    /// tier is reachable; the node gates it on the signer being a recognized
+    /// cell member (fail-closed), exactly as the web read tier gates on a
+    /// session.
+    Get {
+        /// The resource kind to read (e.g. `RetentionPolicy`).
+        kind: String,
+        /// The single object's `metadata.name`, or `None` to list the kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Describe one resource (a VIEW): full detail INCLUDING provenance (the
+    /// signer, authorizing capability, and event CID of the record in force).
+    /// Like [`ResourceOp::Get`] it emits no event and is member-gated.
+    Describe {
+        /// The resource kind (e.g. `RetentionPolicy`).
+        kind: String,
+        /// The resource's `metadata.name`.
+        name: String,
+    },
 }
 
 impl ResourceOp {
     /// The resource kind this op targets — for `Apply`, the CRD's `kind`; for
-    /// `Delete`, the named `kind`. The node routes write-policy authorization
-    /// on this.
+    /// `Delete`/`Get`/`Describe`, the named `kind`. The node routes write-policy
+    /// authorization on this (reads are member-gated, not routed on name).
     #[must_use]
     pub fn kind(&self) -> &str {
         match self {
             ResourceOp::Apply { crd } => &crd.kind,
-            ResourceOp::Delete { kind, .. } => kind,
+            ResourceOp::Delete { kind, .. }
+            | ResourceOp::Get { kind, .. }
+            | ResourceOp::Describe { kind, .. } => kind,
         }
     }
 
-    /// The resource `metadata.name` this op targets.
+    /// The resource `metadata.name` this op targets, if it names a single
+    /// object. `None` for a [`ResourceOp::Get`] that lists a whole kind.
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> Option<&str> {
         match self {
-            ResourceOp::Apply { crd } => &crd.metadata.name,
-            ResourceOp::Delete { name, .. } => name,
+            ResourceOp::Apply { crd } => Some(&crd.metadata.name),
+            ResourceOp::Delete { name, .. } | ResourceOp::Describe { name, .. } => Some(name),
+            ResourceOp::Get { name, .. } => name.as_deref(),
         }
+    }
+
+    /// Whether this op is a read-only VIEW (`Get`/`Describe`) — the node serves
+    /// it from the materialized view and emits no signed event.
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        matches!(self, ResourceOp::Get { .. } | ResourceOp::Describe { .. })
     }
 
     /// Encode this op to its deterministic streamdb op payload: a single
@@ -175,7 +210,7 @@ mod tests {
         let back = ResourceOp::decode(&bytes).expect("decode");
         assert_eq!(back, op, "apply round-trips byte-faithfully");
         assert_eq!(back.kind(), "RetentionPolicy");
-        assert_eq!(back.name(), "metrics-default");
+        assert_eq!(back.name(), Some("metrics-default"));
     }
 
     #[test]
@@ -188,7 +223,47 @@ mod tests {
         let back = ResourceOp::decode(&bytes).expect("decode");
         assert_eq!(back, op);
         assert_eq!(back.kind(), "RetentionPolicy");
-        assert_eq!(back.name(), "metrics-default");
+        assert_eq!(back.name(), Some("metrics-default"));
+    }
+
+    #[test]
+    fn get_and_describe_read_verbs_round_trip_and_report_read() {
+        let list = ResourceOp::Get {
+            kind: "RetentionPolicy".into(),
+            name: None,
+        };
+        let bytes = list.encode().expect("encode");
+        let back = ResourceOp::decode(&bytes).expect("decode");
+        assert_eq!(back, list, "list get round-trips");
+        assert_eq!(back.kind(), "RetentionPolicy");
+        assert_eq!(back.name(), None, "a list get names no single object");
+        assert!(back.is_read(), "get is a view");
+
+        let one = ResourceOp::Get {
+            kind: "RetentionPolicy".into(),
+            name: Some("metrics-default".into()),
+        };
+        let back = ResourceOp::decode(&one.encode().expect("encode")).expect("decode");
+        assert_eq!(back, one);
+        assert_eq!(back.name(), Some("metrics-default"));
+        assert!(back.is_read());
+
+        let desc = ResourceOp::Describe {
+            kind: "RetentionPolicy".into(),
+            name: "metrics-default".into(),
+        };
+        let back = ResourceOp::decode(&desc.encode().expect("encode")).expect("decode");
+        assert_eq!(back, desc);
+        assert!(back.is_read());
+        assert!(list.is_read(), "a list get is a view");
+        assert!(
+            !ResourceOp::Delete {
+                kind: "K".into(),
+                name: "n".into()
+            }
+            .is_read(),
+            "delete is a mutation, not a view"
+        );
     }
 
     /// The load-bearing property: the SAME logical op encodes to the SAME

@@ -173,7 +173,7 @@ use pillar_web::{authorize_nonloopback_signing_action, bind_web};
 use pillar_wot_authority::{FencedActor, WotAuthority};
 
 use crate::observability_ui::ObservabilityBuilders;
-use crate::resource::{Address, ResourceError, ResourcePlane, Selector};
+use crate::resource::{Address, ResourceError, ResourcePlane, ResourceReadError, Selector};
 use crate::resourceset::{
     build_graph, collect_resourcesets, defaults_advisory_for_view, member_origin, member_statuses,
     owned_live, plan_reconcile, roll_up_health, MemberHealth, MemberRef, DEFAULT_RESOURCE_SET,
@@ -3397,7 +3397,87 @@ impl WebAuthContext {
                     &Address::new(kind.clone(), name.clone()),
                 )
                 .map(|applied| applied.event.0.to_string()),
+            pillar_ops::ResourceOp::Get { .. } | pillar_ops::ResourceOp::Describe { .. } => {
+                // Reads are VIEWS: they never reach the write plane. The
+                // resource-op tier dispatches them to `resource_op_get` /
+                // `resource_op_describe` BEFORE this write path, so a read
+                // arriving here is a caller bug, not a mutation to authorize.
+                Err(ResourceError::UnroutableRead)
+            }
         }
+    }
+
+    /// Serve a resource-plane VIEW over the resource-op tier (`pillar get`):
+    /// emits NO event. `name` `None` lists every object of `kind` as a
+    /// `---`-separated CRD-YAML stream; `Some` renders that one object's CRD
+    /// YAML. Member-gated fail-closed: the authenticated signer must be
+    /// reachable in this cell's WoT authority graph — the same bar the web
+    /// read tier's session enforces — or the read is refused.
+    ///
+    /// # Errors
+    /// [`ResourceReadError::Unauthorized`] for an unrecognized signer;
+    /// [`ResourceReadError::NotFound`] when a named object does not exist;
+    /// [`ResourceReadError::Serialize`] if a CRD fails to serialize to YAML.
+    pub fn resource_op_get(
+        &self,
+        actor: &NodeId,
+        kind: &str,
+        name: Option<&str>,
+    ) -> Result<String, ResourceReadError> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err(ResourceReadError::Unauthorized);
+        }
+        let mut docs = Vec::new();
+        for (key, env) in self.resource_platform.view() {
+            if key.api_version != self.resource_api || key.kind != kind {
+                continue;
+            }
+            if let Some(want) = name {
+                if key.name != want {
+                    continue;
+                }
+            }
+            let yaml = env
+                .body()
+                .to_yaml()
+                .map_err(|e| ResourceReadError::Serialize(e.to_string()))?;
+            docs.push(yaml);
+        }
+        if name.is_some() && docs.is_empty() {
+            return Err(ResourceReadError::NotFound {
+                kind: kind.to_owned(),
+                name: name.unwrap_or_default().to_owned(),
+            });
+        }
+        // Each `to_yaml()` document already ends in a newline; join with a
+        // `---` line so the result is a valid multi-document YAML stream that
+        // `pillar apply -f` / `Crd::from_documents` round-trips.
+        Ok(docs.join("---\n"))
+    }
+
+    /// Serve a single resource's DESCRIBE over the resource-op tier
+    /// (`pillar describe`): the full detail INCLUDING provenance (the signer,
+    /// authorizing capability, and event CID of the record in force). A VIEW:
+    /// emits no event; member-gated exactly like [`Self::resource_op_get`].
+    ///
+    /// # Errors
+    /// [`ResourceReadError::Unauthorized`] for an unrecognized signer;
+    /// [`ResourceReadError::NotFound`] when the object does not exist.
+    pub fn resource_op_describe(
+        &self,
+        actor: &NodeId,
+        kind: &str,
+        name: &str,
+    ) -> Result<String, ResourceReadError> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err(ResourceReadError::Unauthorized);
+        }
+        self.resource_platform
+            .describe(&self.resource_api, kind, name)
+            .ok_or_else(|| ResourceReadError::NotFound {
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            })
     }
 
     /// Admit `subject` as a WoT-authoritative resource-op signer at full

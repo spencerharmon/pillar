@@ -29,7 +29,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pillar_cli::apply_over_pillar_message::{apply_manifest_text, delete_resource};
+use pillar_cli::apply_over_pillar_message::{
+    apply_manifest_text, delete_resource, describe_resource, get_resource,
+};
 
 const PASSWORD: &str = "correct horse battery staple 2026 apply";
 const HANDLE: &str = "spencer";
@@ -315,6 +317,72 @@ fn cli_apply_and_delete_mutate_the_live_default_resource_set_over_pillar_udp_wit
     // Describing a resource-set view is best-effort here (its exact route
     // may differ); the load-bearing assertion is the resource-op ack above.
     let _ = describe;
+
+    // --- READ VERBS over pillar-UDP (`pillar get` / `pillar describe`): the
+    // materialized view is reachable over the SAME sealed tier as the
+    // mutations, from a caller that has only the resource-op env above (no
+    // HTTP session, no ClusterIP web reach). A list get returns every
+    // RetentionPolicy applied above as a `---`-separated CRD-YAML stream that
+    // round-trips back through the apply parser.
+    let listed = get_resource("RetentionPolicy", None).expect("list get over pillar-UDP");
+    let listed_crds =
+        pillar_manifest::Crd::from_documents(&listed).expect("the view is a valid YAML stream");
+    let listed_names: std::collections::BTreeSet<_> = listed_crds
+        .iter()
+        .map(|c| c.metadata.name.as_str())
+        .collect();
+    for want in ["web-metrics", "multi-metrics", "multi-logs", "multi-traces"] {
+        assert!(
+            listed_names.contains(want),
+            "list get must include {want}; got {listed_names:?}",
+        );
+    }
+
+    // A named get returns exactly that one object's CRD YAML.
+    let one = get_resource("RetentionPolicy", Some("web-metrics")).expect("named get");
+    let one_crds = pillar_manifest::Crd::from_documents(&one).expect("one valid CRD");
+    assert_eq!(one_crds.len(), 1, "named get returns exactly one object");
+    assert_eq!(one_crds[0].metadata.name, "web-metrics");
+    assert_eq!(
+        one_crds[0].spec.get("window"),
+        Some(&pillar_manifest::Value::Integer(2_592_000)),
+    );
+
+    // Describe returns the provenance detail (a VIEW, emits no event).
+    let detail =
+        describe_resource("RetentionPolicy", "web-metrics").expect("describe over pillar-UDP");
+    assert!(
+        detail.contains("web-metrics"),
+        "describe names the object: {detail}",
+    );
+
+    // A get for a nonexistent object is refused (not a silent empty success).
+    let missing = get_resource("RetentionPolicy", Some("no-such-policy"));
+    assert!(missing.is_err(), "named get of a missing object errors");
+
+    // An UNRECOGNIZED signer is refused fail-closed: swap in a random key the
+    // node never admitted and confirm the read does not leak the view.
+    let intruder = pillar_crypto::Seed::from_bytes(b"cli-get-e2e-unadmitted-intruder".to_vec());
+    let (intruder_pub, intruder_secret) =
+        pillar_crypto::sign::signing_keypair_from_seed(&intruder).expect("intruder keypair");
+    let saved_pub = std::env::var("PILLAR_SIGNER_PUBLIC_HEX").expect("pub set");
+    let saved_secret = std::env::var("PILLAR_SIGNER_SECRET_HEX").expect("secret set");
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(intruder_pub.as_bytes()),
+    );
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(intruder_secret.as_bytes()),
+    );
+    let refused = get_resource("RetentionPolicy", None);
+    assert!(
+        refused.is_err(),
+        "an unadmitted signer must be refused, got: {refused:?}",
+    );
+    // Restore the admitted signer for the delete below.
+    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", saved_pub);
+    std::env::set_var("PILLAR_SIGNER_SECRET_HEX", saved_secret);
 
     // --- THE MUTATION UNDER TEST: `pillar delete kind/name` over
     // pillar-UDP.

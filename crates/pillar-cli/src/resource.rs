@@ -443,7 +443,47 @@ pub enum ResourceError {
     NotFound(Address),
     /// The underlying signed-apply failed (schema/authorization).
     Apply(ApplyError),
+    /// A read verb (`Get`/`Describe`) was routed into the write-apply path.
+    /// The resource-op tier dispatches reads to their own view methods first,
+    /// so this only fires on a caller bug, never on a real mutation.
+    UnroutableRead,
 }
+
+/// Why a resource-plane VIEW served over the resource-op tier (`pillar get` /
+/// `pillar describe`) was refused. Distinct from [`ResourceError`] because a
+/// read authorizes on cell membership (not a write capability) and never
+/// touches the signed-apply path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceReadError {
+    /// The authenticated signer is not a recognized member of this cell
+    /// (unreachable in the WoT authority graph) — refused fail-closed.
+    Unauthorized,
+    /// A named object of the requested kind does not exist in the view.
+    NotFound {
+        /// The requested resource kind.
+        kind: String,
+        /// The requested `metadata.name`.
+        name: String,
+    },
+    /// A CRD in the view failed to serialize to YAML.
+    Serialize(String),
+}
+
+impl fmt::Display for ResourceReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceReadError::Unauthorized => {
+                f.write_str("UNAUTHORIZED (signer is not a recognized member of this cell)")
+            }
+            ResourceReadError::NotFound { kind, name } => {
+                write!(f, "{kind}/{name} not found")
+            }
+            ResourceReadError::Serialize(e) => write!(f, "serializing resource view: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ResourceReadError {}
 
 impl fmt::Display for ResourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -453,6 +493,9 @@ impl fmt::Display for ResourceError {
             ResourceError::AlreadyExists(a) => write!(f, "`{a}` already exists"),
             ResourceError::NotFound(a) => write!(f, "`{a}` not found"),
             ResourceError::Apply(e) => write!(f, "{e}"),
+            ResourceError::UnroutableRead => {
+                f.write_str("internal: a read verb was routed into the write-apply path")
+            }
         }
     }
 }
