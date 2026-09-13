@@ -1819,6 +1819,11 @@ mod yew_impl {
         let arg = use_state(String::new);
         let msg = use_state(|| None::<(String, bool)>);
         let busy = use_state(|| false);
+        // Revision-history panel: prior revisions of the named resource from the
+        // event log (`/portal/resource/history`), each rollback-able by its
+        // MANIFEST content-hash ref through the signed `/portal/resource/rollback`
+        // act path (dry-run + diff gated, exactly like any other apply).
+        let history = use_state(Vec::<crate::resources_console::RevisionRow>::new);
 
         let get = {
             let (auth, rows, kind, selector, msg) = (
@@ -1882,6 +1887,88 @@ mod yew_impl {
                     busy.set(false);
                 });
             })
+        };
+        // Fetch the named resource's revision history from the event log.
+        let load_history = {
+            let (auth, history, kind, name, msg) = (
+                auth.clone(),
+                history.clone(),
+                kind.clone(),
+                name.clone(),
+                msg.clone(),
+            );
+            Callback::from(move |_: MouseEvent| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let url = get_url(
+                    "/portal/resource/history",
+                    &token,
+                    &[("kind", (*kind).trim()), ("name", (*name).trim())],
+                );
+                let (auth, history, msg) = (auth.clone(), history.clone(), msg.clone());
+                spawn_local(async move {
+                    match http("GET", &url, None).await {
+                        Ok(r) if r.ok() => history.set(
+                            crate::resources_console::parse_revisions(&r.body),
+                        ),
+                        Ok(r) => {
+                            if !handle_401(&auth, r.status) {
+                                msg.set(Some((strip_marker(&r.body), false)));
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                });
+            })
+        };
+        // Roll back to a prior revision: re-apply its sealed manifest (named by
+        // its MANIFEST content-hash ref) through the SAME signed, dry-run-gated
+        // act path (`/portal/resource/rollback`) as any other change.
+        let rollback = {
+            let (auth, busy, msg, kind, name, get) = (
+                auth.clone(),
+                busy.clone(),
+                msg.clone(),
+                kind.clone(),
+                name.clone(),
+                get.clone(),
+            );
+            move |manifest_ref: String| {
+                let (auth, busy, msg, kind, name, get) = (
+                    auth.clone(),
+                    busy.clone(),
+                    msg.clone(),
+                    kind.clone(),
+                    name.clone(),
+                    get.clone(),
+                );
+                Callback::from(move |_: MouseEvent| {
+                    if *busy {
+                        return;
+                    }
+                    let token = auth.token.clone().unwrap_or_default();
+                    let body = crate::resources_console::rollback_request_body(
+                        &token,
+                        (*name).trim(),
+                        &manifest_ref,
+                        (*kind).trim(),
+                    );
+                    let (busy, msg, get) = (busy.clone(), msg.clone(), get.clone());
+                    busy.set(true);
+                    spawn_local(async move {
+                        if let Ok(r) =
+                            http("POST", "/portal/resource/rollback", Some(&body)).await
+                        {
+                            msg.set(Some((r.body.trim().to_owned(), r.ok())));
+                            if r.ok() {
+                                get.emit(());
+                            }
+                        }
+                        busy.set(false);
+                    });
+                })
+            }
         };
         let act = {
             let (auth, busy, msg, name, arg, get) = (
@@ -1963,10 +2050,22 @@ mod yew_impl {
                     <PendingButton id="resource-rollout-btn" label="Roll out" busy={*busy} onclick={act("/portal/resource/rollout")} />
                 </div>
                 { message_line("resource-act-msg", &msg) }
+                <label>{ "Revision history & rollback" }</label>
+                <button type="button" id="resource-history-btn" onclick={load_history}>{ "Load revision history" }</button>
+                <div id="resource-history">
+                    { for history.iter().map(|rev| {
+                        let ref_ = rev.manifest.clone();
+                        html! {
+                            <p class="revision-row">
+                                { format!("rev {} · event {} · signer {} · manifest {}", rev.ordinal, rev.event, rev.signer, rev.manifest) }
+                                <PendingButton id="resource-rollback-btn" label="Roll back" busy={*busy} onclick={rollback(ref_)} />
+                            </p>
+                        }
+                    }) }
+                </div>
             </div>
         }
     }
-
     /// Observability: explore/query the five signal kinds + save a dashboard.
     #[function_component(ObservabilityTile)]
     pub(crate) fn observability_tile() -> Html {

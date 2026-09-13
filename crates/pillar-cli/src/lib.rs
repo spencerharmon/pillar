@@ -147,6 +147,24 @@ pub struct Applied {
     pub content_hash: ContentHash,
 }
 
+/// One entry of a resource's revision history: a prior applied manifest for a
+/// single [`ResourceKey`], recorded by exactly one signed event. Carries the
+/// provenance a `describe` surfaces for the record in force, but for EVERY
+/// prior record — the event CID that recorded it, the signer that authorized
+/// it, and the content-hash of the sealed manifest body. The content-hash is
+/// the "manifest ref" a rollback re-applies (see
+/// [`Platform::manifest_by_content_hash`]). Produced by [`Platform::history`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    /// The id of the signed event that recorded this revision.
+    pub event: EventId,
+    /// The subject that signed (authorized) this revision.
+    pub signer: String,
+    /// The content-hash of the sealed manifest body — the manifest ref a
+    /// rollback fetches and re-applies.
+    pub content_hash: ContentHash,
+}
+
 /// What a `--dry-run` preview of an apply-shaped act WOULD produce, computed
 /// by running the identical validate-then-authorize decision path
 /// [`Platform::apply`] uses (see [`Platform::preview`]) — WITHOUT sealing an
@@ -353,6 +371,47 @@ impl Platform {
                 let env = self.store.get(hash)?;
                 (ResourceKey::of(env.body()) == *key).then_some(ev.clone())
             })
+    }
+
+    /// The full REVISION HISTORY of one resource: every prior applied
+    /// manifest for `(api_version, kind, name)`, in apply order (oldest
+    /// first), drawn purely from the log/store. Each [`Revision`] carries the
+    /// event CID that recorded it, the signer that authorized it, and the
+    /// content-hash of the sealed manifest body (the "manifest ref" a rollback
+    /// re-applies). A pure read: computing it mutates nothing. The LAST entry
+    /// is the record currently in force (matching [`Self::event_cid`]).
+    #[must_use]
+    pub fn history(&self, api_version: &str, kind: &str, name: &str) -> Vec<Revision> {
+        let want = ResourceKey {
+            api_version: api_version.to_owned(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        };
+        let mut out = Vec::new();
+        for (hash, ev) in self.applied.iter().zip(self.applied_events.iter()) {
+            let Some(env) = self.store.get(hash) else {
+                continue;
+            };
+            if ResourceKey::of(env.body()) != want {
+                continue;
+            }
+            out.push(Revision {
+                event: ev.clone(),
+                signer: env.signer().to_owned(),
+                content_hash: hash.clone(),
+            });
+        }
+        out
+    }
+
+    /// Fetch the sealed manifest body (`Crd`) of a prior revision by its
+    /// content-hash — the "manifest ref" [`Self::history`] lists. Returns
+    /// `None` if no manifest with that content-hash is stored. A pure read:
+    /// a rollback renders this body and re-applies it through the SAME signed
+    /// [`Self::apply`] path (dry-run gated) as any other change.
+    #[must_use]
+    pub fn manifest_by_content_hash(&self, content_hash: &ContentHash) -> Option<Crd> {
+        self.store.get(content_hash).map(Envelope::render)
     }
 
     fn describe_impl(&self, api_version: &str, kind: &str, name: &str) -> Option<String> {

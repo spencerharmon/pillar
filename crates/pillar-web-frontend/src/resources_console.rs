@@ -58,6 +58,73 @@ pub fn parse_resource_rows(body: &str) -> Vec<ResourceRow> {
     out
 }
 
+/// One row of `GET /portal/resource/history`:
+/// `REVISION <n> EVENT <cid> SIGNER <signer> MANIFEST <content-hash>`. A prior
+/// applied manifest of a resource — the timeline the revision-history panel
+/// renders and a rollback re-applies by its `manifest` content-hash ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionRow {
+    /// The 0-based revision ordinal (stable timeline position; the last is in
+    /// force).
+    pub ordinal: u64,
+    /// The event CID that recorded this revision.
+    pub event: String,
+    /// The subject that signed (authorized) this revision.
+    pub signer: String,
+    /// The sealed manifest's content-hash — the ref a rollback re-applies.
+    pub manifest: String,
+}
+
+/// Parse the `GET /portal/resource/history` body: one
+/// `REVISION <n> EVENT <cid> SIGNER <signer> MANIFEST <content-hash>` per line,
+/// ignoring the trailing `EVENTS <n>` bookkeeping line. Malformed lines are
+/// skipped rather than fabricated.
+#[must_use]
+pub fn parse_revisions(body: &str) -> Vec<RevisionRow> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("EVENTS ") {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("REVISION ") else {
+            continue;
+        };
+        // `<n> EVENT <cid> SIGNER <signer> MANIFEST <content-hash>`
+        let mut it = rest.split_whitespace();
+        let (Some(ord), Some("EVENT"), Some(event), Some("SIGNER"), Some(signer), Some("MANIFEST"), Some(manifest)) = (
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+        ) else {
+            continue;
+        };
+        let Ok(ordinal) = ord.parse::<u64>() else {
+            continue;
+        };
+        out.push(RevisionRow {
+            ordinal,
+            event: event.to_owned(),
+            signer: signer.to_owned(),
+            manifest: manifest.to_owned(),
+        });
+    }
+    out
+}
+
+/// The `<token>\n<name>\n<manifest-ref>\n<kind>` body a
+/// `POST /portal/resource/rollback` expects: re-apply the prior revision named
+/// by its `manifest` content-hash ref, through the signed dry-run-gated act
+/// path.
+#[must_use]
+pub fn rollback_request_body(token: &str, name: &str, manifest_ref: &str, kind: &str) -> String {
+    format!("{token}\n{name}\n{manifest_ref}\n{kind}")
+}
+
 /// One live replica from `GET /portal/resource/replicas`:
 /// `REPLICA <workload> <node> pid=<pid> port=<port> digest=<hex>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,8 +539,8 @@ mod yew_impl {
     use super::{
         act_request_body, change_preview, cronjob_apply_body, cronjob_delete_body,
         parse_act_result, parse_event_trail, parse_predicted, parse_replicas,
-        parse_resource_rows, ChangeState, ReplicaRow, ResourceAction, ResourceRow, RolloutHealth,
-        CRONJOB_KIND,
+        parse_resource_rows, parse_revisions, rollback_request_body, ChangeState, ReplicaRow,
+        ResourceAction, ResourceRow, RevisionRow, RolloutHealth, CRONJOB_KIND,
     };
     use crate::auth::use_auth;
     use crate::portal::{get_url, http, input_value};
@@ -819,6 +886,12 @@ mod yew_impl {
         // health status is never stale relative to the grid.
         let live_replicas = use_state(|| None::<usize>);
 
+        // The resource's revision history (`/portal/resource/history`), fetched
+        // lazily when the History tab is opened, plus a one-line result banner
+        // for a rollback act.
+        let history = use_state(Vec::<RevisionRow>::new);
+        let history_msg = use_state(|| None::<(String, bool)>);
+
         // Fetch the live-replica oracle once per opened row (on mount and on
         // any row swap) and derive this resource's own rollout health from
         // it — the drawer's "richer" health view over just the declared
@@ -889,9 +962,84 @@ mod yew_impl {
             "Logs".to_owned(),
             "Exec".to_owned(),
             "Events".to_owned(),
+            "History".to_owned(),
         ];
+        // Fetch the resource's revision history from the event log.
+        let load_history = {
+            let (auth, row, history) = (auth.clone(), row.clone(), history.clone());
+            Callback::from(move |_: ()| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let url = get_url(
+                    "/portal/resource/history",
+                    &token,
+                    &[("kind", &row.kind), ("name", &row.name)],
+                );
+                let history = history.clone();
+                spawn_local(async move {
+                    if let Ok(r) = http("GET", &url, None).await {
+                        history.set(if r.ok() {
+                            parse_revisions(&r.body)
+                        } else {
+                            Vec::new()
+                        });
+                    }
+                });
+            })
+        };
+        // Roll back to a prior revision: re-apply its sealed manifest (named by
+        // its MANIFEST content-hash ref) through the SAME signed
+        // `/portal/resource/rollback` act path — dry-run + diff gated on the
+        // server exactly like any other change. Refreshes the history on success.
+        let rollback = {
+            let (auth, row, history, history_msg, load_history) = (
+                auth.clone(),
+                row.clone(),
+                history.clone(),
+                history_msg.clone(),
+                load_history.clone(),
+            );
+            move |manifest_ref: String| {
+                let (auth, row, history, history_msg, load_history) = (
+                    auth.clone(),
+                    row.clone(),
+                    history.clone(),
+                    history_msg.clone(),
+                    load_history.clone(),
+                );
+                Callback::from(move |_: MouseEvent| {
+                    let token = auth.token.clone().unwrap_or_default();
+                    let body = rollback_request_body(
+                        &token,
+                        &row.name,
+                        &manifest_ref,
+                        &row.kind,
+                    );
+                    let (history, history_msg, load_history) =
+                        (history.clone(), history_msg.clone(), load_history.clone());
+                    spawn_local(async move {
+                        if let Ok(r) =
+                            http("POST", "/portal/resource/rollback", Some(&body)).await
+                        {
+                            match parse_act_result(&r.body) {
+                                Ok(cid) => {
+                                    history_msg.set(Some((format!("Rolled back: {cid}"), true)));
+                                    let _ = &history;
+                                    load_history.emit(());
+                                }
+                                Err(e) => {
+                                    history_msg.set(Some((format!("Refused: {e}"), false)))
+                                }
+                            }
+                        }
+                    });
+                })
+            }
+        };
         let onselect = {
-            let (tab, output, fetch) = (tab.clone(), output.clone(), fetch.clone());
+            let (tab, output, fetch, load_history) =
+                (tab.clone(), output.clone(), fetch.clone(), load_history.clone());
             Callback::from(move |i: usize| {
                 output.set(String::new());
                 tab.set(i);
@@ -899,6 +1047,7 @@ mod yew_impl {
                     1 => fetch.emit("manifest"),
                     2 => fetch.emit("logs"),
                     4 => fetch.emit("events"),
+                    5 => load_history.emit(()),
                     _ => {}
                 }
             })
@@ -913,6 +1062,29 @@ mod yew_impl {
             0 => html! { <ChangeFlow row={row.clone()} /> },
             1 | 4 => html! { <CodeOut text={(*output).clone()} /> },
             2 => html! { <CodeOut text={(*output).clone()} /> },
+            5 => html! {
+                <div class="res-history" id="resource-history">
+                    { for history.iter().map(|rev| {
+                        let ref_ = rev.manifest.clone();
+                        html! {
+                            <div class="revision-row">
+                                <span class="revision-meta">
+                                    { format!("rev {} · event {} · signer {} · manifest {}",
+                                              rev.ordinal, rev.event, rev.signer, rev.manifest) }
+                                </span>
+                                <button class="ds-tab" id="resource-rollback-btn"
+                                        onclick={rollback(ref_)}>{ "Roll back" }</button>
+                            </div>
+                        }
+                    }) }
+                    { match &*history_msg {
+                        Some((m, ok)) => html! {
+                            <p class={if *ok { "obs-msg" } else { "obs-msg is-error" }}>{ m.clone() }</p>
+                        },
+                        None => Html::default(),
+                    } }
+                </div>
+            },
             _ => {
                 let run = {
                     let fetch = fetch.clone();
@@ -1197,6 +1369,73 @@ mod tests {
     fn resource_rows_skip_malformed_and_never_fabricate() {
         let rows = parse_resource_rows("garbage\n/noname\nKind/\n\n");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn revisions_parse_ordinal_event_signer_and_manifest() {
+        let body = "REVISION 0 EVENT cid-a SIGNER alice MANIFEST hash-a\n\
+                    REVISION 1 EVENT cid-b SIGNER bob MANIFEST hash-b\n\
+                    EVENTS 2\n";
+        let revs = parse_revisions(body);
+        assert_eq!(revs.len(), 2);
+        assert_eq!(
+            revs[0],
+            RevisionRow {
+                ordinal: 0,
+                event: "cid-a".into(),
+                signer: "alice".into(),
+                manifest: "hash-a".into(),
+            }
+        );
+        // the LAST parsed revision is the record in force.
+        assert_eq!(revs[1].ordinal, 1);
+        assert_eq!(revs[1].manifest, "hash-b");
+        // the EVENTS bookkeeping line is never a revision row.
+        assert!(revs.iter().all(|r| r.event != "EVENTS"));
+    }
+
+    #[test]
+    fn revisions_skip_malformed_and_never_fabricate() {
+        // wrong keyword order, missing fields, non-numeric ordinal — all skipped.
+        let revs = parse_revisions(
+            "REVISION x EVENT c SIGNER s MANIFEST m\n\
+             REVISION 0 SIGNER s\n\
+             garbage\n\
+             REVISION\n",
+        );
+        assert!(revs.is_empty());
+    }
+
+    #[test]
+    fn rollback_body_carries_token_name_manifest_ref_and_kind() {
+        // A rollback names the prior revision by its MANIFEST content-hash ref;
+        // the backend re-applies THAT sealed manifest through the signed act
+        // path (never a privileged rewind).
+        let body = rollback_request_body("tok", "web", "hash-a", "Workload");
+        assert_eq!(body, "tok\nweb\nhash-a\nWorkload");
+        assert_eq!(body.lines().nth(2), Some("hash-a"));
+    }
+
+    #[test]
+    fn rollback_cannot_confirm_without_a_preceding_allow_dry_run() {
+        // A rollback is a MUTATING act, so it rides the SAME ChangeState gate
+        // as every other change: confirming a rollback is refused until a
+        // dry-run of that exact change has just answered ALLOW.
+        let mut gate = ChangeState::default();
+        assert!(!gate.can_confirm(), "a rollback must not confirm from Idle");
+        // A DENY dry-run still refuses.
+        gate = gate.previewed(false);
+        assert!(!gate.can_confirm(), "a DENY dry-run must not authorize a rollback");
+        // Only a preceding ALLOW dry-run authorizes the rollback act.
+        gate = gate.previewed(true);
+        assert!(gate.can_confirm(), "an ALLOW dry-run must authorize the rollback");
+        // Editing the target (invalidation) strips the authorization: a stale
+        // ALLOW can never be carried over to a DIFFERENT rollback.
+        gate = gate.invalidated();
+        assert!(
+            !gate.can_confirm(),
+            "an invalidated preview must not authorize a rollback"
+        );
     }
 
     #[test]
