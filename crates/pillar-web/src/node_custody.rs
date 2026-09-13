@@ -64,7 +64,7 @@ use pillar_crypto::{aead, kdf, sign};
 use pillar_crypto::{Ciphertext, KdfParams, Salt, Seed, SigningPublicKey, SymmetricKey};
 use pillar_identity::NodeSubkey;
 use pillar_key_distribution::{
-    Artifact, ArtifactId, ArtifactKind, CellId, KeyDistributionLedger, RecordKey,
+    Artifact, ArtifactId, ArtifactKind, CellId, KeyDistributionLedger, RecordKey, StepUpToken,
     UserId as KdUserId,
 };
 use pillar_wot_authority::{ActError, FencedActor, WotAuthority};
@@ -379,12 +379,31 @@ impl RegisteredOperationalKey {
 /// [`crate::key_login::AuthSubkey::sign_nonce`]'s framing so the same public
 /// verifier checks it.
 fn sign_material(subkey: &NodeSubkey, secret: &str, nonce: &Nonce) -> Signature {
+    sign_bytes(subkey, secret, &nonce.signing_material_public())
+}
+
+/// Sign ARBITRARY bytes SERVER-SIDE with the unlocked operational-key material
+/// — the generalization of [`sign_material`] from a login nonce to any signing
+/// material (e.g. a [`pillar_wire::PillarMessage`]'s signing material). The
+/// delegated-signing kernel: the node holds the key and signs an op body on the
+/// user's behalf; the client never possesses the key.
+fn sign_bytes(subkey: &NodeSubkey, secret: &str, material: &[u8]) -> Signature {
     let seed = subkey_seed(subkey, secret);
     let (_public, secret_key) =
         sign::signing_keypair_from_seed(&seed).expect("ed25519 keygen from valid seed never fails");
-    let sig = sign::sign(&secret_key, &nonce.signing_material_public())
-        .expect("ed25519 signing over valid input never fails");
+    let sig =
+        sign::sign(&secret_key, material).expect("ed25519 signing over valid input never fails");
     Signature::from_wire(sig.into_bytes())
+}
+
+/// The operational public signing key for `(subkey, secret)` — the `signer`
+/// field a delegated-signed [`pillar_wire::PillarMessage`] carries, and the
+/// subject the ingest authenticates the signature against.
+fn operational_public(subkey: &NodeSubkey, secret: &str) -> SigningPublicKey {
+    let seed = subkey_seed(subkey, secret);
+    sign::signing_keypair_from_seed(&seed)
+        .expect("ed25519 keygen from valid seed never fails")
+        .0
 }
 
 /// Why a node-side custody login was refused. The failure modes surface as
@@ -407,6 +426,10 @@ pub enum NodeCustodyError {
     NotAuthorized(ActError),
     /// The challenge nonce was unknown/expired/replayed/wrong-origin.
     BadNonce,
+    /// A delegated signing request arrived without a fresh, unconsumed step-up
+    /// token — one re-authentication is required per delegated signature
+    /// (mirrors [`pillar_key_distribution::Escrow::recover_plaintext_for_signing`]).
+    StepUpRequired,
 }
 
 /// An admitted node-custody login session: the user identity, the subkey the
@@ -826,22 +849,19 @@ impl NodeCustodyVerifier {
     /// # Errors
     ///
     /// The matching [`NodeCustodyError`] for the first failing step.
-    pub fn admit(
-        &mut self,
+    /// Steps 1-3 of a login/sign, shared by [`Self::admit`] and
+    /// [`Self::sign_op_for`]: resolve the user's offer server-side through the
+    /// REAL key-distribution ledger admission (a revoked/unminted offer fails
+    /// `NoOfferForUser` closed), strip the outer node-seal (only this node's
+    /// key can — else `NoCustody`), and unlock the inner operational-key
+    /// material with the password (a wrong password fails AEAD — `UnlockFailed`).
+    /// Returns the resolved offer (carrying the subkey), the user handle, and
+    /// the recovered plaintext operational-key `secret`.
+    fn resolve_and_unlock(
+        &self,
         identifier: &str,
         password: &str,
-        nonce_id: u64,
-        clock: u64,
-        authority: &WotAuthority,
-        actor: &FencedActor,
-    ) -> Result<NodeCustodySession, NodeCustodyError> {
-        // Step 1: resolve the offer server-side (the user never gave a CID) —
-        // through the REAL key-distribution ledger's admission, not a bare
-        // presence check: a record whose offer was revoked
-        // (`KeyDistributionLedger::revoke_offer`) reports no offer here even
-        // though its blob and CID mapping are still physically in the cell
-        // DB, so revocation fails this path closed exactly like every other
-        // ledger consumer.
+    ) -> Result<(SealedOffer, String, String), NodeCustodyError> {
         let Some(cid) = self.cell_db.resolve_cid(identifier).cloned() else {
             return Err(NodeCustodyError::NoOfferForUser);
         };
@@ -859,21 +879,68 @@ impl NodeCustodyVerifier {
             .handle_for(identifier)
             .unwrap_or(identifier)
             .to_owned();
-
-        // Step 2: strip the node seal — only if the cell sealed to this node
-        // (a real AEAD open; an unsealed/foreign node fails authentication).
         let Some(inner) = self.node_key.unseal(&offer) else {
             return Err(NodeCustodyError::NoCustody);
         };
-
-        // Step 3: unlock the operational key server-side — a real argon2id
-        // KEK + AEAD open; a wrong password fails AEAD authentication.
         let Some(material) = unlock_operational_key(&inner, offer.subkey(), password) else {
             return Err(NodeCustodyError::UnlockFailed);
         };
         let Ok(secret) = String::from_utf8(material) else {
             return Err(NodeCustodyError::UnlockFailed);
         };
+        Ok((offer, handle, secret))
+    }
+
+    /// DELEGATED SIGNING: sign `signing_material` (a
+    /// [`pillar_wire::PillarMessage`]'s signing material for an op body) on the
+    /// user's behalf with their unlocked operational key — the node holds the
+    /// key, the client never does. Reuses the SAME
+    /// resolve→node-unseal→password-unlock path as [`Self::admit`], gated on a
+    /// fresh single-use [`StepUpToken`] (one re-authentication per delegated
+    /// signature, operator-directed). Returns the ed25519 signature and the
+    /// operational public signing key (the `signer` the ingest authenticates +
+    /// authorizes).
+    ///
+    /// A user with NO admitted operational offer — an onboarding user whose
+    /// offer was never minted, or one whose offer a require-change / admin-reset
+    /// / disable revoked — fails closed (`NoOfferForUser`): there is no key to
+    /// sign with, so no op can be produced. This is the CRYPTOGRAPHIC
+    /// containment of a must-change/contained user, not a policy refusal.
+    ///
+    /// # Errors
+    /// [`NodeCustodyError::StepUpRequired`] if `step_up` is missing/consumed;
+    /// otherwise as [`Self::resolve_and_unlock`].
+    pub fn sign_op_for(
+        &self,
+        identifier: &str,
+        password: &str,
+        signing_material: &[u8],
+        step_up: &mut StepUpToken,
+    ) -> Result<(Signature, SigningPublicKey), NodeCustodyError> {
+        // Fresh step-up required per delegated signature (checked FIRST, so a
+        // resolve/unlock failure never consumes the token).
+        if !step_up.consume() {
+            return Err(NodeCustodyError::StepUpRequired);
+        }
+        let (offer, _handle, secret) = self.resolve_and_unlock(identifier, password)?;
+        let signature = sign_bytes(offer.subkey(), &secret, signing_material);
+        let signer = operational_public(offer.subkey(), &secret);
+        Ok((signature, signer))
+    }
+
+    pub fn admit(
+        &mut self,
+        identifier: &str,
+        password: &str,
+        nonce_id: u64,
+        clock: u64,
+        authority: &WotAuthority,
+        actor: &FencedActor,
+    ) -> Result<NodeCustodySession, NodeCustodyError> {
+        // Steps 1-3: resolve the offer server-side through the REAL
+        // key-distribution ledger, strip the node seal, and unlock the
+        // operational key with the password (a wrong password fails AEAD).
+        let (offer, handle, secret) = self.resolve_and_unlock(identifier, password)?;
 
         // Step 4: sign the challenge nonce server-side and verify it.
         let Some(nonce) = self.issued.get(&nonce_id).cloned() else {
@@ -955,6 +1022,91 @@ mod tests {
             SECRET,
         );
         (v, subkey)
+    }
+
+    // ---- delegated signing (the KD node signs an op on the user's behalf) ----
+
+    #[test]
+    fn delegated_signing_produces_a_signature_the_operational_pubkey_verifies() {
+        let (v, _subkey) = provisioned();
+        let body = b"a sealed pillar-message body to sign on the user's behalf";
+        let mut step = StepUpToken::fresh();
+        let (sig, signer) = v
+            .sign_op_for("alice@pillar", PASSWORD, body, &mut step)
+            .expect("an admitted operational offer must delegate-sign");
+        // The returned public key is the operational key's real ed25519 public
+        // half, and it verifies the server-side signature over the exact body.
+        let wire_sig = pillar_crypto::Signature::from_bytes(sig.to_wire().to_vec());
+        assert!(
+            pillar_crypto::sign::verify(&signer, body, &wire_sig).is_ok(),
+            "delegated signature must verify under the returned operational pubkey"
+        );
+    }
+
+    #[test]
+    fn delegated_signing_requires_a_fresh_stepup_per_signature() {
+        let (v, _subkey) = provisioned();
+        let body = b"op body";
+        let mut step = StepUpToken::fresh();
+        assert!(v
+            .sign_op_for("alice@pillar", PASSWORD, body, &mut step)
+            .is_ok());
+        // The SAME token is now consumed — a second delegated signature needs a
+        // freshly re-authenticated step-up.
+        assert_eq!(
+            v.sign_op_for("alice@pillar", PASSWORD, body, &mut step),
+            Err(NodeCustodyError::StepUpRequired),
+        );
+    }
+
+    #[test]
+    fn delegated_signing_wrong_password_burns_the_stepup() {
+        // The step-up is consumed FIRST (before the unlock attempt), so a wrong
+        // password still burns it — a caller cannot brute-force passwords under
+        // a single re-authentication. A FRESH step-up is required to retry.
+        let (v, _subkey) = provisioned();
+        let mut step = StepUpToken::fresh();
+        assert_eq!(
+            v.sign_op_for("alice@pillar", "wrong-password", b"op", &mut step),
+            Err(NodeCustodyError::UnlockFailed),
+        );
+        assert_eq!(
+            v.sign_op_for("alice@pillar", PASSWORD, b"op", &mut step),
+            Err(NodeCustodyError::StepUpRequired),
+            "the burned step-up cannot be reused, even with the right password",
+        );
+        // A freshly re-authenticated step-up succeeds.
+        assert!(v
+            .sign_op_for("alice@pillar", PASSWORD, b"op", &mut StepUpToken::fresh())
+            .is_ok());
+    }
+
+    #[test]
+    fn an_onboarding_user_with_no_minted_offer_cannot_be_delegate_signed() {
+        // The CRYPTOGRAPHIC containment: a contained/onboarding user has no
+        // admitted operational offer, so there is NO key to sign with — the
+        // node cannot produce ANY op on their behalf, independent of policy.
+        let v = NodeCustodyVerifier::new(node_key(), ORIGIN);
+        let mut step = StepUpToken::fresh();
+        assert_eq!(
+            v.sign_op_for("nobody@pillar", PASSWORD, b"op", &mut step),
+            Err(NodeCustodyError::NoOfferForUser),
+        );
+    }
+
+    #[test]
+    fn a_revoked_offer_stops_delegated_signing_closed() {
+        // require-change / admin-reset / disable revoke the operational offer;
+        // afterwards the node can sign nothing on the user's behalf.
+        let (mut v, _subkey) = provisioned();
+        assert!(v
+            .sign_op_for("alice@pillar", PASSWORD, b"op", &mut StepUpToken::fresh())
+            .is_ok());
+        v.revoke_offer_for("alice@pillar");
+        assert_eq!(
+            v.sign_op_for("alice@pillar", PASSWORD, b"op", &mut StepUpToken::fresh()),
+            Err(NodeCustodyError::NoOfferForUser),
+        );
     }
 
     #[test]
