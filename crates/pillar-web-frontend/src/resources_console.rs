@@ -532,7 +532,7 @@ pub fn cronjob_delete_body(token: &str, name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "yew")]
-pub use yew_impl::{CronJobsPanel, ResourceDetailPage, ResourcesConsole};
+pub use yew_impl::{CronJobsPanel, ResourceDetail, ResourceDetailPage, ResourcesConsole};
 
 #[cfg(feature = "yew")]
 mod yew_impl {
@@ -874,7 +874,7 @@ mod yew_impl {
     }
 
     #[function_component(ResourceDetail)]
-    fn resource_detail(props: &ResourceDetailProps) -> Html {
+    pub fn resource_detail(props: &ResourceDetailProps) -> Html {
         let auth = use_auth();
         let row = props.row.clone();
         let tab = use_state(|| 0usize);

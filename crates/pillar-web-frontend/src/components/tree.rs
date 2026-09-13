@@ -113,6 +113,13 @@ mod yew_impl {
         /// Node ids expanded initially.
         #[prop_or_default]
         pub default_expanded: Vec<String>,
+        /// Optional per-node selection callback: fired with the clicked node's
+        /// id (its stable [`TreeNode::id`]) when the row is activated, so a host
+        /// (e.g. the ResourceSets console) can open a detail drawer over the
+        /// selected node WITHOUT the tree owning any drawer logic. When unset,
+        /// a click only toggles expansion (the pre-existing behaviour).
+        #[prop_or_default]
+        pub onselect: Option<Callback<String>>,
     }
 
     /// An expand/collapse hierarchical list. Toggling a branch runs the pure
@@ -131,6 +138,24 @@ mod yew_impl {
                             expanded.set(toggle(&expanded, &id));
                         })
                     };
+                    // A per-node select routes the clicked node's id up to the
+                    // host (which opens the shipped detail drawer). Rendered as
+                    // its own control so toggling expansion and opening the
+                    // drawer are distinct clicks.
+                    let select = props.onselect.clone().map(|cb| {
+                        let id = row.id.clone();
+                        let onclick = Callback::from(move |e: MouseEvent| {
+                            e.stop_propagation();
+                            cb.emit(id.clone());
+                        });
+                        html! {
+                            <button
+                                type="button"
+                                class="pillar-tree__select"
+                                onclick={onclick}
+                            >{ row.label.clone() }</button>
+                        }
+                    });
                     let toggle_char = if !row.has_children {
                         ""
                     } else if row.expanded {
@@ -147,7 +172,11 @@ mod yew_impl {
                             onclick={onclick}
                         >
                             <span class="pillar-tree__toggle">{ toggle_char }</span>
-                            { row.label }
+                            if let Some(select) = select {
+                                { select }
+                            } else {
+                                { row.label }
+                            }
                         </li>
                     }
                 }) }

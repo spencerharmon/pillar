@@ -330,6 +330,39 @@ pub fn depth_tree(d: &ResourceSetDetail) -> Option<TreeNode> {
     Some(build(0, &d.nodes, &d.node_health, &d.node_sync, &children))
 }
 
+/// Resolve a depth-tree node id (`rsnode-<idx>`, the id [`depth_tree`] stamps on
+/// every [`TreeNode`]) back to the `Kind/name` resource it represents, as the
+/// [`crate::resources_console::ResourceRow`] the ALREADY-SHIPPED resources-console
+/// per-resource detail drawer ([`crate::resources_console::ResourceDetail`])
+/// consumes. This is the pure routing hop the console's node `onselect` runs to
+/// open the shipped drawer over a clicked graph/tree node — no new backend, no
+/// new drawer. Returns `None` for an id that is not a `rsnode-<idx>` in range, or
+/// whose node label is not a `Kind/name` reference (e.g. the set-root, which the
+/// graph roots at `ResourceSet/<name>` but which carries no per-resource detail).
+/// The set-root node (index 0) is intentionally NOT routable — a ResourceSet is
+/// the container, not a member resource with an Overview/Manifest/Logs drawer.
+#[must_use]
+pub fn node_resource_ref(
+    d: &ResourceSetDetail,
+    node_id: &str,
+) -> Option<crate::resources_console::ResourceRow> {
+    let idx: usize = node_id.strip_prefix("rsnode-")?.parse().ok()?;
+    // Node 0 is the ResourceSet container root, not a per-resource member.
+    if idx == 0 {
+        return None;
+    }
+    let label = d.nodes.get(idx)?;
+    let (kind, name) = label.split_once('/')?;
+    if kind.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(crate::resources_console::ResourceRow {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        replicas: None,
+    })
+}
+
 /// FULL sync tone set (ArgoCD-parity), replacing the old binary Synced-vs-Warn:
 /// Synced -> Success, Progressing -> Info, OutOfSync -> Warn, Error -> Danger,
 /// Unknown / anything else -> Neutral. Host-testable (no `yew`).
@@ -359,15 +392,16 @@ pub fn health_tone(health: &str) -> Tone {
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::{
-        depth_tree, health_tone, is_reconciling, parse_set_detail, parse_set_list,
-        reconcile_request_body, selected_subset, sync_tone, ResourceSetDetail, ResourceSetRow,
+        depth_tree, health_tone, is_reconciling, node_resource_ref, parse_set_detail,
+        parse_set_list, reconcile_request_body, selected_subset, sync_tone, ResourceSetDetail,
+        ResourceSetRow,
     };
     use crate::auth::use_auth;
     use crate::components::data_table::{Column, DataTable, Row};
     use crate::components::tree::Tree;
     use crate::portal::{get_url, http};
-    use crate::primitives::{Badge, DiffView, Tone};
-    use crate::resources_console::{parse_act_result, parse_predicted, ChangeState};
+    use crate::primitives::{Badge, DiffView, Drawer, Tone};
+    use crate::resources_console::{parse_act_result, parse_predicted, ChangeState, ResourceDetail};
     use std::collections::HashSet;
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
@@ -575,6 +609,14 @@ mod yew_impl {
         // Last-observed wall-clock instant (JS millis) of the most recent
         // successful sets-list fetch.
         let last_observed = use_state(|| None::<f64>);
+
+        // The graph/tree node the operator clicked, resolved to the resources-
+        // console `ResourceRow` its ALREADY-SHIPPED per-resource detail drawer
+        // consumes. `Some` opens the shipped Drawer over that resource; `None`
+        // closes it. Node selection is wired straight into the real, mounted
+        // detail drawer — no new backend, no new drawer.
+        let selected_node =
+            use_state(|| None::<crate::resources_console::ResourceRow>);
 
         // Load the set list on mount / token change / manual refresh /
         // interval tick.
@@ -806,6 +848,20 @@ mod yew_impl {
                     .filter(|(i, label)| *i == 0 || label.starts_with("Workload/"))
                     .map(|(i, _)| format!("rsnode-{i}"))
                     .collect();
+                // Clicking a graph/tree node routes its id -> the node's
+                // `Kind/name` resource -> the SHIPPED resources-console detail
+                // drawer (mounted below). `node_resource_ref` is the pure
+                // routing hop; the set-root and any non-resource node resolve to
+                // `None` and simply do not open a drawer.
+                let on_node_select = {
+                    let d = d.clone();
+                    let selected_node = selected_node.clone();
+                    Callback::from(move |node_id: String| {
+                        if let Some(row) = node_resource_ref(&d, &node_id) {
+                            selected_node.set(Some(row));
+                        }
+                    })
+                };
                 let member_rows: Html = d
                     .members
                     .iter()
@@ -917,7 +973,7 @@ mod yew_impl {
                         }
                         <div class="ds-resource-tree ds-resource-tree--zoompan" role="group" aria-label="ResourceSet resource tree">
                             if let Some(root) = tree_root.clone() {
-                                <Tree roots={vec![root]} default_expanded={default_expanded.clone()} />
+                                <Tree roots={vec![root]} default_expanded={default_expanded.clone()} onselect={on_node_select.clone()} />
                             } else {
                                 <p class="ds-muted">{ "No resources in this set yet." }</p>
                             }
@@ -933,6 +989,12 @@ mod yew_impl {
                     </section>
                 }
             }
+        };
+
+        // Close the node detail drawer.
+        let close_node = {
+            let selected_node = selected_node.clone();
+            Callback::from(move |()| selected_node.set(None))
         };
 
         html! {
@@ -973,6 +1035,18 @@ mod yew_impl {
                     empty_label={"No resource sets match the current filters."}
                 />
                 { detail_view }
+                // The ALREADY-SHIPPED resources-console per-resource detail
+                // drawer (Overview / Manifest / Logs / Exec / Events + the
+                // diff-before-apply gate), opened over the clicked graph/tree
+                // node. Reuses the shipped `Drawer` primitive and the
+                // `ResourceDetail` component verbatim — no new drawer.
+                <Drawer open={selected_node.is_some()}
+                        title={selected_node.as_ref().map(|r| format!("{}/{}", r.kind, r.name)).unwrap_or_default()}
+                        onclose={close_node}>
+                    if let Some(row) = &*selected_node {
+                        <ResourceDetail row={row.clone()} />
+                    }
+                </Drawer>
             </div>
         }
     }
@@ -1378,5 +1452,67 @@ mod tests {
             !gate.can_confirm(),
             "narrowing the selection after preview must not carry over its ALLOW"
         );
+    }
+
+    /// The node `onselect` routing hop: a clicked depth-tree node id
+    /// (`rsnode-<idx>`) resolves to the `Kind/name` resource the SHIPPED
+    /// resources-console per-resource detail drawer consumes. This is the exact
+    /// value the console's `on_node_select` callback feeds into the mounted
+    /// `ResourceDetail` drawer — proving node selection is wired to the real
+    /// drawer's input type, not a stub. The return type is
+    /// `crate::resources_console::ResourceRow`, i.e. `ResourceDetailProps::row`.
+    #[test]
+    fn a_selected_graph_node_routes_into_the_resources_console_detail_drawer() {
+        let body = "SET web\n\
+                    HEALTH Degraded\n\
+                    SYNC OutOfSync\n\
+                    NODE 0 ResourceSet/web\n\
+                    NODE 1 Workload/api\n\
+                    NODE 2 Job/nightly\n\
+                    EDGE 0 1 Healthy\n\
+                    EDGE 0 2 Missing";
+        let d = parse_set_detail(body);
+
+        // A member node routes to that member's ResourceRow — the SAME type
+        // `ResourceDetailProps { row }` (the shipped drawer's props) carries.
+        let row: crate::resources_console::ResourceRow =
+            node_resource_ref(&d, "rsnode-1").expect("a member node must route to a resource");
+        assert_eq!(row.kind, "Workload");
+        assert_eq!(row.name, "api");
+        assert_eq!(row.replicas, None);
+
+        let job = node_resource_ref(&d, "rsnode-2").expect("the Job member node must route");
+        assert_eq!(job.kind, "Job");
+        assert_eq!(job.name, "nightly");
+
+        // The set-root (node 0) is the container, not a per-resource member:
+        // it never opens the detail drawer.
+        assert!(
+            node_resource_ref(&d, "rsnode-0").is_none(),
+            "the ResourceSet root node must not open a per-resource drawer"
+        );
+        // A non-node / out-of-range id resolves to nothing (no drawer opens).
+        assert!(node_resource_ref(&d, "rsnode-99").is_none());
+        assert!(node_resource_ref(&d, "not-a-node").is_none());
+    }
+
+    /// Guard the exact ids `depth_tree` stamps are the ones `node_resource_ref`
+    /// resolves — so the tree the console renders and the routing hop the
+    /// `onselect` runs agree on node identity end to end (a stub that hard-coded
+    /// ids would drift from the real tree).
+    #[test]
+    fn depth_tree_node_ids_round_trip_through_the_select_router() {
+        let body = "SET web\n\
+                    NODE 0 ResourceSet/web\n\
+                    NODE 1 Workload/api\n\
+                    EDGE 0 1 Healthy";
+        let d = parse_set_detail(body);
+        let root = depth_tree(&d).expect("a non-empty graph builds a tree");
+        // The root's child is the Workload member node; its id must route.
+        let child = &root.children[0];
+        assert_eq!(child.id, "rsnode-1");
+        let row = node_resource_ref(&d, &child.id)
+            .expect("the tree's own child-node id must route into the detail drawer");
+        assert_eq!((row.kind.as_str(), row.name.as_str()), ("Workload", "api"));
     }
 }
