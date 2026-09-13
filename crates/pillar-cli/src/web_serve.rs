@@ -3339,12 +3339,20 @@ impl WebAuthContext {
             // the defaults bundle is tagged `defaults@<v>`, an operator-authored
             // one `operator`. This never affects HEALTH/SYNC.
             let origin = member_origin(&view, &s.reference);
-            out.push(format!(
+            // ADDITIVE `REASON <msg>` tail (free-form, always LAST so it may
+            // contain spaces): present only for a non-Healthy member, rendered
+            // by the console as health-badge subtext/tooltip. It never affects
+            // the machine HEALTH/SYNC axes.
+            let mut line = format!(
                 "MEMBER {} HEALTH {} ORIGIN {}",
                 s.reference,
                 s.health.as_str(),
                 origin.as_tag(),
-            ));
+            );
+            if !s.reason.is_empty() {
+                line.push_str(&format!(" REASON {}", s.reason));
+            }
+            out.push(line);
         }
         out.push(format!(
             "PLAN ADOPT {}",
@@ -8117,6 +8125,91 @@ mod tests {
         assert!(ctx.resourceset_detail("nope").is_none());
     }
 
+    // Pin the ADDITIVE `MEMBER ... HEALTH <h> ORIGIN <origin> REASON <msg>` wire
+    // line: a member DECLARED by a set but ABSENT from the live plane is
+    // rendered `Missing` AND carries a free-form `REASON <msg>` tail (the
+    // console renders it as health-badge subtext/tooltip). This locks the wire
+    // format so an additive field can never silently regress. A HEALTHY member
+    // carries NO reason tail (the field is present only for a degraded member).
+    #[test]
+    fn resourceset_detail_emits_reason_tail_for_a_missing_member() {
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        let actor = ctx.identity_actor_for_test();
+
+        // Declare an explicit ResourceSet whose one member (Job/nightly) does
+        // NOT exist on the plane -> it is Missing and gets a REASON tail.
+        let set = Crd::new(
+            &ctx.resource_api,
+            "ResourceSet",
+            CrdMetadata::new("web"),
+        )
+        .with_spec("members", CrdValue::String("Job/nightly".into()));
+        {
+            let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
+            plane
+                .apply(&actor, RESOURCE_CAP, set)
+                .expect("owner applies resource set");
+        }
+
+        let detail = ctx.resourceset_detail("web").expect("web set exists");
+        // The additive REASON tail: `MEMBER <ref> HEALTH Missing ORIGIN <o> REASON <msg>`.
+        assert!(
+            detail.contains("MEMBER Job/nightly HEALTH Missing ORIGIN operator REASON "),
+            "missing member carries the additive REASON tail: {detail}"
+        );
+        assert!(
+            detail.contains("REASON declared member Job/nightly is absent from the live resource plane"),
+            "reason message names the absent member: {detail}"
+        );
+
+        // A HEALTHY member (present on the plane) carries NO reason tail.
+        let rp = Crd::new(
+            &ctx.resource_api,
+            "RetentionPolicy",
+            CrdMetadata::new("web-metrics")
+                .with_label("pillar.dev/resource-set", "web"),
+        )
+        .with_spec("signalKind", CrdValue::String("Metric".into()))
+        .with_spec("window", CrdValue::Integer(600));
+        let set2 = Crd::new(
+            &ctx.resource_api,
+            "ResourceSet",
+            CrdMetadata::new("web"),
+        )
+        .with_spec(
+            "members",
+            CrdValue::String("RetentionPolicy/web-metrics".into()),
+        );
+        {
+            let mut plane = ResourcePlane::new(&mut ctx.resource_platform, &ctx.resource_api);
+            plane
+                .apply(&actor, RESOURCE_CAP, rp)
+                .expect("owner applies retention policy");
+            plane
+                .apply(&actor, RESOURCE_CAP, set2)
+                .expect("owner re-declares set with the present member");
+        }
+        let detail2 = ctx.resourceset_detail("web").expect("web set exists");
+        let member_line = detail2
+            .lines()
+            .find(|l| l.starts_with("MEMBER RetentionPolicy/web-metrics"))
+            .expect("present member line");
+        assert!(
+            member_line.contains("HEALTH Healthy"),
+            "present member is Healthy: {member_line}"
+        );
+        assert!(
+            !member_line.contains("REASON"),
+            "a healthy member carries NO reason tail: {member_line}"
+        );
+    }
+
     // A GET carrying an explicit `X-Pillar-Api-Version` assertion.
     fn get_with_api_version(ctx: &mut WebAuthContext, path: &str, version: &str) -> HttpResponse {
         dispatch_http(
@@ -12311,6 +12404,29 @@ mod tests {
         );
     }
 
+    // Anti-facade mount-audit: the ResourceSets tile is not merely built in
+    // isolation but actually mounted+reachable in the compiled portal wasm —
+    // it fetches the set list/detail endpoints AND embeds the DataTable-backed
+    // list's health/sync filter chips plus the full sync tone set. A plain
+    // substring search over the built wasm's data section is a non-fakeable
+    // proof the literals are compiled in.
+    #[test]
+    fn ui_confirms_resourcesets_panel_datatable_chips_and_sync_tones() {
+        assert_ui_wires(
+            "resource-sets",
+            &[
+                "/portal/resource/sets",
+                "/portal/resource/set",
+                // The DataTable-backed list (filter chips + empty state).
+                "No resource sets match the current filters.",
+                // Full sync tone set (ArgoCD-parity), replacing binary Synced/Warn.
+                "Progressing",
+                "OutOfSync",
+                "Unknown",
+            ],
+        );
+    }
+
     #[test]
     fn ui_confirms_identity_panel() {
         assert_ui_wires(
@@ -12389,6 +12505,11 @@ mod tests {
 
     #[test]
     fn ui_confirms_observability_panel() {
+        // The Observability section mounts `ObservabilityConsole`, which wires
+        // the LIVE `/portal/obs/live/*` endpoints (kinds/dashboard/query/…).
+        // The retired `/portal/obs/{explore,query,dashboard}` tile is no longer
+        // mounted, so assert the endpoints the live console actually fetches
+        // (verified present in the compiled wasm).
         assert_ui_wires(
             "observability",
             &[
