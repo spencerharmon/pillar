@@ -390,4 +390,24 @@ fn cli_apply_and_delete_mutate_the_live_default_resource_set_over_pillar_udp_wit
         delete_resource("RetentionPolicy/web-metrics").expect("delete over pillar-UDP succeeds");
     assert!(ack.starts_with("OK"), "delete ack: {ack}");
     assert_eq!(tier, pillar_client::TransportKind::PillarUdp);
+
+    // --- A deleted resource is HIDDEN from the read verbs (soft-delete
+    // tombstone semantics): `get <name>` 404s and the list no longer carries
+    // it, exactly as `kubectl get` never shows a deleted object.
+    assert!(
+        get_resource("RetentionPolicy", Some("web-metrics")).is_err(),
+        "a tombstoned object must not be gettable by name",
+    );
+    assert!(
+        describe_resource("RetentionPolicy", "web-metrics").is_err(),
+        "describe of a tombstoned object 404s",
+    );
+    let after = get_resource("RetentionPolicy", None).expect("list still succeeds");
+    let after_names: std::collections::BTreeSet<_> = pillar_manifest::Crd::from_documents(&after)
+        .map(|crds| crds.into_iter().map(|c| c.metadata.name).collect())
+        .unwrap_or_default();
+    assert!(
+        !after_names.contains("web-metrics"),
+        "the tombstoned object must be gone from the list; got {after_names:?}",
+    );
 }

@@ -173,7 +173,9 @@ use pillar_web::{authorize_nonloopback_signing_action, bind_web};
 use pillar_wot_authority::{FencedActor, WotAuthority};
 
 use crate::observability_ui::ObservabilityBuilders;
-use crate::resource::{Address, ResourceError, ResourcePlane, ResourceReadError, Selector};
+use crate::resource::{
+    is_tombstone, Address, ResourceError, ResourcePlane, ResourceReadError, Selector,
+};
 use crate::resourceset::{
     build_graph, collect_resourcesets, defaults_advisory_for_view, member_origin, member_statuses,
     owned_live, plan_reconcile, roll_up_health, MemberHealth, MemberRef, DEFAULT_RESOURCE_SET,
@@ -3432,6 +3434,13 @@ impl WebAuthContext {
             if key.api_version != self.resource_api || key.kind != kind {
                 continue;
             }
+            // Skip tombstones: a `delete` leaves a soft-delete marker
+            // (`pillar.dev/deleted=true`) in the view rather than removing the
+            // object. `get` shows only LIVE resources, exactly as `kubectl get`
+            // never lists a deleted object.
+            if is_tombstone(env.body()) {
+                continue;
+            }
             if let Some(want) = name {
                 if key.name != want {
                     continue;
@@ -3471,6 +3480,20 @@ impl WebAuthContext {
     ) -> Result<String, ResourceReadError> {
         if self.authority.reachable_depth(actor).is_none() {
             return Err(ResourceReadError::Unauthorized);
+        }
+        // A tombstoned object is not live — describe treats it as absent, so a
+        // deleted resource 404s rather than rendering stale provenance.
+        let live = self.resource_platform.view().into_iter().any(|(k, env)| {
+            k.api_version == self.resource_api
+                && k.kind == kind
+                && k.name == name
+                && !is_tombstone(env.body())
+        });
+        if !live {
+            return Err(ResourceReadError::NotFound {
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            });
         }
         self.resource_platform
             .describe(&self.resource_api, kind, name)
