@@ -174,6 +174,9 @@ pub const CONTROL_OP_CODEC_VERSION: u8 = 1;
 pub enum ControlOp {
     /// Cell-membership management (`pillar member …`).
     Members(MembersOp),
+    /// Server-side session management (`pillar session …`) over the live
+    /// per-principal session registry.
+    Session(SessionOp),
 }
 
 /// Portal-member management ops (`pillar member ls|add|role`). A `List` is a
@@ -197,6 +200,44 @@ pub enum MembersOp {
         handle: String,
         /// The new role.
         role: String,
+    },
+}
+
+/// Server-side session-management ops (`pillar session ls|show|revoke|
+/// revoke-all`) against a node's live per-principal session registry — the
+/// SAME substrate the web session panel lists/revokes. `List`/`Show` are VIEWS;
+/// `Revoke`/`RevokeAll` are signed acts. Every op names the target `principal`
+/// (the login subject whose sessions to act on) explicitly: on the wire the
+/// signing key is the credential, so — unlike the web panel, which auto-scopes
+/// to the caller's login bearer — the target principal is an argument, and the
+/// node authorizes by the AUTHENTICATED signer's authority (a view needs cell
+/// membership; an act runs the same signed-act decider `member` acts use).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum SessionOp {
+    /// List `principal`'s currently-active sessions.
+    List {
+        /// The login subject whose sessions to list.
+        principal: String,
+    },
+    /// Show one session record (`id`) of `principal`.
+    Show {
+        /// The login subject that owns the session.
+        principal: String,
+        /// The session slot id.
+        id: String,
+    },
+    /// Revoke one session (`id`) of `principal`.
+    Revoke {
+        /// The login subject that owns the session.
+        principal: String,
+        /// The session slot id to revoke.
+        id: String,
+    },
+    /// Revoke every one of `principal`'s sessions (sign-out-everywhere).
+    RevokeAll {
+        /// The login subject whose sessions to sweep.
+        principal: String,
     },
 }
 
@@ -235,7 +276,12 @@ impl ControlOp {
     /// member-gated view path and acts through the capability-gated act path.
     #[must_use]
     pub fn is_read(&self) -> bool {
-        matches!(self, ControlOp::Members(MembersOp::List))
+        matches!(
+            self,
+            ControlOp::Members(MembersOp::List)
+                | ControlOp::Session(SessionOp::List { .. })
+                | ControlOp::Session(SessionOp::Show { .. })
+        )
     }
 }
 
@@ -430,6 +476,47 @@ mod tests {
             set
         );
         assert!(!set.is_read());
+    }
+
+    #[test]
+    fn control_op_session_round_trips_and_classifies_read_vs_act() {
+        let list = ControlOp::Session(SessionOp::List {
+            principal: "spencer".into(),
+        });
+        assert_eq!(
+            ControlOp::decode(&list.encode().expect("encode")).expect("decode"),
+            list
+        );
+        assert!(list.is_read(), "session ls is a view");
+
+        let show = ControlOp::Session(SessionOp::Show {
+            principal: "spencer".into(),
+            id: "s3".into(),
+        });
+        assert_eq!(
+            ControlOp::decode(&show.encode().expect("encode")).expect("decode"),
+            show
+        );
+        assert!(show.is_read(), "session show is a view");
+
+        let revoke = ControlOp::Session(SessionOp::Revoke {
+            principal: "spencer".into(),
+            id: "s3".into(),
+        });
+        assert_eq!(
+            ControlOp::decode(&revoke.encode().expect("encode")).expect("decode"),
+            revoke
+        );
+        assert!(!revoke.is_read(), "session revoke is a signed act");
+
+        let revoke_all = ControlOp::Session(SessionOp::RevokeAll {
+            principal: "spencer".into(),
+        });
+        assert_eq!(
+            ControlOp::decode(&revoke_all.encode().expect("encode")).expect("decode"),
+            revoke_all
+        );
+        assert!(!revoke_all.is_read());
     }
 
     #[test]

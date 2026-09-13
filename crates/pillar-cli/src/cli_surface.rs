@@ -58,7 +58,7 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "session",
-        handler: |_v, args| session(args),
+        handler: |_v, args| crate::apply_over_pillar_message::session(args),
     },
     VerbSpec {
         name: "identity",
@@ -533,29 +533,6 @@ fn identity_trust(verb: &str, _args: &[String]) -> ExitCode {
     );
     eprintln!("Run `pillar --help` for the full verb list of this family.");
     ExitCode::from(2)
-}
-
-/// `pillar session {ls|show <id>|revoke <id>|revoke-all}`.
-fn session(args: &[String]) -> ExitCode {
-    match args.first().map(String::as_str) {
-        Some("ls") | Some("show") | Some("revoke") | Some("revoke-all") => {
-            eprintln!(
-                "`pillar session …` reads/acts over a live node's server-side session substrate \
-                 via the pillar_cli::session_cli::SessionCli library API."
-            );
-            eprintln!(
-                "ls/show are views (sign nothing); revoke/revoke-all emit one signed, \
-                 decider-authorized revocation event."
-            );
-            ExitCode::from(2)
-        }
-        _ => {
-            eprintln!(
-                "usage: pillar session {{ls | show <id> | revoke <id> | revoke-all}} [--principal <p>]"
-            );
-            ExitCode::from(2)
-        }
-    }
 }
 
 /// `pillar node {run|list|describe|cordon|uncordon|drain|taint}`.

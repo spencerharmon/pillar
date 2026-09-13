@@ -3541,6 +3541,7 @@ impl WebAuthContext {
     ) -> Result<String, String> {
         match op {
             pillar_ops::ControlOp::Members(m) => self.members_op(actor, m),
+            pillar_ops::ControlOp::Session(s) => self.sessions_op(actor, s),
         }
     }
 
@@ -3596,6 +3597,85 @@ impl WebAuthContext {
                         Ok(format!("MEMBER {handle} ROLE {role} EVENT-CID {}", event.0))
                     }
                     Err(a) => Err(format!("unauthorized actor {a} for portal:members:write")),
+                }
+            }
+        }
+    }
+
+    /// Serve a [`pillar_ops::SessionOp`] over the control-op tier against the
+    /// live per-principal [`SessionRegistry`] (the SAME substrate the web
+    /// session panel `ls`/`revoke`/`revoke-all` acts on). `List`/`Show` are
+    /// member-gated VIEWS; `Revoke`/`RevokeAll` are `portal:sessions:write`
+    /// signed acts (the same `perform_signed_act` decider `member` acts use),
+    /// dispatched to [`Self::revoke_session`]/[`Self::revoke_all_sessions`] so
+    /// the bearer maps stay in lockstep with the registry.
+    fn sessions_op(
+        &mut self,
+        actor: &NodeId,
+        op: &pillar_ops::SessionOp,
+    ) -> Result<String, String> {
+        match op {
+            pillar_ops::SessionOp::List { principal } => {
+                if self.authority.reachable_depth(actor).is_none() {
+                    return Err("unauthorized: signer is not a recognized cell member".to_owned());
+                }
+                let now = self.session_clock;
+                let mut out = String::new();
+                for s in self.session_registry.ls(principal, now) {
+                    out.push_str(&format!(
+                        "SESSION {} PRINCIPAL {} ISSUED {} EXPIRY {} REVOKED {}\n",
+                        s.id,
+                        s.principal,
+                        s.issued_at,
+                        s.expiry,
+                        if s.is_revoked() { "yes" } else { "no" },
+                    ));
+                }
+                Ok(out)
+            }
+            pillar_ops::SessionOp::Show { principal, id } => {
+                if self.authority.reachable_depth(actor).is_none() {
+                    return Err("unauthorized: signer is not a recognized cell member".to_owned());
+                }
+                match self.session_registry.show(principal, id) {
+                    Some(s) => Ok(format!(
+                        "SESSION {} PRINCIPAL {} ISSUED {} EXPIRY {} MINT-EPOCH {} REVOKED {}\n",
+                        s.id,
+                        s.principal,
+                        s.issued_at,
+                        s.expiry,
+                        s.mint_epoch,
+                        if s.is_revoked() { "yes" } else { "no" },
+                    )),
+                    None => Err(format!("no session {id} for principal {principal}")),
+                }
+            }
+            pillar_ops::SessionOp::Revoke { principal, id } => {
+                let payload = format!("SESSION-REVOKE {principal} {id}");
+                match self.perform_signed_act(actor, "portal:sessions:write", &payload) {
+                    Ok(event) => match self.revoke_session(principal, id) {
+                        Ok(()) => Ok(format!(
+                            "REVOKED {id} PRINCIPAL {principal} EVENT-CID {}",
+                            event.0
+                        )),
+                        Err(RevokeError::NoSuchSession) => {
+                            Err(format!("no session {id} for principal {principal}"))
+                        }
+                    },
+                    Err(a) => Err(format!("unauthorized actor {a} for portal:sessions:write")),
+                }
+            }
+            pillar_ops::SessionOp::RevokeAll { principal } => {
+                let payload = format!("SESSION-REVOKE-ALL {principal}");
+                match self.perform_signed_act(actor, "portal:sessions:write", &payload) {
+                    Ok(event) => {
+                        self.revoke_all_sessions(principal);
+                        Ok(format!(
+                            "REVOKED-ALL PRINCIPAL {principal} EVENT-CID {}",
+                            event.0
+                        ))
+                    }
+                    Err(a) => Err(format!("unauthorized actor {a} for portal:sessions:write")),
                 }
             }
         }

@@ -30,7 +30,7 @@ fn usage() -> &'static str {
      \x20 pillar config export [--domain D] [--token T] [--out PATH]  mint+enroll a scoped CLI signing subkey over an authenticated session, save 0600\n\
      \x20 pillar webauthn register --user <handle> [--domain D] [--token T]  register a hardware credential (ctap-hid)\n\
      \x20 pillar webauthn login [--domain D] [--token T] --credential-id <id>  authenticate with a hardware credential (ctap-hid)\n\
-     \x20 pillar session ls|show <id>|revoke <id>|revoke-all       server-side sessions (ls/show view; revoke acts)\n\
+     \x20 pillar session ls <p>|show <p> <id>|revoke <p> <id>|revoke-all <p>   server-side sessions over pillar-message (ls/show view; revoke acts)\n\
      \x20 pillar logout | whoami | status           session lifecycle (see pillar_cli::resource::Session)\n\
      \x20 pillar use|ctx <ls|show|add|rm|rename|current>  local context (see pillar_cli::resource::ContextStore)\n\
      \x20 pillar <get|describe|apply|create|delete|patch|label|scale|diff|explain> <kind>/<name> [-l sel] [-L cols]  kubectl-parity resource plane (see pillar_cli::resource::ResourcePlane)\n\

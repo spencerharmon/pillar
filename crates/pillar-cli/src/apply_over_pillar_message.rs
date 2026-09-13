@@ -651,6 +651,119 @@ pub fn member(args: &[String]) -> ExitCode {
     }
 }
 
+/// List `principal`'s active sessions over pillar-message.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason.
+pub fn session_ls(principal: &str) -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::Session(
+        pillar_ops::SessionOp::List {
+            principal: principal.to_owned(),
+        },
+    ))
+}
+
+/// Show one of `principal`'s session records over pillar-message.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason.
+pub fn session_show(principal: &str, id: &str) -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::Session(
+        pillar_ops::SessionOp::Show {
+            principal: principal.to_owned(),
+            id: id.to_owned(),
+        },
+    ))
+}
+
+/// Revoke one of `principal`'s sessions over pillar-message.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason.
+pub fn session_revoke(principal: &str, id: &str) -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::Session(
+        pillar_ops::SessionOp::Revoke {
+            principal: principal.to_owned(),
+            id: id.to_owned(),
+        },
+    ))
+}
+
+/// Revoke every one of `principal`'s sessions over pillar-message.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason.
+pub fn session_revoke_all(principal: &str) -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::Session(
+        pillar_ops::SessionOp::RevokeAll {
+            principal: principal.to_owned(),
+        },
+    ))
+}
+
+/// `pillar session {ls <principal> | show <principal> <id> | revoke <principal>
+/// <id> | revoke-all <principal>}`: manage a principal's server-side sessions
+/// over the sealed resource-op tier (no HTTP). Views need cell membership; the
+/// revoke acts run the same signed-act decider `member` acts use.
+pub fn session(args: &[String]) -> ExitCode {
+    let render = |r: Result<String, String>, verb: &str| -> ExitCode {
+        match r {
+            Ok(text) => {
+                if text.trim().is_empty() {
+                    eprintln!("no sessions");
+                } else {
+                    print!("{text}");
+                    if !text.ends_with('\n') {
+                        println!();
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("pillar session {verb}: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    };
+    match args.first().map(String::as_str) {
+        Some("ls") | Some("list") => {
+            let Some(principal) = args.get(1) else {
+                eprintln!("usage: pillar session ls <principal>");
+                return ExitCode::from(2);
+            };
+            render(session_ls(principal), "ls")
+        }
+        Some("show") => {
+            let (Some(principal), Some(id)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: pillar session show <principal> <id>");
+                return ExitCode::from(2);
+            };
+            render(session_show(principal, id), "show")
+        }
+        Some("revoke") => {
+            let (Some(principal), Some(id)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: pillar session revoke <principal> <id>");
+                return ExitCode::from(2);
+            };
+            render(session_revoke(principal, id), "revoke")
+        }
+        Some("revoke-all") => {
+            let Some(principal) = args.get(1) else {
+                eprintln!("usage: pillar session revoke-all <principal>");
+                return ExitCode::from(2);
+            };
+            render(session_revoke_all(principal), "revoke-all")
+        }
+        _ => {
+            eprintln!(
+                "usage: pillar session {{ls <principal> | show <principal> <id> | \
+                 revoke <principal> <id> | revoke-all <principal>}}"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;
