@@ -62,12 +62,16 @@ pub fn parse_set_list(body: &str) -> Vec<ResourceSetRow> {
 }
 
 /// One member row of a ResourceSet detail: the `Kind/name` reference, its
-/// observed health, and its provenance (`defaults@<v>` or `operator`).
+/// observed health, its provenance (`defaults@<v>` or `operator`), and — for a
+/// non-`Healthy` member — an optional free-form REASON explaining the
+/// degradation (rendered as health-badge subtext/tooltip).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemberRow {
     pub reference: String,
     pub health: String,
     pub origin: String,
+    /// Free-form degradation reason (empty when healthy / not reported).
+    pub reason: String,
 }
 
 /// A ResourceSet's full detail, parsed from `GET /portal/resource/set`.
@@ -118,8 +122,14 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
         } else if line == "DESC" {
             d.description.clear();
         } else if let Some(rest) = line.strip_prefix("MEMBER ") {
-            // `<ref> HEALTH <h> [ORIGIN <origin>]`
+            // `<ref> HEALTH <h> [ORIGIN <origin>] [REASON <msg>]`. REASON is an
+            // ADDITIVE, free-form tail (always LAST, may contain spaces), so it
+            // is split off FIRST; ORIGIN is then parsed from what remains.
             if let Some((reference, tail)) = rest.split_once(" HEALTH ") {
+                let (tail, reason) = match tail.split_once(" REASON ") {
+                    Some((head, msg)) => (head, msg.trim().to_string()),
+                    None => (tail, String::new()),
+                };
                 let (health, origin) = match tail.split_once(" ORIGIN ") {
                     Some((h, o)) => (h.trim().to_string(), o.trim().to_string()),
                     None => (tail.trim().to_string(), String::new()),
@@ -128,6 +138,7 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
                     reference: reference.trim().to_string(),
                     health,
                     origin,
+                    reason,
                 });
             }
         } else if let Some(rest) = line.strip_prefix("PLAN ADOPT ") {
@@ -167,22 +178,43 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
 #[cfg(feature = "yew")]
 pub use yew_impl::ResourceSetsConsole;
 
+use crate::primitives::Tone;
+
+/// FULL sync tone set (ArgoCD-parity), replacing the old binary Synced-vs-Warn:
+/// Synced -> Success, Progressing -> Info, OutOfSync -> Warn, Error -> Danger,
+/// Unknown / anything else -> Neutral. Host-testable (no `yew`).
+#[must_use]
+pub fn sync_tone(sync: &str) -> Tone {
+    match sync.to_ascii_lowercase().as_str() {
+        "synced" => Tone::Success,
+        "progressing" => Tone::Info,
+        "outofsync" => Tone::Warn,
+        "error" => Tone::Danger,
+        _ => Tone::Neutral,
+    }
+}
+
+/// Tone for a member/set HEALTH string: Healthy -> Success, Degraded -> Warn,
+/// Missing / Error -> Danger, Empty / Unknown -> Neutral. Host-testable.
+#[must_use]
+pub fn health_tone(health: &str) -> Tone {
+    match health.to_ascii_lowercase().as_str() {
+        "healthy" => Tone::Success,
+        "degraded" => Tone::Warn,
+        "missing" | "error" => Tone::Danger,
+        _ => Tone::Neutral,
+    }
+}
+
 #[cfg(feature = "yew")]
 mod yew_impl {
-    use super::{parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
+    use super::{health_tone, parse_set_detail, parse_set_list, sync_tone, ResourceSetDetail, ResourceSetRow};
     use crate::auth::use_auth;
+    use crate::components::data_table::{Column, DataTable, Row};
     use crate::portal::{get_url, http};
     use crate::primitives::{Badge, Graph, GraphEdge, Tone};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
-
-    fn sync_tone(sync: &str) -> Tone {
-        if sync.eq_ignore_ascii_case("Synced") {
-            Tone::Success
-        } else {
-            Tone::Warn
-        }
-    }
 
     /// The Resource Sets console: a list of ResourceSets with health/sync
     /// pills; selecting one loads its detail + resource graph.
@@ -234,37 +266,119 @@ mod yew_impl {
             );
         }
 
-        let rows: Html = sets
+        // Health / sync filter CHIPS: `None` = show all, `Some(v)` = only rows
+        // whose health (resp. sync) equals `v` (case-insensitive). The list then
+        // renders through the SHIPPED DataTable primitive (filter box + sortable
+        // columns) over the chip-narrowed row set.
+        let health_chip = use_state(|| None::<String>);
+        let sync_chip = use_state(|| None::<String>);
+
+        // DataTable columns: Name/Health/Sync are text-sortable; the counts are
+        // numeric-sortable; Defaults is a plain advisory cell.
+        let columns: Vec<Column> = vec![
+            Column::text("Name"),
+            Column::text("Health"),
+            Column::text("Sync"),
+            Column::numeric("Members"),
+            Column::numeric("Adopt"),
+            Column::numeric("Prune"),
+            Column::text("Defaults"),
+        ];
+
+        // Map each set onto DataTable cells, narrowed by the active chips.
+        let table_rows: Vec<Row> = sets
             .iter()
+            .filter(|s| {
+                health_chip
+                    .as_deref()
+                    .is_none_or(|h| s.health.eq_ignore_ascii_case(h))
+                    && sync_chip
+                        .as_deref()
+                        .is_none_or(|sy| s.sync.eq_ignore_ascii_case(sy))
+            })
             .map(|s: &ResourceSetRow| {
-                let name = s.name.clone();
-                let is_active = selected.as_deref() == Some(name.as_str());
-                let select = {
-                    let (selected, name) = (selected.clone(), name.clone());
-                    Callback::from(move |_: MouseEvent| selected.set(Some(name.clone())))
-                };
-                let mut class = Classes::from("ds-row");
-                if is_active {
-                    class.push("is-active");
-                }
-                let defaults_cell = if s.defaults_available > 0 {
-                    html! { <Badge label={format!("{} available", s.defaults_available)} tone={Tone::Info} /> }
+                let defaults = if s.defaults_available > 0 {
+                    format!("{} available", s.defaults_available)
                 } else {
-                    html! { <span class="ds-muted">{ "—" }</span> }
+                    "—".to_string()
                 };
-                html! {
-                    <tr class={class} onclick={select} style="cursor:pointer">
-                        <td class="mono">{ name }</td>
-                        <td><Badge label={s.health.clone()} /></td>
-                        <td><Badge label={s.sync.clone()} tone={sync_tone(&s.sync)} /></td>
-                        <td>{ s.members }</td>
-                        <td>{ s.adopt }</td>
-                        <td>{ s.prune }</td>
-                        <td>{ defaults_cell }</td>
-                    </tr>
-                }
+                vec![
+                    s.name.clone(),
+                    s.health.clone(),
+                    s.sync.clone(),
+                    s.members.to_string(),
+                    s.adopt.to_string(),
+                    s.prune.to_string(),
+                    defaults,
+                ]
             })
             .collect();
+
+        // Render the Health/Sync/Defaults cells as toned Badges; other columns
+        // stay plain text (sort/filter still run over the underlying string).
+        let render_cell = {
+            Callback::from(move |(col, value): (usize, String)| -> Html {
+                match col {
+                    1 => html! { <Badge label={value.clone()} tone={health_tone(&value)} /> },
+                    2 => html! { <Badge label={value.clone()} tone={sync_tone(&value)} /> },
+                    6 if value != "—" => {
+                        html! { <Badge label={value.clone()} tone={Tone::Info} /> }
+                    }
+                    _ => html! { { value } },
+                }
+            })
+        };
+
+        // Row click selects the set (cell 0 is the name).
+        let on_row_click = {
+            let selected = selected.clone();
+            Callback::from(move |row: Row| {
+                if let Some(name) = row.first() {
+                    selected.set(Some(name.clone()));
+                }
+            })
+        };
+
+        // The filter-chip row: one chip per health and sync tone; clicking a
+        // chip toggles it (a second click clears back to "all").
+        let chip = |label: &str,
+                    active: bool,
+                    on_click: Callback<MouseEvent>|
+         -> Html {
+            let mut class = Classes::from("ds-chip");
+            if active {
+                class.push("is-active");
+            }
+            html! { <button type="button" class={class} onclick={on_click}>{ label.to_string() }</button> }
+        };
+        let health_chip_btn = |value: &'static str| {
+            let active = health_chip.as_deref() == Some(value);
+            let on_click = {
+                let health_chip = health_chip.clone();
+                Callback::from(move |_: MouseEvent| {
+                    if active {
+                        health_chip.set(None);
+                    } else {
+                        health_chip.set(Some(value.to_string()));
+                    }
+                })
+            };
+            chip(value, active, on_click)
+        };
+        let sync_chip_btn = |value: &'static str| {
+            let active = sync_chip.as_deref() == Some(value);
+            let on_click = {
+                let sync_chip = sync_chip.clone();
+                Callback::from(move |_: MouseEvent| {
+                    if active {
+                        sync_chip.set(None);
+                    } else {
+                        sync_chip.set(Some(value.to_string()));
+                    }
+                })
+            };
+            chip(value, active, on_click)
+        };
 
         let detail_view: Html = match &*detail {
             None => {
@@ -289,10 +403,24 @@ mod yew_impl {
                         } else {
                             html! { <span class="ds-muted">{ m.origin.clone() }</span> }
                         };
+                        // The additive REASON: rendered as health-badge subtext
+                        // (and a hover tooltip) beneath the health badge.
+                        let health_cell = if m.reason.is_empty() {
+                            html! { <Badge label={m.health.clone()} tone={health_tone(&m.health)} /> }
+                        } else {
+                            html! {
+                                <>
+                                    <Badge label={m.health.clone()} tone={health_tone(&m.health)} />
+                                    <div class="ds-badge__subtext" title={m.reason.clone()}>
+                                        { m.reason.clone() }
+                                    </div>
+                                </>
+                            }
+                        };
                         html! {
                             <tr>
                                 <td class="mono">{ m.reference.clone() }</td>
-                                <td><Badge label={m.health.clone()} /></td>
+                                <td>{ health_cell }</td>
                                 <td>{ origin }</td>
                             </tr>
                         }
@@ -358,7 +486,7 @@ mod yew_impl {
                         <header class="ds-panel__head">
                             <h3>{ format!("ResourceSet / {}", d.name) }</h3>
                             <div class="ds-badges">
-                                <Badge label={d.health.clone()} />
+                                <Badge label={d.health.clone()} tone={health_tone(&d.health)} />
                                 <Badge label={d.sync.clone()} tone={sync_tone(&d.sync)} />
                             </div>
                         </header>
@@ -385,16 +513,25 @@ mod yew_impl {
                 <p class="ds-muted">
                     { "Declarative resource groups (ArgoCD-Application analog). The Default set owns the default retention policies." }
                 </p>
-                <table class="ds-table">
-                    <thead>
-                        <tr>
-                            <th>{ "Name" }</th><th>{ "Health" }</th><th>{ "Sync" }</th>
-                            <th>{ "Members" }</th><th>{ "Adopt" }</th><th>{ "Prune" }</th>
-                            <th>{ "Defaults" }</th>
-                        </tr>
-                    </thead>
-                    <tbody>{ rows }</tbody>
-                </table>
+                <div class="ds-chips" role="group" aria-label="Filter by health and sync">
+                    <span class="ds-chips__label">{ "Health" }</span>
+                    { health_chip_btn("Healthy") }
+                    { health_chip_btn("Degraded") }
+                    { health_chip_btn("Empty") }
+                    <span class="ds-chips__label">{ "Sync" }</span>
+                    { sync_chip_btn("Synced") }
+                    { sync_chip_btn("Progressing") }
+                    { sync_chip_btn("OutOfSync") }
+                    { sync_chip_btn("Unknown") }
+                    { sync_chip_btn("Error") }
+                </div>
+                <DataTable
+                    columns={columns}
+                    rows={table_rows}
+                    render_cell={render_cell}
+                    on_row_click={on_row_click}
+                    empty_label={"No resource sets match the current filters."}
+                />
                 { detail_view }
             </div>
         }
@@ -507,5 +644,83 @@ mod tests {
         // The advisory is a SEPARATE axis: the set is still Synced/Healthy.
         assert_eq!(d.sync, "Synced");
         assert_eq!(d.health, "Healthy");
+    }
+
+    #[test]
+    fn parses_the_additive_member_reason_tail_after_origin() {
+        // A degraded member carries the ADDITIVE, free-form `REASON <msg>` tail
+        // (LAST, may contain spaces) AFTER `ORIGIN <origin>`; a healthy member
+        // has no reason. Both are parsed off correctly.
+        let body = "SET web\n\
+                    MEMBER Job/nightly HEALTH Missing ORIGIN operator REASON declared member Job/nightly is absent from the live resource plane\n\
+                    MEMBER RetentionPolicy/web-metrics HEALTH Healthy ORIGIN operator\n\
+                    HEALTH Degraded\nSYNC OutOfSync";
+        let d = parse_set_detail(body);
+        assert_eq!(d.members.len(), 2);
+        // Missing member: origin still parsed, reason captured whole.
+        assert_eq!(d.members[0].reference, "Job/nightly");
+        assert_eq!(d.members[0].health, "Missing");
+        assert_eq!(d.members[0].origin, "operator");
+        assert_eq!(
+            d.members[0].reason,
+            "declared member Job/nightly is absent from the live resource plane"
+        );
+        // Healthy member: no reason tail.
+        assert_eq!(d.members[1].health, "Healthy");
+        assert_eq!(d.members[1].origin, "operator");
+        assert!(d.members[1].reason.is_empty());
+    }
+
+    #[test]
+    fn member_reason_parses_even_without_an_origin_field() {
+        // Backward/forward compatible: `MEMBER <ref> HEALTH <h> REASON <msg>`
+        // (no ORIGIN) still splits the reason off correctly.
+        let body = "SET web\nMEMBER Job/x HEALTH Missing REASON gone";
+        let d = parse_set_detail(body);
+        assert_eq!(d.members[0].health, "Missing");
+        assert_eq!(d.members[0].origin, "");
+        assert_eq!(d.members[0].reason, "gone");
+    }
+
+    #[test]
+    fn sync_tone_covers_the_full_argocd_parity_set() {
+        // The FULL tone set, replacing the old binary Synced-vs-Warn.
+        assert_eq!(sync_tone("Synced"), Tone::Success);
+        assert_eq!(sync_tone("Progressing"), Tone::Info);
+        assert_eq!(sync_tone("OutOfSync"), Tone::Warn);
+        assert_eq!(sync_tone("Error"), Tone::Danger);
+        assert_eq!(sync_tone("Unknown"), Tone::Neutral);
+        // Case-insensitive; an unrecognized value is Neutral (not Warn).
+        assert_eq!(sync_tone("progressing"), Tone::Info);
+        assert_eq!(sync_tone("whatever"), Tone::Neutral);
+    }
+
+    #[test]
+    fn health_tone_maps_each_health_state() {
+        assert_eq!(health_tone("Healthy"), Tone::Success);
+        assert_eq!(health_tone("Degraded"), Tone::Warn);
+        assert_eq!(health_tone("Missing"), Tone::Danger);
+        assert_eq!(health_tone("Empty"), Tone::Neutral);
+    }
+
+    /// Mount-audit (anti-facade DoD): the ResourceSet list must render through
+    /// the SHIPPED DataTable primitive with health/sync filter chips — not a
+    /// hand-rolled `<table>`. A source audit locks the wiring so a future edit
+    /// cannot silently drop the DataTable/chips and regress to the old list.
+    #[test]
+    fn list_renders_through_datatable_with_filter_chips() {
+        let src = include_str!("resourcesets_console.rs");
+        assert!(
+            src.contains("use crate::components::data_table::{Column, DataTable, Row}"),
+            "resourcesets_console no longer imports the DataTable primitive"
+        );
+        assert!(
+            src.contains("<DataTable") && src.contains("on_row_click={on_row_click}"),
+            "the list is no longer rendered through DataTable with row selection"
+        );
+        assert!(
+            src.contains("health_chip_btn(") && src.contains("sync_chip_btn("),
+            "the list no longer offers health/sync filter chips"
+        );
     }
 }

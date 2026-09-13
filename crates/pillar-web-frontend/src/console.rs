@@ -523,4 +523,16 @@ mod tests {
             "console.rs no longer mounts CustodyWizard in the Trust section"
         );
     }
+
+    /// Mount-audit (anti-facade DoD): the ResourceSets section must mount the
+    /// `ResourceSetsConsole` tile, so a future edit can never silently drop it
+    /// and strand the DataTable-backed ResourceSet list.
+    #[test]
+    fn resourcesets_section_mounts_the_resourcesets_console() {
+        let src = include_str!("console.rs");
+        assert!(
+            src.contains("Section::ResourceSets => html! { <ResourceSetsConsole /> }"),
+            "console.rs no longer mounts ResourceSetsConsole for the ResourceSets section"
+        );
+    }
 }
