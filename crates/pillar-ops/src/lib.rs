@@ -177,6 +177,12 @@ pub enum ControlOp {
     /// Server-side session management (`pillar session …`) over the live
     /// per-principal session registry.
     Session(SessionOp),
+    /// Web-of-trust views (`pillar wot …`) over the live trust store — the
+    /// SAME substrate the web trust-graph panel renders.
+    Wot(WotOp),
+    /// Observability reads (`pillar obs …`) over the node's live obs substrate
+    /// (historical + live explore/query/retention/dashboard).
+    Obs(ObsOp),
 }
 
 /// Portal-member management ops (`pillar member ls|add|role`). A `List` is a
@@ -241,6 +247,66 @@ pub enum SessionOp {
     },
 }
 
+/// Web-of-trust view ops (`pillar wot graph|list-trust|list-signatures|
+/// list-attestations`). All VIEWS over the live trust store; member-gated, no
+/// event emitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum WotOp {
+    /// The node-link trust graph (every node fingerprint + edge signature cid).
+    Graph,
+    /// The trust edges.
+    ListTrust,
+    /// The signature records.
+    ListSignatures,
+    /// The attestation records.
+    ListAttestations,
+}
+
+/// Observability VIEW ops (`pillar obs …`) over the node's live obs substrate.
+/// All reads; member-gated, no event emitted. `kind` is a signal-kind tag
+/// (`metric`/`log`/`trace`/`profile`/`metadata`); the node parses it and
+/// refuses an unknown tag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum ObsOp {
+    /// Historical explore of one signal kind.
+    Explore {
+        /// Signal-kind tag.
+        kind: String,
+    },
+    /// Historical query of one signal kind, optional filter expression.
+    Query {
+        /// Signal-kind tag.
+        kind: String,
+        /// Optional filter expression.
+        filter: Option<String>,
+    },
+    /// Live explore of one signal kind.
+    LiveExplore {
+        /// Signal-kind tag.
+        kind: String,
+    },
+    /// The live signal kinds present.
+    LiveKinds,
+    /// A live PSL (pillar-signal-language) query.
+    Psl {
+        /// The PSL query text.
+        query: String,
+    },
+    /// Live metric names.
+    MetricNames,
+    /// Live label keys.
+    LabelKeys,
+    /// Live label values for one key.
+    LabelValues {
+        /// The label key.
+        key: String,
+    },
+    /// The current retention policy.
+    RetentionGet,
+}
+
 impl ControlOp {
     /// Encode to a control-op payload: a single [`CONTROL_OP_CODEC_VERSION`]
     /// byte followed by the canonical JSON of the op. Deterministic, like
@@ -281,6 +347,8 @@ impl ControlOp {
             ControlOp::Members(MembersOp::List)
                 | ControlOp::Session(SessionOp::List { .. })
                 | ControlOp::Session(SessionOp::Show { .. })
+                | ControlOp::Wot(_)
+                | ControlOp::Obs(_)
         )
     }
 }
@@ -517,6 +585,35 @@ mod tests {
             revoke_all
         );
         assert!(!revoke_all.is_read());
+    }
+
+    #[test]
+    fn control_op_wot_and_obs_round_trip_and_are_reads() {
+        for op in [
+            ControlOp::Wot(WotOp::Graph),
+            ControlOp::Wot(WotOp::ListTrust),
+            ControlOp::Wot(WotOp::ListSignatures),
+            ControlOp::Wot(WotOp::ListAttestations),
+            ControlOp::Obs(ObsOp::Explore {
+                kind: "metric".into(),
+            }),
+            ControlOp::Obs(ObsOp::Query {
+                kind: "log".into(),
+                filter: Some("level=error".into()),
+            }),
+            ControlOp::Obs(ObsOp::LiveKinds),
+            ControlOp::Obs(ObsOp::Psl {
+                query: "metric http_requests".into(),
+            }),
+            ControlOp::Obs(ObsOp::LabelValues { key: "job".into() }),
+            ControlOp::Obs(ObsOp::RetentionGet),
+        ] {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "wot/obs ops are views: {op:?}");
+        }
     }
 
     #[test]

@@ -74,7 +74,7 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "wot",
-        handler: |_v, args| wot_verb(args),
+        handler: |_v, args| crate::apply_over_pillar_message::wot(args),
     },
     VerbSpec {
         name: "offer",
@@ -182,7 +182,7 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "obs",
-        handler: |_v, _args| obs(),
+        handler: |_v, args| crate::apply_over_pillar_message::obs(args),
     },
     VerbSpec {
         name: "apply",
@@ -228,21 +228,6 @@ pub fn dispatch(args: &[String]) -> Option<ExitCode> {
     let verb = args.first()?.as_str();
     let spec = VERBS.iter().find(|s| s.name == verb)?;
     Some((spec.handler)(verb, &args[1..]))
-}
-
-fn obs() -> ExitCode {
-    // Every `obs` verb reads (or, for `dashboard create/update/delete`,
-    // signs) a live node's materialized observability substrate — the
-    // same "no live platform in this shell" boundary `apply`/`get`/
-    // `describe` already document below. The authoritative, fully
-    // unit-tested engine for every verb this help text lists is
-    // `pillar_cli::observability_ui::ObservabilityBuilders`.
-    eprintln!(
-        "`pillar obs …` reads/acts over a live node's observability substrate via the \
-         pillar_cli::observability_ui::ObservabilityBuilders library API."
-    );
-    eprintln!("Run `pillar --help` for the full `obs` verb list.");
-    ExitCode::from(2)
 }
 
 /// `pillar explain <PSL query>`: parse the query with the real PSL parser and
@@ -512,18 +497,6 @@ fn key_verb(args: &[String]) -> ExitCode {
 
 /// `pillar wot {graph|list-trust|list-signatures|list-attestations} …`: the
 /// live web-of-trust views (public keys, signatures, attestations, trust edges).
-fn wot_verb(args: &[String]) -> ExitCode {
-    match crate::wot_cli::run_wot(args) {
-        Ok(out) => {
-            print!("{out}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::from(2)
-        }
-    }
-}
 
 /// `pillar {identity|user|key|offer|trust|attest|grant|caps|revoke|audit} …`.
 fn identity_trust(verb: &str, _args: &[String]) -> ExitCode {

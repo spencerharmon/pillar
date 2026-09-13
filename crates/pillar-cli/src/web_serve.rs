@@ -3542,6 +3542,60 @@ impl WebAuthContext {
         match op {
             pillar_ops::ControlOp::Members(m) => self.members_op(actor, m),
             pillar_ops::ControlOp::Session(s) => self.sessions_op(actor, s),
+            pillar_ops::ControlOp::Wot(w) => self.wot_op(actor, w),
+            pillar_ops::ControlOp::Obs(o) => self.obs_op(actor, o),
+        }
+    }
+
+    /// Serve a [`pillar_ops::WotOp`] over the control-op tier: member-gated
+    /// VIEWS over the live [`TrustStore`] (the SAME renders the web trust-graph
+    /// panel serves, via `crate::wot_cli`). No event emitted.
+    fn wot_op(&mut self, actor: &NodeId, op: &pillar_ops::WotOp) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        let store = self.trust_store();
+        Ok(match op {
+            pillar_ops::WotOp::Graph => crate::wot_cli::graph_text(store),
+            pillar_ops::WotOp::ListTrust => crate::wot_cli::list_trust(store),
+            pillar_ops::WotOp::ListSignatures => crate::wot_cli::list_signatures(store),
+            pillar_ops::WotOp::ListAttestations => crate::wot_cli::list_attestations(store),
+        })
+    }
+
+    /// Serve a [`pillar_ops::ObsOp`] over the control-op tier: member-gated
+    /// VIEWS over the node's live observability substrate (the SAME methods the
+    /// `/portal/obs/*` routes serve). A live-obs query against a node with no
+    /// live-obs subsystem returns an error rather than a false empty.
+    fn obs_op(&mut self, actor: &NodeId, op: &pillar_ops::ObsOp) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        let parse_kind =
+            |k: &str| parse_signal_kind(k).ok_or_else(|| format!("unknown signal kind {k}"));
+        let no_live = || "live observability subsystem not enabled on this node".to_owned();
+        match op {
+            pillar_ops::ObsOp::Explore { kind } => {
+                Ok(self.observability_explore(parse_kind(kind)?))
+            }
+            pillar_ops::ObsOp::Query { kind, filter } => {
+                Ok(self.observability_query(parse_kind(kind)?, filter.as_deref()))
+            }
+            pillar_ops::ObsOp::LiveExplore { kind } => {
+                self.live_obs_explore(parse_kind(kind)?).ok_or_else(no_live)
+            }
+            pillar_ops::ObsOp::LiveKinds => self.live_obs_kinds().ok_or_else(no_live),
+            pillar_ops::ObsOp::Psl { query } => match self.live_obs_psl(query) {
+                Some(Ok(text)) => Ok(text),
+                Some(Err(e)) => Err(e),
+                None => Err(no_live()),
+            },
+            pillar_ops::ObsOp::MetricNames => self.live_obs_metric_names().ok_or_else(no_live),
+            pillar_ops::ObsOp::LabelKeys => self.live_obs_label_keys().ok_or_else(no_live),
+            pillar_ops::ObsOp::LabelValues { key } => {
+                self.live_obs_label_values(key).ok_or_else(no_live)
+            }
+            pillar_ops::ObsOp::RetentionGet => self.live_obs_get_retention().ok_or_else(no_live),
         }
     }
 

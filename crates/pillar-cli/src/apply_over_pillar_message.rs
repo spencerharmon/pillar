@@ -764,6 +764,97 @@ pub fn session(args: &[String]) -> ExitCode {
     }
 }
 
+/// Print a view `Result` from a control op, or its error under `label`.
+fn print_view(r: Result<String, String>, label: &str) -> ExitCode {
+    match r {
+        Ok(text) => {
+            if text.trim().is_empty() {
+                eprintln!("(empty)");
+            } else {
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pillar {label}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pillar wot {graph | list-trust | list-signatures | list-attestations}`:
+/// web-of-trust views over the live trust store, over pillar-message (no HTTP,
+/// no `--token`: the signing key is the credential). Member-gated reads.
+pub fn wot(args: &[String]) -> ExitCode {
+    let op = match args.first().map(String::as_str) {
+        None | Some("graph") => pillar_ops::WotOp::Graph,
+        Some("list-trust") => pillar_ops::WotOp::ListTrust,
+        Some("list-signatures") => pillar_ops::WotOp::ListSignatures,
+        Some("list-attestations") => pillar_ops::WotOp::ListAttestations,
+        Some(other) => {
+            eprintln!(
+                "usage: pillar wot {{graph | list-trust | list-signatures | \
+                 list-attestations}}  (got `{other}`)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Wot(op)), "wot")
+}
+
+/// `pillar obs {explore <kind> | query <kind> [filter] | live-explore <kind> |
+/// live-kinds | psl <query…> | metric-names | label-keys | label-values <key> |
+/// retention}`: observability views over the node's live obs substrate, over
+/// pillar-message. Member-gated reads.
+pub fn obs(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar obs {{explore <kind> | query <kind> [filter] | \
+             live-explore <kind> | live-kinds | psl <query…> | metric-names | \
+             label-keys | label-values <key> | retention}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("explore") => match args.get(1) {
+            Some(kind) => pillar_ops::ObsOp::Explore { kind: kind.clone() },
+            None => return usage(),
+        },
+        Some("query") => match args.get(1) {
+            Some(kind) => pillar_ops::ObsOp::Query {
+                kind: kind.clone(),
+                filter: args.get(2).cloned(),
+            },
+            None => return usage(),
+        },
+        Some("live-explore") => match args.get(1) {
+            Some(kind) => pillar_ops::ObsOp::LiveExplore { kind: kind.clone() },
+            None => return usage(),
+        },
+        Some("live-kinds") => pillar_ops::ObsOp::LiveKinds,
+        Some("psl") => {
+            if args.len() < 2 {
+                return usage();
+            }
+            pillar_ops::ObsOp::Psl {
+                query: args[1..].join(" "),
+            }
+        }
+        Some("metric-names") => pillar_ops::ObsOp::MetricNames,
+        Some("label-keys") => pillar_ops::ObsOp::LabelKeys,
+        Some("label-values") => match args.get(1) {
+            Some(key) => pillar_ops::ObsOp::LabelValues { key: key.clone() },
+            None => return usage(),
+        },
+        Some("retention") => pillar_ops::ObsOp::RetentionGet,
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Obs(op)), "obs")
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;

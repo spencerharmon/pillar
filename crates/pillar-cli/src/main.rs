@@ -52,7 +52,8 @@ fn usage() -> &'static str {
      \x20 pillar render defaults [<name>]           print shipped default RetentionPolicy manifest(s) to apply\n\
      \x20 pillar render kustomize <base.txt>        (see library API for overlay construction)\n\
      \x20 pillar --web [--port N]                  serve the localhost-only bootstrap/web UI\n\
-     \x20 pillar obs <family> <verb> [args]         per-signal observability views (see below)\n\
+     \x20 pillar obs {explore <kind>|query <kind> [filter]|live-explore <kind>|live-kinds|psl <q…>|metric-names|label-keys|label-values <key>|retention}   observability views over pillar-message\n\
+     \x20 pillar wot {graph|list-trust|list-signatures|list-attestations}   web-of-trust views over pillar-message (no --token; signing key is the credential)\n\
      \n\
      apply/get/describe act over a live platform (schema registry + WoT/RBAC\n\
      authority + event log). This shell renders and validates manifests; the\n\
