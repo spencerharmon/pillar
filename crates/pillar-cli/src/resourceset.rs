@@ -268,27 +268,98 @@ pub struct MemberStatus {
     pub health: MemberHealth,
 }
 
-/// The node-link graph the console renders for a ResourceSet: node 0 is the set
-/// itself, nodes `1..=n` are its members (in `members` order), and each edge
-/// runs from the set to a member labeled with the member's health. This is the
-/// exact `(nodes, edges)` shape `pillar_web_frontend::primitives::Graph`
-/// consumes.
+/// The `Kind` string of a member whose live replicas can be descended into a
+/// third graph depth (`ResourceSet -> Workload -> replica`). Matches
+/// `web_serve::WORKLOAD_KIND` — kept as a plain string here (rather than a
+/// cross-module const) since `resourceset` is the pure core and does not
+/// depend on the web plane.
+pub const WORKLOAD_MEMBER_KIND: &str = "Workload";
+
+/// One live replica of a `Workload` member, as surfaced by the
+/// `/portal/resource/replicas` oracle — the minimal shape [`build_graph`]
+/// needs to render a `Workload -> replica` graph edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaNode {
+    /// The rendered node label, e.g. `Replica/<node>:<port>`.
+    pub label: String,
+    /// The replica's health (always `Healthy` — an observed replica is, by
+    /// construction, live; a dead one is reconciled away or restarted before
+    /// ever being observed).
+    pub health: String,
+}
+
+/// One node of a [`ResourceGraph`]: a label plus a per-node health+sync token
+/// (ArgoCD-parity "resource health at a glance" — every node in the tree, not
+/// only the set root, carries its own status).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphNode {
+    pub label: String,
+    pub health: String,
+    pub sync: String,
+}
+
+impl GraphNode {
+    #[must_use]
+    pub fn new(label: impl Into<String>, health: impl Into<String>, sync: impl Into<String>) -> Self {
+        GraphNode {
+            label: label.into(),
+            health: health.into(),
+            sync: sync.into(),
+        }
+    }
+}
+
+/// The node-link graph the console renders for a ResourceSet: node 0 is the
+/// set itself; nodes `1..=n` are its members (in `members` order); a
+/// `Workload` member is further descended into its live replicas (the
+/// `/portal/resource/replicas` oracle's per-workload observations), appended
+/// after all top-level member nodes. Each node carries its own health+sync
+/// token. This is the `(nodes, edges)` shape the console's Tree/Graph
+/// primitives render.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceGraph {
-    pub nodes: Vec<String>,
+    pub nodes: Vec<GraphNode>,
     /// `(from_index, to_index, edge_label)`.
     pub edges: Vec<(usize, usize, String)>,
 }
 
-/// Derive the resource graph for one set from its member statuses.
+/// Derive the resource graph for one set from its member statuses, descending
+/// any `Workload` member into its live replicas (`replicas_by_workload` maps a
+/// workload name to its observed replica nodes — empty/absent when no
+/// reconciler is wired or the workload has no live replicas yet).
 #[must_use]
-pub fn build_graph(set_name: &str, members: &[MemberStatus]) -> ResourceGraph {
+pub fn build_graph(
+    set_name: &str,
+    set_health: SetHealth,
+    set_sync: SyncStatus,
+    members: &[MemberStatus],
+    replicas_by_workload: &BTreeMap<String, Vec<ReplicaNode>>,
+) -> ResourceGraph {
     let mut nodes = Vec::with_capacity(members.len() + 1);
-    nodes.push(format!("ResourceSet/{set_name}"));
+    nodes.push(GraphNode::new(
+        format!("ResourceSet/{set_name}"),
+        set_health.as_str(),
+        set_sync.as_str(),
+    ));
     let mut edges = Vec::with_capacity(members.len());
     for (i, m) in members.iter().enumerate() {
-        nodes.push(m.reference.to_string());
-        edges.push((0, i + 1, m.health.as_str().to_string()));
+        let member_idx = i + 1;
+        nodes.push(GraphNode::new(
+            m.reference.to_string(),
+            m.health.as_str(),
+            m.health.as_str(),
+        ));
+        edges.push((0, member_idx, m.health.as_str().to_string()));
+
+        if m.reference.kind == WORKLOAD_MEMBER_KIND {
+            if let Some(replicas) = replicas_by_workload.get(&m.reference.name) {
+                for r in replicas {
+                    let replica_idx = nodes.len();
+                    nodes.push(GraphNode::new(r.label.clone(), r.health.clone(), "Live"));
+                    edges.push((member_idx, replica_idx, r.health.clone()));
+                }
+            }
+        }
     }
     ResourceGraph { nodes, edges }
 }
@@ -581,18 +652,71 @@ mod tests {
                 health: MemberHealth::Missing,
             },
         ];
-        let g = build_graph("default", &members);
+        let g = build_graph(
+            "default",
+            SetHealth::Degraded,
+            SyncStatus::OutOfSync,
+            &members,
+            &BTreeMap::new(),
+        );
         assert_eq!(
             g.nodes,
             vec![
-                "ResourceSet/default".to_string(),
-                "RetentionPolicy/a".to_string(),
-                "Job/b".to_string(),
+                GraphNode::new("ResourceSet/default", "Degraded", "OutOfSync"),
+                GraphNode::new("RetentionPolicy/a", "Healthy", "Healthy"),
+                GraphNode::new("Job/b", "Missing", "Missing"),
             ]
         );
         assert_eq!(
             g.edges,
             vec![(0, 1, "Healthy".to_string()), (0, 2, "Missing".to_string()),]
+        );
+    }
+
+    #[test]
+    fn graph_descends_a_workload_member_into_its_live_replicas() {
+        let members = vec![MemberStatus {
+            reference: MemberRef::new(WORKLOAD_MEMBER_KIND, "web"),
+            health: MemberHealth::Healthy,
+        }];
+        let mut replicas = BTreeMap::new();
+        replicas.insert(
+            "web".to_string(),
+            vec![
+                ReplicaNode {
+                    label: "Replica/node-a:9001".to_string(),
+                    health: "Healthy".to_string(),
+                },
+                ReplicaNode {
+                    label: "Replica/node-b:9002".to_string(),
+                    health: "Healthy".to_string(),
+                },
+            ],
+        );
+        let g = build_graph(
+            "default",
+            SetHealth::Healthy,
+            SyncStatus::Synced,
+            &members,
+            &replicas,
+        );
+        assert_eq!(
+            g.nodes,
+            vec![
+                GraphNode::new("ResourceSet/default", "Healthy", "Synced"),
+                GraphNode::new("Workload/web", "Healthy", "Healthy"),
+                GraphNode::new("Replica/node-a:9001", "Healthy", "Live"),
+                GraphNode::new("Replica/node-b:9002", "Healthy", "Live"),
+            ]
+        );
+        // Edge 0: set -> workload; edges 1,2: workload -> each replica.
+        assert_eq!(
+            g.edges,
+            vec![
+                (0, 1, "Healthy".to_string()),
+                (1, 2, "Healthy".to_string()),
+                (1, 3, "Healthy".to_string()),
+            ]
         );
     }
 }

@@ -3244,7 +3244,8 @@ impl WebAuthContext {
         let health = roll_up_health(&healths);
         let owned = owned_live(&view, &spec);
         let plan = plan_reconcile(&spec.members, &owned);
-        let graph = build_graph(&spec.name, &statuses);
+        let replicas_by_workload = self.replicas_by_workload();
+        let graph = build_graph(&spec.name, health, plan.sync_status(), &statuses, &replicas_by_workload);
 
         let mut out = Vec::new();
         out.push(format!("SET {}", spec.name));
@@ -3310,13 +3311,33 @@ impl WebAuthContext {
             out.push(format!("DEFAULT-EDITED {}", edited.join(",")));
             out.push(format!("DEFAULT-TOMBSTONED {}", tombs.join(",")));
         }
-        for (i, label) in graph.nodes.iter().enumerate() {
-            out.push(format!("NODE {i} {label}"));
+        for (i, node) in graph.nodes.iter().enumerate() {
+            out.push(format!(
+                "NODE {i} {} HEALTH {} SYNC {}",
+                node.label, node.health, node.sync
+            ));
         }
         for (from, to, label) in &graph.edges {
             out.push(format!("EDGE {from} {to} {label}"));
         }
         Some(out.join("\n"))
+    }
+
+    /// Every reconciled workload's live replicas, grouped by workload name, in
+    /// the [`crate::resourceset::ReplicaNode`] shape [`build_graph`] descends a
+    /// `Workload` member into (`ResourceSet -> Workload -> replica`). Empty
+    /// when no reconciler is wired.
+    fn replicas_by_workload(&self) -> std::collections::BTreeMap<String, Vec<crate::resourceset::ReplicaNode>> {
+        let observations = if let Some(shared) = &self.workload_reconciler {
+            if let Ok(mut reconciler) = shared.lock() {
+                reconciler.observe_all()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        group_replicas_by_workload(observations)
     }
 
     /// The `--dry-run`-style preview of an act: the decider's ALLOW/DENY for
@@ -6609,6 +6630,26 @@ fn dispatch_obs_live_retention_set(
     }
 }
 
+/// Group live replica observations by their owning workload name into the
+/// [`crate::resourceset::ReplicaNode`] shape [`build_graph`] descends a
+/// `Workload` member into. Pure — host-testable independently of the real
+/// (process-spawning) reconciler.
+fn group_replicas_by_workload(
+    observations: Vec<crate::workload_reconcile::ReplicaObservation>,
+) -> std::collections::BTreeMap<String, Vec<crate::resourceset::ReplicaNode>> {
+    let mut out: std::collections::BTreeMap<String, Vec<crate::resourceset::ReplicaNode>> =
+        std::collections::BTreeMap::new();
+    for obs in observations {
+        out.entry(obs.workload.clone())
+            .or_default()
+            .push(crate::resourceset::ReplicaNode {
+                label: format!("Replica/{}:{}", obs.node, obs.port),
+                health: "Healthy".to_string(),
+            });
+    }
+    out
+}
+
 /// List every ResourceSet with its live health/sync roll-up: `GET
 /// /portal/resource/sets?token=<s>` — one `SET <name> HEALTH <h> SYNC <s>
 /// MEMBERS <n> ADOPT <n> PRUNE <n>` line each (the synthesized Default set
@@ -7789,6 +7830,16 @@ mod tests {
             detail.contains("NODE 1 RetentionPolicy/web-metrics"),
             "member node: {detail}"
         );
+        // Each NODE carries its own HEALTH+SYNC token (ArgoCD-parity per-node
+        // status, not just the set-level roll-up).
+        assert!(
+            detail.contains("NODE 0 ResourceSet/default HEALTH Healthy SYNC Synced"),
+            "root node health+sync token: {detail}"
+        );
+        assert!(
+            detail.contains("NODE 1 RetentionPolicy/web-metrics HEALTH Healthy SYNC Healthy"),
+            "member node health+sync token: {detail}"
+        );
         assert!(detail.contains("EDGE 0 1 Healthy"), "edge: {detail}");
         assert!(detail.contains("SYNC Synced"), "sync: {detail}");
 
@@ -7853,6 +7904,69 @@ mod tests {
 
         // An unknown set is a clean miss.
         assert!(ctx.resourceset_detail("nope").is_none());
+    }
+
+    // Pins the NODE/EDGE wire format's depth: a `Workload` member is
+    // descended into its live replicas (`ResourceSet -> Workload ->
+    // replica`), and every node — root, member, and replica alike — carries
+    // its own HEALTH+SYNC token.
+    #[test]
+    fn resourceset_graph_descends_a_workload_member_into_its_live_replicas() {
+        let observations = vec![
+            crate::workload_reconcile::ReplicaObservation {
+                workload: "web".to_string(),
+                node: "node-a".to_string(),
+                pid: 111,
+                port: 9001,
+                image_digest: "deadbeef".to_string(),
+            },
+            crate::workload_reconcile::ReplicaObservation {
+                workload: "web".to_string(),
+                node: "node-b".to_string(),
+                pid: 222,
+                port: 9002,
+                image_digest: "deadbeef".to_string(),
+            },
+        ];
+        let by_workload = group_replicas_by_workload(observations);
+        assert_eq!(
+            by_workload.get("web").map(Vec::len),
+            Some(2),
+            "both replicas grouped under their workload"
+        );
+
+        let members = vec![crate::resourceset::MemberStatus {
+            reference: crate::resourceset::MemberRef::new("Workload", "web"),
+            health: MemberHealth::Healthy,
+        }];
+        let graph = build_graph(
+            "default",
+            crate::resourceset::SetHealth::Healthy,
+            crate::resourceset::SyncStatus::Synced,
+            &members,
+            &by_workload,
+        );
+        // node 0 = set root, node 1 = the Workload member, nodes 2/3 = its
+        // live replicas.
+        assert_eq!(graph.nodes.len(), 4, "root + member + 2 replicas: {graph:?}");
+        assert_eq!(graph.nodes[0].label, "ResourceSet/default");
+        assert_eq!(graph.nodes[1].label, "Workload/web");
+        assert!(graph.nodes[2].label.starts_with("Replica/"));
+        assert!(graph.nodes[3].label.starts_with("Replica/"));
+        // Edge 0->1 is the set-to-workload edge; 1->2 and 1->3 descend the
+        // workload into its replicas (the depth this task adds).
+        assert!(
+            graph.edges.contains(&(0, 1, "Healthy".to_string())),
+            "set -> workload edge: {graph:?}"
+        );
+        assert!(
+            graph.edges.iter().any(|(from, to, _)| *from == 1 && *to == 2),
+            "workload -> replica edge: {graph:?}"
+        );
+        assert!(
+            graph.edges.iter().any(|(from, to, _)| *from == 1 && *to == 3),
+            "workload -> replica edge: {graph:?}"
+        );
     }
 
     // A GET carrying an explicit `X-Pillar-Api-Version` assertion.
@@ -11735,10 +11849,8 @@ mod tests {
         static WASM_TEXT: OnceLock<String> = OnceLock::new();
         WASM_TEXT.get_or_init(|| {
             let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-            let frontend_dir = manifest_dir
-                .parent()
-                .expect("crates/ parent")
-                .join("pillar-frontend");
+            let crates_dir = manifest_dir.parent().expect("crates/ parent");
+            let frontend_dir = crates_dir.join("pillar-frontend");
             let status = std::process::Command::new(env!("CARGO"))
                 .args(["build", "--target", "wasm32-unknown-unknown"])
                 .current_dir(&frontend_dir)
@@ -11753,9 +11865,32 @@ mod tests {
                 status.success(),
                 "pillar-frontend failed to build for wasm32-unknown-unknown"
             );
-            let wasm_path =
-                frontend_dir.join("target/wasm32-unknown-unknown/debug/pillar_frontend.wasm");
-            let bytes = std::fs::read(&wasm_path).unwrap_or_else(|e| {
+            // `pillar-frontend` is a member of the ROOT cargo workspace (see
+            // the root `Cargo.toml`'s `members` comment), so `cargo build`
+            // places its artifacts under the WORKSPACE ROOT's shared
+            // `target/`, not a per-crate `crates/pillar-frontend/target/` —
+            // even when invoked with `current_dir` set to the member crate.
+            // Try the workspace-root path first, falling back to the
+            // per-crate path for a hypothetical future standalone layout.
+            let workspace_root = crates_dir.parent().expect("workspace root");
+            let candidates = [
+                workspace_root.join("target/wasm32-unknown-unknown/debug/pillar_frontend.wasm"),
+                frontend_dir.join("target/wasm32-unknown-unknown/debug/pillar_frontend.wasm"),
+            ];
+            let wasm_path = candidates
+                .iter()
+                .find(|p| p.exists())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "built wasm not found at any of: {}",
+                        candidates
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+            let bytes = std::fs::read(wasm_path).unwrap_or_else(|e| {
                 panic!("failed to read built wasm at {}: {e}", wasm_path.display())
             });
             String::from_utf8_lossy(&bytes).into_owned()

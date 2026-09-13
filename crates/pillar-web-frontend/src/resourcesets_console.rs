@@ -70,6 +70,17 @@ pub struct MemberRow {
     pub origin: String,
 }
 
+/// One node of the ResourceSet's resource graph/tree: its label plus its own
+/// per-node health+sync token (node 0 is the set root; a `Workload` member's
+/// live replica children — descended from the `/portal/resource/replicas`
+/// oracle by the backend dispatcher — carry `sync = "Live"`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphNodeInfo {
+    pub label: String,
+    pub health: String,
+    pub sync: String,
+}
+
 /// A ResourceSet's full detail, parsed from `GET /portal/resource/set`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceSetDetail {
@@ -80,8 +91,10 @@ pub struct ResourceSetDetail {
     pub members: Vec<MemberRow>,
     pub adopt: Vec<String>,
     pub prune: Vec<String>,
-    /// Graph node labels, in emission order (node 0 is the set root).
-    pub nodes: Vec<String>,
+    /// Graph nodes, in emission order (node 0 is the set root) — depth-tree
+    /// aware: a `Workload` member's live replicas are appended after the
+    /// top-level member nodes and reached via `edges`.
+    pub nodes: Vec<GraphNodeInfo>,
     /// Graph edges as `(from_index, to_index, label)`.
     pub edges: Vec<(usize, usize, String)>,
     /// Shipped-defaults advisory (Default set only) — a SEPARATE axis from sync.
@@ -147,9 +160,28 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
         } else if let Some(rest) = line.strip_prefix("SYNC ") {
             d.sync = rest.trim().to_string();
         } else if let Some(rest) = line.strip_prefix("NODE ") {
-            // `<i> <label>` — index is positional (nodes emitted in order).
-            if let Some((_idx, label)) = rest.split_once(' ') {
-                d.nodes.push(label.trim().to_string());
+            // `<i> <label> [HEALTH <h> SYNC <s>]` — index is positional (nodes
+            // emitted in order); the HEALTH/SYNC suffix is optional so an
+            // older wire body (label only) still parses.
+            if let Some((_idx, rest)) = rest.split_once(' ') {
+                match rest.split_once(" HEALTH ") {
+                    Some((label, tail)) => {
+                        let (health, sync) = match tail.split_once(" SYNC ") {
+                            Some((h, s)) => (h.trim().to_string(), s.trim().to_string()),
+                            None => (tail.trim().to_string(), String::new()),
+                        };
+                        d.nodes.push(GraphNodeInfo {
+                            label: label.trim().to_string(),
+                            health,
+                            sync,
+                        });
+                    }
+                    None => d.nodes.push(GraphNodeInfo {
+                        label: rest.trim().to_string(),
+                        health: String::new(),
+                        sync: String::new(),
+                    }),
+                }
             }
         } else if let Some(rest) = line.strip_prefix("EDGE ") {
             // `<from> <to> <label>`
@@ -164,15 +196,60 @@ pub fn parse_set_detail(body: &str) -> ResourceSetDetail {
     d
 }
 
+/// Lower a [`ResourceSetDetail`]'s flat `(nodes, edges)` wire shape into the
+/// nested [`crate::components::tree::TreeNode`] hierarchy the console renders
+/// — a pure, host-testable derivation (no protocol) mirroring the depth the
+/// backend descended (`ResourceSet -> Workload -> replica`). Node 0 is the
+/// root; every other node is reached by following its FIRST incoming edge (a
+/// resource graph here is always tree-shaped: the backend emits exactly one
+/// edge into each non-root node).
+#[must_use]
+pub fn nodes_to_tree(nodes: &[GraphNodeInfo], edges: &[(usize, usize, String)]) -> Vec<crate::components::tree::TreeNode> {
+    use crate::components::tree::TreeNode;
+
+    fn label_for(n: &GraphNodeInfo) -> String {
+        if n.health.is_empty() {
+            n.label.clone()
+        } else if n.sync.is_empty() {
+            format!("{} [{}]", n.label, n.health)
+        } else {
+            format!("{} [{}/{}]", n.label, n.health, n.sync)
+        }
+    }
+
+    fn build(i: usize, nodes: &[GraphNodeInfo], edges: &[(usize, usize, String)]) -> TreeNode {
+        let children: Vec<TreeNode> = edges
+            .iter()
+            .filter(|(from, _, _)| *from == i)
+            .filter_map(|(_, to, _)| nodes.get(*to).map(|_| build(*to, nodes, edges)))
+            .collect();
+        let label = nodes
+            .get(i)
+            .map(|n| label_for(n))
+            .unwrap_or_default();
+        TreeNode {
+            id: i.to_string(),
+            label,
+            children,
+        }
+    }
+
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    vec![build(0, nodes, edges)]
+}
+
 #[cfg(feature = "yew")]
 pub use yew_impl::ResourceSetsConsole;
 
 #[cfg(feature = "yew")]
 mod yew_impl {
-    use super::{parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
+    use super::{nodes_to_tree, parse_set_detail, parse_set_list, ResourceSetDetail, ResourceSetRow};
     use crate::auth::use_auth;
+    use crate::components::tree::Tree;
     use crate::portal::{get_url, http};
-    use crate::primitives::{Badge, Graph, GraphEdge, Tone};
+    use crate::primitives::{Badge, Tone};
     use wasm_bindgen_futures::spawn_local;
     use yew::prelude::*;
 
@@ -181,6 +258,54 @@ mod yew_impl {
             Tone::Success
         } else {
             Tone::Warn
+        }
+    }
+
+    const ZOOM_STEP: f64 = 0.15;
+    const ZOOM_MIN: f64 = 0.4;
+    const ZOOM_MAX: f64 = 2.5;
+
+    /// Zoom/pan chrome around a scrollable tree — zoom in/out/reset buttons
+    /// scale the wrapped content, panning is left to native scroll (the
+    /// wrapper is `overflow: auto`), which keeps this dependency-free (no
+    /// pointer-drag JS glue) while still giving the operator a way to see a
+    /// deep tree at a glance (zoom out) or drill into one branch (zoom in).
+    #[derive(Properties, PartialEq)]
+    pub struct ZoomPanProps {
+        #[prop_or_default]
+        pub children: Html,
+    }
+
+    #[function_component(ZoomPan)]
+    pub fn zoom_pan(props: &ZoomPanProps) -> Html {
+        let zoom = use_state(|| 1.0_f64);
+        let zoom_in = {
+            let zoom = zoom.clone();
+            Callback::from(move |_: MouseEvent| zoom.set((*zoom + ZOOM_STEP).min(ZOOM_MAX)))
+        };
+        let zoom_out = {
+            let zoom = zoom.clone();
+            Callback::from(move |_: MouseEvent| zoom.set((*zoom - ZOOM_STEP).max(ZOOM_MIN)))
+        };
+        let zoom_reset = {
+            let zoom = zoom.clone();
+            Callback::from(move |_: MouseEvent| zoom.set(1.0))
+        };
+        let style = format!("transform: scale({}); transform-origin: top left;", *zoom);
+        html! {
+            <div class="ds-zoompan">
+                <div class="ds-zoompan__controls">
+                    <button type="button" onclick={zoom_out}>{ "\u{2212}" }</button>
+                    <span class="ds-muted">{ format!("{:.0}%", *zoom * 100.0) }</span>
+                    <button type="button" onclick={zoom_in}>{ "+" }</button>
+                    <button type="button" onclick={zoom_reset}>{ "Reset" }</button>
+                </div>
+                <div class="ds-zoompan__viewport">
+                    <div class="ds-zoompan__content" style={style}>
+                        { props.children.clone() }
+                    </div>
+                </div>
+            </div>
         }
     }
 
@@ -271,15 +396,7 @@ mod yew_impl {
                 html! { <p class="ds-empty">{ "Select a resource set to view its graph." }</p> }
             }
             Some(d) => {
-                let graph_edges: Vec<GraphEdge> = d
-                    .edges
-                    .iter()
-                    .map(|(from, to, label)| GraphEdge {
-                        from: *from,
-                        to: *to,
-                        label: label.clone(),
-                    })
-                    .collect();
+                let tree_roots = nodes_to_tree(&d.nodes, &d.edges);
                 let member_rows: Html = d
                     .members
                     .iter()
@@ -365,7 +482,10 @@ mod yew_impl {
                         if !d.description.is_empty() {
                             <p class="ds-muted">{ d.description.clone() }</p>
                         }
-                        <Graph nodes={d.nodes.clone()} edges={graph_edges} />
+                        <h4>{ "Resource tree" }</h4>
+                        <ZoomPan>
+                            <Tree roots={tree_roots} default_expanded={vec!["0".to_string()]} />
+                        </ZoomPan>
                         <h4>{ "Members" }</h4>
                         <table class="ds-table">
                             <thead><tr><th>{ "Resource" }</th><th>{ "Health" }</th><th>{ "Origin" }</th></tr></thead>
@@ -441,9 +561,9 @@ mod tests {
                     PLAN PRUNE \n\
                     HEALTH Degraded\n\
                     SYNC OutOfSync\n\
-                    NODE 0 ResourceSet/default\n\
-                    NODE 1 RetentionPolicy/web-metrics\n\
-                    NODE 2 Job/nightly\n\
+                    NODE 0 ResourceSet/default HEALTH Degraded SYNC OutOfSync\n\
+                    NODE 1 RetentionPolicy/web-metrics HEALTH Healthy SYNC Healthy\n\
+                    NODE 2 Job/nightly HEALTH Missing SYNC Missing\n\
                     EDGE 0 1 Healthy\n\
                     EDGE 0 2 Missing";
         let d = parse_set_detail(body);
@@ -462,9 +582,21 @@ mod tests {
         assert_eq!(
             d.nodes,
             vec![
-                "ResourceSet/default".to_string(),
-                "RetentionPolicy/web-metrics".to_string(),
-                "Job/nightly".to_string(),
+                GraphNodeInfo {
+                    label: "ResourceSet/default".to_string(),
+                    health: "Degraded".to_string(),
+                    sync: "OutOfSync".to_string(),
+                },
+                GraphNodeInfo {
+                    label: "RetentionPolicy/web-metrics".to_string(),
+                    health: "Healthy".to_string(),
+                    sync: "Healthy".to_string(),
+                },
+                GraphNodeInfo {
+                    label: "Job/nightly".to_string(),
+                    health: "Missing".to_string(),
+                    sync: "Missing".to_string(),
+                },
             ]
         );
         assert_eq!(
@@ -474,12 +606,43 @@ mod tests {
     }
 
     #[test]
+    fn nodes_to_tree_descends_a_workload_into_its_replicas() {
+        let body = "SET default\n\
+                    NODE 0 ResourceSet/default HEALTH Healthy SYNC Synced\n\
+                    NODE 1 Workload/web HEALTH Healthy SYNC Healthy\n\
+                    NODE 2 Replica/node-a:9001 HEALTH Healthy SYNC Live\n\
+                    NODE 3 Replica/node-b:9002 HEALTH Healthy SYNC Live\n\
+                    EDGE 0 1 Healthy\n\
+                    EDGE 1 2 Healthy\n\
+                    EDGE 1 3 Healthy";
+        let d = parse_set_detail(body);
+        let tree = nodes_to_tree(&d.nodes, &d.edges);
+        assert_eq!(tree.len(), 1);
+        let root = &tree[0];
+        assert!(root.label.contains("ResourceSet/default"));
+        assert_eq!(root.children.len(), 1);
+        let workload = &root.children[0];
+        assert!(workload.label.contains("Workload/web"));
+        assert_eq!(workload.children.len(), 2);
+        assert!(workload.children[0].label.contains("Replica/node-a:9001"));
+        assert!(workload.children[1].label.contains("Replica/node-b:9002"));
+        assert!(workload.children[0].children.is_empty());
+    }
+
+    #[test]
     fn empty_default_set_detail_has_only_the_root_node() {
-        let body = "SET default\nDESC \nHEALTH Empty\nSYNC Synced\nNODE 0 ResourceSet/default";
+        let body = "SET default\nDESC \nHEALTH Empty\nSYNC Synced\nNODE 0 ResourceSet/default HEALTH Empty SYNC Synced";
         let d = parse_set_detail(body);
         assert_eq!(d.description, "");
         assert_eq!(d.health, "Empty");
-        assert_eq!(d.nodes, vec!["ResourceSet/default".to_string()]);
+        assert_eq!(
+            d.nodes,
+            vec![GraphNodeInfo {
+                label: "ResourceSet/default".to_string(),
+                health: "Empty".to_string(),
+                sync: "Synced".to_string(),
+            }]
+        );
         assert!(d.edges.is_empty());
         assert!(d.members.is_empty());
     }
