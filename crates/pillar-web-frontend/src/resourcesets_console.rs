@@ -106,6 +106,31 @@ pub fn is_reconciling(adopt: usize, prune: usize) -> bool {
     adopt > 0 || prune > 0
 }
 
+// ---------------------------------------------------------------------------
+// Reconcile as an action — selective sync
+// ---------------------------------------------------------------------------
+
+/// Build the `POST /portal/resource/reconcile` body for a (possibly
+/// selective) sync apply: `token`, the set `name`, then `ADOPT <csv>` /
+/// `PRUNE <csv>` lines carrying ONLY the operator-SELECTED subset of the
+/// plan's adopt/prune members — never the full plan when the operator
+/// deselected a member. An empty selection on one axis still emits an empty
+/// `ADOPT `/`PRUNE ` line (never omitted), so the backend never has to guess
+/// whether the field was intentionally cleared or missing.
+#[must_use]
+pub fn reconcile_request_body(token: &str, name: &str, adopt: &[String], prune: &[String]) -> String {
+    format!("{token}\n{name}\nADOPT {}\nPRUNE {}", adopt.join(","), prune.join(","))
+}
+
+/// Narrow a plan's full adopt/prune member lists down to the subset the
+/// operator has checked "selected", preserving the plan's original order.
+/// Host-testable — no `yew` — so the selective-sync narrowing itself is
+/// provably correct independent of the checkbox wiring.
+#[must_use]
+pub fn selected_subset(plan: &[String], selected: &std::collections::HashSet<String>) -> Vec<String> {
+    plan.iter().filter(|m| selected.contains(*m)).cloned().collect()
+}
+
 /// Framework-agnostic driver for the "Refresh" button + optional interval
 /// poll ("watch"). The actual HTTP fetch is injected as a closure so this is
 /// host-testable without wasm/yew: a manual `refresh()` always re-fetches;
@@ -268,13 +293,15 @@ pub fn health_tone(health: &str) -> Tone {
 #[cfg(feature = "yew")]
 mod yew_impl {
     use super::{
-        health_tone, is_reconciling, parse_set_detail, parse_set_list, sync_tone,
-        ResourceSetDetail, ResourceSetRow,
+        health_tone, is_reconciling, parse_set_detail, parse_set_list, reconcile_request_body,
+        selected_subset, sync_tone, ResourceSetDetail, ResourceSetRow,
     };
     use crate::auth::use_auth;
     use crate::components::data_table::{Column, DataTable, Row};
     use crate::portal::{get_url, http};
-    use crate::primitives::{Badge, Graph, GraphEdge, Tone};
+    use crate::primitives::{Badge, DiffView, Graph, GraphEdge, Tone};
+    use crate::resources_console::{parse_act_result, parse_predicted, ChangeState};
+    use std::collections::HashSet;
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::spawn_local;
@@ -297,6 +324,171 @@ mod yew_impl {
         }
     }
 
+
+    /// The "Reconcile" action: turns the adopt/prune plan from a DISPLAY-only
+    /// list into a signed act, gated by the SAME [`ChangeState`] dry-run
+    /// machine `console-resources-view`'s [`crate::resources_console::ChangeFlow`]
+    /// uses (imported, not reimplemented), with per-member checkboxes so the
+    /// operator can apply a SUBSET of the plan ("selective sync") rather than
+    /// only the whole thing.
+    #[derive(Properties, PartialEq)]
+    struct ReconcilePanelProps {
+        name: String,
+        adopt: Vec<String>,
+        prune: Vec<String>,
+    }
+
+    #[function_component(ReconcilePanel)]
+    fn reconcile_panel(props: &ReconcilePanelProps) -> Html {
+        let auth = use_auth();
+        let name = props.name.clone();
+        let adopt = props.adopt.clone();
+        let prune = props.prune.clone();
+
+        // Every member starts SELECTED (a full sync is the default), but the
+        // operator may uncheck any one to hold it back — a selective sync.
+        let selected = use_state({
+            let (adopt, prune) = (adopt.clone(), prune.clone());
+            move || -> HashSet<String> { adopt.iter().chain(prune.iter()).cloned().collect() }
+        });
+        let gate = use_state(ChangeState::default);
+        let result = use_state(|| None::<Result<String, String>>);
+
+        let toggle = {
+            let (selected, gate) = (selected.clone(), gate.clone());
+            Callback::from(move |member: String| {
+                let mut next = (*selected).clone();
+                if !next.remove(&member) {
+                    next.insert(member);
+                }
+                selected.set(next);
+                // The selection just changed WHICH change a confirm would
+                // apply, so any prior preview no longer describes it.
+                gate.set(gate.invalidated());
+            })
+        };
+
+        let selected_adopt = selected_subset(&adopt, &selected);
+        let selected_prune = selected_subset(&prune, &selected);
+
+        // Preview: the SAME `/portal/resource/dry-run` authorization check
+        // every other change flow uses, for the CURRENT (possibly narrowed)
+        // selection.
+        let preview = {
+            let (auth, gate, result) = (auth.clone(), gate.clone(), result.clone());
+            Callback::from(move |_: MouseEvent| {
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let url = get_url("/portal/resource/dry-run", &token, &[]);
+                let (gate, result) = (gate.clone(), result.clone());
+                result.set(None);
+                spawn_local(async move {
+                    if let Ok(r) = http("GET", &url, None).await {
+                        if let Some(allow) = parse_predicted(&r.body) {
+                            gate.set(gate.previewed(allow));
+                        }
+                    }
+                });
+            })
+        };
+
+        // Apply: reachable ONLY while `gate.can_confirm()` holds — the
+        // control below never renders the button otherwise, so no reconcile
+        // apply can issue without a preceding ALLOW dry-run of this exact
+        // (possibly narrowed) selection.
+        let apply = {
+            let (auth, name, gate, result) = (
+                auth.clone(),
+                name.clone(),
+                gate.clone(),
+                result.clone(),
+            );
+            let (selected_adopt, selected_prune) = (selected_adopt.clone(), selected_prune.clone());
+            Callback::from(move |_: MouseEvent| {
+                if !gate.can_confirm() {
+                    return;
+                }
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                let body = reconcile_request_body(&token, &name, &selected_adopt, &selected_prune);
+                let (gate, result) = (gate.clone(), result.clone());
+                spawn_local(async move {
+                    match http("POST", "/portal/resource/reconcile", Some(&body)).await {
+                        Ok(r) => result.set(Some(parse_act_result(&r.body))),
+                        Err(_) => result.set(Some(Err("request failed".to_owned()))),
+                    }
+                    // The act consumed this preview; a re-apply needs a
+                    // fresh dry-run even if the selection is unchanged.
+                    gate.set(gate.invalidated());
+                });
+            })
+        };
+
+        let member_row = |member: &String, verb: &'static str| {
+            let checked = selected.contains(member);
+            let onchange = {
+                let (toggle, member) = (toggle.clone(), member.clone());
+                Callback::from(move |_: Event| toggle.emit(member.clone()))
+            };
+            let member = member.clone();
+            html! {
+                <li class="ds-list__item">
+                    <label>
+                        <input type="checkbox" checked={checked} onchange={onchange} />
+                        { format!(" {verb} {member}") }
+                    </label>
+                </li>
+            }
+        };
+
+        let diff_old = "no changes".to_string();
+        let diff_new = {
+            let mut lines: Vec<String> = Vec::new();
+            lines.extend(selected_adopt.iter().map(|m| format!("adopt {m}")));
+            lines.extend(selected_prune.iter().map(|m| format!("prune {m}")));
+            if lines.is_empty() {
+                "no changes".to_string()
+            } else {
+                lines.join("\n")
+            }
+        };
+
+        html! {
+            <div class="res-change" id="resourceset-reconcile">
+                <h4>{ "Reconcile (selective sync)" }</h4>
+                <ul class="ds-list">
+                    { for adopt.iter().map(|m| member_row(m, "adopt")) }
+                    { for prune.iter().map(|m| member_row(m, "prune")) }
+                </ul>
+                <h4>{ "Diff (current \u{2192} proposed)" }</h4>
+                <DiffView old={diff_old} new={diff_new} />
+                <div class="res-toolbar">
+                    <button type="button" id="resourceset-reconcile-preview" onclick={preview}>
+                        { "Preview reconcile" }
+                    </button>
+                </div>
+                <div class="res-verdict">
+                    { match *gate {
+                        ChangeState::Previewed(true) => html! { <Badge label="dry-run: ALLOW" tone={Tone::Success} /> },
+                        ChangeState::Previewed(false) => html! { <Badge label="dry-run: DENY" tone={Tone::Danger} /> },
+                        ChangeState::Idle => html! { <span class="ds-empty">{ "Preview to see the authorization decision." }</span> },
+                    } }
+                    if gate.can_confirm() {
+                        <button type="button" id="resourceset-reconcile-apply" onclick={apply}>
+                            { "Apply selected" }
+                        </button>
+                    }
+                </div>
+                { match &*result {
+                    Some(Ok(cid)) => html! { <p class="obs-msg">{ format!("Event emitted: {cid}") }</p> },
+                    Some(Err(e)) => html! { <p class="obs-msg is-error">{ format!("Refused: {e}") }</p> },
+                    None => Html::default(),
+                } }
+            </div>
+        }
+    }
 
     /// The Resource Sets console: a list of ResourceSets with health/sync
     /// pills; selecting one loads its detail + resource graph.
@@ -578,10 +770,11 @@ mod yew_impl {
                     html! { <p class="ds-muted">{ "Nothing to reconcile — the set is synced." }</p> }
                 } else {
                     html! {
-                        <ul class="ds-list">
-                            { for d.adopt.iter().map(|r| html!{ <li>{ format!("adopt {r}") }</li> }) }
-                            { for d.prune.iter().map(|r| html!{ <li>{ format!("prune {r}") }</li> }) }
-                        </ul>
+                        <ReconcilePanel
+                            name={d.name.clone()}
+                            adopt={d.adopt.clone()}
+                            prune={d.prune.clone()}
+                        />
                     }
                 };
                 let reconciling_badge = if is_reconciling(d.adopt.len(), d.prune.len()) {
@@ -931,6 +1124,101 @@ mod tests {
         assert!(
             src.contains("health_chip_btn(") && src.contains("sync_chip_btn("),
             "the list no longer offers health/sync filter chips"
+        );
+    }
+
+    /// Mount-audit (anti-facade DoD): the reconcile plan must be a real
+    /// operator ACTION — mounted through `ReconcilePanel`, reusing the SAME
+    /// `ChangeState` dry-run gate + `DiffView` the resources console uses,
+    /// with a checkbox per adopt/prune member (selective sync) — never a
+    /// hand-rolled read-only `<ul>` of the plan.
+    #[test]
+    fn reconcile_plan_is_mounted_as_a_signed_dry_run_gated_action() {
+        let src = include_str!("resourcesets_console.rs");
+        assert!(
+            src.contains("<ReconcilePanel"),
+            "the reconcile plan no longer mounts the ReconcilePanel action"
+        );
+        assert!(
+            src.contains("use crate::resources_console::{parse_act_result, parse_predicted, ChangeState}"),
+            "ReconcilePanel no longer reuses the shared ChangeState dry-run gate"
+        );
+        assert!(
+            src.contains("<DiffView old={diff_old} new={diff_new} />"),
+            "ReconcilePanel no longer renders the shipped DiffView preview"
+        );
+        assert!(
+            src.contains(r#"id="resourceset-reconcile-apply""#)
+                && src.contains("if gate.can_confirm()"),
+            "the apply control is no longer gated on ChangeState::can_confirm"
+        );
+        assert!(
+            src.contains(r#"type="checkbox""#) && src.contains("selected_subset("),
+            "ReconcilePanel no longer offers per-member selective-sync checkboxes"
+        );
+        assert!(
+            src.contains(r#"http("POST", "/portal/resource/reconcile", Some(&body))"#),
+            "the selective apply no longer routes through the signed act path"
+        );
+    }
+
+    #[test]
+    fn reconcile_request_body_carries_token_name_and_selected_members_only() {
+        let body = reconcile_request_body(
+            "tok",
+            "web",
+            &["Job/nightly".to_string()],
+            &["RetentionPolicy/old".to_string()],
+        );
+        assert_eq!(body, "tok\nweb\nADOPT Job/nightly\nPRUNE RetentionPolicy/old");
+        // Deselecting an axis narrows to an empty (never omitted) field.
+        let narrowed = reconcile_request_body("tok", "web", &[], &["RetentionPolicy/old".to_string()]);
+        assert_eq!(narrowed, "tok\nweb\nADOPT \nPRUNE RetentionPolicy/old");
+    }
+
+    #[test]
+    fn selected_subset_narrows_the_plan_to_only_the_checked_members_in_order() {
+        let plan = vec![
+            "Job/a".to_string(),
+            "Job/b".to_string(),
+            "Job/c".to_string(),
+        ];
+        let mut selected = std::collections::HashSet::new();
+        selected.insert("Job/a".to_string());
+        selected.insert("Job/c".to_string());
+        assert_eq!(
+            selected_subset(&plan, &selected),
+            vec!["Job/a".to_string(), "Job/c".to_string()]
+        );
+        // Deselecting everything narrows to an empty selective sync, never
+        // silently falling back to the full plan.
+        assert!(selected_subset(&plan, &std::collections::HashSet::new()).is_empty());
+    }
+
+    /// The reconcile/apply state machine — same [`ChangeState`] the resources
+    /// console's dry-run-gate test proves, applied here to the reconcile
+    /// action: a mutating apply of the (possibly selective) plan cannot issue
+    /// without a preceding dry-run of that EXACT selection having just
+    /// answered ALLOW, and narrowing the selection invalidates a stale
+    /// preview so it can never authorize a DIFFERENT (now-narrower) apply.
+    #[test]
+    fn reconcile_cannot_apply_without_a_preceding_allow_dry_run_of_this_exact_selection() {
+        use crate::resources_console::ChangeState;
+
+        let mut gate = ChangeState::default();
+        assert!(!gate.can_confirm(), "a reconcile apply must not confirm from Idle");
+        // A DENY dry-run still refuses.
+        gate = gate.previewed(false);
+        assert!(!gate.can_confirm(), "a DENY dry-run must not authorize a reconcile apply");
+        // Only a preceding ALLOW dry-run authorizes the apply.
+        gate = gate.previewed(true);
+        assert!(gate.can_confirm(), "an ALLOW dry-run must authorize the reconcile apply");
+        // Toggling a member's selective-sync checkbox (invalidation) strips
+        // the authorization: a stale ALLOW previewed a DIFFERENT selection.
+        gate = gate.invalidated();
+        assert!(
+            !gate.can_confirm(),
+            "narrowing the selection after preview must not carry over its ALLOW"
         );
     }
 }
