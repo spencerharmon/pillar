@@ -113,28 +113,15 @@ impl DefaultPolicy {
         crd
     }
 
-    /// Render this default as applyable manifest TEXT — the exact format
-    /// [`crate::parse_crd`] consumes, so `pillar render defaults/<name>` output
-    /// round-trips through `apply`. Provenance labels are included.
+    /// Render this default as an applyable **YAML** manifest document — the CRD
+    /// shape `pillar apply -f` ([`pillar_manifest::Crd::from_documents`])
+    /// consumes, so `pillar render defaults/<name>` output round-trips through
+    /// `apply`. Provenance labels are included (via [`Self::to_crd`]).
     #[must_use]
     pub fn to_manifest(&self, version: u32) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("apiVersion: {BUNDLE_API_VERSION}\n"));
-        out.push_str(&format!("kind: {RETENTION_POLICY_KIND}\n"));
-        out.push_str(&format!("name: {}\n", self.name));
-        out.push_str(&format!(
-            "label {DEFAULTS_MANAGED_BY_LABEL}: {DEFAULTS_MANAGED_BY_VALUE}\n"
-        ));
-        out.push_str(&format!("label {DEFAULT_BUNDLE_LABEL}: {version}\n"));
-        out.push_str(&format!("spec signalKind string: {}\n", self.signal_kind));
-        if !self.match_labels.is_empty() {
-            out.push_str(&format!("spec matchLabels string: {}\n", self.match_labels));
-        }
-        out.push_str(&format!("spec window integer: {}\n", self.window_secs));
-        if let Some(ds) = self.downsample_secs {
-            out.push_str(&format!("spec downsampleInterval integer: {ds}\n"));
-        }
-        out
+        self.to_crd(version)
+            .to_yaml()
+            .expect("an in-memory CRD serializes to YAML")
     }
 }
 
@@ -223,7 +210,7 @@ pub fn available_count(advisory: &[DefaultAdvisory]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse_crd;
+    use pillar_manifest::Crd;
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| (*s).to_string()).collect()
@@ -266,10 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_text_round_trips_through_parse_crd() {
+    fn manifest_yaml_round_trips_through_from_documents() {
         for p in shipped_default_bundle().policies {
             let text = p.to_manifest(DEFAULT_BUNDLE_VERSION);
-            let crd = parse_crd(&text).expect("shipped default manifest text must parse");
+            let crds = Crd::from_documents(&text).expect("shipped default YAML must parse");
+            assert_eq!(crds.len(), 1, "one document per policy");
+            let crd = &crds[0];
             assert_eq!(crd.metadata.name, p.name);
             assert_eq!(crd.kind, "RetentionPolicy");
             assert_eq!(

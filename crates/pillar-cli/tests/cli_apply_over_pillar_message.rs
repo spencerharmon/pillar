@@ -240,11 +240,15 @@ fn cli_apply_and_delete_mutate_the_live_default_resource_set_over_pillar_udp_wit
         hex_encode(signer_secret.as_bytes()),
     );
 
-    let manifest_text = "apiVersion: pillar.dev/v1\n\
-         kind: RetentionPolicy\n\
-         name: web-metrics\n\
-         spec signalKind string: Metric\n\
-         spec window integer: 2592000\n";
+    let manifest_text = concat!(
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: web-metrics\n",
+        "spec:\n",
+        "  signalKind: Metric\n",
+        "  window: 2592000\n",
+    );
 
     let acks = apply_manifest_text(manifest_text).expect("apply over pillar-UDP succeeds");
     assert_eq!(acks.len(), 1, "single-document manifest => one apply");
@@ -255,29 +259,38 @@ fn cli_apply_and_delete_mutate_the_live_default_resource_set_over_pillar_udp_wit
         "must ride pillar-UDP, never a REST/HTTPS fallback"
     );
 
-    // A MULTI-document manifest (the `# ---`-separated shape `pillar defaults`
-    // emits) must apply EVERY resource, not just the last — the regression this
-    // fixes, where all documents collapsed into a single CRD.
-    let multi = "# --- a ---\n\
-         apiVersion: pillar.dev/v1\n\
-         kind: RetentionPolicy\n\
-         name: multi-metrics\n\
-         spec signalKind string: Metric\n\
-         spec window integer: 2592000\n\
-         \n\
-         # --- b ---\n\
-         apiVersion: pillar.dev/v1\n\
-         kind: RetentionPolicy\n\
-         name: multi-logs\n\
-         spec signalKind string: Log\n\
-         spec window integer: 604800\n\
-         \n\
-         # --- c ---\n\
-         apiVersion: pillar.dev/v1\n\
-         kind: RetentionPolicy\n\
-         name: multi-traces\n\
-         spec signalKind string: TraceSpan\n\
-         spec window integer: 259200\n";
+    // A MULTI-document YAML bundle (the `---`-separated stream `pillar defaults`
+    // emits, and `helm template` / `kustomize build` produce) must apply EVERY
+    // resource, not just the last — the regression this supersedes collapsed
+    // every document into a single CRD.
+    let multi = concat!(
+        "# a\n",
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: multi-metrics\n",
+        "spec:\n",
+        "  signalKind: Metric\n",
+        "  window: 2592000\n",
+        "---\n",
+        "# b\n",
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: multi-logs\n",
+        "spec:\n",
+        "  signalKind: Log\n",
+        "  window: 604800\n",
+        "---\n",
+        "# c\n",
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: multi-traces\n",
+        "spec:\n",
+        "  signalKind: TraceSpan\n",
+        "  window: 259200\n",
+    );
     let macks = apply_manifest_text(multi).expect("multi-document apply succeeds");
     assert_eq!(macks.len(), 3, "three documents => three applies");
     for a in &macks {

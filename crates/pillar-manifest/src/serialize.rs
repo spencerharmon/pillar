@@ -279,6 +279,9 @@ pub enum ManifestFormatError {
     Yaml(serde_yaml::Error),
     /// The JSON text was not a valid CRD manifest.
     Json(serde_json::Error),
+    /// The input carried no resource documents (empty, or only comments /
+    /// `---` separators / null documents).
+    Empty,
 }
 
 impl fmt::Display for ManifestFormatError {
@@ -286,6 +289,7 @@ impl fmt::Display for ManifestFormatError {
         match self {
             ManifestFormatError::Yaml(e) => write!(f, "manifest YAML error: {e}"),
             ManifestFormatError::Json(e) => write!(f, "manifest JSON error: {e}"),
+            ManifestFormatError::Empty => write!(f, "manifest contains no resources"),
         }
     }
 }
@@ -325,5 +329,160 @@ impl Crd {
     /// [`ManifestFormatError::Json`] if the text is not a well-formed CRD.
     pub fn from_json(text: &str) -> Result<Crd, ManifestFormatError> {
         serde_json::from_str(text).map_err(ManifestFormatError::Json)
+    }
+
+    /// Deserialize EVERY resource document from a manifest **bundle** — the
+    /// single authoring surface `pillar apply -f` consumes. Accepts, over one
+    /// path (YAML is a superset of JSON, so one parser reads both):
+    ///
+    /// - a multi-document YAML stream (`---`-separated), as `helm template` /
+    ///   `kustomize build` emit;
+    /// - a single YAML **or** JSON document;
+    /// - a Kubernetes-style `kind: List` object (JSON or YAML), whose `items`
+    ///   are expanded into individual CRDs.
+    ///
+    /// Comment-only / blank / bare-`---` chunks (which parse to a null
+    /// document) are skipped. Parsing is atomic to the batch: a single
+    /// malformed document fails the whole call and NOTHING is returned, so a
+    /// caller never sends a partial bundle.
+    ///
+    /// # Errors
+    /// [`ManifestFormatError::Yaml`] on the first malformed document;
+    /// [`ManifestFormatError::Empty`] if no resource documents are present.
+    pub fn from_documents(text: &str) -> Result<Vec<Crd>, ManifestFormatError> {
+        use serde::Deserialize;
+        let mut crds = Vec::new();
+        for doc in serde_yaml::Deserializer::from_str(text) {
+            let value = serde_yaml::Value::deserialize(doc).map_err(ManifestFormatError::Yaml)?;
+            if matches!(value, serde_yaml::Value::Null) {
+                // A `---`-only or comment-only chunk yields a null document.
+                continue;
+            }
+            if value.get("kind").and_then(serde_yaml::Value::as_str) == Some("List") {
+                let items = value
+                    .get("items")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .cloned()
+                    .unwrap_or_default();
+                for item in items {
+                    crds.push(serde_yaml::from_value(item).map_err(ManifestFormatError::Yaml)?);
+                }
+            } else {
+                crds.push(serde_yaml::from_value(value).map_err(ManifestFormatError::Yaml)?);
+            }
+        }
+        if crds.is_empty() {
+            return Err(ManifestFormatError::Empty);
+        }
+        Ok(crds)
+    }
+}
+
+#[cfg(test)]
+mod from_documents_tests {
+    use crate::serialize::ManifestFormatError;
+    use crate::{Crd, Value};
+
+    const YAML_ONE: &str = concat!(
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: solo\n",
+        "spec:\n",
+        "  signalKind: Metric\n",
+        "  window: 2592000\n",
+    );
+
+    #[test]
+    fn single_yaml_document() {
+        let crds = Crd::from_documents(YAML_ONE).expect("parses");
+        assert_eq!(crds.len(), 1);
+        assert_eq!(crds[0].metadata.name, "solo");
+        assert_eq!(crds[0].spec.get("window"), Some(&Value::Integer(2_592_000)));
+    }
+
+    #[test]
+    fn single_json_document_is_valid_yaml() {
+        // JSON is a subset of YAML: one parser reads both.
+        let json = r#"{"apiVersion":"pillar.dev/v1","kind":"RetentionPolicy",
+            "metadata":{"name":"j"},"spec":{"signalKind":"Log","window":604800}}"#;
+        let crds = Crd::from_documents(json).expect("JSON parses through the YAML path");
+        assert_eq!(crds.len(), 1);
+        assert_eq!(crds[0].metadata.name, "j");
+        assert_eq!(crds[0].spec.get("window"), Some(&Value::Integer(604_800)));
+    }
+
+    #[test]
+    fn multi_document_yaml_stream() {
+        let stream = concat!(
+            "# metrics\n",
+            "apiVersion: pillar.dev/v1\n",
+            "kind: RetentionPolicy\n",
+            "metadata: { name: a }\n",
+            "spec: { signalKind: Metric, window: 1 }\n",
+            "---\n",
+            "apiVersion: pillar.dev/v1\n",
+            "kind: RetentionPolicy\n",
+            "metadata: { name: b }\n",
+            "spec: { signalKind: Log, window: 2 }\n",
+            "---\n",
+            "apiVersion: pillar.dev/v1\n",
+            "kind: RetentionPolicy\n",
+            "metadata: { name: c }\n",
+            "spec: { signalKind: TraceSpan, window: 3 }\n",
+        );
+        let names: Vec<_> = Crd::from_documents(stream)
+            .expect("stream parses")
+            .into_iter()
+            .map(|c| c.metadata.name)
+            .collect();
+        assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn kubernetes_kind_list_is_expanded_into_items() {
+        let list = concat!(
+            "apiVersion: v1\n",
+            "kind: List\n",
+            "items:\n",
+            "  - { apiVersion: pillar.dev/v1, kind: RetentionPolicy,\n",
+            "      metadata: { name: li-a }, spec: { signalKind: Metric, window: 10 } }\n",
+            "  - { apiVersion: pillar.dev/v1, kind: RetentionPolicy,\n",
+            "      metadata: { name: li-b }, spec: { signalKind: Log, window: 20 } }\n",
+        );
+        let names: Vec<_> = Crd::from_documents(list)
+            .expect("List expands")
+            .into_iter()
+            .map(|c| c.metadata.name)
+            .collect();
+        assert_eq!(names, ["li-a", "li-b"]);
+    }
+
+    #[test]
+    fn trailing_separators_and_comments_are_skipped() {
+        let stream = format!("{YAML_ONE}---\n# a dangling comment, no resource\n");
+        let crds = Crd::from_documents(&stream).expect("parses, skipping the empty tail");
+        assert_eq!(crds.len(), 1);
+    }
+
+    #[test]
+    fn empty_input_is_an_error_not_an_empty_batch() {
+        assert!(matches!(
+            Crd::from_documents("# only a comment\n\n"),
+            Err(ManifestFormatError::Empty)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_document_fails_the_whole_batch() {
+        let stream = concat!(
+            "apiVersion: pillar.dev/v1\n",
+            "kind: RetentionPolicy\n",
+            "metadata: { name: ok }\n",
+            "spec: { signalKind: Metric, window: 1 }\n",
+            "---\n",
+            "this: is: not: a: crd\n",
+        );
+        assert!(Crd::from_documents(stream).is_err());
     }
 }

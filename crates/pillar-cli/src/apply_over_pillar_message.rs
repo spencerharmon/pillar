@@ -293,7 +293,7 @@ pub struct AppliedAck {
 /// # Errors
 /// A parse error string for a malformed manifest; else the first [`SendError`].
 pub fn apply_manifest_text(text: &str) -> Result<Vec<AppliedAck>, String> {
-    let crds = crate::parse_crds(text).map_err(|e| e.to_string())?;
+    let crds = pillar_manifest::Crd::from_documents(text).map_err(|e| e.to_string())?;
     let mut acks = Vec::with_capacity(crds.len());
     for crd in crds {
         let label = format!("{}/{}", crd.kind, crd.metadata.name);
@@ -318,8 +318,9 @@ pub fn delete_resource(addr: &str) -> Result<(String, TransportKind), String> {
     .map_err(|e| e.to_string())
 }
 
-/// `pillar apply -f <manifest.txt>`: parse the manifest into a CRD and send
-/// it as a `ResourceOp::Apply` over pillar-message.
+/// `pillar apply -f <manifest.yaml>`: parse a YAML or JSON manifest bundle
+/// (multi-document `---` stream, single document, or a `kind: List`) into one
+/// CRD per resource and send each as a `ResourceOp::Apply` over pillar-message.
 pub fn apply(args: &[String]) -> ExitCode {
     let mut file = None;
     let mut i = 0;
@@ -333,7 +334,7 @@ pub fn apply(args: &[String]) -> ExitCode {
         }
     }
     let Some(file) = file else {
-        eprintln!("usage: pillar apply -f <manifest.txt>");
+        eprintln!("usage: pillar apply -f <manifest.yaml>");
         return ExitCode::from(2);
     };
     let text = match std::fs::read_to_string(&file) {

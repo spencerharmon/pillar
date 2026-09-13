@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
 
-use crate::{parse_crd, HelmChart};
+use crate::HelmChart;
 use pillar_identity::{NodeSubkey, UserPrimary};
 use pillar_web::{AuthMode, Bootstrap};
 
@@ -782,12 +782,13 @@ fn render(args: &[String]) -> ExitCode {
 }
 
 /// `pillar render defaults [<name>]`: emit the binary-shipped default
-/// RetentionPolicy manifest(s) as applyable text (the exact format
-/// [`crate::parse_crd`] consumes), provenance-labeled. With a `<name>` it emits
-/// just that default (pipe straight into an apply); with no name it lists every
-/// shipped default, each as its own document separated by a `# ---` comment for
-/// review. This is the host-side half of "deploy new defaults after the fact":
-/// the bundle is a seed, decoupled from the node image (see specs/Defaults.tla).
+/// RetentionPolicy manifest(s) as applyable **YAML** (the CRD shape
+/// [`pillar_manifest::Crd::from_documents`] consumes), provenance-labeled. With
+/// a `<name>` it emits just that default (pipe straight into an apply); with no
+/// name it lists every shipped default as a `---`-separated YAML document stream
+/// for review. This is the host-side half of "deploy new defaults after the
+/// fact": the bundle is a seed, decoupled from the node image (see
+/// specs/Defaults.tla).
 fn render_defaults(args: &[String]) -> ExitCode {
     match defaults_manifest_output(args.first().map(String::as_str)) {
         Ok(text) => {
@@ -801,10 +802,10 @@ fn render_defaults(args: &[String]) -> ExitCode {
     }
 }
 
-/// Produce the shipped-defaults manifest text: with `Some(name)` just that
-/// default (applyable as-is), with `None` every shipped default as its own
-/// `# ---`-separated document. `Err` names the unknown default + the available
-/// set. Pure (no I/O) so the verb is unit-tested.
+/// Produce the shipped-defaults manifest YAML: with `Some(name)` just that
+/// default (applyable as-is), with `None` every shipped default as a
+/// `---`-separated document in one YAML stream. `Err` names the unknown default
+/// + the available set. Pure (no I/O) so the verb is unit-tested.
 fn defaults_manifest_output(name: Option<&str>) -> Result<String, String> {
     let bundle = crate::defaults::shipped_default_bundle();
     match name {
@@ -812,12 +813,9 @@ fn defaults_manifest_output(name: Option<&str>) -> Result<String, String> {
             let mut out = String::new();
             for (i, p) in bundle.policies.iter().enumerate() {
                 if i > 0 {
-                    out.push('\n');
+                    out.push_str("---\n");
                 }
-                out.push_str(&format!(
-                    "# --- {} (bundle v{}) ---\n",
-                    p.name, bundle.version
-                ));
+                out.push_str(&format!("# {} (bundle v{})\n", p.name, bundle.version));
                 out.push_str(&p.to_manifest(bundle.version));
             }
             Ok(out)
@@ -861,7 +859,7 @@ fn render_helm(args: &[String]) -> ExitCode {
     match chart.render(&values) {
         Ok(text) => {
             // Validate that it parses before emitting, so a bad render fails loud.
-            if let Err(e) = parse_crd(&text) {
+            if let Err(e) = pillar_manifest::Crd::from_documents(&text) {
                 eprintln!("rendered manifest is invalid: {e}");
                 return ExitCode::FAILURE;
             }
@@ -878,21 +876,24 @@ fn render_helm(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod defaults_render_tests {
     use super::defaults_manifest_output;
-    use crate::parse_crd;
+    use pillar_manifest::Crd;
 
     #[test]
-    fn render_one_default_emits_applyable_manifest_text() {
+    fn render_one_default_emits_applyable_manifest_yaml() {
         let text = defaults_manifest_output(Some("metrics-default")).expect("known default");
-        let crd = parse_crd(&text).expect("rendered default must parse as a manifest");
-        assert_eq!(crd.kind, "RetentionPolicy");
-        assert_eq!(crd.metadata.name, "metrics-default");
+        let crds = Crd::from_documents(&text).expect("rendered default must parse as a manifest");
+        assert_eq!(crds.len(), 1);
+        assert_eq!(crds[0].kind, "RetentionPolicy");
+        assert_eq!(crds[0].metadata.name, "metrics-default");
     }
 
     #[test]
-    fn render_all_defaults_lists_every_shipped_policy() {
+    fn render_all_defaults_is_a_multi_document_stream() {
         let text = defaults_manifest_output(None).expect("all defaults");
+        let crds = Crd::from_documents(&text).expect("the whole stream parses");
+        let names: Vec<&str> = crds.iter().map(|c| c.metadata.name.as_str()).collect();
         for name in ["metrics-default", "logs-default", "traces-default"] {
-            assert!(text.contains(name), "listing must include {name}");
+            assert!(names.contains(&name), "stream must include {name}");
         }
     }
 

@@ -257,11 +257,15 @@ fn cli_config_export_mints_a_real_subkey_over_an_authenticated_session_persists_
     std::env::set_var("PILLAR_CONFIG", &out_path);
     std::env::remove_var("PILLAR_RESOURCE_OP_ADDR");
 
-    let manifest_text = "apiVersion: pillar.dev/v1\n\
-         kind: RetentionPolicy\n\
-         name: cli-config-subkey-credential-metrics\n\
-         spec signalKind string: Metric\n\
-         spec window integer: 2592000\n";
+    let manifest_text = concat!(
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: cli-config-subkey-credential-metrics\n",
+        "spec:\n",
+        "  signalKind: Metric\n",
+        "  window: 2592000\n",
+    );
 
     let acks = apply_manifest_text(manifest_text)
         .expect("apply over the exported, persisted CLI config succeeds");

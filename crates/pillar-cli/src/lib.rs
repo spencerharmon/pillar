@@ -438,7 +438,7 @@ impl Platform {
     }
 }
 
-/// Render a spec [`Value`] to the shared text format's scalar syntax.
+/// Render a spec [`Value`] as a scalar string for the human `describe` view.
 fn value_to_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -448,209 +448,13 @@ fn value_to_text(v: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Shared manifest TEXT format — the ecosystem-friendly surface `kustomize` and
-// `helm` both render into, and `apply` reads. Line-oriented, dependency-free.
-// ---------------------------------------------------------------------------
-
-/// A `kind: string`/`integer`/`boolean` typed scalar in the text format,
-/// mirroring the schema field types.
-fn parse_typed_value(ty: &str, raw: &str) -> Result<Value, TextError> {
-    match ty {
-        "string" => Ok(Value::String(raw.to_owned())),
-        "integer" => raw
-            .parse::<i64>()
-            .map(Value::Integer)
-            .map_err(|_| TextError::BadInteger(raw.to_owned())),
-        "boolean" => match raw {
-            "true" => Ok(Value::Boolean(true)),
-            "false" => Ok(Value::Boolean(false)),
-            other => Err(TextError::BadBoolean(other.to_owned())),
-        },
-        other => Err(TextError::UnknownType(other.to_owned())),
-    }
-}
-
-fn field_type_token(ty: FieldType) -> &'static str {
-    match ty {
-        FieldType::String => "string",
-        FieldType::Integer => "integer",
-        FieldType::Boolean => "boolean",
-    }
-}
-
-/// Serialize a CRD body to the shared manifest text format. Round-trips with
-/// [`parse_crd`]: `parse_crd(&to_text(c)) == Ok(c)`.
-#[must_use]
-pub fn to_text(crd: &Crd) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("apiVersion: {}\n", crd.api_version));
-    out.push_str(&format!("kind: {}\n", crd.kind));
-    out.push_str(&format!("name: {}\n", crd.metadata.name));
-    for (k, v) in &crd.metadata.labels {
-        out.push_str(&format!("label {k}: {v}\n"));
-    }
-    for (k, v) in &crd.spec {
-        let ty = match v {
-            Value::String(_) => "string",
-            Value::Integer(_) => "integer",
-            Value::Boolean(_) => "boolean",
-        };
-        out.push_str(&format!("spec {k} {ty}: {}\n", value_to_text(v)));
-    }
-    out
-}
-
-/// Why parsing the manifest text format failed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TextError {
-    /// A line was not recognized.
-    BadLine(String),
-    /// A required header (`apiVersion`/`kind`/`name`) was missing.
-    MissingHeader(&'static str),
-    /// A `spec` line was not `spec <field> <type>: <value>`.
-    BadSpecLine(String),
-    /// An `integer`-typed value did not parse.
-    BadInteger(String),
-    /// A `boolean`-typed value was not `true`/`false`.
-    BadBoolean(String),
-    /// A field type token was not `string`/`integer`/`boolean`.
-    UnknownType(String),
-}
-
-impl fmt::Display for TextError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TextError::BadLine(l) => write!(f, "unrecognized line: {l}"),
-            TextError::MissingHeader(h) => write!(f, "missing required header `{h}`"),
-            TextError::BadSpecLine(l) => write!(f, "malformed spec line: {l}"),
-            TextError::BadInteger(v) => write!(f, "not an integer: {v}"),
-            TextError::BadBoolean(v) => write!(f, "not a boolean: {v}"),
-            TextError::UnknownType(t) => write!(f, "unknown field type: {t}"),
-        }
-    }
-}
-
-impl std::error::Error for TextError {}
-
-/// Parse the shared manifest text format into a CRD body. Ignores blank lines
-/// and `#` comments; round-trips with [`to_text`].
-///
-/// # Errors
-/// A [`TextError`] describing the first malformed or missing element.
-pub fn parse_crd(text: &str) -> Result<Crd, TextError> {
-    let mut api_version: Option<String> = None;
-    let mut kind: Option<String> = None;
-    let mut name: Option<String> = None;
-    let mut labels: BTreeMap<String, String> = BTreeMap::new();
-    let mut spec: BTreeMap<String, Value> = BTreeMap::new();
-
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("apiVersion:") {
-            api_version = Some(rest.trim().to_owned());
-        } else if let Some(rest) = line.strip_prefix("kind:") {
-            kind = Some(rest.trim().to_owned());
-        } else if let Some(rest) = line.strip_prefix("name:") {
-            name = Some(rest.trim().to_owned());
-        } else if let Some(rest) = line.strip_prefix("label ") {
-            let (k, v) = rest
-                .split_once(':')
-                .ok_or_else(|| TextError::BadLine(line.to_owned()))?;
-            labels.insert(k.trim().to_owned(), v.trim().to_owned());
-        } else if let Some(rest) = line.strip_prefix("spec ") {
-            // spec <field> <type>: <value>
-            let (lhs, value) = rest
-                .split_once(':')
-                .ok_or_else(|| TextError::BadSpecLine(line.to_owned()))?;
-            let mut parts = lhs.split_whitespace();
-            let field = parts
-                .next()
-                .ok_or_else(|| TextError::BadSpecLine(line.to_owned()))?;
-            let ty = parts
-                .next()
-                .ok_or_else(|| TextError::BadSpecLine(line.to_owned()))?;
-            if parts.next().is_some() {
-                return Err(TextError::BadSpecLine(line.to_owned()));
-            }
-            spec.insert(field.to_owned(), parse_typed_value(ty, value.trim())?);
-        } else {
-            return Err(TextError::BadLine(line.to_owned()));
-        }
-    }
-
-    let mut metadata = Metadata::new(name.ok_or(TextError::MissingHeader("name"))?);
-    metadata.labels = labels;
-    Ok(Crd {
-        api_version: api_version.ok_or(TextError::MissingHeader("apiVersion"))?,
-        kind: kind.ok_or(TextError::MissingHeader("kind"))?,
-        metadata,
-        spec,
-    })
-}
-
-/// Parse a MULTI-document manifest into one [`Crd`] per resource.
-///
-/// The pillar text manifest ([`to_text`] / `pillar defaults`) emits each
-/// resource as its own document, conventionally separated by a `# ---` comment.
-/// Because those separators are only comments (and a human may drop them), a
-/// document boundary is taken at each `apiVersion:` header line: every resource
-/// begins with one, and no `label`/`spec` line can start with `apiVersion:`, so
-/// the split is unambiguous. Any leading/trailing comment-or-blank chunk (e.g. a
-/// dangling `# ---` separator) is skipped. Each document is parsed with
-/// [`parse_crd`], so a malformed line fails the whole batch BEFORE anything is
-/// applied (atomic parse).
-///
-/// # Errors
-/// The first [`parse_crd`] error encountered, or [`TextError::MissingHeader`]
-/// (`apiVersion`) if the input contains no resource at all.
-pub fn parse_crds(text: &str) -> Result<Vec<Crd>, TextError> {
-    fn is_header(line: &str) -> bool {
-        line.trim_start().starts_with("apiVersion:")
-    }
-    fn only_comments_or_blank(doc: &str) -> bool {
-        doc.lines().all(|l| {
-            let t = l.trim();
-            t.is_empty() || t.starts_with('#')
-        })
-    }
-
-    let mut docs: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for raw_line in text.lines() {
-        if is_header(raw_line) && current.lines().any(is_header) {
-            docs.push(std::mem::take(&mut current));
-        }
-        current.push_str(raw_line);
-        current.push('\n');
-    }
-    if !current.is_empty() {
-        docs.push(current);
-    }
-
-    let mut crds = Vec::new();
-    for doc in docs {
-        if only_comments_or_blank(&doc) {
-            continue;
-        }
-        crds.push(parse_crd(&doc)?);
-    }
-    if crds.is_empty() {
-        return Err(TextError::MissingHeader("apiVersion"));
-    }
-    Ok(crds)
-}
-
-// ---------------------------------------------------------------------------
-// kustomize (text overlay) — a base plus additive name-prefix, labels, and
-// spec patches, rendered to the shared text format.
+// kustomize (YAML overlay) — a base plus additive name-prefix, labels, and
+// spec patches, rendered to a CRD YAML manifest.
 // ---------------------------------------------------------------------------
 
 /// A kustomize-style overlay: a base CRD plus an additive name-prefix, extra
-/// labels, and spec patches. [`render`](Kustomization::render) produces the
-/// shared manifest text, which `apply`s through the ordinary authorized path.
+/// labels, and spec patches. [`render`](Kustomization::render) produces a CRD
+/// YAML manifest, which `apply`s through the ordinary authorized path.
 #[derive(Clone, Debug, Default)]
 pub struct Kustomization {
     base: Option<Crd>,
@@ -710,12 +514,15 @@ impl Kustomization {
         Ok(crd)
     }
 
-    /// Render to the shared manifest text format.
+    /// Render to a CRD YAML manifest document.
     ///
     /// # Errors
-    /// [`RenderError::NoBase`] if no base was set.
+    /// [`RenderError::NoBase`] if no base was set; [`RenderError::Manifest`]
+    /// if the overlaid CRD fails to serialize.
     pub fn render(&self) -> Result<String, RenderError> {
-        Ok(to_text(&self.render_crd()?))
+        self.render_crd()?
+            .to_yaml()
+            .map_err(|e| RenderError::Manifest(e.to_string()))
     }
 }
 
@@ -766,14 +573,15 @@ impl HelmChart {
         Ok(out)
     }
 
-    /// Render straight to a CRD body (render text, then [`parse_crd`]).
+    /// Render straight to a CRD body (render text, then [`Crd::from_yaml`]).
     ///
     /// # Errors
     /// [`RenderError`] on a missing value or unterminated placeholder, or a
-    /// wrapped [`TextError`] if the rendered text is malformed.
+    /// wrapped [`RenderError::Manifest`] if the rendered text is not a valid
+    /// CRD.
     pub fn render_crd(&self, values: &BTreeMap<String, String>) -> Result<Crd, RenderError> {
         let text = self.render(values)?;
-        parse_crd(&text).map_err(RenderError::Text)
+        Crd::from_yaml(&text).map_err(|e| RenderError::Manifest(e.to_string()))
     }
 }
 
@@ -786,8 +594,9 @@ pub enum RenderError {
     MissingValue(String),
     /// A helm `{{` was never closed by a `}}`.
     UnterminatedPlaceholder(String),
-    /// The rendered text did not parse as a manifest.
-    Text(TextError),
+    /// The rendered text did not parse as a manifest, or a CRD failed to
+    /// serialize.
+    Manifest(String),
 }
 
 impl fmt::Display for RenderError {
@@ -798,19 +607,12 @@ impl fmt::Display for RenderError {
             RenderError::UnterminatedPlaceholder(s) => {
                 write!(f, "unterminated placeholder near: {s}")
             }
-            RenderError::Text(e) => write!(f, "rendered manifest is invalid: {e}"),
+            RenderError::Manifest(e) => write!(f, "rendered manifest is invalid: {e}"),
         }
     }
 }
 
 impl std::error::Error for RenderError {}
-
-/// Convenience: a schema field-type token, exposed so callers building schemas
-/// alongside text manifests can name types consistently with the text format.
-#[must_use]
-pub fn type_token(ty: FieldType) -> &'static str {
-    field_type_token(ty)
-}
 
 #[cfg(test)]
 mod tests {
@@ -990,58 +792,10 @@ mod tests {
     }
 
     #[test]
-    fn text_format_round_trips() {
+    fn yaml_round_trips() {
         let crd = route_crd("default").with_spec("blackhole", Value::Boolean(false));
-        let text = to_text(&crd);
-        assert_eq!(parse_crd(&text), Ok(crd));
-    }
-
-    #[test]
-    fn parse_crds_splits_a_multi_document_bundle() {
-        // The `# ---`-separated shape `pillar defaults` emits: three resources
-        // in one file must parse to three CRDs, not collapse into the last.
-        let text = "# --- metrics-default (bundle v1) ---\n\
-             apiVersion: pillar.dev/v1\n\
-             kind: RetentionPolicy\n\
-             name: metrics-default\n\
-             label pillar.dev/managed-by: defaults\n\
-             spec signalKind string: Metric\n\
-             spec window integer: 2592000\n\
-             \n\
-             # --- logs-default (bundle v1) ---\n\
-             apiVersion: pillar.dev/v1\n\
-             kind: RetentionPolicy\n\
-             name: logs-default\n\
-             spec signalKind string: Log\n\
-             spec window integer: 604800\n\
-             \n\
-             # --- traces-default (bundle v1) ---\n\
-             apiVersion: pillar.dev/v1\n\
-             kind: RetentionPolicy\n\
-             name: traces-default\n\
-             spec signalKind string: TraceSpan\n\
-             spec window integer: 259200\n";
-        let crds = parse_crds(text).expect("multi-document bundle parses");
-        let names: Vec<_> = crds.iter().map(|c| c.metadata.name.as_str()).collect();
-        assert_eq!(names, ["metrics-default", "logs-default", "traces-default"]);
-        assert_eq!(crds[0].spec.get("window"), Some(&Value::Integer(2_592_000)));
-        assert_eq!(crds[2].spec.get("window"), Some(&Value::Integer(259_200)));
-    }
-
-    #[test]
-    fn parse_crds_handles_a_single_document_without_separators() {
-        let text = to_text(&route_crd("solo"));
-        let crds = parse_crds(&text).expect("single document parses");
-        assert_eq!(crds.len(), 1);
-        assert_eq!(crds[0].metadata.name, "solo");
-    }
-
-    #[test]
-    fn parse_crds_rejects_an_empty_or_comment_only_input() {
-        assert_eq!(
-            parse_crds("# just a comment\n\n"),
-            Err(TextError::MissingHeader("apiVersion"))
-        );
+        let yaml = crd.to_yaml().expect("serialize");
+        assert_eq!(Crd::from_yaml(&yaml).expect("parse"), crd);
     }
 
     #[test]
@@ -1053,7 +807,7 @@ mod tests {
             .label("env", "prod")
             .patch("metric", Value::Integer(50));
         let text = kust.render().expect("renders");
-        let crd = parse_crd(&text).expect("valid text");
+        let crd = Crd::from_yaml(&text).expect("valid YAML");
         // The rendered overlay applies through the ordinary authorized path.
         p.apply(&NodeId::from(OWNER), CAP, crd, [], [])
             .expect("kustomize output applies");
@@ -1066,13 +820,15 @@ mod tests {
     #[test]
     fn helm_output_applies() {
         let mut p = platform();
-        let chart = HelmChart::new(
-            "apiVersion: {{ apiVersion }}\n\
-             kind: {{ kind }}\n\
-             name: {{ name }}\n\
-             spec prefix string: {{ prefix }}\n\
-             spec metric integer: {{ metric }}\n",
-        );
+        let chart = HelmChart::new(concat!(
+            "apiVersion: {{ apiVersion }}\n",
+            "kind: {{ kind }}\n",
+            "metadata:\n",
+            "  name: {{ name }}\n",
+            "spec:\n",
+            "  prefix: {{ prefix }}\n",
+            "  metric: {{ metric }}\n",
+        ));
         let mut values = BTreeMap::new();
         values.insert("apiVersion".to_owned(), API.to_owned());
         values.insert("kind".to_owned(), KIND.to_owned());

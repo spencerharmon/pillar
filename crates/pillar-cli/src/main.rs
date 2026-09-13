@@ -19,7 +19,7 @@ fn usage() -> &'static str {
     "pillar — signed-manifest CLI (status is a view, never written back)\n\
      \n\
      USAGE:\n\
-     \x20 pillar apply    <manifest.txt>            validate, authorize, sign, emit a signed event\n\
+     \x20 pillar apply -f <manifest.yaml>           validate, authorize, sign, emit a signed event (YAML/JSON; multi-doc & `kind: List` bundles)\n\
      \x20 pillar get      <api> <kind> <name>       render a resource from the materialized view\n\
      \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
      \x20 pillar ingress-lb-udp serve <manifest-file>   bind a real UDP LB dataplane (Frontend/Route/LoadBalancerPolicy) on a VIP and forward datagrams; prints `vip=<ip:port>`\n\

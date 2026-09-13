@@ -374,11 +374,15 @@ fn a_profile_exported_persisted_config_applies_a_retention_policy_over_pillar_ud
     std::env::set_var("PILLAR_CONFIG", &out_path);
     std::env::remove_var("PILLAR_RESOURCE_OP_ADDR");
 
-    let manifest_text = "apiVersion: pillar.dev/v1\n\
-         kind: RetentionPolicy\n\
-         name: ui-cli-config-export-metrics\n\
-         spec signalKind string: Metric\n\
-         spec window integer: 2592000\n";
+    let manifest_text = concat!(
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: ui-cli-config-export-metrics\n",
+        "spec:\n",
+        "  signalKind: Metric\n",
+        "  window: 2592000\n",
+    );
 
     let acks = apply_manifest_text(manifest_text)
         .expect("apply over the profile-exported, persisted turnkey config succeeds");
