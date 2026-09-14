@@ -99,6 +99,11 @@ pub use resource_op_bind::{
     RESOURCE_OP_UDP_BIND_ENV,
 };
 
+pub mod collection_placement;
+pub use collection_placement::{
+    view_placement, CollectionPlacement, NodeSelector,
+};
+
 /// Gossipsub topic carrying Pillar's append-only event log.
 pub const EVENT_LOG_TOPIC: &str = "/pillar/event-log/1.0.0";
 
