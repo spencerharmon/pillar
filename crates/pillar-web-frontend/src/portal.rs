@@ -206,15 +206,22 @@ pub fn login_wire(identifier: &str, password: &str, nonce_id: u64) -> String {
 ///
 /// # Errors
 /// Returns `Err(reason)` when the login was not admitted.
-pub fn interpret_login(ok: bool, body: &str, submitted: &str) -> Result<String, String> {
+pub fn interpret_login(ok: bool, body: &str, submitted: &str) -> Result<(String, bool), String> {
     let body = body.trim();
     if ok && body.starts_with("OK") {
-        let handle = body.trim_start_matches("OK").trim();
-        Ok(if handle.is_empty() {
-            submitted.to_owned()
-        } else {
-            handle.to_owned()
-        })
+        let rest = body.trim_start_matches("OK").trim();
+        let mut tokens = rest.split_whitespace();
+        let handle = match tokens.next() {
+            Some(h) => h.to_owned(),
+            None => submitted.to_owned(),
+        };
+        let mut force_password_change = false;
+        for tok in tokens {
+            if let Some(v) = tok.strip_prefix("force_password_change=") {
+                force_password_change = v == "true";
+            }
+        }
+        Ok((handle, force_password_change))
     } else {
         Err(strip_marker(body))
     }
@@ -430,7 +437,13 @@ pub fn parse_credential_line(line: &str) -> Option<CredentialRow> {
     if f.len() != 7 || f[0] != "CRED" {
         return None;
     }
-    let undash = |s: &str| if s == "-" { String::new() } else { s.to_owned() };
+    let undash = |s: &str| {
+        if s == "-" {
+            String::new()
+        } else {
+            s.to_owned()
+        }
+    };
     Some(CredentialRow {
         id: f[1].to_owned(),
         label: undash(f[2]),
@@ -620,11 +633,11 @@ pub(crate) use yew_impl::{
 mod yew_impl {
     use super::*;
     use crate::auth::{use_auth, AuthAction, AuthContext};
+    use crate::components::Dialog;
     use crate::explore::{
         ExploreBuilder, ExploreLogsBuilder, ExploreMetadataBuilder, ExploreProfilesBuilder,
         ExploreTracesBuilder,
     };
-    use crate::components::Dialog;
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::{spawn_local, JsFuture};
     use web_sys::{
@@ -1423,9 +1436,7 @@ mod yew_impl {
                 spawn_local(async move {
                     if let Ok(r) = http("POST", "/webauthn/credentials/list", Some(&token)).await {
                         if r.ok() {
-                            rows.set(
-                                r.body.lines().filter_map(parse_credential_line).collect(),
-                            );
+                            rows.set(r.body.lines().filter_map(parse_credential_line).collect());
                         }
                     }
                 });
@@ -1462,7 +1473,10 @@ mod yew_impl {
                 let (busy, msg, refresh, label) =
                     (busy.clone(), msg.clone(), refresh.clone(), label.clone());
                 busy.set(true);
-                msg.set(Some(("Touch your security key to enroll it…".to_owned(), true)));
+                msg.set(Some((
+                    "Touch your security key to enroll it…".to_owned(),
+                    true,
+                )));
                 spawn_local(async move {
                     match crate::webauthn::run_register(&token, &user, &label_v).await {
                         Ok(_) => {
@@ -1502,13 +1516,15 @@ mod yew_impl {
                 } else {
                     body_lines(&[&token, &id])
                 };
-                let (busy, msg, refresh, confirm_target) =
-                    (busy.clone(), msg.clone(), refresh.clone(), confirm_target.clone());
+                let (busy, msg, refresh, confirm_target) = (
+                    busy.clone(),
+                    msg.clone(),
+                    refresh.clone(),
+                    confirm_target.clone(),
+                );
                 busy.set(true);
                 spawn_local(async move {
-                    if let Ok(r) =
-                        http("POST", "/webauthn/credentials/revoke", Some(&body)).await
-                    {
+                    if let Ok(r) = http("POST", "/webauthn/credentials/revoke", Some(&body)).await {
                         if r.status == 409 && r.body.contains("CONFIRM-REQUIRED") {
                             // Last key: ask before disabling 2FA.
                             confirm_target.set(Some(id));
@@ -1909,9 +1925,9 @@ mod yew_impl {
                 let (auth, history, msg) = (auth.clone(), history.clone(), msg.clone());
                 spawn_local(async move {
                     match http("GET", &url, None).await {
-                        Ok(r) if r.ok() => history.set(
-                            crate::resources_console::parse_revisions(&r.body),
-                        ),
+                        Ok(r) if r.ok() => {
+                            history.set(crate::resources_console::parse_revisions(&r.body))
+                        }
                         Ok(r) => {
                             if !handle_401(&auth, r.status) {
                                 msg.set(Some((strip_marker(&r.body), false)));
@@ -1957,8 +1973,7 @@ mod yew_impl {
                     let (busy, msg, get) = (busy.clone(), msg.clone(), get.clone());
                     busy.set(true);
                     spawn_local(async move {
-                        if let Ok(r) =
-                            http("POST", "/portal/resource/rollback", Some(&body)).await
+                        if let Ok(r) = http("POST", "/portal/resource/rollback", Some(&body)).await
                         {
                             msg.set(Some((r.body.trim().to_owned(), r.ok())));
                             if r.ok() {
@@ -2526,11 +2541,15 @@ mod tests {
         );
         assert_eq!(
             interpret_login(true, "OK spencer", "x"),
-            Ok("spencer".to_owned())
+            Ok(("spencer".to_owned(), false))
+        );
+        assert_eq!(
+            interpret_login(true, "OK spencer force_password_change=true", "x"),
+            Ok(("spencer".to_owned(), true))
         );
         assert_eq!(
             interpret_login(true, "OK", "spencer"),
-            Ok("spencer".to_owned())
+            Ok(("spencer".to_owned(), false))
         );
         assert_eq!(
             interpret_login(false, "DENIED unlock-failed", "x"),
@@ -2540,7 +2559,10 @@ mod tests {
 
     #[test]
     fn bootstrap_wire_and_interpret() {
-        assert_eq!(bootstrap_wire("cell", "h", "f", "passkey"), "cell\nh\nf\npasskey");
+        assert_eq!(
+            bootstrap_wire("cell", "h", "f", "passkey"),
+            "cell\nh\nf\npasskey"
+        );
         assert!(interpret_bootstrap(true, "BOOTSTRAPPED cell").is_ok());
         assert_eq!(
             interpret_bootstrap(false, "DENIED CellNameInUse"),
@@ -2653,8 +2675,8 @@ mod tests {
 
     #[test]
     fn credential_line_parsing() {
-        let c = parse_credential_line("CRED aWQ yubikey-blue deleteme.example.com 100 250 7")
-            .unwrap();
+        let c =
+            parse_credential_line("CRED aWQ yubikey-blue deleteme.example.com 100 250 7").unwrap();
         assert_eq!(c.id, "aWQ");
         assert_eq!(c.label, "yubikey-blue");
         assert_eq!(c.rp_id, "deleteme.example.com");

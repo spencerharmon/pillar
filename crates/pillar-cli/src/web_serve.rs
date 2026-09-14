@@ -8037,6 +8037,13 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
             // no enrolled credential logs in on the password alone (the
             // pre-enrollment window used to register the first authenticator).
             let subject = session.subject.to_string();
+            // The forced-change flag the client uses to intercept into the
+            // change-password ceremony (`UserRecord::force_password_change`),
+            // resolved authoritatively from the record at sign-in.
+            let force_password_change = ctx
+                .iam_users()
+                .get(&handle)
+                .is_some_and(|r| r.force_password_change);
             if ctx.webauthn_rp.user_has_credentials(&subject) {
                 let ptoken = format!("p{}", ctx.next_pending);
                 ctx.next_pending += 1;
@@ -8052,7 +8059,9 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
                     reason: "OK",
                     content_type: "text/plain; charset=utf-8",
                     session_token: Some(ptoken),
-                    body: format!("NEEDS-2FA {handle}"),
+                    body: format!(
+                        "NEEDS-2FA {handle} force_password_change={force_password_change}"
+                    ),
                     bytes: None,
                 };
             }
@@ -8062,7 +8071,11 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
                 reason: "OK",
                 content_type: "text/plain; charset=utf-8",
                 session_token: Some(token),
-                body: LoginResponse { handle }.to_wire(),
+                body: LoginResponse {
+                    handle,
+                    force_password_change,
+                }
+                .to_wire(),
                 bytes: None,
             }
         }

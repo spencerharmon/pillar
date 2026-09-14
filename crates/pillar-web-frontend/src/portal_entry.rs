@@ -94,12 +94,17 @@ mod yew_impl {
                             // promotes a real session.
                             let body = r.body.trim().to_owned();
                             if r.ok() && body.starts_with("NEEDS-2FA") {
-                                let handle = body
-                                    .strip_prefix("NEEDS-2FA")
-                                    .map(str::trim)
+                                let after =
+                                    body.strip_prefix("NEEDS-2FA").map(str::trim).unwrap_or("");
+                                let mut toks = after.split_whitespace();
+                                let handle = toks
+                                    .next()
                                     .filter(|h| !h.is_empty())
                                     .unwrap_or(&id)
                                     .to_owned();
+                                let force_password_change = after
+                                    .split_whitespace()
+                                    .any(|t| t == "force_password_change=true");
                                 let ptoken = r.session_token.clone().unwrap_or_default();
                                 message.set(Some(
                                     "Touch your security key / passkey to finish signing in…"
@@ -112,7 +117,7 @@ mod yew_impl {
                                             auth.dispatch(AuthAction::LoginSuccess {
                                                 user: handle,
                                                 token: real,
-                                                force_password_change: false,
+                                                force_password_change,
                                             });
                                         }
                                         _ => message.set(Some(friendly_error(
@@ -123,12 +128,12 @@ mod yew_impl {
                                 }
                             } else {
                                 match interpret_login(r.ok(), &r.body, &id) {
-                                    Ok(handle) => {
+                                    Ok((handle, force_password_change)) => {
                                         message.set(None);
                                         auth.dispatch(AuthAction::LoginSuccess {
                                             user: handle,
                                             token: r.session_token.unwrap_or_default(),
-                                            force_password_change: false,
+                                            force_password_change,
                                         });
                                     }
                                     Err(reason) => message.set(Some(friendly_error(&reason))),
