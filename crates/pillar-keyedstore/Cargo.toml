@@ -1,0 +1,22 @@
+[package]
+name = "pillar-keyedstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pillar keyed store: K/V and Document surfaces over ONE HLC-ordered per-field-LWW fold on the streamdb op log (specs/KeyedStore.tla), persisted via the existing streamdb IPFS-backed durability — no second storage engine."
+
+[dependencies]
+# ONE fold engine over the existing streamdb op log — no parallel store. We
+# depend on the pure content-addressing + persistence primitives only; the
+# `ipfs` durability feature is what the native persistence path uses.
+pillar-streamdb = { path = "../pillar-streamdb", default-features = false }
+# `SideEffect` for the streamdb persistence append surface (keyed ops are
+# CvRDT-convergent).
+pillar-core = { path = "../pillar-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
