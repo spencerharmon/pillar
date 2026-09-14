@@ -46,7 +46,17 @@ append field-delta, new-view-over-existing-data with no migration), the HLC orde
 requirement, the AP-default / CP-co-partitioned-fold consistency split, collection-scoped
 placement over node tags (default = whole cell, isolation opt-in, views follow sources),
 the component migration map, the Samza/Kafka/Mongo comparison, and the standing
-performance program. Referenced by `ROI.md`. Prose design-of-record; no `.tex` yet.
+performance program. Referenced by `ROI.md`. Rendered as a formal LaTeX paper
+(`pillar-data-layer.tex`) with a full-width **time sequence diagram of common and
+unique streamdb operations** — write + gossip merge, concurrent last-writer-wins
+convergence, a CP exclusive admission via the coordination-core lease, a query from a
+folded view, a new view over existing data, and content-addressed rehydrate — the
+`.md` is the design-of-record prose. Build the PDF (needs a TeX install with tikz +
+pgfplots + pifont):
+
+```
+pdflatex pillar-data-layer.tex && pdflatex pillar-data-layer.tex
+```
 
 `pillar-udp-encryption.md` — *pillar-udp Encryption: the portable cell-minted
 session key*. How a **pillar-udp** datagram is encrypted on the wire, replacing the
