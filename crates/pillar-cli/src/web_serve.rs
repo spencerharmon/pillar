@@ -1492,8 +1492,15 @@ impl WebAuthContext {
             PortalOp::UserRequireChange { handle, at } => {
                 pillar_iam::apply_op(
                     &mut self.users,
-                    pillar_iam::UserOp::RequireChange { handle, at },
+                    pillar_iam::UserOp::RequireChange {
+                        handle: handle.clone(),
+                        at,
+                    },
                 );
+                // Mirror the live revoke so post-replay ledger state equals
+                // live: an operational offer restored by an earlier mint op is
+                // revoked again when this require-change replays over it.
+                self.verifier.revoke_offer_for(&handle);
             }
             PortalOp::UserPasswordSet {
                 handle,
@@ -2764,6 +2771,11 @@ impl WebAuthContext {
                 at,
             },
         );
+        // CRYPTOGRAPHIC containment: revoke the user's operational offer so they
+        // hold no admitted key. `sign_op_for` then fails closed (no delegated
+        // signature) and normal `admit` fails closed — the user can only
+        // re-authenticate through the ownership-proof path to rotate their key.
+        self.verifier.revoke_offer_for(handle);
         self.record(&PortalOp::UserRequireChange {
             handle: handle.to_owned(),
             at,
@@ -8272,77 +8284,97 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
 
     let authority = ctx.authority.clone();
     let actor = ctx.actor.clone();
-    match ctx
+    let session = match ctx
         .verifier
         .admit(&identifier, &password, nonce_id, 0, &authority, &actor)
     {
-        Ok(session) => {
-            let handle = session.handle.clone();
-            // Disabled accounts never obtain a session (`DisabledNeverActive`),
-            // even though their node-sealed offer still unlocks — the IAM status
-            // gate refuses admission before any session is minted.
-            if ctx
-                .iam_users()
-                .get(&handle)
-                .is_some_and(|r| r.status == pillar_iam::UserStatus::Disabled)
-            {
-                return text_response(403, "Forbidden", "DENIED account-disabled".to_owned());
-            }
-            // 2FA ENFORCEMENT: if this user (keyed on the STABLE admitted
-            // subject, robust to which identifier form was typed) has an
-            // ENROLLED WebAuthn credential, a password alone is NOT enough. Park
-            // the admitted session under a pending `p<n>` token (no live session
-            // minted) and tell the client to complete a WebAuthn assertion; only
-            // `authenticate/finish` promotes it into a real session. A user with
-            // no enrolled credential logs in on the password alone (the
-            // pre-enrollment window used to register the first authenticator).
-            let subject = session.subject.to_string();
-            // The forced-change flag the client uses to intercept into the
-            // change-password ceremony (`UserRecord::force_password_change`),
-            // resolved authoritatively from the record at sign-in.
-            let force_password_change = ctx
-                .iam_users()
-                .get(&handle)
-                .is_some_and(|r| r.force_password_change);
-            if ctx.webauthn_rp.user_has_credentials(&subject) {
-                let ptoken = format!("p{}", ctx.next_pending);
-                ctx.next_pending += 1;
-                ctx.pending_2fa.insert(
-                    ptoken.clone(),
-                    PendingLogin {
-                        session,
-                        identifier: subject,
-                    },
-                );
-                return HttpResponse {
-                    status: 200,
-                    reason: "OK",
-                    content_type: "text/plain; charset=utf-8",
-                    session_token: Some(ptoken),
-                    body: format!(
-                        "NEEDS-2FA {handle} force_password_change={force_password_change}"
-                    ),
-                    bytes: None,
-                };
-            }
-            let token = ctx.store_session(session);
-            HttpResponse {
-                status: 200,
-                reason: "OK",
-                content_type: "text/plain; charset=utf-8",
-                session_token: Some(token),
-                body: LoginResponse {
-                    handle,
-                    force_password_change,
+        Ok(session) => session,
+        Err(NodeCustodyError::NoOfferForUser) => {
+            // OWNERSHIP-PROOF fallback: a require-change revoked this user's
+            // operational offer, so `admit` fails closed. If they can still
+            // unseal the revoked blob with their current password they PROVE
+            // ownership and earn a forced-change-only session to rotate their
+            // key. A genuinely unknown user (no revoked ownable offer) still
+            // fails `NoOfferForUser` here — no bypass for normal users.
+            match ctx.verifier.prove_ownership(
+                &identifier,
+                &password,
+                nonce_id,
+                0,
+                &authority,
+                &actor,
+            ) {
+                Ok(session) => session,
+                Err(e) => {
+                    let reason = login_reason(&e);
+                    return text_response(401, "Unauthorized", format!("DENIED {reason}"));
                 }
-                .to_wire(),
-                bytes: None,
             }
         }
         Err(e) => {
             let reason = login_reason(&e);
-            text_response(401, "Unauthorized", format!("DENIED {reason}"))
+            return text_response(401, "Unauthorized", format!("DENIED {reason}"));
         }
+    };
+
+    let handle = session.handle.clone();
+    // Disabled accounts never obtain a session (`DisabledNeverActive`),
+    // even though their node-sealed offer still unlocks — the IAM status
+    // gate refuses admission before any session is minted.
+    if ctx
+        .iam_users()
+        .get(&handle)
+        .is_some_and(|r| r.status == pillar_iam::UserStatus::Disabled)
+    {
+        return text_response(403, "Forbidden", "DENIED account-disabled".to_owned());
+    }
+    // 2FA ENFORCEMENT: if this user (keyed on the STABLE admitted
+    // subject, robust to which identifier form was typed) has an
+    // ENROLLED WebAuthn credential, a password alone is NOT enough. Park
+    // the admitted session under a pending `p<n>` token (no live session
+    // minted) and tell the client to complete a WebAuthn assertion; only
+    // `authenticate/finish` promotes it into a real session. A user with
+    // no enrolled credential logs in on the password alone (the
+    // pre-enrollment window used to register the first authenticator).
+    let subject = session.subject.to_string();
+    // The forced-change flag the client uses to intercept into the
+    // change-password ceremony (`UserRecord::force_password_change`),
+    // resolved authoritatively from the record at sign-in.
+    let force_password_change = ctx
+        .iam_users()
+        .get(&handle)
+        .is_some_and(|r| r.force_password_change);
+    if ctx.webauthn_rp.user_has_credentials(&subject) {
+        let ptoken = format!("p{}", ctx.next_pending);
+        ctx.next_pending += 1;
+        ctx.pending_2fa.insert(
+            ptoken.clone(),
+            PendingLogin {
+                session,
+                identifier: subject,
+            },
+        );
+        return HttpResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "text/plain; charset=utf-8",
+            session_token: Some(ptoken),
+            body: format!("NEEDS-2FA {handle} force_password_change={force_password_change}"),
+            bytes: None,
+        };
+    }
+    let token = ctx.store_session(session);
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type: "text/plain; charset=utf-8",
+        session_token: Some(token),
+        body: LoginResponse {
+            handle,
+            force_password_change,
+        }
+        .to_wire(),
+        bytes: None,
     }
 }
 
@@ -9491,6 +9523,72 @@ mod tests {
         let _hugo2 = login_token(&mut ctx, "hugo", &new_temp);
     }
 
+    // Slice 6 — require-change is CRYPTOGRAPHIC, not a bare flag. An admin
+    // "require password change" on an OPERATIONAL user REVOKES their operational
+    // key: a normal login then fails closed and no op can be delegated-signed on
+    // their behalf. The user re-authenticates ONLY through the ownership-proof
+    // path — unsealing the revoked key with their CURRENT password — which forces
+    // the change ceremony; completing it mints a fresh operational key and the
+    // pre-change password is dead thereafter.
+    #[test]
+    fn require_change_revokes_the_key_and_login_falls_back_to_ownership_proof() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+        let invite = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\niris\niris@example.com\niris-pw\nfalse\nfalse"),
+        );
+        assert_eq!(invite.status, 200, "invite: {}", invite.body);
+        // Iris holds an operational key under iris-pw.
+        let _iris = login_token(&mut ctx, "iris", "iris-pw");
+
+        // Admin requires a password change → the operational key is revoked.
+        let req = post(
+            &mut ctx,
+            "/portal/users/require-password-change",
+            &format!("{admin}\niris"),
+        );
+        assert_eq!(req.status, 200, "require-change: {}", req.body);
+
+        // Login STILL succeeds — but only via the ownership-proof fallback — and
+        // reports force_password_change so the client forces the ceremony.
+        let nonce = get(&mut ctx, "/nonce");
+        let id: u64 = nonce
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let login = post(&mut ctx, "/login", &format!("iris\niris-pw\n{id}"));
+        assert_eq!(login.status, 200, "ownership-proof login: {}", login.body);
+        assert!(
+            login.body.contains("force_password_change=true"),
+            "the ownership-proof login must force the change: {}",
+            login.body
+        );
+        let iris = login
+            .session_token
+            .expect("an ownership-proof session token");
+
+        // Iris completes the forced change → mints a fresh operational key.
+        let change = post(
+            &mut ctx,
+            "/portal/users/reset-password",
+            &format!("{iris}\niris-rotated-pw"),
+        );
+        assert_eq!(change.status, 200, "forced self-change: {}", change.body);
+
+        // The OLD password is cryptographically dead (revoked, not rotated-into).
+        assert!(
+            login_is_refused(&mut ctx, "iris", "iris-pw"),
+            "the pre-change password must not admit after the rotation"
+        );
+        // The NEW password admits the freshly minted operational key normally.
+        let _iris2 = login_token(&mut ctx, "iris", "iris-rotated-pw");
+    }
+
     /// Attempt a node-side login and report whether it was refused (any
     /// non-2xx), driving the same `/nonce` -> `/login` handshake `login_token`
     /// uses.
@@ -10015,6 +10113,117 @@ mod tests {
         );
         node_b.replay(&persisted_ops);
         let _iris_b2 = login_token(&mut node_b, "iris", "iris-new-strong-password");
+    }
+
+    #[test]
+    fn replay_keeps_a_require_changed_users_key_revoked() {
+        // Containment-critical restart path: a require-change REVOKES the
+        // operational offer. That revoke MUST replay too — otherwise a fresh
+        // node (same PVC) would re-admit the minted offer and silently restore
+        // the key a require-change was meant to contain. After replay the user's
+        // offer is still revoked (normal admit fails closed; login only via the
+        // ownership-proof path), and completing the forced change on the
+        // restarted node rotates to a fresh operational key.
+        let journal = test_journal();
+        let mut node_a = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        )
+        .with_persistent_journal(Arc::clone(&journal));
+        assert_eq!(
+            post(&mut node_a, "/bootstrap/create-cell", "cell-genesis").status,
+            200
+        );
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/bootstrap/create-user",
+                &format!("alice@pillar\n{PASSWORD}")
+            )
+            .status,
+            200
+        );
+        let admin = login_token(&mut node_a, "alice@pillar", PASSWORD);
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/portal/users/invite",
+                &format!("{admin}\nj\nj@example.com\nj-pw\nfalse\nfalse"),
+            )
+            .status,
+            200
+        );
+        let _j = login_token(&mut node_a, "j", "j-pw");
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/portal/users/require-password-change",
+                &format!("{admin}\nj"),
+            )
+            .status,
+            200
+        );
+
+        let persisted_ops: Vec<Vec<u8>> = {
+            let stream = journal.lock().expect("journal lock");
+            stream
+                .stream()
+                .log()
+                .order()
+                .iter()
+                .map(|op| op.payload().to_vec())
+                .collect()
+        };
+
+        let mut node_b = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        node_b.replay(&persisted_ops);
+
+        // The revoke SURVIVED replay: the node no longer holds an admitted offer
+        // for j (a missing replay-revoke would make this true, restoring the key).
+        assert!(
+            !node_b.verifier.has_offer_for("j"),
+            "a require-changed user's operational key must stay revoked across a restart"
+        );
+
+        // Login on the restarted node still works via ownership proof and forces
+        // the change; completing it rotates to a fresh operational key and the
+        // pre-change password is dead.
+        let nonce = get(&mut node_b, "/nonce");
+        let id: u64 = nonce
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let login = post(&mut node_b, "/login", &format!("j\nj-pw\n{id}"));
+        assert_eq!(login.status, 200, "ownership-proof login: {}", login.body);
+        assert!(
+            login.body.contains("force_password_change=true"),
+            "got: {}",
+            login.body
+        );
+        let j = login.session_token.expect("ownership-proof session");
+        assert_eq!(
+            post(
+                &mut node_b,
+                "/portal/users/reset-password",
+                &format!("{j}\nj-rotated-pw"),
+            )
+            .status,
+            200
+        );
+        assert!(login_is_refused(&mut node_b, "j", "j-pw"));
+        let _j2 = login_token(&mut node_b, "j", "j-rotated-pw");
     }
 
     #[test]

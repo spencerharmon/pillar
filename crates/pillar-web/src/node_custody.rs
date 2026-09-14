@@ -499,6 +499,17 @@ pub struct NodeCustodyVerifier {
     ledger: KeyDistributionLedger,
 }
 
+/// The ledger-admission state [`NodeCustodyVerifier::resolve_and_unlock_with`]
+/// requires of the offer it unseals — see that method and
+/// [`NodeCustodyVerifier::prove_ownership`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RequiredAdmission {
+    /// The normal login/sign path: the offer must be currently admitted.
+    Admitted,
+    /// The ownership-proof path: the offer must be currently REVOKED.
+    Revoked,
+}
+
 impl NodeCustodyVerifier {
     /// A verifier for a node holding `node_key`, serving the origin `origin`,
     /// with an empty cell DB and a fresh key-distribution ledger with this
@@ -930,13 +941,36 @@ impl NodeCustodyVerifier {
         identifier: &str,
         password: &str,
     ) -> Result<(SealedOffer, String, String), NodeCustodyError> {
+        self.resolve_and_unlock_with(identifier, password, RequiredAdmission::Admitted)
+    }
+
+    /// [`Self::resolve_and_unlock`] parameterised by the ledger-admission state
+    /// the offer must be in. `Admitted` is the normal login/sign path (a
+    /// revoked or never-minted offer fails `NoOfferForUser` closed). `Revoked`
+    /// is the ownership-proof path ([`Self::prove_ownership`]): it unseals ONLY
+    /// an offer the ledger has REVOKED — never one still admitted (which must go
+    /// through the normal path) and never one that never existed — so a user
+    /// whose operational key a require-change revoked can prove ownership of the
+    /// dead key with their password. The node-unseal + AEAD password-unlock are
+    /// identical either way; only the admission predicate differs.
+    fn resolve_and_unlock_with(
+        &self,
+        identifier: &str,
+        password: &str,
+        required: RequiredAdmission,
+    ) -> Result<(SealedOffer, String, String), NodeCustodyError> {
         let Some(cid) = self.cell_db.resolve_cid(identifier).cloned() else {
             return Err(NodeCustodyError::NoOfferForUser);
         };
         let Some(record) = self.cell_db.record_for(identifier) else {
             return Err(NodeCustodyError::NoOfferForUser);
         };
-        if !self.ledger.is_admitted(record) {
+        let admitted = self.ledger.is_admitted(record);
+        let admission_ok = match required {
+            RequiredAdmission::Admitted => admitted,
+            RequiredAdmission::Revoked => !admitted,
+        };
+        if !admission_ok {
             return Err(NodeCustodyError::NoOfferForUser);
         }
         let Some(offer) = self.cell_db.offer_for(&cid).cloned() else {
@@ -996,6 +1030,46 @@ impl NodeCustodyVerifier {
         Ok((signature, signer))
     }
 
+    /// Validate the challenge nonce `nonce_id` against this node: it must be
+    /// issued, unconsumed, bound to this node's origin, and unexpired at
+    /// `clock`. Shared by [`Self::admit`] and [`Self::prove_ownership`]; returns
+    /// the live nonce (never consumes it — the caller consumes on full success).
+    fn check_nonce(&self, nonce_id: u64, clock: u64) -> Result<Nonce, NodeCustodyError> {
+        let Some(nonce) = self.issued.get(&nonce_id).cloned() else {
+            return Err(NodeCustodyError::BadNonce);
+        };
+        if self.consumed.contains(&nonce_id) {
+            return Err(NodeCustodyError::BadNonce);
+        }
+        if nonce.origin() != &self.origin {
+            return Err(NodeCustodyError::BadNonce);
+        }
+        if nonce.expiry() <= clock {
+            return Err(NodeCustodyError::BadNonce);
+        }
+        Ok(nonce)
+    }
+
+    /// Sign `nonce` with the unlocked operational key for `offer.subkey()` and
+    /// verify it against the registered public key — the server-side half of the
+    /// challenge-response that re-proves the unlocked secret matches the minted
+    /// key. `UnlockFailed` if the key is unregistered or the check fails.
+    fn verify_nonce_signature(
+        &self,
+        offer: &SealedOffer,
+        secret: &str,
+        nonce: &Nonce,
+    ) -> Result<(), NodeCustodyError> {
+        let signature = sign_material(offer.subkey(), secret, nonce);
+        let Some(registered) = self.registered.get(offer.subkey()) else {
+            return Err(NodeCustodyError::UnlockFailed);
+        };
+        if !registered.verify(nonce, &signature) {
+            return Err(NodeCustodyError::UnlockFailed);
+        }
+        Ok(())
+    }
+
     pub fn admit(
         &mut self,
         identifier: &str,
@@ -1011,25 +1085,8 @@ impl NodeCustodyVerifier {
         let (offer, handle, secret) = self.resolve_and_unlock(identifier, password)?;
 
         // Step 4: sign the challenge nonce server-side and verify it.
-        let Some(nonce) = self.issued.get(&nonce_id).cloned() else {
-            return Err(NodeCustodyError::BadNonce);
-        };
-        if self.consumed.contains(&nonce_id) {
-            return Err(NodeCustodyError::BadNonce);
-        }
-        if nonce.origin() != &self.origin {
-            return Err(NodeCustodyError::BadNonce);
-        }
-        if nonce.expiry() <= clock {
-            return Err(NodeCustodyError::BadNonce);
-        }
-        let signature = sign_material(offer.subkey(), &secret, &nonce);
-        let Some(registered) = self.registered.get(offer.subkey()) else {
-            return Err(NodeCustodyError::UnlockFailed);
-        };
-        if !registered.verify(&nonce, &signature) {
-            return Err(NodeCustodyError::UnlockFailed);
-        }
+        let nonce = self.check_nonce(nonce_id, clock)?;
+        self.verify_nonce_signature(&offer, &secret, &nonce)?;
 
         // Step 5: the SHARED fail-closed WoT authority guard — one path.
         let subject = offer.subkey().node_id();
@@ -1037,6 +1094,55 @@ impl NodeCustodyVerifier {
             .act(authority, &subject)
             .map_err(NodeCustodyError::NotAuthorized)?;
 
+        self.consumed.insert(nonce_id);
+        Ok(NodeCustodySession {
+            handle,
+            subject,
+            nonce_id,
+            watermark: snapshot.watermark,
+        })
+    }
+
+    /// OWNERSHIP-PROOF login for a require-changed user. A require-change REVOKES
+    /// the user's operational offer in the key-distribution ledger, so both
+    /// [`Self::admit`] and [`Self::sign_op_for`] fail closed (`NoOfferForUser`):
+    /// the user holds no admitted key and can produce no signed op (the
+    /// cryptographic containment of a must-change user). This path lets that
+    /// user still AUTHENTICATE — purely to rotate their key — by unsealing the
+    /// REVOKED offer blob (still physically present in the cell DB) with their
+    /// current password: an AEAD open only the key owner can perform
+    /// (`UnlockFailed` for the wrong password / a non-owner). It then runs the
+    /// SAME nonce challenge and WoT authority guard as `admit` and returns a
+    /// session.
+    ///
+    /// It succeeds ONLY on a REVOKED offer — an offer still admitted must use
+    /// `admit`, and a never-minted one fails `NoOfferForUser` — so it is not an
+    /// alternate login for normal users. Login dispatch reaches it only after
+    /// `admit` returns `NoOfferForUser` for a forced-change user; the returned
+    /// session is good only for the change-password ceremony, since the user
+    /// still holds no operational key until that ceremony mints a fresh one.
+    ///
+    /// # Errors
+    /// `NoOfferForUser` (no revoked ownable offer), `NoCustody`, `UnlockFailed`
+    /// (wrong password / not the owner), `BadNonce`, `NotAuthorized`.
+    pub fn prove_ownership(
+        &mut self,
+        identifier: &str,
+        password: &str,
+        nonce_id: u64,
+        clock: u64,
+        authority: &WotAuthority,
+        actor: &FencedActor,
+    ) -> Result<NodeCustodySession, NodeCustodyError> {
+        // Ownership is proven by unsealing the REVOKED offer with the password.
+        let (offer, handle, secret) =
+            self.resolve_and_unlock_with(identifier, password, RequiredAdmission::Revoked)?;
+        let nonce = self.check_nonce(nonce_id, clock)?;
+        self.verify_nonce_signature(&offer, &secret, &nonce)?;
+        let subject = offer.subkey().node_id();
+        let snapshot = actor
+            .act(authority, &subject)
+            .map_err(NodeCustodyError::NotAuthorized)?;
         self.consumed.insert(nonce_id);
         Ok(NodeCustodySession {
             handle,
@@ -1252,6 +1358,78 @@ mod tests {
         assert_eq!(
             v.sign_op_for("alice@pillar", PASSWORD, b"op", &mut StepUpToken::fresh()),
             Err(NodeCustodyError::NoOfferForUser),
+        );
+    }
+
+    #[test]
+    fn require_change_revokes_then_ownership_proof_reauthenticates() {
+        // Model a require-change: the operational offer is revoked. Afterwards
+        // BOTH admit and sign_op_for fail closed (crypto containment), but the
+        // owner can still PROVE ownership of the dead key with their password to
+        // earn a forced-change session; a wrong password cannot.
+        let (mut v, subkey) = provisioned();
+        let (auth, actor) = chained(&subkey);
+
+        // Before revoke: normal admit works.
+        let nonce = v.issue_nonce(10);
+        assert!(v
+            .admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+            .is_ok());
+
+        // While the offer is still ADMITTED, ownership-proof must REFUSE it
+        // (an admitted offer belongs to the normal admit path only).
+        let nonce = v.issue_nonce(10);
+        assert_eq!(
+            v.prove_ownership("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+                .err(),
+            Some(NodeCustodyError::NoOfferForUser),
+        );
+
+        // require-change: revoke the operational offer.
+        v.revoke_offer_for("alice@pillar");
+
+        // admit now fails closed — the user holds no admitted key.
+        let nonce = v.issue_nonce(10);
+        assert_eq!(
+            v.admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+                .err(),
+            Some(NodeCustodyError::NoOfferForUser),
+        );
+
+        // A WRONG password cannot prove ownership of the revoked key.
+        let nonce = v.issue_nonce(10);
+        assert_eq!(
+            v.prove_ownership("alice@pillar", "wrong", nonce.id(), 0, &auth, &actor)
+                .err(),
+            Some(NodeCustodyError::UnlockFailed),
+        );
+
+        // The OWNER proves ownership with the real password and gets a session
+        // (good only to rotate the key — they still hold no admitted key).
+        let nonce = v.issue_nonce(10);
+        let session = v
+            .prove_ownership("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+            .expect("the key owner re-authenticates via ownership proof");
+        assert_eq!(session.subject, subkey.node_id());
+        assert_eq!(session.handle, "Alice");
+        // Still contained: no delegated signature is possible.
+        assert_eq!(
+            v.sign_op_for("alice@pillar", PASSWORD, b"op", &mut StepUpToken::fresh()),
+            Err(NodeCustodyError::NoOfferForUser),
+        );
+    }
+
+    #[test]
+    fn ownership_proof_fails_closed_for_an_unknown_user() {
+        // A user the node holds NO offer for (never minted, never revoked)
+        // cannot prove ownership — there is nothing to unseal.
+        let (mut v, subkey) = provisioned();
+        let (auth, actor) = chained(&subkey);
+        let nonce = v.issue_nonce(10);
+        assert_eq!(
+            v.prove_ownership("nobody@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+                .err(),
+            Some(NodeCustodyError::NoOfferForUser),
         );
     }
 
