@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "note": "Tracked streamdb performance baseline. Metrics are ns/op (lower is better). Recorded by the recurring streamdb-perf-benchmark discipline (ROI P1). The harness (scripts/streamdb-perf-benchmark.sh -> cargo run -p pillar-streamdb --example perf_bench --release) compares a fresh measurement against these values with a regression tolerance (STREAMDB_PERF_TOLERANCE, default 1.40 = allow 40% noise). A measurement worse than baseline*tolerance is a REGRESSION and fails the check unless a follow-up tuning task is filed. A measurement meaningfully BELOW baseline is headroom to record a new baseline. Update this file (and note it in the change doc) when a real, verified improvement lands.",
+  "n": 5000,
+  "recorded_at": "2026-09-14",
+  "recorded_commit_note": "initial baseline from bee-streamdb-perf-benchmark-recurring on the runner rig",
+  "metrics": {
+    "append_ns_per_op": 520.0,
+    "view_fold_ns_per_op": 125.0,
+    "merge_ns_per_op": 470.0,
+    "compact_ns_per_op": 300.0
+  }
+}
