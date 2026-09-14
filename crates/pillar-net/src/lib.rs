@@ -101,6 +101,9 @@ pub use resource_op_bind::{
 
 pub mod kv_plane_migration;
 
+pub mod data_placement;
+pub use data_placement::{CollectionPlacement, ViewPlacement};
+
 /// Gossipsub topic carrying Pillar's append-only event log.
 pub const EVENT_LOG_TOPIC: &str = "/pillar/event-log/1.0.0";
 
