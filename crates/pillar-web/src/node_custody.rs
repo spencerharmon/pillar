@@ -367,6 +367,18 @@ impl RegisteredOperationalKey {
         RegisteredOperationalKey { subkey, verifier }
     }
 
+    /// Register from a KNOWN public verifier, WITHOUT the plaintext `secret`.
+    /// This is how a RANDOM-secret offer (an operational key minted from OS
+    /// entropy, never re-derivable from the handle) is reconstructed on
+    /// restart/replay: the node persisted only the sealed blob and this public
+    /// key, never the secret, so [`register`](Self::register) (which needs the
+    /// secret) cannot be used — the login-time AEAD unlock still recovers the
+    /// secret from the blob and re-derives a signature this verifier checks.
+    #[must_use]
+    pub fn from_public(subkey: NodeSubkey, verifier: SigningPublicKey) -> Self {
+        RegisteredOperationalKey { subkey, verifier }
+    }
+
     fn verify(&self, nonce: &Nonce, signature: &Signature) -> bool {
         let sig = pillar_crypto::Signature::from_bytes(signature.to_wire().to_vec());
         sign::verify(&self.verifier, &nonce.signing_material_public(), &sig).is_ok()
@@ -697,7 +709,51 @@ impl NodeCustodyVerifier {
             .put_offer(identifier, handle, cid, record, offer);
     }
 
-    /// Re-seal an ALREADY-provisioned offer's operational key under a NEW
+    /// Restore a RANDOM-secret offer from its persisted parts — the replay
+    /// counterpart of a mint whose operational-key `secret` was drawn from OS
+    /// entropy (never re-derivable from the handle) and therefore NEVER
+    /// journaled. Instead of the secret, the node persisted the operational
+    /// PUBLIC key (safe to store) alongside the pre-sealed blob; this installs
+    /// the blob verbatim and registers the verifier from that public key
+    /// ([`RegisteredOperationalKey::from_public`]). The login-time AEAD unlock
+    /// still recovers the secret from the blob under the user's password and
+    /// re-derives a signature this public key checks — identical admission to a
+    /// freshly minted offer, with no secret ever read from disk.
+    pub fn restore_offer_with_public(
+        &mut self,
+        identifier: impl Into<String>,
+        handle: impl Into<String>,
+        cid: Cid,
+        subkey: NodeSubkey,
+        public_bytes: &[u8],
+        node_sealed: Vec<u8>,
+    ) {
+        let identifier = identifier.into();
+        let this_node = self.node_key.node().clone();
+        let record = self.register_admit_record(&identifier, &cid, std::iter::once(this_node));
+        let offer = SealedOffer::from_sealed_parts(
+            subkey.clone(),
+            node_sealed,
+            self.ledger.seal_of(&record),
+        );
+        let verifier = SigningPublicKey::from_bytes(public_bytes.to_vec());
+        self.registered.insert(
+            subkey.clone(),
+            RegisteredOperationalKey::from_public(subkey, verifier),
+        );
+        self.cell_db
+            .put_offer(identifier, handle, cid, record, offer);
+    }
+
+    /// The operational public signing key a `(subkey, secret)` pair yields — the
+    /// value a mint journals so [`Self::restore_offer_with_public`] can
+    /// reconstruct the verifier at replay WITHOUT the secret. The caller (the
+    /// web layer, which holds the freshly generated random `secret` only at
+    /// mint time) computes this immediately after provisioning and persists it.
+    #[must_use]
+    pub fn operational_public_for(subkey: &NodeSubkey, secret: &str) -> SigningPublicKey {
+        operational_public(subkey, secret)
+    }
     /// password, keeping the SAME key-distribution ledger admission record and
     /// CID (only the password that unlocks the inner layer changes). The
     /// operational-key `secret` is unchanged — so [`Self::admit`] keeps
@@ -1025,6 +1081,84 @@ mod tests {
     }
 
     // ---- delegated signing (the KD node signs an op on the user's behalf) ----
+
+    #[test]
+    fn random_secret_mint_survives_a_pubkey_only_replay() {
+        // A RANDOM operational secret (never derivable from the handle) is
+        // sealed under a password; the node journals only the blob + the
+        // operational PUBLIC key. A fresh node reconstructs the verifier from
+        // that public key alone (no secret) and admits the SAME password login
+        // — the replay path for entropy-minted offers.
+        let subkey = NodeSubkey::from("op-random-alice");
+        let random_secret = "3f9a2c7e5b1d84066a2f0e9c7d15b8a4"; // stands in for OS entropy
+        let mut v = NodeCustodyVerifier::new(node_key(), ORIGIN);
+        v.provision_offer(
+            "alice@pillar",
+            "Alice",
+            Cid::from("cid-random-alice"),
+            subkey.clone(),
+            PASSWORD,
+            random_secret,
+        );
+        let (cid, handle, blob) = v
+            .provisioned_offer_parts("alice@pillar")
+            .expect("a just-minted offer has persisted parts");
+        let public = NodeCustodyVerifier::operational_public_for(&subkey, random_secret);
+
+        // A brand-new node holding ONLY (blob, public) — never the secret.
+        let mut replayed = NodeCustodyVerifier::new(node_key(), ORIGIN);
+        replayed.restore_offer_with_public(
+            "alice@pillar",
+            handle,
+            cid,
+            subkey.clone(),
+            public.as_bytes(),
+            blob,
+        );
+        let (auth, actor) = chained(&subkey);
+        let nonce = replayed.issue_nonce(10);
+        let session = replayed
+            .admit("alice@pillar", PASSWORD, nonce.id(), 0, &auth, &actor)
+            .expect("a pubkey-only replayed random-secret offer must admit the same password");
+        assert_eq!(session.subject, subkey.node_id());
+    }
+
+    #[test]
+    fn a_replay_registered_with_the_wrong_pubkey_fails_login_closed() {
+        // If the journaled public key does not match the sealed secret, the
+        // login-time signature verification fails closed — the verifier is not
+        // a mere presence check.
+        let subkey = NodeSubkey::from("op-random-bob");
+        let mut v = NodeCustodyVerifier::new(node_key(), ORIGIN);
+        v.provision_offer(
+            "bob@pillar",
+            "Bob",
+            Cid::from("cid-random-bob"),
+            subkey.clone(),
+            PASSWORD,
+            "the-real-random-secret",
+        );
+        let (cid, handle, blob) = v.provisioned_offer_parts("bob@pillar").unwrap();
+        let wrong_public =
+            NodeCustodyVerifier::operational_public_for(&subkey, "a-different-secret");
+
+        let mut replayed = NodeCustodyVerifier::new(node_key(), ORIGIN);
+        replayed.restore_offer_with_public(
+            "bob@pillar",
+            handle,
+            cid,
+            subkey.clone(),
+            wrong_public.as_bytes(),
+            blob,
+        );
+        let (auth, actor) = chained(&subkey);
+        let nonce = replayed.issue_nonce(10);
+        assert_eq!(
+            replayed.admit("bob@pillar", PASSWORD, nonce.id(), 0, &auth, &actor),
+            Err(NodeCustodyError::UnlockFailed),
+            "a mismatched journaled pubkey must fail the login signature check closed"
+        );
+    }
 
     #[test]
     fn delegated_signing_produces_a_signature_the_operational_pubkey_verifies() {
