@@ -659,19 +659,31 @@ impl NodeCustodyVerifier {
                 .add_node_to_allowlist(&cell, node)
                 .expect("cell was just registered above");
         }
-        self.ledger
-            .offer(
-                record.user.clone(),
-                record.cell.clone(),
-                record.artifact.clone(),
-            )
-            .expect("fresh (user, cell, artifact) record is never already offered/admitted");
-        self.ledger
-            .accept(&record)
-            .expect("just-offered record is always acceptable");
-        self.ledger
-            .admit(&record)
-            .expect("offered + accepted, non-cross-owner record always admits");
+        // Idempotent offer/accept/admit so a repeated replay (a node that
+        // reboots twice, or a re-onboarding that re-admits a record after a
+        // prior `revoke_offer` left its `accepted` marker set) rebuilds the
+        // SAME admission instead of panicking on an "already X" transition.
+        // A record already admitted needs nothing; otherwise ensure it is
+        // offered and accepted, then admit.
+        if !self.ledger.is_admitted(&record) {
+            if !self.ledger.is_offered(&record) {
+                self.ledger
+                    .offer(
+                        record.user.clone(),
+                        record.cell.clone(),
+                        record.artifact.clone(),
+                    )
+                    .expect("a non-offered, non-admitted record always offers");
+            }
+            if !self.ledger.is_accepted(&record) {
+                self.ledger
+                    .accept(&record)
+                    .expect("a freshly offered record is always acceptable");
+            }
+            self.ledger
+                .admit(&record)
+                .expect("offered + accepted, non-cross-owner record always admits");
+        }
         record
     }
 
