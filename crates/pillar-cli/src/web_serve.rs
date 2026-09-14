@@ -3834,6 +3834,8 @@ impl WebAuthContext {
                     .perform_signed_act(actor, "iam:users:write", &format!("USER-INVITE {handle}"))
                     .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
                 let at = self.iam_now();
+                let offer_material =
+                    fresh_offer_material(handle).map_err(|()| "offer RNG failure".to_owned())?;
                 match self.iam_invite(
                     handle,
                     handle.clone(),
@@ -3841,6 +3843,7 @@ impl WebAuthContext {
                     *force_password_change,
                     *require_passkey,
                     &password,
+                    offer_material,
                     at,
                 ) {
                     Ok(()) if generated => Ok(format!(
@@ -3900,7 +3903,9 @@ impl WebAuthContext {
                     .perform_signed_act(actor, "iam:users:write", &format!("USER-RESET {handle}"))
                     .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
                 let at = self.iam_now();
-                if self.iam_set_password(handle, password, *force, at) {
+                let offer_material =
+                    fresh_offer_material(handle).map_err(|()| "offer RNG failure".to_owned())?;
+                if self.iam_set_password(handle, password, *force, offer_material, at) {
                     Ok(format!("USER {handle} PASSWORD-SET EVENT-CID {}", cid.0))
                 } else {
                     Err(format!("no user {handle}"))
