@@ -1,0 +1,19 @@
+[package]
+name = "pillar-sqlviews"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pillar SQL views (specs/SqlViews.tla): SQL is a derived-read layer over the keyed Document store. Catalog (CREATE TABLE/VIEW) is data written into the __catalog collection; a view is materialized by folding the existing keyed-store/materialized-view-persistence machinery over its source collection -- no second view engine."
+
+[dependencies]
+# The ONE fold engine: catalog + rows are both keyed-store Documents, and a
+# view is folded over the existing streamdb-backed persistence. No parallel
+# storage or persistence layer is introduced here.
+pillar-keyedstore = { path = "../pillar-keyedstore" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

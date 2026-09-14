@@ -340,6 +340,27 @@ impl KeyedStore {
         self.field_value(collection, id, field)
     }
 
+    /// Every document id in `collection` that currently has at least one live
+    /// field (K/V or Document) -- the enumeration primitive the SQL-view
+    /// layer folds a collection through to materialize a view over it. Pure
+    /// derived state over the op set, sorted for a deterministic fold order.
+    #[must_use]
+    pub fn doc_ids(&self, collection: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .log
+            .order()
+            .into_iter()
+            .filter_map(|op| KeyedOp::decode(op.payload()))
+            .filter(|k| k.collection == collection)
+            .map(|k| k.id)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.into_iter()
+            .filter(|id| !self.doc_fields(collection, id).is_empty())
+            .collect()
+    }
+
     /// The set of live field names of document `id` in `collection`.
     #[must_use]
     pub fn doc_fields(&self, collection: &str, id: &str) -> Vec<String> {
