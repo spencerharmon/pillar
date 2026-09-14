@@ -495,6 +495,39 @@ const PORTAL_OP_TAG: &[u8] = b"PORTALOPv1\n";
 /// password (the first-user offer persists as its already-sealed ciphertext,
 /// `bootstrap_offer_sealed`, which login re-opens live with the user-supplied
 /// password; the plaintext password is never written to disk).
+/// The persisted record of a minted node-custody offer — everything a
+/// deterministic replay needs to reconstruct an offer that was sealed under a
+/// RANDOM secret (never re-derivable from the handle), WITHOUT the secret ever
+/// touching disk. Journaled inside [`PortalOp::InviteUser`]/
+/// [`PortalOp::UserPasswordSet`]; an empty `cid` (serde default) marks a
+/// legacy op written before the enrollment/operational split, which replays
+/// through the old deterministic-secret path instead.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct MintedOffer {
+    /// `"enrollment"` (login-only onboarding credential) or `"operational"`.
+    kind: String,
+    /// The exact key-distribution CID this offer was admitted under (fresh per
+    /// mint; never reused).
+    cid: String,
+    /// The exact [`NodeSubkey`] label the offer's operational key derives from.
+    subkey: String,
+    /// The offer's operational PUBLIC key bytes — registers the login verifier
+    /// on replay ([`NodeCustodyVerifier::restore_offer_with_public`]) with no
+    /// secret.
+    public: Vec<u8>,
+    /// The node-sealed ciphertext blob (the outer node-seal over the
+    /// password-locked inner key), installed verbatim on replay.
+    sealed: Vec<u8>,
+}
+
+impl MintedOffer {
+    /// Whether this op carries a real minted offer (vs a legacy op whose offer
+    /// replays through the deterministic-secret path).
+    fn is_present(&self) -> bool {
+        !self.cid.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum PortalOp {
     /// The atomic cell + first-user bootstrap. `bootstrap_offer_sealed` is the
@@ -693,6 +726,11 @@ enum PortalOp {
         force_password_change: bool,
         require_passkey_enrollment: bool,
         sealed_offer: Vec<u8>,
+        /// The enrollment/operational offer minted for this invite (random
+        /// secret; pubkey-only replay). Empty (serde default) for a legacy
+        /// invite op, which replays via `sealed_offer` + deterministic secret.
+        #[serde(default)]
+        minted: MintedOffer,
         at: u64,
     },
     /// IAM: a self/admin profile edit (display name + email) on an existing
@@ -726,6 +764,11 @@ enum PortalOp {
         handle: String,
         sealed_offer: Vec<u8>,
         force_password_change: bool,
+        /// The offer minted by this password set (operational for a self
+        /// change/rotation, enrollment for an admin reset). Empty (serde
+        /// default) for a legacy op, which replays the old re-seal-in-place blob.
+        #[serde(default)]
+        minted: MintedOffer,
         at: u64,
     },
     /// IAM: the invited user's required passkey was enrolled — clears the
@@ -756,6 +799,48 @@ fn bootstrap_offer_cid(handle: &str) -> Cid {
 /// the live seal and the restart-time verifier re-registration derive it here.
 fn bootstrap_secret(handle: &str) -> String {
     format!("operational-key-material-{handle}")
+}
+
+/// The onboarding ENROLLMENT subkey for `handle` — a DISTINCT WoT identity from
+/// the operational [`bootstrap_subkey`]. An invited must-change user is admitted
+/// on this login-only key; the operational key literally does not exist until
+/// the password-change ceremony mints it, so an onboarding user holds no
+/// operational key material at all (the cryptographic containment).
+fn enrollment_subkey(handle: &str) -> NodeSubkey {
+    NodeSubkey::from(format!("enroll-{handle}").as_str())
+}
+
+/// A FRESH, random key-distribution CID for a new offer mint. Every mint MUST
+/// be a brand-new record: [`pillar_key_distribution::KeyDistributionLedger::revoke_offer`]
+/// leaves the record's `accepted` marker set, so re-offering the SAME
+/// `(user, cell, artifact)` fails — a rotated/re-onboarded offer therefore lands
+/// on a never-before-used CID. The random suffix also guarantees no collision
+/// with a pre-restart CID whose record replay has re-admitted. `Err(())` only if
+/// the OS RNG fails (surfaced as `500`, never a weak/empty fallback).
+fn fresh_offer_cid(handle: &str) -> Result<Cid, ()> {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).map_err(|_| ())?;
+    let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(Cid::from(format!("cid-{handle}-{suffix}").as_str()))
+}
+
+/// A random operational-key `secret` (256 bits, hex) drawn from OS entropy —
+/// NEVER derivable from the handle (unlike the deterministic [`bootstrap_secret`]
+/// the first-user bootstrap uses). This is what makes an UN-minted operational
+/// key genuinely unrecoverable: with no offer sealing this secret, no password
+/// and no handle can reconstruct the key. `Err(())` on OS RNG failure.
+fn random_offer_secret() -> Result<String, ()> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|_| ())?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Freshly generate the random material a new offer mint needs (a never-reused
+/// CID + an entropy secret) in one OS-RNG hit; the caller passes it into
+/// [`WebAuthContext::iam_mint_offer`] so the mint itself stays infallible and
+/// RNG failure surfaces once, at the HTTP edge, as `500`.
+fn fresh_offer_material(handle: &str) -> Result<(Cid, String), ()> {
+    Ok((fresh_offer_cid(handle)?, random_offer_secret()?))
 }
 
 /// Render a [`pillar_iam::UserStatus`] as the stable wire token the
@@ -1354,11 +1439,13 @@ impl WebAuthContext {
                 force_password_change,
                 require_passkey_enrollment,
                 sealed_offer,
+                minted,
                 at,
             } => {
-                // Rebuild the record, re-admit the login subkey, and restore
-                // the node-sealed offer verbatim (no password) — the invited
-                // user logs in exactly as before the restart.
+                // Rebuild the record, then restore the login credential: the
+                // random-secret enrollment/operational offer from its journaled
+                // MintedOffer (pubkey-only), or — for a legacy pre-split op — the
+                // deterministic-secret operational offer verbatim.
                 if let Ok(op) = pillar_iam::invite_user(
                     &self.users,
                     &handle,
@@ -1370,9 +1457,13 @@ impl WebAuthContext {
                 ) {
                     pillar_iam::apply_op(&mut self.users, op);
                 }
-                let subkey = bootstrap_subkey(&handle);
-                self.admit_subject_login_only(subkey.node_id());
-                self.iam_restore_offer(&handle, sealed_offer);
+                if minted.is_present() {
+                    self.iam_restore_minted(&handle, &minted);
+                } else {
+                    let subkey = bootstrap_subkey(&handle);
+                    self.admit_subject_login_only(subkey.node_id());
+                    self.iam_restore_offer(&handle, sealed_offer);
+                }
             }
             PortalOp::UserProfileSet {
                 handle,
@@ -1408,6 +1499,7 @@ impl WebAuthContext {
                 handle,
                 sealed_offer,
                 force_password_change,
+                minted,
                 at,
             } => {
                 let op = if force_password_change {
@@ -1422,7 +1514,11 @@ impl WebAuthContext {
                     }
                 };
                 pillar_iam::apply_op(&mut self.users, op);
-                self.iam_restore_offer_blob(&handle, sealed_offer);
+                if minted.is_present() {
+                    self.iam_restore_minted(&handle, &minted);
+                } else {
+                    self.iam_restore_offer_blob(&handle, sealed_offer);
+                }
             }
             PortalOp::UserPasskeyEnrolled { handle, at } => {
                 pillar_iam::apply_op(
@@ -2439,30 +2535,91 @@ impl WebAuthContext {
         t
     }
 
-    /// Live-provision the invited/reset user's node-sealed operational-key
-    /// offer under `password` (the SAME `provision_offer` machinery the
-    /// bootstrap first-user uses) and return the sealed ciphertext to journal,
-    /// so a restart re-registers the identical offer via [`Self::iam_restore_offer`].
-    fn iam_provision_offer(&mut self, handle: &str, password: &str) -> Vec<u8> {
-        let subkey = bootstrap_subkey(handle);
-        let cid = bootstrap_offer_cid(handle);
-        let secret = bootstrap_secret(handle);
+    /// Mint a FRESH node-custody offer for `handle` under `password` — an
+    /// `operational` key (the user's real signing credential) or an enrollment
+    /// key (the login-only onboarding credential). Uses the caller-supplied
+    /// random `secret` + fresh `cid` (see [`fresh_offer_material`]), so the key
+    /// is entropy-minted and never derivable from the handle. Revokes whatever
+    /// offer was active before (an onboarding enrollment key, or a prior
+    /// operational key being rotated) — its old password can never unlock
+    /// anything again — then admits the new subject login-only and returns the
+    /// [`MintedOffer`] to journal (carrying the PUBLIC key for pubkey-only
+    /// replay). The plaintext `secret` is never retained past the seal.
+    fn iam_mint_offer(
+        &mut self,
+        handle: &str,
+        password: &str,
+        cid: Cid,
+        secret: &str,
+        operational: bool,
+    ) -> MintedOffer {
+        // Fail-closed revoke of the currently-active offer FIRST (while the
+        // cell DB still resolves it), so the superseded key/password dies.
+        self.verifier.revoke_offer_for(handle);
+        let subkey = if operational {
+            bootstrap_subkey(handle)
+        } else {
+            enrollment_subkey(handle)
+        };
         self.provision_offer(
+            handle.to_owned(),
+            handle.to_owned(),
+            cid.clone(),
+            subkey.clone(),
+            password,
+            secret,
+        );
+        self.admit_subject_login_only(subkey.node_id());
+        let public = NodeCustodyVerifier::operational_public_for(&subkey, secret)
+            .as_bytes()
+            .to_vec();
+        let sealed = self
+            .verifier
+            .provisioned_offer_parts(handle)
+            .map(|(_, _, sealed)| sealed)
+            .unwrap_or_default();
+        MintedOffer {
+            kind: if operational {
+                "operational"
+            } else {
+                "enrollment"
+            }
+            .to_owned(),
+            cid: cid.0,
+            subkey: subkey.0,
+            public,
+            sealed,
+        }
+    }
+
+    /// Replay counterpart of [`Self::iam_mint_offer`]: reconstruct a
+    /// random-secret offer from its journaled [`MintedOffer`] parts — admit the
+    /// subject login-only and restore the pre-sealed blob, registering the
+    /// verifier from the journaled PUBLIC key ([`NodeCustodyVerifier::restore_offer_with_public`]),
+    /// with no secret read from disk.
+    fn iam_restore_minted(&mut self, handle: &str, minted: &MintedOffer) {
+        // Match the live mint's revoke of the prior active offer, so the
+        // ledger state after replay equals the live state (e.g. the enrollment
+        // record restored by an earlier InviteUser op is revoked when this
+        // operational offer supersedes it). A no-op when no prior offer exists.
+        self.verifier.revoke_offer_for(handle);
+        let subkey = NodeSubkey::from(minted.subkey.as_str());
+        let cid = Cid::from(minted.cid.as_str());
+        self.admit_subject_login_only(subkey.node_id());
+        self.verifier.restore_offer_with_public(
             handle.to_owned(),
             handle.to_owned(),
             cid,
             subkey,
-            password,
-            &secret,
+            &minted.public,
+            minted.sealed.clone(),
         );
-        self.verifier
-            .provisioned_offer_parts(handle)
-            .map(|(_, _, sealed)| sealed)
-            .unwrap_or_default()
     }
 
-    /// Replay counterpart of [`Self::iam_provision_offer`]: restore the SAME
-    /// node-sealed offer from its journaled ciphertext without the password.
+    /// Replay counterpart of a legacy deterministic-secret provision: restore
+    /// the SAME node-sealed offer from its journaled ciphertext without the
+    /// password. Retained for journals written before the enrollment/
+    /// operational split.
     fn iam_restore_offer(&mut self, handle: &str, sealed: Vec<u8>) {
         let subkey = bootstrap_subkey(handle);
         let cid = bootstrap_offer_cid(handle);
@@ -2477,23 +2634,9 @@ impl WebAuthContext {
         );
     }
 
-    /// Live re-seal of an already-provisioned offer under `new_password` (a self
-    /// password change / admin reset): the offer stays admitted, only its
-    /// password wrapping changes. Returns the new sealed ciphertext to journal.
-    fn iam_reseal_offer(&mut self, handle: &str, new_password: &str) -> Vec<u8> {
-        let subkey = bootstrap_subkey(handle);
-        let secret = bootstrap_secret(handle);
-        self.verifier
-            .reseal_offer(handle, subkey, new_password, &secret);
-        self.verifier
-            .provisioned_offer_parts(handle)
-            .map(|(_, _, sealed)| sealed)
-            .unwrap_or_default()
-    }
-
-    /// Replay counterpart of [`Self::iam_reseal_offer`]: replace the offer's
+    /// Replay counterpart of a legacy re-seal-in-place: replace the offer's
     /// node-sealed blob verbatim (the record is already admitted by the
-    /// invite's replay).
+    /// invite's replay). Retained for pre-split journals.
     fn iam_restore_offer_blob(&mut self, handle: &str, sealed: Vec<u8>) {
         let subkey = bootstrap_subkey(handle);
         self.verifier.restore_offer_blob(handle, subkey, sealed);
@@ -2501,10 +2644,14 @@ impl WebAuthContext {
 
     /// Admin invite of a NEW IAM user (`iam:users:write`-gated by the caller):
     /// create the `pillar_iam` record with the two Keycloak-style optional
-    /// required actions, admit the user's operational subkey for login, and
-    /// provision its node-sealed offer under `password` so it can immediately
-    /// log in through the existing node-custody `/login` path. Signed act:
-    /// the caller already passed [`Self::perform_signed_act`].
+    /// required actions, then mint the user's login credential from the
+    /// caller-supplied random `offer_material` (see [`fresh_offer_material`]).
+    /// An onboarding invite (`force_password_change`) mints an ENROLLMENT-only
+    /// credential — the operational key is NOT created, so the invited user
+    /// holds no operational key material and cannot sign any op until the
+    /// password-change ceremony mints one (the cryptographic containment). An
+    /// invite with no required change mints the OPERATIONAL key directly.
+    /// Signed act: the caller already passed [`Self::perform_signed_act`].
     ///
     /// # Errors
     /// [`pillar_iam::InviteError::AlreadyExists`] if `handle` already has a
@@ -2518,6 +2665,7 @@ impl WebAuthContext {
         force_password_change: bool,
         require_passkey_enrollment: bool,
         password: &str,
+        offer_material: (Cid, String),
         at: u64,
     ) -> Result<(), pillar_iam::InviteError> {
         let op = pillar_iam::invite_user(
@@ -2530,16 +2678,19 @@ impl WebAuthContext {
             at,
         )?;
         pillar_iam::apply_op(&mut self.users, op);
-        let subkey = bootstrap_subkey(handle);
-        self.admit_subject_login_only(subkey.node_id());
-        let sealed_offer = self.iam_provision_offer(handle, password);
+        // Onboarding (must-change) users get a login-only ENROLLMENT credential
+        // and NO operational key; a no-required-change invite mints the
+        // operational key directly. Either way the secret is random.
+        let (cid, secret) = offer_material;
+        let minted = self.iam_mint_offer(handle, password, cid, &secret, !force_password_change);
         self.record(&PortalOp::InviteUser {
             handle: handle.to_owned(),
             display_name,
             email,
             force_password_change,
             require_passkey_enrollment,
-            sealed_offer,
+            sealed_offer: Vec::new(),
+            minted,
             at,
         });
         Ok(())
@@ -2630,12 +2781,21 @@ impl WebAuthContext {
         handle: &str,
         new_password: &str,
         force: bool,
+        offer_material: (Cid, String),
         at: u64,
     ) -> bool {
         if !self.users.contains_key(handle) {
             return false;
         }
-        let sealed_offer = self.iam_reseal_offer(handle, new_password);
+        // A self change / rotation (`force == false`) mints a fresh OPERATIONAL
+        // key under the new password — completing onboarding (enrollment ->
+        // operational) or rotating an existing operational key; the superseded
+        // key and its password are revoked. An admin reset (`force == true`)
+        // RE-ONBOARDS: it revokes the operational key and mints a login-only
+        // ENROLLMENT credential under the admin temp password, so the reset
+        // user again holds no operational key until they change it.
+        let (cid, secret) = offer_material;
+        let minted = self.iam_mint_offer(handle, new_password, cid, &secret, !force);
         let op = if force {
             pillar_iam::UserOp::RequireChange {
                 handle: handle.to_owned(),
@@ -2650,8 +2810,9 @@ impl WebAuthContext {
         pillar_iam::apply_op(&mut self.users, op);
         self.record(&PortalOp::UserPasswordSet {
             handle: handle.to_owned(),
-            sealed_offer,
+            sealed_offer: Vec::new(),
             force_password_change: force,
+            minted,
             at,
         });
         true
@@ -6299,6 +6460,10 @@ fn dispatch_users_invite(
         );
     }
     let at = ctx.iam_now();
+    let offer_material = match fresh_offer_material(handle) {
+        Ok(m) => m,
+        Err(()) => return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned()),
+    };
     match ctx.iam_invite(
         handle,
         handle.to_owned(),
@@ -6306,6 +6471,7 @@ fn dispatch_users_invite(
         force_password_change,
         require_passkey,
         &password,
+        offer_material,
         at,
     ) {
         Ok(()) => text_response(200, "OK", password),
@@ -6434,7 +6600,13 @@ fn dispatch_users_reset_password(
             }
         };
         let at = ctx.iam_now();
-        if ctx.iam_set_password(field2, &temp, true, at) {
+        let offer_material = match fresh_offer_material(field2) {
+            Ok(m) => m,
+            Err(()) => {
+                return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned())
+            }
+        };
+        if ctx.iam_set_password(field2, &temp, true, offer_material, at) {
             text_response(200, "OK", temp)
         } else {
             text_response(404, "Not Found", "DENIED unknown-user".to_owned())
@@ -6445,7 +6617,13 @@ fn dispatch_users_reset_password(
             return text_response(409, "Conflict", "DENIED no-self-record".to_owned());
         }
         let at = ctx.iam_now();
-        if ctx.iam_set_password(&caller, field2, false, at) {
+        let offer_material = match fresh_offer_material(&caller) {
+            Ok(m) => m,
+            Err(()) => {
+                return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned())
+            }
+        };
+        if ctx.iam_set_password(&caller, field2, false, offer_material, at) {
             text_response(200, "OK", "PASSWORD-CHANGED".to_owned())
         } else {
             text_response(404, "Not Found", "DENIED no-profile".to_owned())
@@ -8026,6 +8204,7 @@ fn login_reason(e: &NodeCustodyError) -> &'static str {
         NodeCustodyError::UnlockFailed => "unlock-failed",
         NodeCustodyError::NotAuthorized(_) => "not-authorized",
         NodeCustodyError::BadNonce => "bad-nonce",
+        NodeCustodyError::StepUpRequired => "step-up-required",
     }
 }
 
@@ -8969,6 +9148,91 @@ mod tests {
         );
     }
 
+    // The operator's reported bug, killed at the crypto layer: a temp password
+    // must NOT stay valid forever. An onboarding invite mints only a login-only
+    // ENROLLMENT credential (no operational key); completing the password change
+    // mints the operational key under the NEW password and revokes the
+    // enrollment offer, so the old temp password can never admit again.
+    #[test]
+    fn onboarding_temp_password_dies_when_the_user_changes_it() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+        let invite = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\ngina\ngina@example.com"),
+        );
+        assert_eq!(invite.status, 200, "invite: {}", invite.body);
+        let temp = invite.body.trim().to_owned();
+
+        // The temp admits during onboarding.
+        let gina = login_token(&mut ctx, "gina", &temp);
+        // Gina completes her password change.
+        let change = post(
+            &mut ctx,
+            "/portal/users/reset-password",
+            &format!("{gina}\ngina-new-strong-password"),
+        );
+        assert_eq!(change.status, 200, "self change: {}", change.body);
+
+        // The OLD temp password no longer admits — the enrollment offer it
+        // unlocked was revoked at the mint (crypto containment, not a flag).
+        assert!(
+            login_is_refused(&mut ctx, "gina", &temp),
+            "the onboarding temp password must be cryptographically dead after the change"
+        );
+        // The new password admits the freshly minted operational key.
+        let _gina2 = login_token(&mut ctx, "gina", "gina-new-strong-password");
+    }
+
+    // Admin reset revokes the user's PRIOR operational key: the old operational
+    // password stops admitting the instant the reset mints a new enrollment
+    // credential, and the new temp admits instead.
+    #[test]
+    fn admin_reset_revokes_the_prior_operational_key() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let admin = login_token(&mut ctx, "alice@pillar", PASSWORD);
+        let invite = post(
+            &mut ctx,
+            "/portal/users/invite",
+            &format!("{admin}\nhugo\nhugo@example.com\nhugo-pw\nfalse\nfalse"),
+        );
+        assert_eq!(invite.status, 200);
+        // Hugo has an operational key under hugo-pw.
+        let _hugo = login_token(&mut ctx, "hugo", "hugo-pw");
+
+        let reset = post(
+            &mut ctx,
+            "/portal/users/reset-password",
+            &format!("{admin}\nhugo"),
+        );
+        assert_eq!(reset.status, 200, "admin reset: {}", reset.body);
+        let new_temp = reset.body.trim().to_owned();
+
+        // The OLD operational password is cryptographically dead.
+        assert!(
+            login_is_refused(&mut ctx, "hugo", "hugo-pw"),
+            "the reset must revoke the prior operational key"
+        );
+        // The new temp admits the re-onboarded enrollment credential.
+        let _hugo2 = login_token(&mut ctx, "hugo", &new_temp);
+    }
+
+    /// Attempt a node-side login and report whether it was refused (any
+    /// non-2xx), driving the same `/nonce` -> `/login` handshake `login_token`
+    /// uses.
+    fn login_is_refused(ctx: &mut WebAuthContext, identifier: &str, password: &str) -> bool {
+        let nonce = get(ctx, "/nonce");
+        let id = nonce
+            .body
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("/nonce yields an id");
+        let resp = post(ctx, "/login", &format!("{identifier}\n{password}\n{id}"));
+        resp.status / 100 != 2
+    }
+
     #[test]
     fn login_form_asks_two_fields_only_no_cid_field() {
         // Retargeted onto the built Yew wasm: `/` now serves the wasm loader and
@@ -9397,6 +9661,87 @@ mod tests {
         node_c.replay(&persisted_ops);
         node_c.replay(&persisted_ops);
         assert_eq!(node_c.bootstrap().initial_user(), Some("spencer"));
+    }
+
+    #[test]
+    fn replay_rehydrates_an_onboarding_invite_and_password_change() {
+        // The live-cell restart path for the new enrollment/operational split:
+        // an onboarding invite (enrollment offer) + a completed password change
+        // (operational mint) journal MintedOffer records that a fresh node
+        // rehydrates via pubkey-only replay. After replay the NEW password must
+        // admit and the OLD temp must be cryptographically dead — identical to
+        // the live node, with no secret ever read from disk.
+        let journal = test_journal();
+        let mut node_a = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        )
+        .with_persistent_journal(Arc::clone(&journal));
+        assert_eq!(
+            post(&mut node_a, "/bootstrap/create-cell", "cell-genesis").status,
+            200
+        );
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/bootstrap/create-user",
+                &format!("alice@pillar\n{PASSWORD}")
+            )
+            .status,
+            200
+        );
+        let admin = login_token(&mut node_a, "alice@pillar", PASSWORD);
+        let invite = post(
+            &mut node_a,
+            "/portal/users/invite",
+            &format!("{admin}\niris\niris@example.com"),
+        );
+        assert_eq!(invite.status, 200, "invite: {}", invite.body);
+        let temp = invite.body.trim().to_owned();
+        let iris = login_token(&mut node_a, "iris", &temp);
+        assert_eq!(
+            post(
+                &mut node_a,
+                "/portal/users/reset-password",
+                &format!("{iris}\niris-new-strong-password"),
+            )
+            .status,
+            200
+        );
+
+        let persisted_ops: Vec<Vec<u8>> = {
+            let stream = journal.lock().expect("journal lock");
+            stream
+                .stream()
+                .log()
+                .order()
+                .iter()
+                .map(|op| op.payload().to_vec())
+                .collect()
+        };
+
+        // Node B: a fresh node (post-restart, same PVC) that only replays.
+        let mut node_b = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        node_b.replay(&persisted_ops);
+
+        // The rehydrated operational key admits the new password; the old temp
+        // is dead. Replaying twice (a node rebooting twice) stays consistent.
+        let _iris_b = login_token(&mut node_b, "iris", "iris-new-strong-password");
+        assert!(
+            login_is_refused(&mut node_b, "iris", &temp),
+            "the onboarding temp password must be dead after a rehydrated change"
+        );
+        node_b.replay(&persisted_ops);
+        let _iris_b2 = login_token(&mut node_b, "iris", "iris-new-strong-password");
     }
 
     #[test]

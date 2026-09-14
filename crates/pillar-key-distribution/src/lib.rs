@@ -617,6 +617,15 @@ impl KeyDistributionLedger {
     pub fn is_offered(&self, record: &RecordKey) -> bool {
         self.offered.contains(record)
     }
+
+    /// Whether `record` has been accepted. Note this survives a
+    /// [`revoke_offer`](Self::revoke_offer) (which clears only `offered` +
+    /// `admitted`), so a re-offer of a revoked record must NOT re-accept —
+    /// callers rebuilding an admission idempotently check this first.
+    #[must_use]
+    pub fn is_accepted(&self, record: &RecordKey) -> bool {
+        self.accepted.contains(record)
+    }
 }
 
 /// A recipient node's real X25519 sealing keypair, deterministically derived
