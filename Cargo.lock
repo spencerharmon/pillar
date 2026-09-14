@@ -3634,6 +3634,7 @@ dependencies = [
 name = "pillar-streamdb"
 version = "0.1.0"
 dependencies = [
+ "pillar-coordination",
  "pillar-core",
  "pillar-crypto",
  "pillar-wire",

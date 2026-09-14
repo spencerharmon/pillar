@@ -43,6 +43,9 @@ pub const MIN_SCHEMA_VERSION: pillar_crypto::SurfaceVersion = pillar_crypto::Sur
 mod persist;
 pub use persist::{PersistError, PersistentStream};
 
+pub mod cofold;
+pub use cofold::{CoFoldError, CoFoldInvariant, QuotaCeiling, StrictCofold, UniqueOnce};
+
 // SignedSegment/Cid/HeadRecord/Visibility/ContentStore/IpfsBackend moved DOWN
 // to `pillar-wire` (the shared wire/persistence substrate every one of
 // pillar-streamdb/pillar-observability/pillar-net rides) per
