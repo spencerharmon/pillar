@@ -25,8 +25,10 @@ use std::time::Duration;
 use pillar_crypto::compat::{negotiate_surface, NegotiationRefused};
 use pillar_crypto::version::SurfaceVersion;
 
-use crate::{LoginRequest, LoginResponse, NonceResponse, API_COMPAT_WINDOW, API_VERSION,
-    API_VERSION_HEADER, HTTP_API_SURFACE};
+use crate::{
+    LoginRequest, LoginResponse, NonceResponse, API_COMPAT_WINDOW, API_VERSION, API_VERSION_HEADER,
+    HTTP_API_SURFACE,
+};
 
 /// Every way an [`SdkClient`] call can fail.
 #[derive(Debug)]
@@ -156,13 +158,8 @@ impl SdkClient {
             });
         }
         self.check_server_version(&resp.headers)?;
-        let handle = resp
-            .body
-            .trim()
-            .strip_prefix("OK ")
-            .ok_or_else(|| ClientError::Malformed(format!("bad /login body: {:?}", resp.body)))?
-            .to_owned();
-        Ok(LoginResponse { handle })
+        LoginResponse::from_body(&resp.body)
+            .ok_or_else(|| ClientError::Malformed(format!("bad /login body: {:?}", resp.body)))
     }
 
     /// Negotiate the server's advertised [`crate::HTTP_API_SURFACE`] version
@@ -174,8 +171,9 @@ impl SdkClient {
     /// no-header handling.
     fn check_server_version(&self, headers: &BTreeMap<String, String>) -> Result<(), ClientError> {
         let server_version = match headers.get(&API_VERSION_HEADER.to_lowercase()) {
-            Some(raw) => parse_surface_version(raw)
-                .ok_or_else(|| ClientError::Malformed(format!("bad {API_VERSION_HEADER}: {raw:?}")))?,
+            Some(raw) => parse_surface_version(raw).ok_or_else(|| {
+                ClientError::Malformed(format!("bad {API_VERSION_HEADER}: {raw:?}"))
+            })?,
             None => SurfaceVersion(1),
         };
         negotiate_surface(
@@ -239,7 +237,9 @@ fn parse_response(raw: &str) -> Option<RawResponse> {
         }
     }
 
-    let body = if let Some(len) = headers.get("content-length").and_then(|v| v.parse::<usize>().ok())
+    let body = if let Some(len) = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
     {
         body.get(..len).unwrap_or(body).to_owned()
     } else {
@@ -351,7 +351,10 @@ mod tests {
     fn route(method: &str, path: &str, body: &str, advertised_version: SurfaceVersion) -> String {
         match (method, path) {
             ("GET", "/nonce") => {
-                let nonce = NonceResponse { id: 7, expiry: 1_000_000 };
+                let nonce = NonceResponse {
+                    id: 7,
+                    expiry: 1_000_000,
+                };
                 let wire = nonce.to_wire();
                 format!(
                     "HTTP/1.1 200 OK\r\n{API_VERSION_HEADER}: {advertised_version}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}",
@@ -360,14 +363,18 @@ mod tests {
             }
             ("POST", "/login") => {
                 let req = LoginRequest::from_body(body);
-                let resp = LoginResponse { handle: req.identifier };
+                let resp = LoginResponse {
+                    handle: req.identifier,
+                    force_password_change: false,
+                };
                 let wire = resp.to_wire();
                 format!(
                     "HTTP/1.1 200 OK\r\n{API_VERSION_HEADER}: {advertised_version}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}",
                     wire.len(),
                 )
             }
-            _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_owned(),
         }
     }
 
@@ -376,7 +383,13 @@ mod tests {
         let addr = spawn_fixture(API_VERSION);
         let client = SdkClient::new(addr);
         let nonce = client.get_nonce().expect("get_nonce");
-        assert_eq!(nonce, NonceResponse { id: 7, expiry: 1_000_000 });
+        assert_eq!(
+            nonce,
+            NonceResponse {
+                id: 7,
+                expiry: 1_000_000
+            }
+        );
     }
 
     #[test]
@@ -389,7 +402,13 @@ mod tests {
             nonce_id: 7,
         };
         let resp = client.login(&req).expect("login");
-        assert_eq!(resp, LoginResponse { handle: "alice".to_owned() });
+        assert_eq!(
+            resp,
+            LoginResponse {
+                handle: "alice".to_owned(),
+                force_password_change: false,
+            }
+        );
     }
 
     #[test]

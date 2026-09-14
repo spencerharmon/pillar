@@ -151,13 +151,45 @@ impl LoginRequest {
 pub struct LoginResponse {
     /// The handle the session was admitted under.
     pub handle: String,
+    /// Whether this handle currently owes a forced password change (its
+    /// `UserRecord::force_password_change`) — the client intercepts every route
+    /// to the change-password ceremony while it is set. Carried on the login
+    /// response so the client learns it atomically at sign-in (serde default
+    /// `false` for a legacy body without the field).
+    #[serde(default)]
+    pub force_password_change: bool,
 }
 
 impl LoginResponse {
-    /// Render the `"OK <handle>\n"` success body.
+    /// Render the `"OK <handle> force_password_change=<bool>\n"` success body.
     #[must_use]
     pub fn to_wire(&self) -> String {
-        format!("OK {}\n", self.handle)
+        format!(
+            "OK {} force_password_change={}\n",
+            self.handle, self.force_password_change
+        )
+    }
+
+    /// Parse an `"OK <handle> [force_password_change=<bool>]"` success body. The
+    /// flag token is OPTIONAL and order-independent within the tokens after the
+    /// handle; a body lacking it (a legacy server) parses as `false`. `None` if
+    /// the body is not an `OK` success line.
+    #[must_use]
+    pub fn from_body(body: &str) -> Option<Self> {
+        let body = body.trim();
+        let rest = body.strip_prefix("OK ")?;
+        let mut tokens = rest.split_whitespace();
+        let handle = tokens.next()?.to_owned();
+        let mut force_password_change = false;
+        for tok in tokens {
+            if let Some(v) = tok.strip_prefix("force_password_change=") {
+                force_password_change = v == "true";
+            }
+        }
+        Some(LoginResponse {
+            handle,
+            force_password_change,
+        })
     }
 }
 
@@ -562,6 +594,7 @@ mod tests {
     fn login_response_json_round_trips() {
         round_trip(&LoginResponse {
             handle: "alice".to_owned(),
+            force_password_change: true,
         });
     }
 
@@ -569,8 +602,26 @@ mod tests {
     fn login_response_wire_renders() {
         let resp = LoginResponse {
             handle: "alice".to_owned(),
+            force_password_change: false,
         };
-        assert_eq!(resp.to_wire(), "OK alice\n");
+        assert_eq!(resp.to_wire(), "OK alice force_password_change=false\n");
+        assert_eq!(
+            LoginResponse::from_body(&resp.to_wire()),
+            Some(resp.clone())
+        );
+        // A forced-change body round-trips, and a legacy body parses as false.
+        let forced = LoginResponse {
+            handle: "bob".to_owned(),
+            force_password_change: true,
+        };
+        assert_eq!(LoginResponse::from_body(&forced.to_wire()), Some(forced));
+        assert_eq!(
+            LoginResponse::from_body("OK carol"),
+            Some(LoginResponse {
+                handle: "carol".to_owned(),
+                force_password_change: false,
+            })
+        );
     }
 
     #[test]
@@ -751,7 +802,10 @@ mod tests {
     #[test]
     fn observability_row_json_round_trips() {
         round_trip(&ObservabilityRow {
-            fields: vec![("ts".to_owned(), "10".to_owned()), ("value".to_owned(), "0.5".to_owned())],
+            fields: vec![
+                ("ts".to_owned(), "10".to_owned()),
+                ("value".to_owned(), "0.5".to_owned()),
+            ],
         });
     }
 
@@ -800,7 +854,9 @@ mod tests {
 
     #[test]
     fn published_api_version_is_within_its_own_supported_window() {
-        assert!(API_VERSION.check_supported(MIN_API_VERSION, API_VERSION).is_ok());
+        assert!(API_VERSION
+            .check_supported(MIN_API_VERSION, API_VERSION)
+            .is_ok());
     }
 
     #[test]

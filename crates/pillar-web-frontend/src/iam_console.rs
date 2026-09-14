@@ -147,7 +147,11 @@ pub fn invite_user_wire(
         handle,
         email,
         initial_password,
-        if force_password_change { "true" } else { "false" },
+        if force_password_change {
+            "true"
+        } else {
+            "false"
+        },
         if require_passkey { "true" } else { "false" },
     ])
 }
@@ -426,7 +430,9 @@ mod yew_impl {
     /// operator sees the server's verdict BEFORE firing (predicted == enforced).
     fn predicted_caption(p: Option<bool>) -> Html {
         match p {
-            Some(true) => html! { <p class="predict is-allow">{ "The server will allow this action." }</p> },
+            Some(true) => {
+                html! { <p class="predict is-allow">{ "The server will allow this action." }</p> }
+            }
             Some(false) => html! {
                 <p class="predict is-deny">
                     { "Blocked \u{2014} the server would refuse this (for example, the last remaining \
@@ -464,11 +470,26 @@ mod yew_impl {
     #[function_component(AccountHub)]
     pub fn account_hub() -> Html {
         let tabs = vec![
-            TabItem { label: "Profile".into(), panel: html! { <ProfileTile /> } },
-            TabItem { label: "Password".into(), panel: html! { <PasswordTab /> } },
-            TabItem { label: "Security keys".into(), panel: html! { <CredentialsTile /> } },
-            TabItem { label: "Sessions".into(), panel: html! { <SessionsTile /> } },
-            TabItem { label: "Identity".into(), panel: html! { <IdentityTile /> } },
+            TabItem {
+                label: "Profile".into(),
+                panel: html! { <ProfileTile /> },
+            },
+            TabItem {
+                label: "Password".into(),
+                panel: html! { <PasswordTab /> },
+            },
+            TabItem {
+                label: "Security keys".into(),
+                panel: html! { <CredentialsTile /> },
+            },
+            TabItem {
+                label: "Sessions".into(),
+                panel: html! { <SessionsTile /> },
+            },
+            TabItem {
+                label: "Identity".into(),
+                panel: html! { <IdentityTile /> },
+            },
         ];
         html! {
             <section class="account-hub" id="account-hub">
@@ -526,7 +547,9 @@ mod yew_impl {
                             pw.set(String::new());
                             confirm.set(String::new());
                         }
-                        Ok(r) => toaster.error(&format!("Could not change password: {}", r.body.trim())),
+                        Ok(r) => {
+                            toaster.error(&format!("Could not change password: {}", r.body.trim()))
+                        }
                         Err(_) => toaster.error("Could not change password: the request failed."),
                     }
                     busy.set(false);
@@ -569,13 +592,20 @@ mod yew_impl {
         let busy = use_state(|| false);
 
         {
-            let (auth, view, display_name, email) =
-                (auth.clone(), view.clone(), display_name.clone(), email.clone());
+            let (auth, view, display_name, email) = (
+                auth.clone(),
+                view.clone(),
+                display_name.clone(),
+                email.clone(),
+            );
             use_effect_with(auth.token.clone(), move |_| {
                 if let Some(token) = auth.token.clone() {
-                    let (view, display_name, email) = (view.clone(), display_name.clone(), email.clone());
+                    let (view, display_name, email) =
+                        (view.clone(), display_name.clone(), email.clone());
                     spawn_local(async move {
-                        if let Ok(r) = http("GET", &get_url("/portal/profile", &token, &[]), None).await {
+                        if let Ok(r) =
+                            http("GET", &get_url("/portal/profile", &token, &[]), None).await
+                        {
                             if r.ok() {
                                 let parsed = parse_profile(&r.body);
                                 display_name.set(parsed.display_name.clone());
@@ -616,7 +646,9 @@ mod yew_impl {
                 spawn_local(async move {
                     match http("PUT", "/portal/profile", Some(&body)).await {
                         Ok(r) if r.ok() => toaster.success("Profile saved."),
-                        Ok(r) => toaster.error(&format!("Could not save profile: {}", r.body.trim())),
+                        Ok(r) => {
+                            toaster.error(&format!("Could not save profile: {}", r.body.trim()))
+                        }
                         Err(_) => toaster.error("Could not save profile: the request failed."),
                     }
                     busy.set(false);
@@ -624,7 +656,11 @@ mod yew_impl {
             })
         };
 
-        let status = if view.status.is_empty() { "Unknown".to_owned() } else { view.status.clone() };
+        let status = if view.status.is_empty() {
+            "Unknown".to_owned()
+        } else {
+            view.status.clone()
+        };
         html! {
             <div class="tile" id="profile-tile">
                 <div class="tile-head">
@@ -691,10 +727,14 @@ mod yew_impl {
         let refresh = {
             let (auth, users) = (auth.clone(), users.clone());
             Callback::from(move |_: ()| {
-                let Some(token) = auth.token.clone() else { return };
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
                 let (auth, users) = (auth.clone(), users.clone());
                 spawn_local(async move {
-                    if let Some(lines) = get_lines(auth, get_url("/portal/users", &token, &[])).await {
+                    if let Some(lines) =
+                        get_lines(auth, get_url("/portal/users", &token, &[])).await
+                    {
                         users.set(parse_user_rows(&lines.join("\n")));
                     }
                 });
@@ -716,7 +756,11 @@ mod yew_impl {
                     u.handle.clone(),
                     u.status.clone(),
                     u.roles.join(","),
-                    if u.force_password_change { "Must change".to_owned() } else { "OK".to_owned() },
+                    if u.force_password_change {
+                        "Must change".to_owned()
+                    } else {
+                        "OK".to_owned()
+                    },
                 ]
             })
             .collect();
@@ -726,7 +770,11 @@ mod yew_impl {
                 1 => html! { <StatusPill status={val} /> },
                 2 => chips(&val),
                 3 => {
-                    let tone = if val == "Must change" { Tone::Warning } else { Tone::Success };
+                    let tone = if val == "Must change" {
+                        Tone::Warning
+                    } else {
+                        Tone::Success
+                    };
                     html! { <Badge label={val} tone={tone} /> }
                 }
                 _ => html! { { val } },
@@ -781,7 +829,8 @@ mod yew_impl {
 
         // Fire a non-sensitive enable directly (still enforced server-side).
         let enable = {
-            let (auth, toaster, busy, refresh) = (auth.clone(), toaster.clone(), busy.clone(), refresh.clone());
+            let (auth, toaster, busy, refresh) =
+                (auth.clone(), toaster.clone(), busy.clone(), refresh.clone());
             move |h: String| {
                 let token = auth.token.clone().unwrap_or_default();
                 let body = user_target_wire(&token, &h);
@@ -811,7 +860,9 @@ mod yew_impl {
                 selected.clone(),
             );
             Callback::from(move |_: MouseEvent| {
-                let Some(act) = (*pending).clone() else { return };
+                let Some(act) = (*pending).clone() else {
+                    return;
+                };
                 if *busy || !matches!(*predicted, Some(true)) {
                     return;
                 }
@@ -830,7 +881,10 @@ mod yew_impl {
                     match http("POST", act.path, Some(&body)).await {
                         Ok(r) if r.ok() => {
                             if act.reveals_secret {
-                                secret.set(Some(("Temporary password".to_owned(), r.body.trim().to_owned())));
+                                secret.set(Some((
+                                    "Temporary password".to_owned(),
+                                    r.body.trim().to_owned(),
+                                )));
                             } else {
                                 toaster.success("Done.");
                             }
@@ -892,7 +946,18 @@ mod yew_impl {
             })
         };
         let do_invite = {
-            let (auth, toaster, busy, refresh, handle, email, secret, password, force_change, require_passkey) = (
+            let (
+                auth,
+                toaster,
+                busy,
+                refresh,
+                handle,
+                email,
+                secret,
+                password,
+                force_change,
+                require_passkey,
+            ) = (
                 auth.clone(),
                 toaster.clone(),
                 busy.clone(),
@@ -918,7 +983,12 @@ mod yew_impl {
                     *force_change,
                     *require_passkey,
                 );
-                let (toaster, busy, refresh, secret) = (toaster.clone(), busy.clone(), refresh.clone(), secret.clone());
+                let (toaster, busy, refresh, secret) = (
+                    toaster.clone(),
+                    busy.clone(),
+                    refresh.clone(),
+                    secret.clone(),
+                );
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/users/invite", Some(&body)).await {
@@ -928,7 +998,10 @@ mod yew_impl {
                             if admin_set {
                                 toaster.success("User invited.");
                             } else {
-                                secret.set(Some(("Temporary password".to_owned(), r.body.trim().to_owned())));
+                                secret.set(Some((
+                                    "Temporary password".to_owned(),
+                                    r.body.trim().to_owned(),
+                                )));
                             }
                             refresh.emit(());
                         }
@@ -1073,19 +1146,25 @@ mod yew_impl {
 
         let on_disable = {
             let (stage, h) = (stage.clone(), h.clone());
-            Callback::from(move |_: MouseEvent| stage(UserAction {
-                handle: h.clone(),
-                path: "/portal/users/disable",
-                dry: "/portal/users/disable/dry-run",
-                title: "Disable user",
-                confirm_label: "Disable",
-                desc: format!("Disable {} — they will be signed out and cannot sign in until re-enabled.", h),
-                reveals_secret: false,
-            }))
+            Callback::from(move |_: MouseEvent| {
+                stage(UserAction {
+                    handle: h.clone(),
+                    path: "/portal/users/disable",
+                    dry: "/portal/users/disable/dry-run",
+                    title: "Disable user",
+                    confirm_label: "Disable",
+                    desc: format!(
+                        "Disable {} — they will be signed out and cannot sign in until re-enabled.",
+                        h
+                    ),
+                    reveals_secret: false,
+                })
+            })
         };
         let on_reset = {
             let (stage, h) = (stage.clone(), h.clone());
-            Callback::from(move |_: MouseEvent| stage(UserAction {
+            Callback::from(move |_: MouseEvent| {
+                stage(UserAction {
                 handle: h.clone(),
                 path: "/portal/users/reset-password",
                 dry: "/portal/users/reset-password/dry-run",
@@ -1093,19 +1172,22 @@ mod yew_impl {
                 confirm_label: "Reset password",
                 desc: format!("Issue a new one-time password for {} (their registered security keys are preserved).", h),
                 reveals_secret: true,
-            }))
+            })
+            })
         };
         let on_require = {
             let (stage, h) = (stage.clone(), h.clone());
-            Callback::from(move |_: MouseEvent| stage(UserAction {
-                handle: h.clone(),
-                path: "/portal/users/require-password-change",
-                dry: "/portal/users/require-password-change/dry-run",
-                title: "Require password change",
-                confirm_label: "Require change",
-                desc: format!("Force {} to set a new password at their next sign-in.", h),
-                reveals_secret: false,
-            }))
+            Callback::from(move |_: MouseEvent| {
+                stage(UserAction {
+                    handle: h.clone(),
+                    path: "/portal/users/require-password-change",
+                    dry: "/portal/users/require-password-change/dry-run",
+                    title: "Require password change",
+                    confirm_label: "Require change",
+                    desc: format!("Force {} to set a new password at their next sign-in.", h),
+                    reveals_secret: false,
+                })
+            })
         };
         let on_enable = {
             let (enable, h) = (enable.clone(), h.clone());
@@ -1160,8 +1242,14 @@ mod yew_impl {
     #[function_component(RolesGroupsTile)]
     pub fn roles_groups_tile() -> Html {
         let tabs = vec![
-            TabItem { label: "Roles".into(), panel: html! { <RolesPanel /> } },
-            TabItem { label: "Groups".into(), panel: html! { <GroupsPanel /> } },
+            TabItem {
+                label: "Roles".into(),
+                panel: html! { <RolesPanel /> },
+            },
+            TabItem {
+                label: "Groups".into(),
+                panel: html! { <GroupsPanel /> },
+            },
         ];
         html! {
             <section class="tile" id="roles-groups-tile">
@@ -1184,10 +1272,14 @@ mod yew_impl {
         let refresh = {
             let (auth, roles) = (auth.clone(), roles.clone());
             Callback::from(move |_: ()| {
-                let Some(token) = auth.token.clone() else { return };
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
                 let (auth, roles) = (auth.clone(), roles.clone());
                 spawn_local(async move {
-                    if let Some(lines) = get_lines(auth, get_url("/portal/roles", &token, &[])).await {
+                    if let Some(lines) =
+                        get_lines(auth, get_url("/portal/roles", &token, &[])).await
+                    {
                         roles.set(parse_role_rows(&lines.join("\n")));
                     }
                 });
@@ -1195,51 +1287,98 @@ mod yew_impl {
         };
         {
             let refresh = refresh.clone();
-            use_effect_with(auth.token.clone(), move |_| { refresh.emit(()); || () });
+            use_effect_with(auth.token.clone(), move |_| {
+                refresh.emit(());
+                || ()
+            });
         }
 
         let rows: Vec<Row> = roles
             .iter()
-            .map(|r| vec![r.name.clone(), r.capabilities.join(","), r.capabilities.len().to_string()])
+            .map(|r| {
+                vec![
+                    r.name.clone(),
+                    r.capabilities.join(","),
+                    r.capabilities.len().to_string(),
+                ]
+            })
             .collect();
         let render_cell = Callback::from(|(col, val): (usize, String)| -> Html {
-            if col == 1 { chips(&val) } else { html! { { val } } }
+            if col == 1 {
+                chips(&val)
+            } else {
+                html! { { val } }
+            }
         });
 
-        let on_name = { let name = name.clone(); Callback::from(move |e: InputEvent| name.set(input_value(&e))) };
-        let on_extra = { let extra = extra.clone(); Callback::from(move |e: InputEvent| extra.set(input_value(&e))) };
+        let on_name = {
+            let name = name.clone();
+            Callback::from(move |e: InputEvent| name.set(input_value(&e)))
+        };
+        let on_extra = {
+            let extra = extra.clone();
+            Callback::from(move |e: InputEvent| extra.set(input_value(&e)))
+        };
         let toggle_cap = {
             let checked = checked.clone();
             move |cap: &'static str| {
                 let checked = checked.clone();
                 Callback::from(move |_: MouseEvent| {
                     let mut next = (*checked).clone();
-                    if let Some(i) = next.iter().position(|c| c == cap) { next.remove(i); } else { next.push(cap.to_owned()); }
+                    if let Some(i) = next.iter().position(|c| c == cap) {
+                        next.remove(i);
+                    } else {
+                        next.push(cap.to_owned());
+                    }
                     checked.set(next);
                 })
             }
         };
         let create = {
             let (auth, toaster, busy, refresh, name, checked, extra) = (
-                auth.clone(), toaster.clone(), busy.clone(), refresh.clone(), name.clone(), checked.clone(), extra.clone(),
+                auth.clone(),
+                toaster.clone(),
+                busy.clone(),
+                refresh.clone(),
+                name.clone(),
+                checked.clone(),
+                extra.clone(),
             );
             Callback::from(move |_: MouseEvent| {
-                if *busy || name.trim().is_empty() { return; }
+                if *busy || name.trim().is_empty() {
+                    return;
+                }
                 let mut caps: Vec<String> = (*checked).clone();
-                caps.extend(extra.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned));
+                caps.extend(
+                    extra
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                );
                 let token = auth.token.clone().unwrap_or_default();
                 let body = create_role_wire(&token, name.trim(), &caps.join(","));
-                let (toaster, busy, refresh, name, checked, extra) =
-                    (toaster.clone(), busy.clone(), refresh.clone(), name.clone(), checked.clone(), extra.clone());
+                let (toaster, busy, refresh, name, checked, extra) = (
+                    toaster.clone(),
+                    busy.clone(),
+                    refresh.clone(),
+                    name.clone(),
+                    checked.clone(),
+                    extra.clone(),
+                );
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/roles/create", Some(&body)).await {
                         Ok(r) if r.ok() => {
                             toaster.success("Role created.");
-                            name.set(String::new()); checked.set(Vec::new()); extra.set(String::new());
+                            name.set(String::new());
+                            checked.set(Vec::new());
+                            extra.set(String::new());
                             refresh.emit(());
                         }
-                        Ok(r) => toaster.error(&format!("Could not create role: {}", r.body.trim())),
+                        Ok(r) => {
+                            toaster.error(&format!("Could not create role: {}", r.body.trim()))
+                        }
                         Err(_) => toaster.error("Could not create role: the request failed."),
                     }
                     busy.set(false);
@@ -1295,7 +1434,9 @@ mod yew_impl {
         let refresh = {
             let (auth, groups, roles) = (auth.clone(), groups.clone(), roles.clone());
             Callback::from(move |_: ()| {
-                let Some(token) = auth.token.clone() else { return };
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
                 let (a1, groups, t1) = (auth.clone(), groups.clone(), token.clone());
                 spawn_local(async move {
                     if let Some(lines) = get_lines(a1, get_url("/portal/groups", &t1, &[])).await {
@@ -1312,7 +1453,10 @@ mod yew_impl {
         };
         {
             let refresh = refresh.clone();
-            use_effect_with(auth.token.clone(), move |_| { refresh.emit(()); || () });
+            use_effect_with(auth.token.clone(), move |_| {
+                refresh.emit(());
+                || ()
+            });
         }
 
         let rows: Vec<Row> = groups
@@ -1320,25 +1464,53 @@ mod yew_impl {
             .map(|g| vec![g.name.clone(), g.roles.join(","), g.roles.len().to_string()])
             .collect();
         let render_cell = Callback::from(|(col, val): (usize, String)| -> Html {
-            if col == 1 { chips(&val) } else { html! { { val } } }
+            if col == 1 {
+                chips(&val)
+            } else {
+                html! { { val } }
+            }
         });
 
-        let on_name = { let name = name.clone(); Callback::from(move |e: InputEvent| name.set(input_value(&e))) };
-        let on_attach_group = { let g = attach_group.clone(); Callback::from(move |e: Event| g.set(select_value(&e))) };
-        let on_attach_role = { let r = attach_role.clone(); Callback::from(move |e: Event| r.set(select_value(&e))) };
+        let on_name = {
+            let name = name.clone();
+            Callback::from(move |e: InputEvent| name.set(input_value(&e)))
+        };
+        let on_attach_group = {
+            let g = attach_group.clone();
+            Callback::from(move |e: Event| g.set(select_value(&e)))
+        };
+        let on_attach_role = {
+            let r = attach_role.clone();
+            Callback::from(move |e: Event| r.set(select_value(&e)))
+        };
 
         let create = {
-            let (auth, toaster, busy, refresh, name) = (auth.clone(), toaster.clone(), busy.clone(), refresh.clone(), name.clone());
+            let (auth, toaster, busy, refresh, name) = (
+                auth.clone(),
+                toaster.clone(),
+                busy.clone(),
+                refresh.clone(),
+                name.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
-                if *busy || name.trim().is_empty() { return; }
+                if *busy || name.trim().is_empty() {
+                    return;
+                }
                 let token = auth.token.clone().unwrap_or_default();
                 let body = create_group_wire(&token, name.trim());
-                let (toaster, busy, refresh, name) = (toaster.clone(), busy.clone(), refresh.clone(), name.clone());
+                let (toaster, busy, refresh, name) =
+                    (toaster.clone(), busy.clone(), refresh.clone(), name.clone());
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/groups/create", Some(&body)).await {
-                        Ok(r) if r.ok() => { toaster.success("Group created."); name.set(String::new()); refresh.emit(()); }
-                        Ok(r) => toaster.error(&format!("Could not create group: {}", r.body.trim())),
+                        Ok(r) if r.ok() => {
+                            toaster.success("Group created.");
+                            name.set(String::new());
+                            refresh.emit(());
+                        }
+                        Ok(r) => {
+                            toaster.error(&format!("Could not create group: {}", r.body.trim()))
+                        }
                         Err(_) => toaster.error("Could not create group: the request failed."),
                     }
                     busy.set(false);
@@ -1347,18 +1519,30 @@ mod yew_impl {
         };
         let attach = {
             let (auth, toaster, busy, refresh, attach_group, attach_role) = (
-                auth.clone(), toaster.clone(), busy.clone(), refresh.clone(), attach_group.clone(), attach_role.clone(),
+                auth.clone(),
+                toaster.clone(),
+                busy.clone(),
+                refresh.clone(),
+                attach_group.clone(),
+                attach_role.clone(),
             );
             Callback::from(move |_: MouseEvent| {
-                if *busy || attach_group.is_empty() || attach_role.is_empty() { return; }
+                if *busy || attach_group.is_empty() || attach_role.is_empty() {
+                    return;
+                }
                 let token = auth.token.clone().unwrap_or_default();
                 let body = attach_role_wire(&token, &attach_group, &attach_role);
                 let (toaster, busy, refresh) = (toaster.clone(), busy.clone(), refresh.clone());
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/groups/attach-role", Some(&body)).await {
-                        Ok(r) if r.ok() => { toaster.success("Role attached to group."); refresh.emit(()); }
-                        Ok(r) => toaster.error(&format!("Could not attach role: {}", r.body.trim())),
+                        Ok(r) if r.ok() => {
+                            toaster.success("Role attached to group.");
+                            refresh.emit(());
+                        }
+                        Ok(r) => {
+                            toaster.error(&format!("Could not attach role: {}", r.body.trim()))
+                        }
                         Err(_) => toaster.error("Could not attach role: the request failed."),
                     }
                     busy.set(false);
@@ -1414,8 +1598,14 @@ mod yew_impl {
     #[function_component(OAuthClientsTile)]
     pub fn oauth_clients_tile() -> Html {
         let tabs = vec![
-            TabItem { label: "Clients".into(), panel: html! { <OAuthClientsPanel /> } },
-            TabItem { label: "Consents".into(), panel: html! { <OAuthConsentsPanel /> } },
+            TabItem {
+                label: "Clients".into(),
+                panel: html! { <OAuthClientsPanel /> },
+            },
+            TabItem {
+                label: "Consents".into(),
+                panel: html! { <OAuthConsentsPanel /> },
+            },
         ];
         html! {
             <section class="tile" id="oauth-clients-tile">
@@ -1440,10 +1630,14 @@ mod yew_impl {
         let refresh = {
             let (auth, rows_state) = (auth.clone(), rows_state.clone());
             Callback::from(move |_: ()| {
-                let Some(token) = auth.token.clone() else { return };
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
                 let (auth, rows_state) = (auth.clone(), rows_state.clone());
                 spawn_local(async move {
-                    if let Some(lines) = get_lines(auth, get_url("/portal/oauth/clients", &token, &[])).await {
+                    if let Some(lines) =
+                        get_lines(auth, get_url("/portal/oauth/clients", &token, &[])).await
+                    {
                         rows_state.set(parse_oauth_client_rows(&lines.join("\n")));
                     }
                 });
@@ -1451,45 +1645,102 @@ mod yew_impl {
         };
         {
             let refresh = refresh.clone();
-            use_effect_with(auth.token.clone(), move |_| { refresh.emit(()); || () });
+            use_effect_with(auth.token.clone(), move |_| {
+                refresh.emit(());
+                || ()
+            });
         }
 
         let rows: Vec<Row> = rows_state
             .iter()
-            .map(|c| vec![c.client_id.clone(), c.client_type.clone(), c.scopes.join(","), c.redirect_uris.join(", ")])
+            .map(|c| {
+                vec![
+                    c.client_id.clone(),
+                    c.client_type.clone(),
+                    c.scopes.join(","),
+                    c.redirect_uris.join(", "),
+                ]
+            })
             .collect();
         let render_cell = Callback::from(|(col, val): (usize, String)| -> Html {
-            if col == 2 { chips(&val) } else { html! { { val } } }
+            if col == 2 {
+                chips(&val)
+            } else {
+                html! { { val } }
+            }
         });
 
-        let on_type = { let t = client_type.clone(); Callback::from(move |e: Event| t.set(select_value(&e))) };
-        let on_redirect = { let r = redirect_uri.clone(); Callback::from(move |e: InputEvent| r.set(input_value(&e))) };
-        let on_scopes = { let s = scopes.clone(); Callback::from(move |e: InputEvent| s.set(input_value(&e))) };
+        let on_type = {
+            let t = client_type.clone();
+            Callback::from(move |e: Event| t.set(select_value(&e)))
+        };
+        let on_redirect = {
+            let r = redirect_uri.clone();
+            Callback::from(move |e: InputEvent| r.set(input_value(&e)))
+        };
+        let on_scopes = {
+            let s = scopes.clone();
+            Callback::from(move |e: InputEvent| s.set(input_value(&e)))
+        };
         let open = {
-            let (dialog_open, redirect_uri, scopes, secret) = (dialog_open.clone(), redirect_uri.clone(), scopes.clone(), secret.clone());
+            let (dialog_open, redirect_uri, scopes, secret) = (
+                dialog_open.clone(),
+                redirect_uri.clone(),
+                scopes.clone(),
+                secret.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
-                redirect_uri.set(String::new()); scopes.set(String::new()); secret.set(None); dialog_open.set(true);
+                redirect_uri.set(String::new());
+                scopes.set(String::new());
+                secret.set(None);
+                dialog_open.set(true);
             })
         };
         let close = {
             let (dialog_open, secret) = (dialog_open.clone(), secret.clone());
-            Callback::from(move |_: MouseEvent| { dialog_open.set(false); secret.set(None); })
+            Callback::from(move |_: MouseEvent| {
+                dialog_open.set(false);
+                secret.set(None);
+            })
         };
         let register = {
             let (auth, toaster, busy, refresh, client_type, redirect_uri, scopes, secret) = (
-                auth.clone(), toaster.clone(), busy.clone(), refresh.clone(),
-                client_type.clone(), redirect_uri.clone(), scopes.clone(), secret.clone(),
+                auth.clone(),
+                toaster.clone(),
+                busy.clone(),
+                refresh.clone(),
+                client_type.clone(),
+                redirect_uri.clone(),
+                scopes.clone(),
+                secret.clone(),
             );
             Callback::from(move |_: MouseEvent| {
-                if *busy || redirect_uri.trim().is_empty() { return; }
+                if *busy || redirect_uri.trim().is_empty() {
+                    return;
+                }
                 let token = auth.token.clone().unwrap_or_default();
-                let body = register_client_wire(&token, client_type.trim(), redirect_uri.trim(), scopes.trim());
-                let (toaster, busy, refresh, secret) = (toaster.clone(), busy.clone(), refresh.clone(), secret.clone());
+                let body = register_client_wire(
+                    &token,
+                    client_type.trim(),
+                    redirect_uri.trim(),
+                    scopes.trim(),
+                );
+                let (toaster, busy, refresh, secret) = (
+                    toaster.clone(),
+                    busy.clone(),
+                    refresh.clone(),
+                    secret.clone(),
+                );
                 busy.set(true);
                 spawn_local(async move {
                     match http("POST", "/portal/oauth/clients/register", Some(&body)).await {
-                        Ok(r) if r.ok() => { secret.set(Some(r.body.trim().to_owned())); refresh.emit(()); }
-                        Ok(r) => toaster.error(&format!("Could not register client: {}", r.body.trim())),
+                        Ok(r) if r.ok() => {
+                            secret.set(Some(r.body.trim().to_owned()));
+                            refresh.emit(());
+                        }
+                        Ok(r) => {
+                            toaster.error(&format!("Could not register client: {}", r.body.trim()))
+                        }
                         Err(_) => toaster.error("Could not register client: the request failed."),
                     }
                     busy.set(false);
@@ -1560,7 +1811,9 @@ mod yew_impl {
                 if let Some(token) = auth.token.clone() {
                     let (auth, clients) = (auth.clone(), clients.clone());
                     spawn_local(async move {
-                        if let Some(lines) = get_lines(auth, get_url("/portal/oauth/clients", &token, &[])).await {
+                        if let Some(lines) =
+                            get_lines(auth, get_url("/portal/oauth/clients", &token, &[])).await
+                        {
                             clients.set(parse_oauth_client_rows(&lines.join("\n")));
                         }
                     });
@@ -1569,33 +1822,68 @@ mod yew_impl {
             });
         }
 
-        let on_client = { let c = client.clone(); Callback::from(move |e: Event| c.set(select_value(&e))) };
-        let on_handle = { let h = handle.clone(); Callback::from(move |e: InputEvent| h.set(input_value(&e))) };
+        let on_client = {
+            let c = client.clone();
+            Callback::from(move |e: Event| c.set(select_value(&e)))
+        };
+        let on_handle = {
+            let h = handle.clone();
+            Callback::from(move |e: InputEvent| h.set(input_value(&e)))
+        };
 
         let stage = {
-            let (auth, client, handle, staged, predicted) = (auth.clone(), client.clone(), handle.clone(), staged.clone(), predicted.clone());
+            let (auth, client, handle, staged, predicted) = (
+                auth.clone(),
+                client.clone(),
+                handle.clone(),
+                staged.clone(),
+                predicted.clone(),
+            );
             Callback::from(move |_: MouseEvent| {
-                if client.is_empty() || handle.trim().is_empty() { return; }
+                if client.is_empty() || handle.trim().is_empty() {
+                    return;
+                }
                 predicted.set(None);
                 staged.set(true);
-                let (auth, client, handle, predicted) = (auth.clone(), client.clone(), handle.clone(), predicted.clone());
+                let (auth, client, handle, predicted) = (
+                    auth.clone(),
+                    client.clone(),
+                    handle.clone(),
+                    predicted.clone(),
+                );
                 spawn_local(async move {
                     let token = auth.token.clone().unwrap_or_default();
-                    let url = get_url("/portal/oauth/clients/revoke-consent/dry-run", &token,
-                        &[("client_id", &client), ("handle", handle.trim())]);
+                    let url = get_url(
+                        "/portal/oauth/clients/revoke-consent/dry-run",
+                        &token,
+                        &[("client_id", &client), ("handle", handle.trim())],
+                    );
                     if let Ok(r) = http("GET", &url, None).await {
                         predicted.set(Some(sensitive_action_allowed(&r.body)));
-                    } else { predicted.set(Some(false)); }
+                    } else {
+                        predicted.set(Some(false));
+                    }
                 });
             })
         };
-        let cancel = { let staged = staged.clone(); Callback::from(move |_: MouseEvent| staged.set(false)) };
+        let cancel = {
+            let staged = staged.clone();
+            Callback::from(move |_: MouseEvent| staged.set(false))
+        };
         let confirm = {
             let (auth, toaster, client, handle, staged, predicted, busy) = (
-                auth.clone(), toaster.clone(), client.clone(), handle.clone(), staged.clone(), predicted.clone(), busy.clone(),
+                auth.clone(),
+                toaster.clone(),
+                client.clone(),
+                handle.clone(),
+                staged.clone(),
+                predicted.clone(),
+                busy.clone(),
             );
             Callback::from(move |_: MouseEvent| {
-                if *busy || !matches!(*predicted, Some(true)) { return; }
+                if *busy || !matches!(*predicted, Some(true)) {
+                    return;
+                }
                 let token = auth.token.clone().unwrap_or_default();
                 let body = revoke_consent_wire(&token, client.trim(), handle.trim());
                 let (toaster, staged, busy) = (toaster.clone(), staged.clone(), busy.clone());
@@ -1680,11 +1968,26 @@ mod yew_impl {
                 }
                 let token = auth.token.clone().unwrap_or_default();
                 let body = body_lines(&[&token, new_password.trim()]);
-                let (busy, msg) = (busy.clone(), msg.clone());
+                let (auth, busy, msg) = (auth.clone(), busy.clone(), msg.clone());
                 busy.set(true);
                 spawn_local(async move {
                     if let Ok(r) = http("POST", "/portal/users/reset-password", Some(&body)).await {
-                        msg.set(Some((r.body.trim().to_owned(), r.ok())));
+                        if r.ok() {
+                            // The change minted a fresh OPERATIONAL key under the
+                            // new password and revoked the onboarding enrollment
+                            // credential this session was admitted on — the
+                            // current session is now cryptographically stale.
+                            // Log out so the user re-authenticates on the new
+                            // operational key.
+                            msg.set(Some((
+                                "Password changed — please sign in with your new password."
+                                    .to_owned(),
+                                true,
+                            )));
+                            auth.dispatch(AuthAction::Logout);
+                        } else {
+                            msg.set(Some((r.body.trim().to_owned(), false)));
+                        }
                     }
                     busy.set(false);
                 });
