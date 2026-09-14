@@ -3455,7 +3455,10 @@ version = "0.1.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
+ "pillar-keyedstore",
  "rand_core 0.6.4",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -3495,6 +3498,7 @@ version = "0.1.0"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
+ "pillar-keyedstore",
  "pillar-net",
  "rand_core 0.6.4",
 ]
@@ -3535,8 +3539,10 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-eventlog",
+ "pillar-identity",
  "pillar-ipam",
  "pillar-ipfs",
+ "pillar-keyedstore",
  "pillar-manifest",
  "pillar-observability",
  "pillar-ops",

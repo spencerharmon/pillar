@@ -4667,7 +4667,7 @@ impl WebAuthContext {
         self.session_registry
             .ls(principal, now)
             .into_iter()
-            .map(|s: &Session| SessionSummary {
+            .map(|s: Session| SessionSummary {
                 id: s.id.clone(),
                 node: self.identity.peer_id.clone(),
                 issued_at: s.issued_at,

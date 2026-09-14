@@ -12,6 +12,12 @@ pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
+# session_registry's session records are stored on the shared K/V surface
+# (pillar-keyedstore) instead of a bespoke hand-rolled fold — the
+# sessions-kv-plane-migration data-layer consumer swap.
+pillar-keyedstore = { path = "../pillar-keyedstore" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

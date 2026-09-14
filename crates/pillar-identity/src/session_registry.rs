@@ -35,10 +35,19 @@
 //! session would otherwise admit — freshness unconfirmable ⇒ fail-closed.
 //! Expired or revoked sessions admit nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use pillar_keyedstore::{Hlc, KeyedStore};
+use serde::{Deserialize, Serialize};
+
+/// The K/V collection every session record is stored under — the
+/// sessions-kv-plane-migration data-layer consumer swap onto
+/// `pillar_keyedstore`'s shared K/V surface (see `specs/KeyedStore.tla`),
+/// replacing the registry's former bespoke `HashMap` fold.
+const SESSIONS_COLLECTION: &str = "sessions";
 
 /// A minted server-side session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     /// The session's id — a reusable slot within its principal's sessions.
     pub id: String,
@@ -97,13 +106,33 @@ pub enum RevokeError {
 /// state of `specs/SessionRegistry.tla`. No server-side database — a real
 /// deployment persists mint/revoke as epoch-stamped signed events on the
 /// streaming DB; this type models the resulting decision state.
+///
+/// Session records are the storage-consumer swap's payload: each session is
+/// stored as one opaque JSON-encoded K/V value in `pillar_keyedstore`'s
+/// shared K/V surface (collection [`SESSIONS_COLLECTION`], keyed by
+/// `principal\0id`), replacing the registry's former hand-rolled
+/// `HashMap<(String, String), Session>` fold. `rev_epoch` and the
+/// `by_principal` index remain in-memory bookkeeping — a scalar counter and a
+/// key-enumeration index are not themselves stored VALUES the K/V surface is
+/// meant to hold, only a means of addressing it (the same role
+/// `KeyedStore::kv_keys` plays generically for the browse surface, kept local
+/// here so `ls`/`revoke_all` need not scan the whole log).
 #[derive(Clone, Debug, Default)]
 pub struct SessionRegistry {
     /// The single global revocation epoch (`revEpoch`), bumped by every
     /// revocation (individual or sweep).
     rev_epoch: u64,
-    /// (principal, id) -> session
-    sessions: HashMap<(String, String), Session>,
+    /// The K/V-backed store of session records.
+    store: KeyedStore,
+    /// A monotonically increasing logical clock feeding each store write's
+    /// HLC — this registry is the sole author of its own sessions
+    /// collection, so a simple increasing counter (author id fixed to
+    /// `"session-registry"`) is a valid, deterministic HLC source.
+    clock: u64,
+    /// principal -> set of session ids ever minted for it. An addressing
+    /// index only (never a copy of session state), letting `ls`/`revoke_all`
+    /// enumerate a principal's slots without scanning the whole K/V log.
+    by_principal: HashMap<String, HashSet<String>>,
 }
 
 impl SessionRegistry {
@@ -117,6 +146,49 @@ impl SessionRegistry {
     #[must_use]
     pub fn rev_epoch(&self) -> u64 {
         self.rev_epoch
+    }
+
+    fn kv_key(principal: &str, id: &str) -> String {
+        format!("{principal}\u{0}{id}")
+    }
+
+    fn next_hlc(&mut self) -> Hlc {
+        self.clock += 1;
+        Hlc::new(self.clock, 0, "session-registry")
+    }
+
+    fn get(&self, principal: &str, id: &str) -> Option<Session> {
+        let bytes = self.store.kv_get(SESSIONS_COLLECTION, &Self::kv_key(principal, id))?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn put(&mut self, session: &Session) {
+        let key = Self::kv_key(&session.principal, &session.id);
+        let bytes = serde_json::to_vec(session).expect("Session serializes");
+        let hlc = self.next_hlc();
+        self.store.kv_put(SESSIONS_COLLECTION, &key, bytes, hlc);
+        self.by_principal
+            .entry(session.principal.clone())
+            .or_default()
+            .insert(session.id.clone());
+    }
+
+    /// The K/V collection name every session record lives under in the
+    /// backing [`KeyedStore`] — the raw browse-surface handle a `pillar kv`
+    /// / portal K/V browse view reads directly, alongside
+    /// [`SessionRegistry::kv_keys`].
+    #[must_use]
+    pub fn kv_collection(&self) -> &'static str {
+        SESSIONS_COLLECTION
+    }
+
+    /// Every live K/V key currently stored in the sessions collection
+    /// (`principal\0id`, one per non-tombstoned session) — the generic
+    /// `pillar kv` / portal K/V browse-surface enumeration over this
+    /// registry's backing store, via [`KeyedStore::kv_keys`].
+    #[must_use]
+    pub fn kv_keys(&self) -> Vec<String> {
+        self.store.kv_keys(SESSIONS_COLLECTION)
     }
 
     /// Mint a session for `principal` at slot `id`, valid from `issued_at`
@@ -138,14 +210,14 @@ impl SessionRegistry {
         let principal = principal.into();
         let id = id.into();
         let session = Session {
-            id: id.clone(),
-            principal: principal.clone(),
+            id,
+            principal,
             issued_at,
             expiry,
             mint_epoch: self.rev_epoch,
             revoked_epoch: None,
         };
-        self.sessions.insert((principal, id), session.clone());
+        self.put(&session);
         session
     }
 
@@ -158,15 +230,10 @@ impl SessionRegistry {
     /// [`RevokeError::NoSuchSession`] if no session with that id exists for
     /// that principal.
     pub fn revoke_one(&mut self, principal: &str, id: &str) -> Result<(), RevokeError> {
-        let key = (principal.to_owned(), id.to_owned());
-        if !self.sessions.contains_key(&key) {
-            return Err(RevokeError::NoSuchSession);
-        }
+        let mut session = self.get(principal, id).ok_or(RevokeError::NoSuchSession)?;
         self.rev_epoch += 1;
-        let new_epoch = self.rev_epoch;
-        if let Some(s) = self.sessions.get_mut(&key) {
-            s.revoked_epoch = Some(new_epoch);
-        }
+        session.revoked_epoch = Some(self.rev_epoch);
+        self.put(&session);
         Ok(())
     }
 
@@ -182,9 +249,19 @@ impl SessionRegistry {
     pub fn revoke_all(&mut self, principal: &str) {
         self.rev_epoch += 1;
         let new_epoch = self.rev_epoch;
-        for (key, session) in self.sessions.iter_mut() {
-            if key.0 == principal && session.revoked_epoch.is_none() {
-                session.revoked_epoch = Some(new_epoch);
+        let ids: Vec<String> = self
+            .by_principal
+            .get(principal)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for id in ids {
+            if let Some(mut session) = self.get(principal, &id) {
+                if session.revoked_epoch.is_none() {
+                    session.revoked_epoch = Some(new_epoch);
+                    self.put(&session);
+                }
             }
         }
     }
@@ -192,18 +269,20 @@ impl SessionRegistry {
     /// The full session record for `principal`'s `id` slot, if it exists
     /// (whether or not it is currently active) — backs CLI `show`.
     #[must_use]
-    pub fn show(&self, principal: &str, id: &str) -> Option<&Session> {
-        self.sessions.get(&(principal.to_owned(), id.to_owned()))
+    pub fn show(&self, principal: &str, id: &str) -> Option<Session> {
+        self.get(principal, id)
     }
 
     /// Every currently-ACTIVE (unrevoked, unexpired at `now`) session
     /// belonging to `principal` — backs CLI `ls`.
     #[must_use]
-    pub fn ls(&self, principal: &str, now: u64) -> Vec<&Session> {
-        self.sessions
-            .iter()
-            .filter(|((p, _), s)| p == principal && s.is_active(now))
-            .map(|(_, s)| s)
+    pub fn ls(&self, principal: &str, now: u64) -> Vec<Session> {
+        self.by_principal
+            .get(principal)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.get(principal, id))
+            .filter(|s| s.is_active(now))
             .collect()
     }
 }
@@ -498,5 +577,36 @@ mod tests {
             Err(RevokeError::NoSuchSession)
         );
         assert_eq!(reg.rev_epoch(), 0);
+    }
+
+    /// The K/V browse surface (`kv_collection`/`kv_keys`) is a real
+    /// projection over the SAME backing store `mint`/`revoke_one` write to —
+    /// a session's key appears the moment it is minted and is gone (no
+    /// longer live) is not the contract here (sessions are never
+    /// K/V-tombstoned, only revoked in place), but a distinct principal's
+    /// slot is a distinct key, proving the storage-consumer swap onto the
+    /// shared K/V surface actually holds real per-session records, not an
+    /// opaque blob.
+    #[test]
+    fn kv_browse_surface_lists_live_session_keys() {
+        let mut reg = SessionRegistry::new();
+        reg.mint("alice", "s1", 0, 1000);
+        reg.mint("alice", "s2", 0, 1000);
+        reg.mint("bob", "s1", 0, 1000);
+
+        assert_eq!(reg.kv_collection(), "sessions");
+        let keys = reg.kv_keys();
+        assert_eq!(keys.len(), 3, "one live K/V key per minted session");
+        // Keys are `principal\0id` — every minted (principal, id) pair
+        // appears exactly once.
+        assert!(keys.iter().any(|k| k.starts_with("alice") && k.ends_with("s1")));
+        assert!(keys.iter().any(|k| k.starts_with("alice") && k.ends_with("s2")));
+        assert!(keys.iter().any(|k| k.starts_with("bob") && k.ends_with("s1")));
+
+        // Revoking does not remove the key from the browse surface — the
+        // record is still live in the K/V surface, only its `revoked_epoch`
+        // field changed.
+        reg.revoke_one("alice", "s1").unwrap();
+        assert_eq!(reg.kv_keys().len(), 3);
     }
 }
