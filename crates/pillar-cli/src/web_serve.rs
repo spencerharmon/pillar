@@ -3544,6 +3544,207 @@ impl WebAuthContext {
             pillar_ops::ControlOp::Session(s) => self.sessions_op(actor, s),
             pillar_ops::ControlOp::Wot(w) => self.wot_op(actor, w),
             pillar_ops::ControlOp::Obs(o) => self.obs_op(actor, o),
+            pillar_ops::ControlOp::Identity(i) => self.identity_op(actor, i),
+            pillar_ops::ControlOp::User(u) => self.user_op(actor, u),
+        }
+    }
+
+    /// Serve a [`pillar_ops::IdentityOp`] over the control-op tier. `Show`/
+    /// `Domains` are member-gated views over the live identity log; `Enroll`/
+    /// `Rotate`/`Recover` are signed acts gated on `portal:identity:write`
+    /// (the SAME `perform_signed_act` decider every portal write uses), each
+    /// emitting exactly one signed event and journaling its `PortalOp`.
+    fn identity_op(
+        &mut self,
+        actor: &NodeId,
+        op: &pillar_ops::IdentityOp,
+    ) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            pillar_ops::IdentityOp::Show => {
+                let log = self.identity_log();
+                let mut body = format!("CID {}\nGEN {}\n", log.cid().0, log.head_generation());
+                for (domain, key) in log.domains() {
+                    body.push_str(&format!("DOMAIN {} KEY {}\n", domain.0, key.0));
+                }
+                Ok(body)
+            }
+            pillar_ops::IdentityOp::Domains => {
+                let mut body = String::new();
+                for (domain, cells) in self.domain_cells() {
+                    body.push_str(&format!("DOMAIN {} CELLS {}\n", domain, cells.join(",")));
+                }
+                Ok(body)
+            }
+            pillar_ops::IdentityOp::Enroll { domain } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "portal:identity:write",
+                        &format!("IDENTITY-ENROLL {domain}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for portal:identity:write"))?;
+                match self.identity_enroll(domain) {
+                    Ok(subkey) => Ok(format!(
+                        "ENROLLED domain={domain} subkey={} EVENT-CID {}",
+                        subkey.0, cid.0
+                    )),
+                    Err(e) => Err(format!("identity enroll refused: {e:?}")),
+                }
+            }
+            pillar_ops::IdentityOp::Rotate { new_primary } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "portal:identity:write",
+                        &format!("IDENTITY-ROTATE {new_primary}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for portal:identity:write"))?;
+                match self.identity_rotate(new_primary) {
+                    Ok(gen) => Ok(format!(
+                        "ROTATED new-primary={new_primary} GEN {gen} EVENT-CID {}",
+                        cid.0
+                    )),
+                    Err(e) => Err(format!("identity rotate refused: {e:?}")),
+                }
+            }
+            pillar_ops::IdentityOp::Recover => {
+                let cid = self
+                    .perform_signed_act(actor, "portal:identity:write", "IDENTITY-RECOVER")
+                    .map_err(|a| format!("unauthorized actor {a} for portal:identity:write"))?;
+                match self.identity_recover() {
+                    Ok(gen) => Ok(format!("RECOVERED GEN {gen} EVENT-CID {}", cid.0)),
+                    Err(e) => Err(format!("identity recover refused: {e:?}")),
+                }
+            }
+        }
+    }
+
+    /// Render one IAM user row (the SAME framing `dispatch_users_view` uses).
+    fn iam_user_row(handle: &str, rec: &pillar_iam::UserRecord) -> String {
+        let roles = rec.roles.iter().cloned().collect::<Vec<_>>().join(",");
+        format!(
+            "{handle} status={} force_password_change={} roles={roles}\n",
+            iam_status_str(rec.status),
+            rec.force_password_change
+        )
+    }
+
+    /// Serve a [`pillar_ops::UserOp`] over the control-op tier. `List`/`Show`
+    /// are member-gated views; every lifecycle act is gated on `iam:users:write`
+    /// through `perform_signed_act` — the SAME decider `/portal/users/*` uses —
+    /// then runs the SAME mutators (`iam_invite`/`iam_set_status`/
+    /// `iam_require_change`/`iam_set_password`, `disable` also revoking live
+    /// sessions).
+    fn user_op(&mut self, actor: &NodeId, op: &pillar_ops::UserOp) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            pillar_ops::UserOp::List => {
+                let mut body = String::new();
+                for (handle, rec) in self.iam_users() {
+                    body.push_str(&Self::iam_user_row(handle, rec));
+                }
+                Ok(body)
+            }
+            pillar_ops::UserOp::Show { handle } => match self.iam_users().get(handle) {
+                Some(rec) => Ok(Self::iam_user_row(handle, rec)),
+                None => Err(format!("no user {handle}")),
+            },
+            pillar_ops::UserOp::Invite {
+                handle,
+                email,
+                force_password_change,
+                require_passkey,
+                password,
+            } => {
+                let (password, generated) = match password {
+                    Some(p) => (p.clone(), false),
+                    None => (
+                        generate_temp_password()
+                            .map_err(|()| "temp-password RNG failure".to_owned())?,
+                        true,
+                    ),
+                };
+                let cid = self
+                    .perform_signed_act(actor, "iam:users:write", &format!("USER-INVITE {handle}"))
+                    .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                let at = self.iam_now();
+                match self.iam_invite(
+                    handle,
+                    handle.clone(),
+                    email.clone(),
+                    *force_password_change,
+                    *require_passkey,
+                    &password,
+                    at,
+                ) {
+                    Ok(()) if generated => Ok(format!(
+                        "INVITED handle={handle} TEMP-PASSWORD {password} EVENT-CID {}",
+                        cid.0
+                    )),
+                    Ok(()) => Ok(format!("INVITED handle={handle} EVENT-CID {}", cid.0)),
+                    Err(pillar_iam::InviteError::AlreadyExists) => {
+                        Err(format!("user {handle} already exists"))
+                    }
+                }
+            }
+            pillar_ops::UserOp::Disable { handle } => {
+                let cid = self
+                    .perform_signed_act(actor, "iam:users:write", &format!("USER-DISABLE {handle}"))
+                    .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                let at = self.iam_now();
+                if self.iam_set_status(handle, pillar_iam::UserStatus::Disabled, at) {
+                    self.iam_revoke_user_sessions(handle);
+                    Ok(format!("USER {handle} Disabled EVENT-CID {}", cid.0))
+                } else {
+                    Err(format!("no user {handle}"))
+                }
+            }
+            pillar_ops::UserOp::Enable { handle } => {
+                let cid = self
+                    .perform_signed_act(actor, "iam:users:write", &format!("USER-ENABLE {handle}"))
+                    .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                let at = self.iam_now();
+                if self.iam_set_status(handle, pillar_iam::UserStatus::Active, at) {
+                    Ok(format!("USER {handle} Active EVENT-CID {}", cid.0))
+                } else {
+                    Err(format!("no user {handle}"))
+                }
+            }
+            pillar_ops::UserOp::RequireChange { handle } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "iam:users:write",
+                        &format!("USER-REQUIRE-CHANGE {handle}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                let at = self.iam_now();
+                if self.iam_require_change(handle, at) {
+                    Ok(format!("USER {handle} RequireChange EVENT-CID {}", cid.0))
+                } else {
+                    Err(format!("no user {handle}"))
+                }
+            }
+            pillar_ops::UserOp::SetPassword {
+                handle,
+                password,
+                force,
+            } => {
+                let cid = self
+                    .perform_signed_act(actor, "iam:users:write", &format!("USER-RESET {handle}"))
+                    .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                let at = self.iam_now();
+                if self.iam_set_password(handle, password, *force, at) {
+                    Ok(format!("USER {handle} PASSWORD-SET EVENT-CID {}", cid.0))
+                } else {
+                    Err(format!("no user {handle}"))
+                }
+            }
         }
     }
 

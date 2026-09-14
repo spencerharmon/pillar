@@ -62,11 +62,11 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "identity",
-        handler: identity_trust,
+        handler: |_v, args| crate::apply_over_pillar_message::identity(args),
     },
     VerbSpec {
         name: "user",
-        handler: identity_trust,
+        handler: |_v, args| crate::apply_over_pillar_message::user(args),
     },
     VerbSpec {
         name: "key",

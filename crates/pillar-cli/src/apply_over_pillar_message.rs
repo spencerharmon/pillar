@@ -855,6 +855,114 @@ pub fn obs(args: &[String]) -> ExitCode {
     print_view(control_op(&pillar_ops::ControlOp::Obs(op)), "obs")
 }
 
+/// `pillar identity {show | domains | enroll <domain> | rotate <new-primary> |
+/// recover}`: global-identity views + signed acts over pillar-message.
+pub fn identity(args: &[String]) -> ExitCode {
+    let op = match args.first().map(String::as_str) {
+        None | Some("show") => pillar_ops::IdentityOp::Show,
+        Some("domains") => pillar_ops::IdentityOp::Domains,
+        Some("enroll") => match args.get(1) {
+            Some(domain) => pillar_ops::IdentityOp::Enroll {
+                domain: domain.clone(),
+            },
+            None => {
+                eprintln!("usage: pillar identity enroll <domain>");
+                return ExitCode::from(2);
+            }
+        },
+        Some("rotate") => match args.get(1) {
+            Some(np) => pillar_ops::IdentityOp::Rotate {
+                new_primary: np.clone(),
+            },
+            None => {
+                eprintln!("usage: pillar identity rotate <new-primary>");
+                return ExitCode::from(2);
+            }
+        },
+        Some("recover") => pillar_ops::IdentityOp::Recover,
+        Some(other) => {
+            eprintln!(
+                "usage: pillar identity {{show | domains | enroll <domain> | \
+                 rotate <new-primary> | recover}}  (got `{other}`)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Identity(op)), "identity")
+}
+
+/// `pillar user {ls | show <handle> | invite <handle> <email> [--password <p>]
+/// [--no-force-change] [--require-passkey] | disable <handle> | enable <handle>
+/// | require-change <handle> | set-password <handle> <password> [--force]}`:
+/// IAM user views + lifecycle acts over pillar-message.
+pub fn user(args: &[String]) -> ExitCode {
+    let has = |f: &str| args.iter().any(|a| a == f);
+    let flag = |f: &str| {
+        args.iter()
+            .position(|a| a == f)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let op = match args.first().map(String::as_str) {
+        None | Some("ls") | Some("list") => pillar_ops::UserOp::List,
+        Some("show") => match args.get(1) {
+            Some(h) => pillar_ops::UserOp::Show { handle: h.clone() },
+            None => return user_usage(),
+        },
+        Some("invite") => match (args.get(1), args.get(2)) {
+            (Some(handle), Some(email)) => pillar_ops::UserOp::Invite {
+                handle: handle.clone(),
+                email: email.clone(),
+                force_password_change: !has("--no-force-change"),
+                require_passkey: has("--require-passkey"),
+                password: flag("--password"),
+            },
+            _ => {
+                eprintln!(
+                    "usage: pillar user invite <handle> <email> [--password <p>] \
+                     [--no-force-change] [--require-passkey]"
+                );
+                return ExitCode::from(2);
+            }
+        },
+        Some("disable") => match args.get(1) {
+            Some(h) => pillar_ops::UserOp::Disable { handle: h.clone() },
+            None => return user_usage(),
+        },
+        Some("enable") => match args.get(1) {
+            Some(h) => pillar_ops::UserOp::Enable { handle: h.clone() },
+            None => return user_usage(),
+        },
+        Some("require-change") => match args.get(1) {
+            Some(h) => pillar_ops::UserOp::RequireChange { handle: h.clone() },
+            None => return user_usage(),
+        },
+        Some("set-password") => match (args.get(1), args.get(2)) {
+            (Some(h), Some(pw)) => pillar_ops::UserOp::SetPassword {
+                handle: h.clone(),
+                password: pw.clone(),
+                force: has("--force"),
+            },
+            _ => {
+                eprintln!("usage: pillar user set-password <handle> <password> [--force]");
+                return ExitCode::from(2);
+            }
+        },
+        Some(_) => return user_usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::User(op)), "user")
+}
+
+fn user_usage() -> ExitCode {
+    eprintln!(
+        "usage: pillar user {{ls | show <handle> | invite <handle> <email> \
+         [--password <p>] [--no-force-change] [--require-passkey] | disable <handle> | \
+         enable <handle> | require-change <handle> | set-password <handle> <password> \
+         [--force]}}"
+    );
+    ExitCode::from(2)
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;

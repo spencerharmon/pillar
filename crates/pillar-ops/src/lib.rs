@@ -183,6 +183,12 @@ pub enum ControlOp {
     /// Observability reads (`pillar obs …`) over the node's live obs substrate
     /// (historical + live explore/query/retention/dashboard).
     Obs(ObsOp),
+    /// Global-identity views + acts (`pillar identity …`) over the node's live
+    /// identity log.
+    Identity(IdentityOp),
+    /// IAM user views + lifecycle acts (`pillar user …`) over the node's live
+    /// IAM user store.
+    User(UserOp),
 }
 
 /// Portal-member management ops (`pillar member ls|add|role`). A `List` is a
@@ -307,6 +313,85 @@ pub enum ObsOp {
     RetentionGet,
 }
 
+/// Global-identity ops (`pillar identity …`). `Show`/`Domains` are member-gated
+/// VIEWS; `Enroll`/`Rotate`/`Recover` are signed acts gated on
+/// `portal:identity:write` (the SAME WoT decider every portal write uses).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum IdentityOp {
+    /// The identity log head (CID, generation, per-domain subkeys).
+    Show,
+    /// The domain (naming-only) grouping: each domain's cells.
+    Domains,
+    /// Enroll the cell identity in a domain (certifies a per-domain subkey).
+    Enroll {
+        /// The domain to enroll in.
+        domain: String,
+    },
+    /// Rotate the primary to `new_primary`, signed by the current primary.
+    Rotate {
+        /// The new primary key id.
+        new_primary: String,
+    },
+    /// Recover: rotate to a fresh primary using the genesis recovery key.
+    Recover,
+}
+
+/// IAM user ops (`pillar user …`). `List`/`Show` are member-gated VIEWS;
+/// `Invite`/`Disable`/`Enable`/`RequireChange`/`SetPassword` are signed acts
+/// gated on `iam:users:write` (the SAME decider the `/portal/users/*` routes
+/// use).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum UserOp {
+    /// Every IAM user: `<handle> status=<s> force_password_change=<b> roles=…`.
+    List,
+    /// One IAM user's row.
+    Show {
+        /// The user handle.
+        handle: String,
+    },
+    /// Admin invite of a NEW user. When `password` is `None` the node mints a
+    /// one-time temporary password and returns it (revealed once).
+    Invite {
+        /// The new user handle.
+        handle: String,
+        /// The new user's email.
+        email: String,
+        /// Require a password change at first login (Keycloak default ON).
+        force_password_change: bool,
+        /// Require passkey enrollment at onboarding (default OFF).
+        require_passkey: bool,
+        /// Explicit initial password, or `None` to mint a temp one.
+        password: Option<String>,
+    },
+    /// Disable a user (revokes live sessions; record retained).
+    Disable {
+        /// The user handle.
+        handle: String,
+    },
+    /// Re-enable a disabled user.
+    Enable {
+        /// The user handle.
+        handle: String,
+    },
+    /// Set the forced-password-change onboarding action.
+    RequireChange {
+        /// The user handle.
+        handle: String,
+    },
+    /// Admin reset of a user's password (`force` = require change at next
+    /// login).
+    SetPassword {
+        /// The user handle.
+        handle: String,
+        /// The new password.
+        password: String,
+        /// Require a password change at next login.
+        force: bool,
+    },
+}
+
 impl ControlOp {
     /// Encode to a control-op payload: a single [`CONTROL_OP_CODEC_VERSION`]
     /// byte followed by the canonical JSON of the op. Deterministic, like
@@ -349,6 +434,10 @@ impl ControlOp {
                 | ControlOp::Session(SessionOp::Show { .. })
                 | ControlOp::Wot(_)
                 | ControlOp::Obs(_)
+                | ControlOp::Identity(IdentityOp::Show)
+                | ControlOp::Identity(IdentityOp::Domains)
+                | ControlOp::User(UserOp::List)
+                | ControlOp::User(UserOp::Show { .. })
         )
     }
 }
@@ -613,6 +702,55 @@ mod tests {
                 op
             );
             assert!(op.is_read(), "wot/obs ops are views: {op:?}");
+        }
+    }
+
+    #[test]
+    fn control_op_identity_and_user_round_trip() {
+        let acts = [
+            ControlOp::Identity(IdentityOp::Enroll {
+                domain: "acme".into(),
+            }),
+            ControlOp::Identity(IdentityOp::Rotate {
+                new_primary: "key-2".into(),
+            }),
+            ControlOp::Identity(IdentityOp::Recover),
+            ControlOp::User(UserOp::Invite {
+                handle: "bob".into(),
+                email: "bob@example.com".into(),
+                force_password_change: true,
+                require_passkey: false,
+                password: None,
+            }),
+            ControlOp::User(UserOp::Disable {
+                handle: "bob".into(),
+            }),
+            ControlOp::User(UserOp::SetPassword {
+                handle: "bob".into(),
+                password: "s3cret".into(),
+                force: true,
+            }),
+        ];
+        for op in &acts {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                *op
+            );
+            assert!(!op.is_read(), "identity/user acts are not reads: {op:?}");
+        }
+        for op in [
+            ControlOp::Identity(IdentityOp::Show),
+            ControlOp::Identity(IdentityOp::Domains),
+            ControlOp::User(UserOp::List),
+            ControlOp::User(UserOp::Show {
+                handle: "bob".into(),
+            }),
+        ] {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "identity/user views are reads: {op:?}");
         }
     }
 
