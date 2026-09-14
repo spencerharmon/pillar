@@ -447,6 +447,10 @@ pub enum ResourceError {
     /// The resource-op tier dispatches reads to their own view methods first,
     /// so this only fires on a caller bug, never on a real mutation.
     UnroutableRead,
+    /// A `delete` targeted a bootstrap FLOOR object ([`is_floor`]) — existence
+    /// is bootstrap-guaranteed, so the delete is refused outright rather than
+    /// tombstoning it.
+    FloorRefused(Address),
 }
 
 /// Why a resource-plane VIEW served over the resource-op tier (`pillar get` /
@@ -496,6 +500,10 @@ impl fmt::Display for ResourceError {
             ResourceError::UnroutableRead => {
                 f.write_str("internal: a read verb was routed into the write-apply path")
             }
+            ResourceError::FloorRefused(a) => write!(
+                f,
+                "`{a}` is a bootstrap floor object — its existence is guaranteed and delete is refused"
+            ),
         }
     }
 }
@@ -666,6 +674,9 @@ impl<'p> ResourcePlane<'p> {
             .platform
             .get(&self.api_version, &addr.kind, &addr.name)
             .ok_or_else(|| ResourceError::NotFound(addr.clone()))?;
+        if is_floor(&existing) {
+            return Err(ResourceError::FloorRefused(addr.clone()));
+        }
         let mut tombstone = existing;
         tombstone
             .metadata
@@ -685,6 +696,9 @@ impl<'p> ResourcePlane<'p> {
             .platform
             .get(&self.api_version, &addr.kind, &addr.name)
             .ok_or_else(|| ResourceError::NotFound(addr.clone()))?;
+        if is_floor(&existing) {
+            return Err(ResourceError::FloorRefused(addr.clone()));
+        }
         let mut tombstone = existing;
         tombstone
             .metadata
@@ -856,6 +870,24 @@ pub fn tombstone(api_version: &str, kind: &str, name: &str) -> Crd {
         kind,
         Metadata::new(name).with_label(DELETED_LABEL, "true"),
     )
+}
+
+/// The label a bootstrap-seeded FLOOR object carries (`= "true"`): a resource
+/// whose EXISTENCE is bootstrap-guaranteed (the Default ResourceSet's own
+/// `ResourceSet/default` record and the shipped default `RetentionPolicy`
+/// entries — see `pillar_cli::defaults::bootstrap_default_manifests`). A floor
+/// object may be freely EDITED (its spec/content is never reconcile-pinned —
+/// only its existence is), but [`ResourcePlane::delete`] refuses to tombstone
+/// one: the operator sees a clear refusal instead of the object silently
+/// vanishing, and existence is never at risk of "self-healing" a soft-deleted
+/// tombstone back in because it was never actually removed.
+pub const FLOOR_LABEL: &str = "pillar.dev/floor";
+
+/// Whether `crd` is a bootstrap floor object (its [`FLOOR_LABEL`] is
+/// `"true"`).
+#[must_use]
+pub fn is_floor(crd: &Crd) -> bool {
+    crd.metadata.labels.get(FLOOR_LABEL).map(String::as_str) == Some("true")
 }
 
 #[cfg(test)]
