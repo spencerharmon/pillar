@@ -21,7 +21,7 @@ if [[ -z "$JAR" ]]; then
 fi
 
 # spec name : extra TLC flags. Order is fixed so output is deterministic.
-SPECS=(CoordinationCore Registration StreamingDB StreamdbIpfsStore StreamdbPersistence EventDAG IPAM WoTAuthority WebKeyAuth AntiEntropy Bootstrap Observability ObsIngestionSubstrate RetentionPolicy ResourceSet Defaults PSLCore IdentityLogin KeyDistribution Recovery Cells NodeCustodyLogin WebAuthnCustody BootstrapRequest LoginToken NamingAuthorityPlane GlobalIdentity SessionRegistry TrustArtifacts PillarUDP VersioningCompat PillarMessageFormat PillarBodySeals PillarUdpEncryption SchedulerController PillarIntegration PillarUdpClient PillarUdpMesh UserLifecycle OidcProvider)
+SPECS=(CoordinationCore Registration StreamingDB StreamdbIpfsStore StreamdbPersistence EventDAG IPAM WoTAuthority WebKeyAuth AntiEntropy Bootstrap Observability ObsIngestionSubstrate RetentionPolicy ResourceSet Defaults PSLCore IdentityLogin KeyDistribution Recovery Cells NodeCustodyLogin WebAuthnCustody BootstrapRequest LoginToken NamingAuthorityPlane GlobalIdentity SessionRegistry TrustArtifacts PillarUDP VersioningCompat PillarMessageFormat PillarBodySeals PillarUdpEncryption SchedulerController PillarIntegration PillarUdpClient PillarUdpMesh UserLifecycle OidcProvider KeyedStore)
 declare -A FLAGS=(
   [CoordinationCore]="-deadlock"
   [Registration]="-deadlock"
@@ -63,6 +63,7 @@ declare -A FLAGS=(
   [PillarIntegration]="-deadlock"
   [PillarUdpClient]="-deadlock"
   [PillarUdpMesh]="-deadlock"
+  [KeyedStore]="-deadlock"
 )
 
 rc=0
