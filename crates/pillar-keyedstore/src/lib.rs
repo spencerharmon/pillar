@@ -254,6 +254,45 @@ impl KeyedStore {
         }
     }
 
+    /// Every currently-live K/V key in `collection` — the enumeration
+    /// primitive the `pillar kv` CLI / portal K/V browse surface projects
+    /// over. Pure derived state over the op set: a key appears iff its
+    /// winning op (highest HLC on the K/V field) is a `Put`, never a
+    /// tombstone. Sorted for a stable, deterministic browse listing.
+    #[must_use]
+    pub fn kv_keys(&self, collection: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .log
+            .order()
+            .into_iter()
+            .filter_map(|op| KeyedOp::decode(op.payload()))
+            .filter(|k| k.collection == collection && k.field == KV_FIELD)
+            .map(|k| k.id)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.into_iter()
+            .filter(|id| self.kv_get(collection, id).is_some())
+            .collect()
+    }
+
+    /// Every collection name that currently has at least one live op (K/V or
+    /// Document field) anywhere in the log — backs a top-level `pillar kv
+    /// collections` browse listing.
+    #[must_use]
+    pub fn collections(&self) -> Vec<String> {
+        let mut cols: Vec<String> = self
+            .log
+            .order()
+            .into_iter()
+            .filter_map(|op| KeyedOp::decode(op.payload()))
+            .map(|k| k.collection)
+            .collect();
+        cols.sort();
+        cols.dedup();
+        cols
+    }
+
     // ------------------------------------------------------------------
     // Document surface — per-field structured, field-queryable values.
     // ------------------------------------------------------------------
@@ -568,6 +607,38 @@ mod keyed_store {
             Some(Value::Scalar(b"paris".to_vec())),
         );
         assert_eq!(s.doc_query("docs", "d1", "address.missing"), None);
+    }
+
+    #[test]
+    fn kv_keys_lists_only_live_keys_sorted() {
+        let mut s = KeyedStore::new();
+        s.kv_put("sessions", "b", b"1".to_vec(), hlc(1, 0, "n1"));
+        s.kv_put("sessions", "a", b"2".to_vec(), hlc(1, 0, "n1"));
+        s.kv_put("sessions", "c", b"3".to_vec(), hlc(1, 0, "n1"));
+        s.kv_delete("sessions", "c", hlc(2, 0, "n1"));
+        assert_eq!(
+            s.kv_keys("sessions"),
+            vec!["a".to_string(), "b".to_string()],
+            "tombstoned key is excluded, remaining keys sorted"
+        );
+        assert!(s.kv_keys("other-collection").is_empty());
+    }
+
+    #[test]
+    fn collections_lists_every_collection_with_a_live_or_tombstoned_op() {
+        let mut s = KeyedStore::new();
+        s.kv_put("sessions", "a", b"1".to_vec(), hlc(1, 0, "n1"));
+        s.doc_put_field(
+            "key-offers",
+            "o1",
+            "state",
+            Value::Scalar(b"offered".to_vec()),
+            hlc(1, 0, "n1"),
+        );
+        assert_eq!(
+            s.collections(),
+            vec!["key-offers".to_string(), "sessions".to_string()]
+        );
     }
 
     #[test]

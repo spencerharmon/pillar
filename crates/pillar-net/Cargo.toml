@@ -84,6 +84,13 @@ pillar-manifest = { path = "../pillar-manifest" }
 # the substrate, not merely dev-deps of its tests.
 pillar-topology = { path = "../pillar-topology" }
 pillar-observability = { path = "../pillar-observability" }
+# The sessions-kv-plane-migration proof: pillar-identity's session records
+# now ride the shared K/V surface (pillar-keyedstore) instead of a bespoke
+# fold, and this substrate composes the two so the migration is exercised
+# end to end from one place (kv_plane_migration). pillar-identity depends on
+# neither pillar-net nor anything that does, so this edge is acyclic.
+pillar-identity = { path = "../pillar-identity" }
+pillar-keyedstore = { path = "../pillar-keyedstore" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

@@ -93,6 +93,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use pillar_core::NodeId;
+use pillar_keyedstore::{Hlc, KeyedStore};
 use pillar_net::BlobDigest;
 
 /// A user identity permitted to offer artifacts into a cell.
@@ -197,6 +198,11 @@ impl Artifact {
         matches!(self.kind(), ArtifactKind::Root)
     }
 }
+
+/// The K/V collection [`KeyDistributionLedger`]'s pending offer records live
+/// under — the `pillar kv` / portal K/V browse-surface handle over the
+/// storage-consumer swap of the former bespoke `offered` fold.
+pub const OFFERS_COLLECTION: &str = "key-offers";
 
 /// An (user, cell, artifact) triple — the unit of offer/accept/admission,
 /// matching `specs/KeyDistribution.tla`'s `AllRecords`.
@@ -330,7 +336,17 @@ pub struct KeyDistributionLedger {
     cells: BTreeMap<CellId, CellPolicy>,
     artifacts: BTreeMap<ArtifactId, Artifact>,
     foreign_nodes: BTreeSet<NodeId>,
-    offered: BTreeSet<RecordKey>,
+    /// Pending offer records — the sessions-kv-plane-migration storage
+    /// consumer swap: this was formerly a bespoke `BTreeSet<RecordKey>`
+    /// fold; it is now the shared K/V surface (`pillar_keyedstore`,
+    /// collection [`OFFERS_COLLECTION`]), keyed by each record's `Display`
+    /// string. Presence in the K/V surface (a live, non-tombstoned key) is
+    /// exactly "is offered" — `offer` puts, `revoke_offer` tombstones.
+    offered: KeyedStore,
+    /// Monotonic logical clock feeding `offered`'s K/V writes — this ledger
+    /// is the sole author of its offers collection, so a simple increasing
+    /// counter (fixed author id) is a valid, deterministic HLC source.
+    offered_clock: u64,
     accepted: BTreeSet<RecordKey>,
     admitted: BTreeSet<RecordKey>,
     cross_confirmed: BTreeSet<RecordKey>,
@@ -371,7 +387,8 @@ impl KeyDistributionLedger {
             cells: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             foreign_nodes,
-            offered: BTreeSet::new(),
+            offered: KeyedStore::new(),
+            offered_clock: 0,
             accepted: BTreeSet::new(),
             admitted: BTreeSet::new(),
             cross_confirmed: BTreeSet::new(),
@@ -399,6 +416,36 @@ impl KeyDistributionLedger {
         self.artifacts
             .get(artifact)
             .ok_or_else(|| KeyDistributionError::UnknownArtifact(artifact.clone()))
+    }
+
+    fn offer_present(&self, record: &RecordKey) -> bool {
+        self.offered
+            .kv_get(OFFERS_COLLECTION, &record.to_string())
+            .is_some()
+    }
+
+    fn next_offered_hlc(&mut self) -> Hlc {
+        self.offered_clock += 1;
+        Hlc::new(self.offered_clock, 0, "key-distribution-ledger")
+    }
+
+    fn insert_offered(&mut self, record: &RecordKey) {
+        let hlc = self.next_offered_hlc();
+        self.offered
+            .kv_put(OFFERS_COLLECTION, &record.to_string(), b"offered".to_vec(), hlc);
+    }
+
+    fn remove_offered(&mut self, record: &RecordKey) {
+        let hlc = self.next_offered_hlc();
+        self.offered
+            .kv_delete(OFFERS_COLLECTION, &record.to_string(), hlc);
+    }
+
+    /// Every currently-live key-offer record key in the K/V browse surface —
+    /// the `pillar kv` / portal K/V browse enumeration over pending offers.
+    #[must_use]
+    pub fn offered_kv_keys(&self) -> Vec<String> {
+        self.offered.kv_keys(OFFERS_COLLECTION)
     }
 
     /// Add a node to a cell's allow-list, atomically re-sealing every
@@ -470,20 +517,20 @@ impl KeyDistributionLedger {
             cell,
             artifact,
         };
-        if self.offered.contains(&record) || self.admitted.contains(&record) {
+        if self.offer_present(&record) || self.admitted.contains(&record) {
             return Err(KeyDistributionError::InvalidTransition {
                 record,
                 reason: "already offered or already admitted",
             });
         }
-        self.offered.insert(record);
+        self.insert_offered(&record);
         Ok(())
     }
 
     /// The cell/node-side policy accept, recorded at offer time, standing in
     /// for "each node's policy accepts" (`Accept`).
     pub fn accept(&mut self, record: &RecordKey) -> Result<(), KeyDistributionError> {
-        if !self.offered.contains(record) {
+        if !self.offer_present(record) {
             return Err(KeyDistributionError::InvalidTransition {
                 record: record.clone(),
                 reason: "not offered",
@@ -514,7 +561,7 @@ impl KeyDistributionLedger {
     /// allow-list already authorizes but confirmation had been withholding
     /// (`ConfirmCrossOwner`).
     pub fn confirm_cross_owner(&mut self, record: &RecordKey) -> Result<(), KeyDistributionError> {
-        if !self.offered.contains(record) {
+        if !self.offer_present(record) {
             return Err(KeyDistributionError::InvalidTransition {
                 record: record.clone(),
                 reason: "not offered",
@@ -551,7 +598,7 @@ impl KeyDistributionLedger {
                 record.artifact.clone(),
             ));
         }
-        if !self.offered.contains(record) {
+        if !self.offer_present(record) {
             return Err(KeyDistributionError::InvalidTransition {
                 record: record.clone(),
                 reason: "not offered",
@@ -587,13 +634,13 @@ impl KeyDistributionLedger {
     /// admitted-login entry (if any) and clears the seal target
     /// (`RevokeOffer`).
     pub fn revoke_offer(&mut self, record: &RecordKey) -> Result<(), KeyDistributionError> {
-        if !self.offered.contains(record) {
+        if !self.offer_present(record) {
             return Err(KeyDistributionError::InvalidTransition {
                 record: record.clone(),
                 reason: "not offered",
             });
         }
-        self.offered.remove(record);
+        self.remove_offered(record);
         self.admitted.remove(record);
         self.sealed_to.insert(record.clone(), BTreeSet::new());
         Ok(())
@@ -615,7 +662,7 @@ impl KeyDistributionLedger {
     /// Whether `record` is currently offered.
     #[must_use]
     pub fn is_offered(&self, record: &RecordKey) -> bool {
-        self.offered.contains(record)
+        self.offer_present(record)
     }
 
     /// Whether `record` has been accepted. Note this survives a
@@ -1153,6 +1200,34 @@ mod tests {
         assert!(!ledger.is_admitted(&record));
         assert!(!ledger.is_offered(&record));
         assert!(ledger.seal_of(&record).is_empty());
+    }
+
+    // sessions-kv-plane-migration: `offered` is now a real K/V-surface
+    // consumer (pillar_keyedstore), not a bespoke `BTreeSet` fold — a record
+    // appears in the K/V browse surface exactly while it is offered, and a
+    // `revoke_offer` tombstones it out of the live key set (the same
+    // fail-closed contract `is_offered` proves, restated over the
+    // enumerable browse surface a `pillar kv` / portal view reads).
+    #[test]
+    fn offer_and_revoke_are_reflected_in_the_kv_browse_surface() {
+        let (mut ledger, record) = setup();
+        assert!(ledger.offered_kv_keys().is_empty());
+
+        ledger
+            .offer(
+                record.user.clone(),
+                record.cell.clone(),
+                record.artifact.clone(),
+            )
+            .unwrap();
+        let keys = ledger.offered_kv_keys();
+        assert_eq!(keys, vec![record.to_string()]);
+
+        ledger.revoke_offer(&record).unwrap();
+        assert!(
+            ledger.offered_kv_keys().is_empty(),
+            "revoked offer is tombstoned out of the live K/V browse surface"
+        );
     }
 
     // SealedMatchesAllowlist (+ L2 auto-distribution): adding/removing a

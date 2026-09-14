@@ -12,6 +12,10 @@ pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-net = { path = "../pillar-net" }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# The `offered` record set (pending key-distribution offers) is stored on the
+# shared K/V surface instead of a bespoke hand-rolled fold — the
+# sessions-kv-plane-migration data-layer consumer swap.
+pillar-keyedstore = { path = "../pillar-keyedstore" }
 
 [lints]
 workspace = true

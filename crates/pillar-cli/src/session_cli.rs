@@ -440,7 +440,7 @@ impl SessionCli {
             .registry
             .ls(target, now)
             .into_iter()
-            .map(|s| SessionRow::project(s, now, current))
+            .map(|s| SessionRow::project(&s, now, current))
             .collect();
         // Deterministic order for stable rendering/tests.
         rows.sort_by(|a, b| a.id.cmp(&b.id));
@@ -476,7 +476,7 @@ impl SessionCli {
                     principal: target.to_owned(),
                     id: id.to_owned(),
                 })?;
-        Ok(SessionRow::project(session, now, current))
+        Ok(SessionRow::project(&session, now, current))
     }
 
     // ---- ACTS (emit one signed, decider-authorized revocation event) ----
