@@ -1016,6 +1016,20 @@ fn resource_registry() -> SchemaRegistry {
             .property("generation", FieldType::Integer),
     );
     reg.register(Schema::new(RESOURCE_API, IDENTITY_KIND).required("handle", FieldType::String));
+    // The cell-wide credential policy (ROI P1 B2): an editable floor resource
+    // the password change/reset ceremonies read. Registered here so its
+    // bootstrap-seeded floor manifest applies on the same signed plane and
+    // operator edits validate against a real schema.
+    reg.register(
+        Schema::new(
+            crate::credential_policy::CREDENTIAL_POLICY_API_VERSION,
+            crate::credential_policy::CREDENTIAL_POLICY_KIND,
+        )
+        .property("minPasswordStrength", FieldType::Integer)
+        .property("maxPasswordAgeSecs", FieldType::Integer)
+        .property("reuseHistory", FieldType::Integer)
+        .property("breachCheck", FieldType::Boolean),
+    );
     pillar_manifest::builtin::register_builtin_schemas(&mut reg);
     reg
 }
@@ -5846,6 +5860,17 @@ impl WebAuthContext {
                     manifest.kind, manifest.metadata.name
                 );
             }
+        }
+        // The cell-wide credential policy floor (ROI P1 B2) — seeded on the
+        // SAME signed plane so the change/reset ceremonies read it via
+        // `pillar get` and the operator edits it via `pillar apply`.
+        let credential_policy = crate::credential_policy::bootstrap_credential_policy_manifest();
+        if let Err(e) = plane.apply(&actor, RESOURCE_CAP, credential_policy.clone()) {
+            debug_assert!(
+                false,
+                "bootstrap floor seed {}/{} failed: {e}",
+                credential_policy.kind, credential_policy.metadata.name
+            );
         }
     }
 

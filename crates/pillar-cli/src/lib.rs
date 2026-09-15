@@ -34,6 +34,7 @@ pub mod bootstrap;
 pub mod cli_surface;
 pub mod cluster;
 pub mod config_export;
+pub mod credential_policy;
 pub mod defaults;
 pub mod foundational_guardrails;
 pub mod health;
