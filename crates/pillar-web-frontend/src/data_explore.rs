@@ -77,12 +77,86 @@ pub fn decode_kv_value(hex: &str) -> String {
     }
 }
 
+/// One field parsed off a `key: value\n` ack body (`log info`/`log show`/
+/// `log verify`/`object stat`/`object verify` all render this shape) — a
+/// pure, host-tested parser shared by every drill-down layer below.
+#[must_use]
+pub fn parse_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+}
+
+/// The storage-layout panel's discriminated shape: a document collection's
+/// snapshot marker + tail count, or a TSDB collection's retention-block
+/// ribbon (horizon, retained block count, pruned count) — parsed off
+/// `/portal/data/log/blocks`'s response body (see `log_blocks` in
+/// `web_serve.rs`). The two variants render visibly different panels.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum StorageLayout {
+    /// No live layout report yet (nothing fetched, or the collection is
+    /// unknown).
+    #[default]
+    Unknown,
+    /// Document/keyed: a snapshot (or `none` if never compacted) plus a
+    /// bounded op tail.
+    Document {
+        /// `none`, or the snapshot CID.
+        snapshot: String,
+        /// How many ops sit in the uncompacted tail.
+        tail_ops: usize,
+    },
+    /// TSDB: an immutable retention-block ribbon back to the horizon, with
+    /// older data pruned.
+    Tsdb {
+        /// The retained-block window size.
+        retention_horizon: usize,
+        /// How many blocks are still retained.
+        retained: usize,
+        /// How many ops aged out past the horizon.
+        pruned: usize,
+    },
+}
+
+/// Parse a `/portal/data/log/blocks` response body into a [`StorageLayout`].
+#[must_use]
+pub fn parse_storage_layout(body: &str) -> StorageLayout {
+    if body.contains("kind: tsdb") {
+        let horizon = parse_field(body, "retention_horizon")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let pruned = parse_field(body, "pruned")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let retained = body
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.trim_start().starts_with("pruned"))
+            .count();
+        StorageLayout::Tsdb {
+            retention_horizon: horizon,
+            retained,
+            pruned,
+        }
+    } else if body.contains("kind: document") {
+        let snapshot = parse_field(body, "snapshot").unwrap_or("none").to_owned();
+        let tail_ops = parse_field(body, "tail")
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        StorageLayout::Document { snapshot, tail_ops }
+    } else {
+        StorageLayout::Unknown
+    }
+}
+
 #[cfg(feature = "yew")]
-pub use yew_impl::ExploreDataConsole;
+pub use yew_impl::{CollectionExplorerPanel, ExploreDataConsole};
 
 #[cfg(feature = "yew")]
 mod yew_impl {
-    use super::{decode_kv_value, parse_name_list, parse_view_rows, DataRow};
+    use super::{
+        decode_kv_value, parse_field, parse_name_list, parse_storage_layout, parse_view_rows,
+        DataRow, StorageLayout,
+    };
     use crate::auth::use_auth;
     use crate::components::{Column, DataTable, TabItem, Tabs};
     use crate::portal::{get_url, http, input_value};
@@ -409,10 +483,322 @@ mod yew_impl {
         }
     }
 
-    /// The Explore section: three tabs, one per data primitive, all reading
-    /// the SAME live keyed-store substrate the query-tier CLI verbs read.
-    /// Never mutates — the query tier (`pillar kv`/`doc`/`sql` over
-    /// pillar-UDP) stays the one authoritative write path.
+    /// The four-layer **Collection Explorer** drill-down: folded view (a
+    /// live K/V collection browse, layer 1) -> op log/DAG (layer 2, over
+    /// `/portal/data/log/*`, layered on `pillar-log-inspection-tier`) ->
+    /// storage-layout panel (layer 3, the SAME `log/blocks` report rendered
+    /// as a distinct shape per storage kind) -> object inspector (layer 4,
+    /// over `/portal/data/object/*`, layered on
+    /// `pillar-object-inspection-tier`), with a `Collection ▸ op log ▸ op
+    /// <cid> ▸ object <cid>` breadcrumb — never a separate portal-only fold
+    /// path (`docs/data-inspection.md`'s "Exploring in the portal").
+    #[function_component(CollectionExplorerPanel)]
+    pub fn collection_explorer_panel() -> Html {
+        let auth = use_auth();
+        let collection = use_state(String::new);
+        let log_info = use_state(String::new);
+        let log_ids = use_state(Vec::<String>::new);
+        let selected_event = use_state(String::new);
+        let log_show = use_state(String::new);
+        let log_verify = use_state(String::new);
+        let log_dag = use_state(String::new);
+        let layout = use_state(StorageLayout::default);
+        let object_cid = use_state(String::new);
+        let object_stat = use_state(String::new);
+        let object_links = use_state(Vec::<String>::new);
+        let object_cat = use_state(String::new);
+        let object_verify = use_state(String::new);
+
+        // Loading a collection re-fetches op-log info/list/dag and the
+        // storage-layout panel, and clears any deeper breadcrumb selection.
+        let load_collection = {
+            let (auth, log_info, log_ids, log_dag, layout, selected_event, log_show, log_verify, object_cid, object_stat, object_links, object_cat, object_verify) = (
+                auth.clone(),
+                log_info.clone(),
+                log_ids.clone(),
+                log_dag.clone(),
+                layout.clone(),
+                selected_event.clone(),
+                log_show.clone(),
+                log_verify.clone(),
+                object_cid.clone(),
+                object_stat.clone(),
+                object_links.clone(),
+                object_cat.clone(),
+                object_verify.clone(),
+            );
+            Callback::from(move |col: String| {
+                selected_event.set(String::new());
+                log_show.set(String::new());
+                log_verify.set(String::new());
+                object_cid.set(String::new());
+                object_stat.set(String::new());
+                object_links.set(Vec::new());
+                object_cat.set(String::new());
+                object_verify.set(String::new());
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                refresh(
+                    token.clone(),
+                    "/portal/data/log/info",
+                    vec![("collection".to_owned(), col.clone())],
+                    Callback::from({
+                        let log_info = log_info.clone();
+                        move |body: String| log_info.set(body)
+                    }),
+                );
+                refresh(
+                    token.clone(),
+                    "/portal/data/log/list",
+                    vec![("collection".to_owned(), col.clone())],
+                    Callback::from({
+                        let log_ids = log_ids.clone();
+                        move |body: String| log_ids.set(parse_name_list(&body))
+                    }),
+                );
+                refresh(
+                    token.clone(),
+                    "/portal/data/log/dag",
+                    vec![("collection".to_owned(), col.clone())],
+                    Callback::from({
+                        let log_dag = log_dag.clone();
+                        move |body: String| log_dag.set(body)
+                    }),
+                );
+                refresh(
+                    token,
+                    "/portal/data/log/blocks",
+                    vec![("collection".to_owned(), col)],
+                    Callback::from({
+                        let layout = layout.clone();
+                        move |body: String| layout.set(parse_storage_layout(&body))
+                    }),
+                );
+            })
+        };
+
+        let on_collection_input = {
+            let (collection, load_collection) = (collection.clone(), load_collection.clone());
+            Callback::from(move |e: InputEvent| {
+                let v = input_value(&e);
+                collection.set(v.clone());
+                if !v.is_empty() {
+                    load_collection.emit(v);
+                }
+            })
+        };
+
+        // Expand an op-log row: decode it and fetch its real verify badge.
+        let on_pick_event = {
+            let (auth, collection, selected_event, log_show, log_verify) = (
+                auth.clone(),
+                collection.clone(),
+                selected_event.clone(),
+                log_show.clone(),
+                log_verify.clone(),
+            );
+            Callback::from(move |event_id: String| {
+                selected_event.set(event_id.clone());
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                refresh(
+                    token.clone(),
+                    "/portal/data/log/show",
+                    vec![
+                        ("collection".to_owned(), (*collection).clone()),
+                        ("event_id".to_owned(), event_id.clone()),
+                    ],
+                    Callback::from({
+                        let log_show = log_show.clone();
+                        move |body: String| log_show.set(body)
+                    }),
+                );
+                refresh(
+                    token,
+                    "/portal/data/log/verify",
+                    vec![
+                        ("collection".to_owned(), (*collection).clone()),
+                        ("event_id".to_owned(), event_id),
+                    ],
+                    Callback::from({
+                        let log_verify = log_verify.clone();
+                        move |body: String| log_verify.set(body)
+                    }),
+                );
+            })
+        };
+
+        // Descend the CID breadcrumb into the object inspector layer.
+        let on_pick_cid = {
+            let (auth, object_cid, object_stat, object_links, object_cat, object_verify) = (
+                auth.clone(),
+                object_cid.clone(),
+                object_stat.clone(),
+                object_links.clone(),
+                object_cat.clone(),
+                object_verify.clone(),
+            );
+            Callback::from(move |cid: String| {
+                object_cid.set(cid.clone());
+                let Some(token) = auth.token.clone() else {
+                    return;
+                };
+                refresh(
+                    token.clone(),
+                    "/portal/data/object/stat",
+                    vec![("cid".to_owned(), cid.clone())],
+                    Callback::from({
+                        let object_stat = object_stat.clone();
+                        move |body: String| object_stat.set(body)
+                    }),
+                );
+                refresh(
+                    token.clone(),
+                    "/portal/data/object/links",
+                    vec![("cid".to_owned(), cid.clone())],
+                    Callback::from({
+                        let object_links = object_links.clone();
+                        move |body: String| object_links.set(parse_name_list(&body))
+                    }),
+                );
+                refresh(
+                    token.clone(),
+                    "/portal/data/object/cat",
+                    vec![("cid".to_owned(), cid.clone())],
+                    Callback::from({
+                        let object_cat = object_cat.clone();
+                        move |body: String| object_cat.set(body)
+                    }),
+                );
+                refresh(
+                    token,
+                    "/portal/data/object/verify",
+                    vec![("cid".to_owned(), cid)],
+                    Callback::from({
+                        let object_verify = object_verify.clone();
+                        move |body: String| object_verify.set(body)
+                    }),
+                );
+            })
+        };
+
+        let payload_cid = parse_field(&log_show, "payload-cid").unwrap_or("").to_owned();
+        let log_verified = log_verify.contains("hash-matches-id: true")
+            && log_verify.contains("signature-valid: true");
+        let object_verified = object_verify.contains("hash-matches-cid: true")
+            && object_verify.contains("signature-valid: true");
+
+        html! {
+            <div class="collection-explorer" id="collection-explorer-panel">
+                <nav class="collection-explorer__breadcrumb" id="collection-explorer-breadcrumb">
+                    { (*collection).clone() }
+                    if !selected_event.is_empty() {
+                        { " ▸ op " } { format!("{:.12}", *selected_event) }
+                    }
+                    if !object_cid.is_empty() {
+                        { " ▸ object " } { format!("{:.12}", *object_cid) }
+                    }
+                </nav>
+                <label>{ "Collection" }
+                    <input type="text" oninput={on_collection_input} id="ce-collection-input" placeholder="widgets" />
+                </label>
+                if !collection.is_empty() {
+                    <section class="collection-explorer__layout" id="ce-storage-layout">
+                        <h4>{ "Storage layout" }</h4>
+                        {
+                            match &*layout {
+                                StorageLayout::Document { snapshot, tail_ops } => html! {
+                                    <p class="ce-layout-document">
+                                        { format!("snapshot+tail — snapshot: {snapshot}, tail: {tail_ops} ops") }
+                                    </p>
+                                },
+                                StorageLayout::Tsdb { retention_horizon, retained, pruned } => html! {
+                                    <p class="ce-layout-tsdb">
+                                        { format!(
+                                            "retention-block ribbon — horizon: {retention_horizon}, retained: {retained}, pruned: {pruned}"
+                                        ) }
+                                    </p>
+                                },
+                                StorageLayout::Unknown => html! { <p>{ "no layout report yet" }</p> },
+                            }
+                        }
+                    </section>
+                    <section class="collection-explorer__log" id="ce-op-log">
+                        <h4>{ "Op log" }</h4>
+                        <pre id="ce-log-info">{ (*log_info).clone() }</pre>
+                        <ul id="ce-log-list">
+                            { for log_ids.iter().map(|id| {
+                                let onclick = {
+                                    let on_pick_event = on_pick_event.clone();
+                                    let id2 = id.clone();
+                                    Callback::from(move |_: MouseEvent| on_pick_event.emit(id2.clone()))
+                                };
+                                html! { <li><button type="button" onclick={onclick}>{ id }</button></li> }
+                            }) }
+                        </ul>
+                        <details id="ce-log-dag">
+                            <summary>{ "DAG" }</summary>
+                            <pre>{ (*log_dag).clone() }</pre>
+                        </details>
+                    </section>
+                    if !selected_event.is_empty() {
+                        <section class="collection-explorer__op" id="ce-op-detail">
+                            <h4>{ "Op detail" }</h4>
+                            <pre id="ce-log-show">{ (*log_show).clone() }</pre>
+                            <p id="ce-log-verify-badge" class={if log_verified { "verify-ok" } else { "verify-fail" }}>
+                                { if log_verified { "✓ verified" } else { "verification unavailable" } }
+                            </p>
+                            if !payload_cid.is_empty() {
+                                <button type="button" id="ce-follow-payload-cid" onclick={
+                                    let on_pick_cid = on_pick_cid.clone();
+                                    let cid = payload_cid.clone();
+                                    Callback::from(move |_: MouseEvent| on_pick_cid.emit(cid.clone()))
+                                }>{ format!("View object {payload_cid}") }</button>
+                            }
+                            <label>{ "Follow CID" }
+                                <input type="text" id="ce-cid-input" onchange={
+                                    let on_pick_cid = on_pick_cid.clone();
+                                    Callback::from(move |e: Event| {
+                                        if let Some(input) = e.target_dyn_into::<web_sys::HtmlInputElement>() {
+                                            on_pick_cid.emit(input.value());
+                                        }
+                                    })
+                                } />
+                            </label>
+                        </section>
+                    }
+                    if !object_cid.is_empty() {
+                        <section class="collection-explorer__object" id="ce-object-inspector">
+                            <h4>{ "Object inspector" }</h4>
+                            <pre id="ce-object-stat">{ (*object_stat).clone() }</pre>
+                            <pre id="ce-object-cat">{ (*object_cat).clone() }</pre>
+                            <ul id="ce-object-links">
+                                { for object_links.iter().map(|l| {
+                                    let onclick = {
+                                        let on_pick_cid = on_pick_cid.clone();
+                                        let l2 = l.clone();
+                                        Callback::from(move |_: MouseEvent| on_pick_cid.emit(l2.clone()))
+                                    };
+                                    html! { <li><button type="button" onclick={onclick}>{ l }</button></li> }
+                                }) }
+                            </ul>
+                            <p id="ce-object-verify-badge" class={if object_verified { "verify-ok" } else { "verify-fail" }}>
+                                { if object_verified { "✓ verified" } else { "verification unavailable" } }
+                            </p>
+                        </section>
+                    }
+                }
+            </div>
+        }
+    }
+
+    /// The Explore section: four tabs — three data primitives plus the
+    /// Collection Explorer drill-down — all reading the SAME live substrate
+    /// the query-tier CLI verbs read. Never mutates — the query tier
+    /// (`pillar kv`/`doc`/`sql`/`log`/`object` over pillar-UDP) stays the one
+    /// authoritative write path.
     #[function_component(ExploreDataConsole)]
     pub fn explore_data_console() -> Html {
         let tabs = vec![
@@ -427,6 +813,10 @@ mod yew_impl {
             TabItem {
                 label: "SQL Views".into(),
                 panel: html! { <SqlViewPanel /> },
+            },
+            TabItem {
+                label: "Collection Explorer".into(),
+                panel: html! { <CollectionExplorerPanel /> },
             },
         ];
         html! {
@@ -488,5 +878,44 @@ mod tests {
         assert_eq!(decode_kv_value("abc"), "abc");
         // A non-hex digit falls back too.
         assert_eq!(decode_kv_value("zz"), "zz");
+    }
+
+    #[test]
+    fn parse_field_reads_a_key_value_line() {
+        let body = "event: abc\nauthor: did:pillar:x\nhlc: 1.2.3\n";
+        assert_eq!(parse_field(body, "author"), Some("did:pillar:x"));
+        assert_eq!(parse_field(body, "missing"), None);
+    }
+
+    #[test]
+    fn parse_storage_layout_reads_a_document_report() {
+        let body = "collection: widgets\nkind: document\nsnapshot: none\ntail: 3 ops (uncompacted)\n  abcd\n  ef01\n  1234\n";
+        let layout = parse_storage_layout(body);
+        assert_eq!(
+            layout,
+            StorageLayout::Document {
+                snapshot: "none".to_owned(),
+                tail_ops: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_storage_layout_reads_a_tsdb_report() {
+        let body = "collection: __objects\nkind: tsdb\nretention_horizon: 4\nblocks:\n  aa\n  bb\n  cc\n  dd\npruned: 2\n  pruned ee\n  pruned ff\n";
+        let layout = parse_storage_layout(body);
+        assert_eq!(
+            layout,
+            StorageLayout::Tsdb {
+                retention_horizon: 4,
+                retained: 4,
+                pruned: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_storage_layout_is_unknown_for_an_unrecognized_body() {
+        assert_eq!(parse_storage_layout("garbage"), StorageLayout::Unknown);
     }
 }

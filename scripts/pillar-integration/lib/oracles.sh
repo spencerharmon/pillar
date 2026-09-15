@@ -624,6 +624,67 @@ oracle_apply_authz() {
     return 0
 }
 
+# oracle_public_visibility : the public-visibility scenario family's defining
+# realness oracle. Drives the REAL published image's `public-visibility` CLI
+# verb (`pillar_cli::public_visibility_class`), which runs the REAL production
+# streamdb op path (`pillar_streamdb::IpfsPersistentStream` — the SAME
+# constructor the node entrypoint uses) and the REAL `pillar_rbac::RbacDecider`,
+# and asserts, from the transcript ALONE (never a bare return code), that
+# `public` is a real, DISTINCT visibility class that leaves the cell-encrypted
+# default intact. Four real effects, each an `oracle-observed:` line the verb
+# emits only when the real crate path produced it:
+#
+#   1. public-plaintext-at-rest   — a public collection's persisted,
+#      content-addressed segment decodes back to the EXACT cleartext record
+#      with NO group key (the AEAD seal is elided for public);
+#   2. public-keyless-readback    — a SEPARATE keyless reader recovers the
+#      exact cleartext AND every segment's Ed25519 signature verifies + CID
+#      resolves during rehydrate;
+#   3. unauthorized-write-denied  — an unauthorized write is RBAC-refused
+#      fail-closed by the real decider (public drops the READ barrier only),
+#      while an explicitly-granted writer IS allowed;
+#   4. cell-encrypted contrast    — the default cell-encrypted collection is
+#      ciphertext at rest, is NOT readable by the keyless reader, and is read
+#      back ONLY by the cell member holding the group key — proving the two
+#      classes are distinct and the encrypted default intact.
+#
+# RED if any oracle is unobserved (the verb exits non-zero on the first broken
+# invariant); GREEN when every `oracle-observed:` and `ok:` line is present.
+# Black-box: drives ONLY the real image's external CLI surface and observes only
+# its transcript — no crate linkage.
+oracle_public_visibility() {
+    local out
+    out=$(driver_cli_exec public-visibility) \
+        || fail "public-visibility oracle: real image reported a broken visibility-class invariant (a public op unreadable keyless, an unauthorized write admitted, or the cell-encrypted default leaked):\n$out"
+
+    # Every real step must have reported ok:.
+    local step
+    for step in public-write-keyless-read unauthorized-write-refused \
+                cell-encrypted-contrast; do
+        printf '%s\n' "$out" | grep -q "^ok: ${step}$" \
+            || fail "public-visibility oracle: real image did not report '$step' ok:\n$out"
+    done
+
+    # Each concrete real effect must appear as its own observed line.
+    printf '%s\n' "$out" | grep -q '^oracle-observed: public-plaintext-at-rest ' \
+        || fail "public-visibility oracle: no observed public plaintext-at-rest (seal not elided for public):\n$out"
+    printf '%s\n' "$out" | grep -q '^oracle-observed: public-keyless-readback ' \
+        || fail "public-visibility oracle: no observed keyless read-back of the public record (signature/CID verify):\n$out"
+    printf '%s\n' "$out" | grep -q '^oracle-observed: unauthorized-write-denied .*capability=stream:append verdict=denied' \
+        || fail "public-visibility oracle: no observed fail-closed RBAC denial of an unauthorized write to a public collection:\n$out"
+    printf '%s\n' "$out" | grep -q '^oracle-observed: authorized-write-allowed ' \
+        || fail "public-visibility oracle: the real decider did not allow an explicitly-granted writer (decider is not real):\n$out"
+    printf '%s\n' "$out" | grep -q '^oracle-observed: cell-encrypted-ciphertext-at-rest ' \
+        || fail "public-visibility oracle: no observed ciphertext-at-rest for the cell-encrypted contrast collection:\n$out"
+    printf '%s\n' "$out" | grep -q '^oracle-observed: cell-encrypted-keyless-unreadable ' \
+        || fail "public-visibility oracle: the keyless reader was NOT refused the cell-encrypted plaintext (encrypted default not intact):\n$out"
+    printf '%s\n' "$out" | grep -q '^oracle-observed: cell-encrypted-member-readback ' \
+        || fail "public-visibility oracle: the cell member holding the group key did NOT recover the cell-encrypted plaintext:\n$out"
+
+    info "oracle-observed: public-visibility real image proved public is a DISTINCT visibility class — keyless-readable cleartext (signed + content-addressed), unauthorized write RBAC-refused, and the cell-encrypted default intact (keyless-unreadable ciphertext, member-readable)"
+    return 0
+}
+
 # oracle_manifests_apply : assert the real manifest/CRD apply surface
 # (`pillar_manifest::apply::ManifestStore` + `ControllerRegistry` — the SAME
 # engine a `pillar node run` cell backs `pillar apply|get|delete` with, via

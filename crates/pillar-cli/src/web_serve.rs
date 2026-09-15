@@ -6936,6 +6936,11 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/portal/users/bulk-invite"),
+        handler: dispatch_users_bulk_invite,
+    },
+    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/portal/users/reset-password"),
         handler: dispatch_users_reset_password,
     },
@@ -7304,6 +7309,63 @@ pub static ROUTES: &[RouteSpec] = &[
         path: PathMatch::Exact("/portal/data/sql/view"),
         handler: |ctx, _peer, request| dispatch_data_sql_view(ctx, request),
     },
+    // The Collection Explorer's drill-down layers: op log/DAG
+    // (`/portal/data/log/*`, layered on `pillar-log-inspection-tier`'s
+    // `QueryOp::Log`) and the content-addressed object inspector
+    // (`/portal/data/object/*`, layered on `pillar-object-inspection-tier`'s
+    // `QueryOp::Object`) — both served over the SAME sealed `QueryOp` remote
+    // surface `pillar log`/`pillar object` already ride
+    // (`WebAuthContext::query_op`), never a separate portal-only fold path.
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/log/info"),
+        handler: |ctx, _peer, request| dispatch_data_log_info(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/log/blocks"),
+        handler: |ctx, _peer, request| dispatch_data_log_blocks(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/log/list"),
+        handler: |ctx, _peer, request| dispatch_data_log_list(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/log/show"),
+        handler: |ctx, _peer, request| dispatch_data_log_show(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/log/dag"),
+        handler: |ctx, _peer, request| dispatch_data_log_dag(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/log/verify"),
+        handler: |ctx, _peer, request| dispatch_data_log_verify(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/object/stat"),
+        handler: |ctx, _peer, request| dispatch_data_object_stat(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/object/links"),
+        handler: |ctx, _peer, request| dispatch_data_object_links(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/object/cat"),
+        handler: |ctx, _peer, request| dispatch_data_object_cat(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/object/verify"),
+        handler: |ctx, _peer, request| dispatch_data_object_verify(ctx, request),
+    },
 ];
 
 /// The real, currently-served HTTP route table — the exact data
@@ -7501,6 +7563,240 @@ fn dispatch_data_sql_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRe
         Some(rows) => text_response(200, "OK", render_rows(&rows)),
         None => text_response(404, "Not Found", "DENIED no-such-view".to_owned()),
     }
+}
+
+/// Require an admitted session for a `GET .../portal/data/{log,object}/*`
+/// drill-down route and hand back the ADMITTED SIGNER's [`NodeId`] — the
+/// `actor` [`WebAuthContext::query_op`]'s member-gate checks — reading the
+/// `token` query param. Returns the 401 response to short-circuit with on
+/// failure.
+fn require_data_session_actor(
+    ctx: &WebAuthContext,
+    request: &HttpRequest,
+) -> Result<NodeId, HttpResponse> {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    match ctx.login_session_for(token) {
+        Some(session) => Ok(session.subject.clone()),
+        None => Err(text_response(
+            401,
+            "Unauthorized",
+            "DENIED not-authenticated".to_owned(),
+        )),
+    }
+}
+
+/// Render a [`pillar_ops::QueryOp`] result as the same plain-text ack body
+/// every other `/portal/data/*` browse route serves: `OK <payload>` on
+/// success flattens to just the payload text (the drill-down panels read a
+/// bare body, same as `kv`/`doc`/`sql`); a refusal renders 404 with the
+/// reason (a malformed CID/event id, an unknown collection, or a fail-closed
+/// membership check) — the Collection Explorer never gets a silent empty
+/// panel for a real backend refusal.
+fn query_op_response(ctx: &mut WebAuthContext, actor: &NodeId, op: pillar_ops::QueryOp) -> HttpResponse {
+    match ctx.query_op(actor, &op) {
+        Ok(body) => text_response(200, "OK", body),
+        Err(reason) => text_response(404, "Not Found", format!("DENIED {reason}")),
+    }
+}
+
+/// `GET /portal/data/log/info?token=<s>&collection=<c>` — layer 2 (op log)
+/// summary: op count + current tip, over the SAME `QueryOp::Log(LogOp::Info)`
+/// `pillar log info` reads.
+fn dispatch_data_log_info(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(collection) = query_value(&request.path, "collection").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Log(pillar_ops::LogOp::Info { collection }),
+    )
+}
+
+/// `GET /portal/data/log/blocks?token=<s>&collection=<c>` — layer 3 (storage
+/// layout): a snapshot+tail report for a document collection, or a
+/// retention-block ribbon (with horizon + pruned region) for a TSDB
+/// collection — the exact discriminator `pillar log blocks` reports.
+fn dispatch_data_log_blocks(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(collection) = query_value(&request.path, "collection").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Log(pillar_ops::LogOp::Blocks { collection }),
+    )
+}
+
+/// `GET /portal/data/log/list?token=<s>&collection=<c>` — every op-log event
+/// id of `collection`, append order (the virtualized op-log row source).
+fn dispatch_data_log_list(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(collection) = query_value(&request.path, "collection").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Log(pillar_ops::LogOp::List { collection }),
+    )
+}
+
+/// `GET /portal/data/log/show?token=<s>&collection=<c>&event_id=<hex>` —
+/// decode one op: author, HLC, kind, key, payload CID, parents, signature —
+/// the row the op-log panel expands to when a caller clicks a log row, and
+/// the CID breadcrumb's hop from the op-log layer to the object layer.
+fn dispatch_data_log_show(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(collection) = query_value(&request.path, "collection").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    let Some(event_id_hex) = query_value(&request.path, "event_id").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING event_id".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Log(pillar_ops::LogOp::Show {
+            collection,
+            event_id_hex,
+        }),
+    )
+}
+
+/// `GET /portal/data/log/dag?token=<s>&collection=<c>` — the causal DAG
+/// (`parent -> child` edges), the op-log panel's DAG-toggle data source; two
+/// ops sharing parents with neither preceding the other render as concurrent
+/// (CRDT-merged) branches.
+fn dispatch_data_log_dag(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(collection) = query_value(&request.path, "collection").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Log(pillar_ops::LogOp::Dag { collection }),
+    )
+}
+
+/// `GET /portal/data/log/verify?token=<s>&collection=<c>&event_id=<hex>` —
+/// re-checks hash==id and signature validity of one op, WITHOUT interpreting
+/// its payload: the real result behind the op-log row's verify badge (never a
+/// cosmetic checkmark).
+fn dispatch_data_log_verify(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(collection) = query_value(&request.path, "collection").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    let Some(event_id_hex) = query_value(&request.path, "event_id").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING event_id".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Log(pillar_ops::LogOp::Verify {
+            collection,
+            event_id_hex,
+        }),
+    )
+}
+
+/// `GET /portal/data/object/stat?token=<s>&cid=<hex>` — layer 4 (object
+/// inspector): codec, size, pin status, visibility — the same
+/// `QueryOp::Object(ObjectOp::Stat)` `pillar object stat` reads.
+fn dispatch_data_object_stat(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(cid_hex) = query_value(&request.path, "cid").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING cid".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Stat { cid_hex }),
+    )
+}
+
+/// `GET /portal/data/object/links?token=<s>&cid=<hex>` — the block's child
+/// CIDs (one DAG hop), the links graph the object inspector's "descend a
+/// child CID" action reads — never requires opening the body.
+fn dispatch_data_object_links(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(cid_hex) = query_value(&request.path, "cid").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING cid".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Links { cid_hex }),
+    )
+}
+
+/// `GET /portal/data/object/cat?token=<s>&cid=<hex>[&secret=<hex>]` — the
+/// decoded body (or a `SEALED …` envelope-only placeholder when the caller
+/// holds no opening secret) — the object inspector's decoded-body view.
+fn dispatch_data_object_cat(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(cid_hex) = query_value(&request.path, "cid").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING cid".to_owned());
+    };
+    let sealing_secret_hex = query_value(&request.path, "secret").map(str::to_owned);
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Cat {
+            cid_hex,
+            sealing_secret_hex,
+        }),
+    )
+}
+
+/// `GET /portal/data/object/verify?token=<s>&cid=<hex>` — recomputes the
+/// block's hash and confirms it equals its CID, and checks the authorship
+/// signature WITHOUT ever attempting to open a sealed body: the real result
+/// driving the object inspector's verify badge.
+fn dispatch_data_object_verify(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let actor = match require_data_session_actor(ctx, request) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(cid_hex) = query_value(&request.path, "cid").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING cid".to_owned());
+    };
+    query_op_response(
+        ctx,
+        &actor,
+        pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Verify { cid_hex }),
+    )
 }
 
 fn dispatch_http(
@@ -8445,6 +8741,148 @@ fn dispatch_users_invite(
         }
         Err(resp) => resp,
     }
+}
+
+/// One parsed row of a bulk/CSV invite batch: `handle,email[,password,
+/// force_password_change,require_passkey,verified_email]`. Trailing fields
+/// are optional and follow the same Keycloak-style defaults as the
+/// single-invite endpoint (force-change ON unless `false`, require-passkey
+/// OFF unless `true`, verified-email OFF unless `true`).
+struct BulkInviteRow {
+    handle: String,
+    email: String,
+    password: Option<String>,
+    force_password_change: bool,
+    require_passkey: bool,
+    verified_email: bool,
+}
+
+/// Split one CSV row on commas. No quoting/escaping support — handles and
+/// emails never legitimately contain a comma, so a bare `split(',')` is
+/// sufficient for this batching convenience (it reuses the proven per-row
+/// invite path; it introduces no new authority or parsing surface).
+fn parse_bulk_invite_row(line: &str) -> Result<BulkInviteRow, String> {
+    let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
+    if fields.len() < 2 {
+        return Err("MALFORMED-ROW expected at least handle,email".to_owned());
+    }
+    let handle = fields[0].to_owned();
+    let email = fields[1].to_owned();
+    if handle.is_empty() {
+        return Err("MALFORMED-ROW empty handle".to_owned());
+    }
+    let password = fields.get(2).filter(|p| !p.is_empty()).map(|p| p.to_string());
+    let force_password_change = fields.get(3).map(|f| *f != "false").unwrap_or(true);
+    let require_passkey = fields.get(4).map(|f| *f == "true").unwrap_or(false);
+    let verified_email = fields.get(5).map(|f| *f == "true").unwrap_or(false);
+    Ok(BulkInviteRow {
+        handle,
+        email,
+        password,
+        force_password_change,
+        require_passkey,
+        verified_email,
+    })
+}
+
+/// Bulk/CSV admin invite of NEW users: `POST /portal/users/bulk-invite`, body
+/// `<admin_password>\n<token>\n<csv row>\n<csv row>\n...` where each CSV row
+/// is `handle,email[,password,force_password_change,require_passkey,
+/// verified_email]` (see [`parse_bulk_invite_row`]). Batches the SAME
+/// delegated-signed [`dispatch_delegated_user_op`] path the single-user
+/// `/portal/users/invite` endpoint already uses, row by row: one admin
+/// re-authentication (`<admin_password>`) covers the whole batch, exactly as
+/// a human operator would type the password once and paste a CSV. This is
+/// batching CONVENIENCE ONLY — no new authority and no new TLA+ gate; every
+/// row still goes through the identical `iam:users:write`-gated,
+/// delegated-signature-verified `user_op` mutation.
+///
+/// PARTIAL-BATCH TOLERANT: a malformed row or a per-row failure (e.g.
+/// `already exists`) does NOT abort the batch — every remaining row is still
+/// attempted. The response is one line per row, in the SAME order as the
+/// input:
+/// - `<handle> OK <password>` — invited; `<password>` is the temp password
+///   (either the row's explicit one or the freshly generated one).
+/// - `<handle> FAILED <reason>` — this row failed; every other row still ran.
+/// A wrong admin password fails EVERY row identically (`FAILED REFUSED
+/// delegated-sign ...`), since the delegated signature is verified once per
+/// row using the same caller/password pair — the response still enumerates
+/// each row for a uniform, machine-parseable report.
+fn dispatch_users_bulk_invite(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
+    let token = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let mut report = String::new();
+    let mut any_row = false;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        any_row = true;
+        let row = match parse_bulk_invite_row(line) {
+            Ok(row) => row,
+            Err(reason) => {
+                report.push_str(&format!("{line} FAILED {reason}\n"));
+                continue;
+            }
+        };
+        let (password, generated_password_err) = match row.password {
+            Some(p) => (p, None),
+            None => match generate_temp_password() {
+                Ok(p) => (p, None),
+                Err(()) => (String::new(), Some("RNG-FAILURE")),
+            },
+        };
+        if let Some(reason) = generated_password_err {
+            report.push_str(&format!("{} FAILED {reason}\n", row.handle));
+            continue;
+        }
+        let op = pillar_ops::UserOp::Invite {
+            handle: row.handle.clone(),
+            email: row.email.clone(),
+            force_password_change: row.force_password_change,
+            require_passkey: row.require_passkey,
+            password: Some(password.clone()),
+        };
+        match dispatch_delegated_user_op(ctx, &caller, &admin_password, op) {
+            Ok(_detail) => {
+                if row.verified_email {
+                    let at = ctx.iam_now();
+                    ctx.iam_verify_email(&row.handle, at);
+                }
+                report.push_str(&format!("{} OK {password}\n", row.handle));
+            }
+            Err(resp) if resp.body.contains("already exists") => {
+                report.push_str(&format!("{} FAILED already-exists\n", row.handle));
+            }
+            Err(resp) => {
+                report.push_str(&format!(
+                    "{} FAILED {}\n",
+                    row.handle,
+                    resp.body.trim()
+                ));
+            }
+        }
+    }
+    if !any_row {
+        return text_response(400, "Bad Request", "MISSING csv-rows".to_owned());
+    }
+    text_response(200, "OK", report)
 }
 
 /// Self profile read: `GET /portal/profile?token=...`. Renders
