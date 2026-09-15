@@ -20,6 +20,7 @@ pillar-ipam = { path = "../pillar-ipam" }
 pillar-manifest = { path = "../pillar-manifest" }
 pillar-net = { path = "../pillar-net" }
 pillar-cli = { path = "../pillar-cli" }
+pillar-ops = { path = "../pillar-ops" }
 pillar-web = { path = "../pillar-web" }
 pillar-observability = { path = "../pillar-observability" }
 pillar-surface-inventory = { path = "../pillar-surface-inventory" }

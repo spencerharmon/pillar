@@ -103,6 +103,13 @@ pub static PARITY_MAP: &[ParityRule] = &[
     // family; `get`/`describe` are additionally recorded CLI-only below since
     // the `apply` rule already claims the shared portal family.
     ParityRule::Paired { verb: "apply", route_prefix: "/portal/resource" },
+    // The Collection Explorer drill-down's op-log/DAG and content-addressed
+    // object-inspector layers (`pillar-log-inspection-tier`/`pillar-object-
+    // inspection-tier`): the `pillar log`/`pillar object` CLI verbs pair with
+    // the `/portal/data/log/*` / `/portal/data/object/*` route families
+    // added by `portal-collection-explorer-drilldown`.
+    ParityRule::Paired { verb: "log", route_prefix: "/portal/data/log" },
+    ParityRule::Paired { verb: "object", route_prefix: "/portal/data/object" },
     ParityRule::CliOnly {
         verb: "get",
         reason: "kubectl-parity resource read; served in the portal under the shared /portal/resource/* family (paired via `apply`)",
