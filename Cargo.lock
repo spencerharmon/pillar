@@ -3637,6 +3637,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pillar-sqlviews"
+version = "0.1.0"
+dependencies = [
+ "pillar-keyedstore",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pillar-streamdb"
 version = "0.1.0"
 dependencies = [

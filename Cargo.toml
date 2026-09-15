@@ -15,6 +15,7 @@ members = [
     "crates/pillar-wire",
     "crates/pillar-streamdb",
     "crates/pillar-keyedstore",
+    "crates/pillar-sqlviews",
     "crates/pillar-ipfs",
     "crates/pillar-swarm",
     "crates/pillar-observability",
