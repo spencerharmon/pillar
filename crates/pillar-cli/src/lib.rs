@@ -45,6 +45,7 @@ pub mod onboard;
 pub mod polish;
 pub mod portal_cli;
 pub mod psl_client;
+pub mod public_visibility_class;
 pub mod psl_quic_server;
 pub mod psl_udp_server;
 pub mod resource;

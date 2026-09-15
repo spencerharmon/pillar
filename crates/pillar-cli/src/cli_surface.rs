@@ -181,6 +181,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, _args| apply_authz(),
     },
     VerbSpec {
+        name: "public-visibility",
+        handler: |_v, _args| public_visibility(),
+    },
+    VerbSpec {
         name: "versioning-rollout",
         handler: |_v, _args| versioning_rollout(),
     },
@@ -336,6 +340,15 @@ fn versioning_rollout() -> ExitCode {
 /// `apply` is rejected with a real fail-closed 403 (never a mock).
 fn apply_authz() -> ExitCode {
     crate::trust_rbac_authz::run()
+}
+
+/// `pillar public-visibility`: drive the real production streamdb op path and
+/// the real RBAC decider, proving `public` is a first-class, DISTINCT
+/// visibility class (keyless-readable cleartext, signed + content-addressed)
+/// that leaves the cell-encrypted default intact (keyless-unreadable
+/// ciphertext), and that an unauthorized write is still RBAC-refused.
+fn public_visibility() -> ExitCode {
+    crate::public_visibility_class::run()
 }
 
 /// `pillar bootstrap …`.
