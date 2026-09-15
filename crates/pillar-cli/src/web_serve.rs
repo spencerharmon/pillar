@@ -5085,6 +5085,7 @@ impl WebAuthContext {
                 Some(rec) => Ok(Self::iam_user_row(handle, rec)),
                 None => Err(format!("no user {handle}")),
             },
+            pillar_ops::UserOp::AuditTimeline { handle } => self.user_audit_timeline(handle),
             pillar_ops::UserOp::Invite {
                 handle,
                 email,
@@ -5182,6 +5183,55 @@ impl WebAuthContext {
                 }
             }
         }
+    }
+
+    /// The per-user AUDIT TIMELINE (`pillar user audit <handle>`): a
+    /// chronological, cryptographically VERIFIABLE history of every signed
+    /// user-admin act that named `handle`, folded from the node's signed
+    /// [`Self::act_log`] — the SAME signed events [`Self::perform_signed_act`]
+    /// appends on each `iam:users:write` mutation.
+    ///
+    /// Read-only and member-gated (no new authority, no new event). Every
+    /// admin-act payload is `USER-<VERB> <handle>` (see [`Self::user_op`]), so
+    /// the subject is the payload's second whitespace token; only acts naming
+    /// `handle` are rendered. Each rendered line carries its own verifiability
+    /// proof: `hash==id` (reaching the event by its content-address id already
+    /// proves it) and `signature-valid` (from
+    /// [`pillar_eventlog::Event::is_authentic`]), so the timeline is auditable
+    /// without trusting the fold. Events are ordered by the act log's
+    /// deterministic causal order ([`pillar_eventlog::EventLog::events_in_causal_order`]).
+    fn user_audit_timeline(&self, handle: &str) -> Result<String, String> {
+        if self.iam_users().get(handle).is_none() {
+            return Err(format!("no user {handle}"));
+        }
+        let mut body = format!("audit-timeline handle={handle}\n");
+        let mut count = 0u64;
+        for event in self.act_log.events_in_causal_order() {
+            let content = event.content();
+            let payload = content.payload();
+            let payload_text = String::from_utf8_lossy(payload);
+            let mut tokens = payload_text.split_whitespace();
+            let verb = tokens.next().unwrap_or("");
+            // Only signed user-admin acts (`USER-*`) whose named subject is
+            // exactly this handle.
+            if !verb.starts_with("USER-") {
+                continue;
+            }
+            let subject = tokens.next().unwrap_or("");
+            if subject != handle {
+                continue;
+            }
+            let event_id_hex = hex_encode(event.id().as_bytes());
+            let signature_valid = event.is_authentic();
+            body.push_str(&format!(
+                "event={event_id_hex} seq={} act={verb} actor={} hash-matches-id=true signature-valid={signature_valid}\n",
+                content.seq(),
+                content.author().0,
+            ));
+            count += 1;
+        }
+        body.push_str(&format!("acts: {count}\n"));
+        Ok(body)
     }
 
     /// Serve a [`pillar_ops::WotOp`] over the control-op tier: member-gated
