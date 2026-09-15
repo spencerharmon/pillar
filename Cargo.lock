@@ -3441,6 +3441,7 @@ dependencies = [
  "pillar-core",
  "pillar-crypto",
  "pillar-identity",
+ "pillar-keyedstore",
  "pillar-rbac",
  "pillar-web",
  "pillar-wot-authority",

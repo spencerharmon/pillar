@@ -10,15 +10,21 @@ description = "Pillar IAM: the user record (handle, display name, email, status,
 [dependencies]
 pillar-core = { path = "../pillar-core" }
 pillar-crypto = { path = "../pillar-crypto" }
+# The shared Document surface (keyed-store / sql-views plane). The user record
+# is migrated onto this ONE fold primitive instead of a bespoke hand-rolled
+# fold, and is browsable as an ordinary Document collection.
+pillar-keyedstore = { path = "../pillar-keyedstore" }
 pillar-identity = { path = "../pillar-identity" }
 pillar-rbac = { path = "../pillar-rbac" }
 pillar-web = { path = "../pillar-web" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
 serde = { version = "1", features = ["derive"] }
+# The migrated Document consumer serializes a `UserRecord` as one opaque
+# Document scalar; the shared keyed-store surface stores it verbatim.
+serde_json = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
-serde_json = "1"
 ciborium = "0.2"
 
 [lints]
