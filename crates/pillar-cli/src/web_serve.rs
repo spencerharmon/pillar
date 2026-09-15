@@ -535,7 +535,53 @@ pub struct WebAuthContext {
     /// the SAME signed event DAG every `Kv`/`Doc`/`Sql`/`Object` write already
     /// appends to.
     log_index: BTreeMap<String, Vec<(EventId, pillar_keyedstore::Hlc)>>,
+    /// Consecutive failed `/login` attempts per identifier, and the
+    /// wall-clock lockout deadline once the threshold trips (ROI P1 "User
+    /// management & lifecycle" roadmap B3 — account lockout + rate-limit).
+    /// Cleared on a successful admit, and clearable early by an admin via
+    /// `POST /portal/users/unlock`; a tripped lockout self-expires once
+    /// `unix_now_secs()` passes `locked_until` — no separate sweep needed.
+    failed_logins: HashMap<String, FailedLoginState>,
+    /// Sliding-window request timestamps (unix secs), keyed by
+    /// `(route, source)`, backing the rate limit on `/login`, `/nonce`, and
+    /// `/portal/users/reset-password` (ROI P1 roadmap B3). `source` is the
+    /// caller's IP for `/login`/`/nonce` (pre-authentication) and the
+    /// caller's session token for `/portal/users/reset-password`.
+    rate_limit_hits: HashMap<(&'static str, String), Vec<u64>>,
 }
+
+/// Per-identifier failed-`/login`-attempt state (ROI P1 roadmap B3).
+#[derive(Clone, Debug, Default)]
+struct FailedLoginState {
+    /// Consecutive failures since the last successful admit or admin unlock.
+    count: u32,
+    /// Set once `count` reaches [`LOCKOUT_THRESHOLD`]; the unix-seconds
+    /// deadline at which the lockout auto-expires.
+    locked_until: Option<u64>,
+}
+
+/// Consecutive failed `/login` attempts (for one identifier) that trip an
+/// account lockout.
+const LOCKOUT_THRESHOLD: u32 = 5;
+/// How long a tripped lockout holds, in seconds, absent an admin unlock.
+/// Default 300s (5 min); overridable via `PILLAR_LOGIN_LOCKOUT_SECS` (e.g.
+/// for a test that must observe the auto-expiry within a bounded wait).
+const LOCKOUT_DURATION_SECS_DEFAULT: u64 = 300;
+
+/// Resolve the lockout duration, honoring `PILLAR_LOGIN_LOCKOUT_SECS` when
+/// it parses to a valid `u64`.
+fn lockout_duration_secs() -> u64 {
+    std::env::var("PILLAR_LOGIN_LOCKOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LOCKOUT_DURATION_SECS_DEFAULT)
+}
+
+/// The rate-limit sliding-window width, in seconds.
+const RATE_LIMIT_WINDOW_SECS: u64 = 10;
+/// The max requests a single source may make to a rate-limited route within
+/// [`RATE_LIMIT_WINDOW_SECS`] before further requests are refused `429`.
+const RATE_LIMIT_MAX_PER_WINDOW: usize = 20;
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
 /// mutation journal. The controller loop and the web server both hold a clone;
@@ -1129,6 +1175,8 @@ impl WebAuthContext {
             objects: crate::object_inspection::ObjectStore::new(),
             collection_placement: BTreeMap::new(),
             log_index: BTreeMap::new(),
+            failed_logins: HashMap::new(),
+            rate_limit_hits: HashMap::new(),
         }
     }
 
@@ -5928,6 +5976,63 @@ impl WebAuthContext {
         self.login_sessions.get(token)
     }
 
+    /// Is `identifier` currently locked out (ROI P1 roadmap B3)? A tripped
+    /// lockout self-expires the instant `now` passes its deadline — checked
+    /// here rather than by a background sweep, so the stale entry is dropped
+    /// lazily on the next attempt. Returns the remaining lockout deadline
+    /// (unix secs) when still locked.
+    fn login_lockout_until(&mut self, identifier: &str, now: u64) -> Option<u64> {
+        let expired = matches!(
+            self.failed_logins.get(identifier),
+            Some(FailedLoginState { locked_until: Some(until), .. }) if *until <= now
+        );
+        if expired {
+            self.failed_logins.remove(identifier);
+            return None;
+        }
+        self.failed_logins
+            .get(identifier)
+            .and_then(|s| s.locked_until)
+    }
+
+    /// Record one failed `/login` attempt for `identifier`. Trips the
+    /// lockout (setting `locked_until = now + LOCKOUT_DURATION_SECS`) once
+    /// [`LOCKOUT_THRESHOLD`] consecutive failures accumulate.
+    fn record_login_failure(&mut self, identifier: &str, now: u64) {
+        let state = self.failed_logins.entry(identifier.to_owned()).or_default();
+        state.count = state.count.saturating_add(1);
+        if state.count >= LOCKOUT_THRESHOLD {
+            state.locked_until = Some(now + lockout_duration_secs());
+        }
+    }
+
+    /// Clear `identifier`'s failed-attempt/lockout state — called on a
+    /// successful admit and by the admin `POST /portal/users/unlock` act.
+    fn clear_login_lockout(&mut self, identifier: &str) {
+        self.failed_logins.remove(identifier);
+    }
+
+    /// Sliding-window rate limit shared by `/login`, `/nonce`, and
+    /// `/portal/users/reset-password` (ROI P1 roadmap B3): `true` if this
+    /// request is WITHIN the limit (and is recorded), `false` if `source`
+    /// has already made [`RATE_LIMIT_MAX_PER_WINDOW`] requests to `route`
+    /// within the trailing [`RATE_LIMIT_WINDOW_SECS`] (refused, NOT
+    /// recorded, so a client that backs off recovers as soon as its oldest
+    /// hit ages out).
+    fn rate_limit_allow(&mut self, route: &'static str, source: &str, now: u64) -> bool {
+        let hits = self
+            .rate_limit_hits
+            .entry((route, source.to_owned()))
+            .or_default();
+        hits.retain(|&t| now.saturating_sub(t) < RATE_LIMIT_WINDOW_SECS);
+        if hits.len() >= RATE_LIMIT_MAX_PER_WINDOW {
+            false
+        } else {
+            hits.push(now);
+            true
+        }
+    }
+
     /// Drop token `token`'s admitted-session bearer state — the shared step
     /// [`revoke_session`](Self::revoke_session) and
     /// [`revoke_all_sessions`](Self::revoke_all_sessions) both take after
@@ -6677,9 +6782,13 @@ fn dispatch_cli_config_export(
 
 fn dispatch_nonce(
     ctx: &mut WebAuthContext,
-    _peer: &SocketAddr,
+    peer: &SocketAddr,
     _req: &HttpRequest,
 ) -> HttpResponse {
+    let now = unix_now_secs();
+    if !ctx.rate_limit_allow("/nonce", &peer.ip().to_string(), now) {
+        return text_response(429, "Too Many Requests", "DENIED rate-limited".to_owned());
+    }
     let nonce = ctx.verifier.issue_nonce(u64::MAX);
     text_response(
         200,
@@ -6750,7 +6859,7 @@ pub static ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "POST",
         path: PathMatch::Exact("/login"),
-        handler: |ctx, _peer, request| dispatch_login(ctx, request),
+        handler: |ctx, peer, request| dispatch_login(ctx, peer, request),
     },
     RouteSpec {
         method: "POST",
@@ -6876,6 +6985,11 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "POST",
         path: PathMatch::Exact("/portal/users/reset-password"),
         handler: dispatch_users_reset_password,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/users/unlock"),
+        handler: dispatch_users_unlock,
     },
     RouteSpec {
         method: "POST",
@@ -8456,6 +8570,10 @@ fn dispatch_users_reset_password(
     let token = lines.next().unwrap_or("").trim();
     let field2 = lines.next().unwrap_or("").trim();
     let admin_password = lines.next().unwrap_or("").trim().to_owned();
+    if !ctx.rate_limit_allow("/portal/users/reset-password", &peer.ip().to_string(), unix_now_secs())
+    {
+        return text_response(429, "Too Many Requests", "DENIED rate-limited".to_owned());
+    }
     let session = ctx.login_session_for(token).cloned();
     if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
         return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
@@ -8535,6 +8653,41 @@ fn dispatch_users_action_dry_run(ctx: &WebAuthContext, request: &HttpRequest) ->
         "OK",
         format!("PREDICTED {}", if predicted { "ALLOW" } else { "DENY" }),
     )
+}
+
+/// Admin unlock of a locked-out account: `POST /portal/users/unlock`, body
+/// `<token>\n<identifier>` (ROI P1 "User management & lifecycle" roadmap B3).
+/// Gated on the caller's `iam:users:write` capability — the SAME decider
+/// every other single-target admin user act (`disable`/`enable`/
+/// `require-password-change`) authorizes against. Unlike those, this is
+/// PURELY in-memory failed-attempt bookkeeping (no IAM ledger record, no
+/// signed op) — clearing it is not a durable identity mutation, just an
+/// early end to the lockout window `LOCKOUT_DURATION_SECS` would otherwise
+/// hold on its own. Idempotent: unlocking an identifier that is not
+/// currently locked out still returns `200 OK`.
+fn dispatch_users_unlock(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let identifier = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    let Some(session) = session else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if identifier.is_empty() {
+        return text_response(400, "Bad Request", "MISSING identifier".to_owned());
+    }
+    if !ctx.iam_predict_users_write(&session.subject) {
+        return text_response(403, "Forbidden", "DENIED iam:users:write".to_owned());
+    }
+    ctx.clear_login_lockout(identifier);
+    text_response(200, "OK", format!("UNLOCKED {identifier}"))
 }
 
 /// A single-target admin lifecycle act (`POST /portal/users/{disable,enable,
@@ -9860,7 +10013,7 @@ fn dispatch_webauthn_authenticate_finish(
 /// Drive one node-side custody login: parse the TWO fields (identifier +
 /// password), issue nothing here (the client already fetched a nonce), and let
 /// the node resolve+strip+unlock+sign+admit SERVER-SIDE.
-fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+fn dispatch_login(ctx: &mut WebAuthContext, peer: &SocketAddr, request: &HttpRequest) -> HttpResponse {
     // Body: the shared `pillar_web_api::LoginRequest` wire framing
     // "<identifier>\n<password>\n<nonce_id>". The client fetched the nonce
     // via GET /nonce and echoes its id so the server can bind the login to
@@ -9874,6 +10027,21 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
 
     if identifier.is_empty() || password.is_empty() {
         return text_response(401, "Unauthorized", "DENIED missing-field".to_owned());
+    }
+
+    let now = unix_now_secs();
+    // Rate limit BEFORE the lockout check (and before any crypto work) so a
+    // flood against one identifier from one source is throttled uniformly,
+    // independent of whether that identifier happens to be locked out.
+    if !ctx.rate_limit_allow("/login", &peer.ip().to_string(), now) {
+        return text_response(429, "Too Many Requests", "DENIED rate-limited".to_owned());
+    }
+    // ACCOUNT LOCKOUT (ROI P1 roadmap B3): a tripped lockout refuses the
+    // attempt WITHOUT touching `admit`/`prove_ownership` at all — a locked
+    // account never even burns a real crypto verification, and a wrong
+    // password against it never advances the counter further.
+    if ctx.login_lockout_until(&identifier, now).is_some() {
+        return text_response(423, "Locked", "DENIED account-locked".to_owned());
     }
 
     let authority = ctx.authority.clone();
@@ -9900,16 +10068,21 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
             ) {
                 Ok(session) => session,
                 Err(e) => {
+                    ctx.record_login_failure(&identifier, now);
                     let reason = login_reason(&e);
                     return text_response(401, "Unauthorized", format!("DENIED {reason}"));
                 }
             }
         }
         Err(e) => {
+            ctx.record_login_failure(&identifier, now);
             let reason = login_reason(&e);
             return text_response(401, "Unauthorized", format!("DENIED {reason}"));
         }
     };
+    // A successful admit clears any accumulated failure count — only
+    // CONSECUTIVE failures trip the lockout.
+    ctx.clear_login_lockout(&identifier);
 
     let handle = session.handle.clone();
     // Disabled accounts never obtain a session (`DisabledNeverActive`),
