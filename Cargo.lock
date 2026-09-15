@@ -3283,6 +3283,7 @@ dependencies = [
  "pillar-eventlog",
  "pillar-iam",
  "pillar-identity",
+ "pillar-ipfs",
  "pillar-key-distribution",
  "pillar-keyedstore",
  "pillar-manifest",

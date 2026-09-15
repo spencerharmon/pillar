@@ -586,6 +586,112 @@ pub enum QueryOp {
     Doc(DocOp),
     /// SQL views over the Document store (`pillar sql …`).
     Sql(SqlOp),
+    /// The IPFS object-inspection tier (`pillar object …`,
+    /// `pillar-object-inspection-tier`): the bottom layer of the inspection
+    /// stack, addressing any content-addressed block by CID.
+    Object(ObjectOp),
+}
+
+/// The visibility class of a `pillar object put` block: whether the body
+/// travels sealed to a fixed recipient set or in the clear.
+///
+/// Mirrors the `public`/`sealed` distinction `docs/data-inspection.md`'s
+/// "What you can see" section calls for: a `public` object carries NO access
+/// barrier (`object cat`/`get` always returns its plaintext); a `sealed`
+/// object's body is opened only by a holder of one of its recipients' X25519
+/// secret keys — everyone else still sees the envelope (author, size,
+/// recipient count, links) but never the plaintext.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectVisibility {
+    /// No access barrier: `cat`/`get` always return the plaintext body.
+    Public,
+    /// Sealed to a fixed recipient set (X25519, `RecipientSeal`): `cat`/`get`
+    /// return plaintext only when the caller supplies a recipient secret that
+    /// opens the envelope; otherwise only the envelope (author/size/
+    /// recipient-count/links) is returned.
+    Sealed,
+}
+
+/// The content-addressed **object** surface (`pillar object …`): the bottom
+/// tier of the inspection stack (`docs/data-inspection.md`) — any block,
+/// reached over the SAME sealed `QueryOp` remote surface as `kv`/`doc`/`sql`.
+/// `Put` authors a new signed, content-addressed block (a signed act, gated
+/// on `data:write`, exactly like a `Kv`/`Doc` write); `Stat`/`Links`/`Get`/
+/// `Cat`/`Verify` are member-gated VIEWS over an existing block by CID.
+///
+/// `Get`/`Cat` accept an optional `sealing_secret_hex` (the caller's X25519
+/// sealing secret, lowercase hex) so a `Sealed` object's body can be opened
+/// IN PLACE against the node's held ciphertext — never by weakening the
+/// seal itself: an absent or non-matching secret yields the envelope-only
+/// view (no plaintext), and a `Public` object's plaintext is always
+/// returned regardless. `Verify` never takes a secret: it confirms the
+/// block's hash equals its CID and its authorship signature is valid
+/// WITHOUT ever attempting to open the sealed body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum ObjectOp {
+    /// Author a new content-addressed block. `payload_hex` is the plaintext
+    /// body (lowercase hex); for `Sealed` visibility it is sealed to every
+    /// key in `recipients_hex` (lowercase-hex X25519 `SealingPublicKey`s)
+    /// before storage — the plaintext itself is never stored for a `Sealed`
+    /// object. `links_hex` names this block's child CIDs (one DAG hop),
+    /// stored in the clear as envelope metadata so `Links` never needs to
+    /// open the body.
+    Put {
+        /// `Public` (no barrier) or `Sealed` (recipient-gated) visibility.
+        visibility: ObjectVisibility,
+        /// The plaintext body, lowercase hex.
+        payload_hex: String,
+        /// Child CIDs (one DAG hop), lowercase hex multihash, in the clear.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links_hex: Vec<String>,
+        /// Recipient `SealingPublicKey`s (lowercase hex), required (non-empty)
+        /// for `Sealed` visibility; ignored for `Public`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        recipients_hex: Vec<String>,
+    },
+    /// Codec/size/pin-status + which nodes pin the block named by `cid_hex`.
+    Stat {
+        /// The block's CID, lowercase hex multihash.
+        cid_hex: String,
+    },
+    /// The child CIDs (one DAG hop) `cid_hex` names, from the block's
+    /// in-the-clear envelope metadata — never requires opening the body.
+    Links {
+        /// The block's CID, lowercase hex multihash.
+        cid_hex: String,
+    },
+    /// The raw body bytes (hex): plaintext for `Public`; for `Sealed`, the
+    /// plaintext only if `sealing_secret_hex` opens it, else the envelope.
+    Get {
+        /// The block's CID, lowercase hex multihash.
+        cid_hex: String,
+        /// The caller's X25519 sealing secret, lowercase hex, to attempt
+        /// opening a `Sealed` body. Ignored for `Public`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sealing_secret_hex: Option<String>,
+    },
+    /// The decoded payload, rendered for display: plaintext for `Public`; for
+    /// `Sealed`, the plaintext only if `sealing_secret_hex` opens it, else the
+    /// envelope (author/HLC-less size/recipient-count/links; a `Sealed`
+    /// object's plaintext is never guessed at or partially revealed).
+    Cat {
+        /// The block's CID, lowercase hex multihash.
+        cid_hex: String,
+        /// The caller's X25519 sealing secret, lowercase hex, to attempt
+        /// opening a `Sealed` body. Ignored for `Public`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sealing_secret_hex: Option<String>,
+    },
+    /// Recompute the block's hash and confirm it equals `cid_hex`, and check
+    /// its authorship signature — WITHOUT ever attempting to open/decrypt
+    /// the sealed body. Proves integrity + authorship to a reader who cannot
+    /// decrypt.
+    Verify {
+        /// The block's CID, lowercase hex multihash.
+        cid_hex: String,
+    },
 }
 
 /// K/V surface ops (`pillar kv put|get|delete|keys|collections`). `Put`/
@@ -757,6 +863,7 @@ impl QueryOp {
                 DocOp::GetField { .. } | DocOp::Fields { .. } | DocOp::Ids { .. }
             ),
             QueryOp::Sql(op) => matches!(op, SqlOp::View { .. } | SqlOp::Views),
+            QueryOp::Object(op) => !matches!(op, ObjectOp::Put { .. }),
         }
     }
 }
@@ -1226,6 +1333,42 @@ mod tests {
                 op
             );
             assert!(op.is_read(), "query view is a read: {op:?}");
+        }
+    }
+
+    #[test]
+    fn object_op_round_trips_and_classifies_read_vs_write() {
+        let put = QueryOp::Object(ObjectOp::Put {
+            visibility: ObjectVisibility::Sealed,
+            payload_hex: "68656c6c6f".into(),
+            links_hex: vec!["aa".into()],
+            recipients_hex: vec!["bb".into()],
+        });
+        let bytes = put.encode().expect("encode");
+        assert_eq!(&QueryOp::decode(&bytes).expect("decode"), &put);
+        assert!(!put.is_read(), "object put is a write");
+
+        for op in [
+            QueryOp::Object(ObjectOp::Stat {
+                cid_hex: "cc".into(),
+            }),
+            QueryOp::Object(ObjectOp::Links {
+                cid_hex: "cc".into(),
+            }),
+            QueryOp::Object(ObjectOp::Get {
+                cid_hex: "cc".into(),
+                sealing_secret_hex: Some("dd".into()),
+            }),
+            QueryOp::Object(ObjectOp::Cat {
+                cid_hex: "cc".into(),
+                sealing_secret_hex: None,
+            }),
+            QueryOp::Object(ObjectOp::Verify {
+                cid_hex: "cc".into(),
+            }),
+        ] {
+            assert_eq!(QueryOp::decode(&op.encode().expect("encode")).expect("decode"), op);
+            assert!(op.is_read(), "object view is a read: {op:?}");
         }
     }
 

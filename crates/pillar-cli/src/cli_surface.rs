@@ -221,6 +221,10 @@ pub static VERBS: &[VerbSpec] = &[
         handler: |_v, args| crate::apply_over_pillar_message::sql(args),
     },
     VerbSpec {
+        name: "object",
+        handler: |_v, args| crate::apply_over_pillar_message::object(args),
+    },
+    VerbSpec {
         name: "explain",
         handler: |_v, args| explain(args),
     },
