@@ -836,6 +836,14 @@ enum PortalOp {
         handle: String,
         at: u64,
     },
+    /// IAM: the user's email was marked verified
+    /// (`pillar_iam::UserOp::EmailVerified`, `um-email-selfservice-reset`) —
+    /// the ONLY lookup key the self-service "forgot password" flow matches
+    /// against.
+    UserEmailVerified {
+        handle: String,
+        at: u64,
+    },
 }
 
 /// The first user's operational subkey id — deterministic from the handle, so a
@@ -1613,6 +1621,12 @@ impl WebAuthContext {
                 pillar_iam::apply_op(
                     &mut self.users,
                     pillar_iam::UserOp::PasskeyEnrolled { handle, at },
+                );
+            }
+            PortalOp::UserEmailVerified { handle, at } => {
+                pillar_iam::apply_op(
+                    &mut self.users,
+                    pillar_iam::UserOp::EmailVerified { handle, at },
                 );
             }
         }
@@ -2932,6 +2946,29 @@ impl WebAuthContext {
                 at,
             });
         }
+    }
+
+    /// Mark `handle`'s email verified (`um-email-selfservice-reset`) — the
+    /// ONLY lookup key [`Self::iam_find_by_verified_email`] matches against.
+    /// `false` if `handle` has no record.
+    pub fn iam_verify_email(&mut self, handle: &str, at: u64) -> bool {
+        let Ok(op) = pillar_iam::mark_email_verified(&self.users, handle, at) else {
+            return false;
+        };
+        pillar_iam::apply_op(&mut self.users, op);
+        self.record(&PortalOp::UserEmailVerified {
+            handle: handle.to_owned(),
+            at,
+        });
+        true
+    }
+
+    /// Find the (at most one) record whose verified email matches — the
+    /// lookup the self-service "forgot password" flow uses. Never
+    /// distinguishes "no such account" from "found but unverified" to a
+    /// caller.
+    pub fn iam_find_by_verified_email(&self, email: &str) -> Option<&pillar_iam::UserRecord> {
+        pillar_iam::find_by_verified_email(&self.users, email)
     }
 
     /// The portal's single real signed-action gate: authorize `actor` for
@@ -6904,6 +6941,11 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/portal/users/forgot-password"),
+        handler: dispatch_users_forgot_password,
+    },
+    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/portal/users/disable"),
         handler: |ctx, peer, request| {
             dispatch_users_lifecycle(ctx, peer, request, UserLifecycleAction::Disable)
@@ -8349,6 +8391,7 @@ fn dispatch_users_invite(
     let pw_line = lines.next().unwrap_or("").trim();
     let force_line = lines.next().unwrap_or("").trim();
     let passkey_line = lines.next().unwrap_or("").trim();
+    let verified_email_line = lines.next().unwrap_or("").trim().to_owned();
     let session = ctx.login_session_for(token).cloned();
     if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
         return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
@@ -8384,7 +8427,19 @@ fn dispatch_users_invite(
         password: Some(password.clone()),
     };
     match dispatch_delegated_user_op(ctx, &caller, &admin_password, op) {
-        Ok(_detail) => text_response(200, "OK", password),
+        Ok(_detail) => {
+            // Optional 8th line ("verified_email"): an admin who already
+            // knows this address is reachable (e.g. it was confirmed
+            // out-of-band) may mark it verified at invite time — the ONLY
+            // way an email becomes eligible for the self-service
+            // "forgot password" lookup (`um-email-selfservice-reset`).
+            // Never the default: silence leaves the email unverified.
+            if verified_email_line == "true" {
+                let at = ctx.iam_now();
+                ctx.iam_verify_email(handle, at);
+            }
+            text_response(200, "OK", password)
+        }
         Err(resp) if resp.body.contains("already exists") => {
             text_response(409, "Conflict", "DENIED already-exists".to_owned())
         }
@@ -8534,6 +8589,74 @@ fn dispatch_users_reset_password(
             text_response(404, "Not Found", "DENIED no-profile".to_owned())
         }
     }
+}
+
+/// Self-service email-triggered password reset (`um-email-selfservice-reset`,
+/// ROI P1 "User management & lifecycle" roadmap B1): `POST
+/// /portal/users/forgot-password`, body `<email>`. UNAUTHENTICATED — a
+/// forgotten password means the caller by definition holds no session or
+/// current password, so this is the one account-mutating act reached with
+/// neither a token nor the delegated-signed `ControlOp::User(...)` tier
+/// (exactly like the self-change branch of
+/// [`dispatch_users_reset_password`], never a privileged act on ANOTHER
+/// caller's behalf). Trust is anchored on the operator-configured mailbox
+/// instead: only an email already marked [`pillar_iam::UserRecord::verified_email`]
+/// (see [`WebAuthContext::iam_verify_email`]) can ever be matched.
+///
+/// Reuses the SAME re-enrollment offer path an admin reset drives
+/// ([`WebAuthContext::iam_set_password`] with `force = true`): the match's
+/// operational key is revoked and a fresh login-only ENROLLMENT credential
+/// (no opKey) is minted under a freshly generated one-time password —
+/// re-onboarding through the already-proven containment offer machinery,
+/// never a new TLA+ gate. The one-time password is delivered ONLY by email
+/// (via the infra-supplied SMTP relay/capture backend,
+/// [`crate::mailer::SmtpConfig::from_env`]) — never echoed in the HTTP
+/// response, unlike the admin-reset REST path.
+///
+/// ALWAYS responds `200 OK` with an identical, generic body regardless of
+/// whether `email` matched a verified account — a match/no-match distinction
+/// would let a caller enumerate registered addresses. Mail delivery being
+/// unconfigured is likewise silent to the caller (best-effort; the
+/// underlying account mutation, when there was a match, already applied).
+fn dispatch_users_forgot_password(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    const GENERIC_BODY: &str = "IF-VERIFIED a reset email has been sent";
+    let email = request.body.lines().next().unwrap_or("").trim();
+    if email.is_empty() {
+        return text_response(200, "OK", GENERIC_BODY.to_owned());
+    }
+    let Some(handle) = ctx
+        .iam_find_by_verified_email(email)
+        .map(|r| r.handle.clone())
+    else {
+        // No verified match: respond identically, do nothing further.
+        return text_response(200, "OK", GENERIC_BODY.to_owned());
+    };
+    let Ok(temp) = generate_temp_password() else {
+        return text_response(200, "OK", GENERIC_BODY.to_owned());
+    };
+    let Ok(offer_material) = fresh_offer_material(&handle) else {
+        return text_response(200, "OK", GENERIC_BODY.to_owned());
+    };
+    let at = ctx.iam_now();
+    if ctx.iam_set_password(&handle, &temp, true, offer_material, at) {
+        if let Some(cfg) = crate::mailer::SmtpConfig::from_env() {
+            let subject = "Pillar password reset";
+            let body = format!(
+                "A password reset was requested for your Pillar account ({handle}).\n\n\
+                 Your one-time sign-in password is:\n\n    {temp}\n\n\
+                 Sign in with it, then set a new password. If you did not \
+                 request this, contact your administrator."
+            );
+            if let Err(e) = crate::mailer::send_mail(&cfg, email, subject, &body) {
+                eprintln!("forgot-password: mail delivery to {email} failed: {e}");
+            }
+        }
+    }
+    text_response(200, "OK", GENERIC_BODY.to_owned())
 }
 
 /// Which single-target admin lifecycle act a `/portal/users/{...}` route drives.
