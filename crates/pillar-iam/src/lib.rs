@@ -65,6 +65,11 @@ pub use admin_credentials::{
 pub mod admin_reset;
 pub use admin_reset::{admin_reset_password, AdminResetError};
 
+pub mod scoped_delegated_administration;
+pub use scoped_delegated_administration::{
+    delegate_scoped_admin, is_authorized_for_target, GranterScope, ScopeGrantError, ScopedGrant,
+};
+
 /// The capability string gating every admin write to the user/IAM surface
 /// (invite, list, show, role/group edits performed on someone OTHER than the
 /// acting user). A three-segment `namespace:resource:verb` capability, the
