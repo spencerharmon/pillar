@@ -12,8 +12,13 @@ exactly how a collection is stored and verify it byte for byte:
 
 > **Scope / status.** This is the design of record for the inspection surface. The
 > substrate it inspects — the content-addressed op log and the embedded IPFS node — is
-> real; the `pillar log` / `pillar object` verb tiers and the Collection Explorer layers
-> land with the inspection implementation task. Every read here rides the same
+> real; `pillar object` (the bottom, object-inspection tier) is implemented
+> (`pillar-object-inspection-tier`) — `stat`/`links`/`get`/`cat`/`verify` address any
+> content-addressed block by CID over the sealed `QueryOp` remote surface, with
+> `put` authoring a real `public` (no barrier) or `sealed` (X25519 recipient-gated)
+> block; `verify` confirms hash==CID and signature validity without ever opening a
+> sealed body. The `pillar log` verb tier and the Collection Explorer layers land
+> with a follow-on inspection-implementation task. Every read here rides the same
 > pillar-message query path and is subject to the same access control as any other read
 > (see [What you can see](#what-you-can-see)).
 

@@ -33,6 +33,7 @@ pillar-observability = { path = "../pillar-observability" }
 pillar-wire = { path = "../pillar-wire" }
 pillar-cells = { path = "../pillar-cells" }
 pillar-ops = { path = "../pillar-ops" }
+pillar-ipfs = { path = "../pillar-ipfs" }
 pillar-client = { path = "../pillar-client" }
 pillar-keyedstore = { path = "../pillar-keyedstore" }
 pillar-sqlviews = { path = "../pillar-sqlviews" }

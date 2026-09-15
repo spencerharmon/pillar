@@ -1258,6 +1258,136 @@ pub fn sql(args: &[String]) -> ExitCode {
     }
 }
 
+/// `pillar object {put <public|sealed> <payload> [--link <cid-hex>]... \
+/// [--recipient <sealing-pubkey-hex>]... | stat <cid> | links <cid> | \
+/// get <cid> [--secret <sealing-secret-hex>] | cat <cid> [--secret <hex>] | \
+/// verify <cid>}`: the content-addressed IPFS object-inspection tier — the
+/// bottom layer of `repo/docs/data-inspection.md`'s inspection stack, over
+/// the SAME sealed query tier as `kv`/`doc`/`sql`. `put` is a signed act;
+/// `stat`/`links`/`get`/`cat`/`verify` are member-gated views. `<payload>` is
+/// taken as UTF-8 text and hex-encoded for the wire; `get`/`cat` print the
+/// decoded body when it can be opened, else the envelope-only rendering.
+pub fn object(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar object {{put <public|sealed> <payload> [--link <cid-hex>]... \
+             [--recipient <sealing-pubkey-hex>]... | stat <cid> | links <cid> | \
+             get <cid> [--secret <sealing-secret-hex>] | cat <cid> [--secret <hex>] | \
+             verify <cid>}}"
+        );
+        ExitCode::from(2)
+    };
+    match args.first().map(String::as_str) {
+        Some("put") => {
+            let (Some(vis), Some(payload)) = (args.get(1), args.get(2)) else {
+                return usage();
+            };
+            let visibility = match vis.as_str() {
+                "public" => pillar_ops::ObjectVisibility::Public,
+                "sealed" => pillar_ops::ObjectVisibility::Sealed,
+                _ => return usage(),
+            };
+            let mut links_hex = Vec::new();
+            let mut recipients_hex = Vec::new();
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--link" => {
+                        let Some(l) = args.get(i + 1) else {
+                            return usage();
+                        };
+                        links_hex.push(l.clone());
+                        i += 2;
+                    }
+                    "--recipient" => {
+                        let Some(r) = args.get(i + 1) else {
+                            return usage();
+                        };
+                        recipients_hex.push(r.clone());
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            print_view(
+                query_op(&pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Put {
+                    visibility,
+                    payload_hex: hex_encode_value(payload.as_bytes()),
+                    links_hex,
+                    recipients_hex,
+                })),
+                "object put",
+            )
+        }
+        Some("stat") => match args.get(1) {
+            Some(cid) => print_view(
+                query_op(&pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Stat {
+                    cid_hex: cid.clone(),
+                })),
+                "object stat",
+            ),
+            None => usage(),
+        },
+        Some("links") => match args.get(1) {
+            Some(cid) => print_view(
+                query_op(&pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Links {
+                    cid_hex: cid.clone(),
+                })),
+                "object links",
+            ),
+            None => usage(),
+        },
+        Some("get") => match args.get(1) {
+            Some(cid) => {
+                let secret = object_secret_flag(args);
+                print_view(
+                    query_op(&pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Get {
+                        cid_hex: cid.clone(),
+                        sealing_secret_hex: secret,
+                    })),
+                    "object get",
+                )
+            }
+            None => usage(),
+        },
+        Some("cat") => match args.get(1) {
+            Some(cid) => {
+                let secret = object_secret_flag(args);
+                print_view(
+                    query_op(&pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Cat {
+                        cid_hex: cid.clone(),
+                        sealing_secret_hex: secret,
+                    })),
+                    "object cat",
+                )
+            }
+            None => usage(),
+        },
+        Some("verify") => match args.get(1) {
+            Some(cid) => print_view(
+                query_op(&pillar_ops::QueryOp::Object(pillar_ops::ObjectOp::Verify {
+                    cid_hex: cid.clone(),
+                })),
+                "object verify",
+            ),
+            None => usage(),
+        },
+        _ => usage(),
+    }
+}
+
+/// Parse a trailing `--secret <hex>` flag for `pillar object get|cat`.
+fn object_secret_flag(args: &[String]) -> Option<String> {
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--secret" {
+            return args.get(i + 1).cloned();
+        }
+        i += 1;
+    }
+    None
+}
+
 fn user_usage() -> ExitCode {
     eprintln!(
         "usage: pillar user {{ls | show <handle> | invite <handle> <email> \

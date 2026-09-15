@@ -487,6 +487,11 @@ pub struct WebAuthContext {
     /// write, so successive writes to the same field order deterministically
     /// (last-writer-wins) without a wall clock.
     keyed_clock: u64,
+    /// The IPFS object-inspection tier's store (`pillar-object-inspection-
+    /// tier`): the bottom layer of the data-inspection stack, addressing any
+    /// content-addressed block by CID over the sealed query tier. `pillar
+    /// object put/stat/links/get/cat/verify` all act on THIS store.
+    objects: crate::object_inspection::ObjectStore,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -1074,6 +1079,7 @@ impl WebAuthContext {
             cli_export: None,
             keyed_store: pillar_keyedstore::KeyedStore::new(),
             keyed_clock: 0,
+            objects: crate::object_inspection::ObjectStore::new(),
         }
     }
 
@@ -3765,6 +3771,7 @@ impl WebAuthContext {
             pillar_ops::QueryOp::Kv(kv) => self.kv_query_op(actor, kv),
             pillar_ops::QueryOp::Doc(doc) => self.doc_query_op(actor, doc),
             pillar_ops::QueryOp::Sql(sql) => self.sql_query_op(actor, sql),
+            pillar_ops::QueryOp::Object(obj) => self.object_query_op(actor, obj),
         }
     }
 
@@ -3914,6 +3921,48 @@ impl WebAuthContext {
         }
     }
 
+    /// Serve a [`pillar_ops::ObjectOp`] over the sealed query tier
+    /// (`pillar-object-inspection-tier`): the bottom tier of the inspection
+    /// stack, addressing any content-addressed block by CID. `Put` is a
+    /// signed act gated on `data:write` (the SAME decider `Kv`/`Doc`/`Sql`
+    /// writes use), attributed to the AUTHENTICATED `actor` subject; the
+    /// object's own authorship signature is produced by the store's
+    /// dedicated node-local signing key (see
+    /// `object_inspection::OBJECT_SIGNER_SEED`) — the requester's real
+    /// signing secret never leaves its own machine, exactly like the
+    /// resource-op tier's own dedicated ack signer.
+    /// `Stat`/`Links`/`Get`/`Cat`/`Verify` are member-gated views.
+    fn object_query_op(
+        &mut self,
+        actor: &NodeId,
+        op: &pillar_ops::ObjectOp,
+    ) -> Result<String, String> {
+        match op {
+            pillar_ops::ObjectOp::Put { .. } => {
+                let event_cid = self.authorize_data_write(actor, "OBJECT-PUT")?;
+                let cid_hex = self.objects.put(&actor.to_string(), op)?;
+                Ok(format!("OBJECT-PUT {cid_hex} EVENT-CID {event_cid}"))
+            }
+            pillar_ops::ObjectOp::Stat { cid_hex } => {
+                let this_node = if self.identity.peer_id.is_empty() {
+                    "local-node".to_owned()
+                } else {
+                    self.identity.peer_id.clone()
+                };
+                self.objects.stat(cid_hex, &this_node)
+            }
+            pillar_ops::ObjectOp::Links { cid_hex } => self.objects.links(cid_hex),
+            pillar_ops::ObjectOp::Get {
+                cid_hex,
+                sealing_secret_hex,
+            } => self.objects.get(cid_hex, sealing_secret_hex.as_deref()),
+            pillar_ops::ObjectOp::Cat {
+                cid_hex,
+                sealing_secret_hex,
+            } => self.objects.cat(cid_hex, sealing_secret_hex.as_deref()),
+            pillar_ops::ObjectOp::Verify { cid_hex } => self.objects.verify(cid_hex),
+        }
+    }
 
     /// Serve a [`pillar_ops::IdentityOp`] over the control-op tier. `Show`/
     /// `Domains` are member-gated views over the live identity log; `Enroll`/
