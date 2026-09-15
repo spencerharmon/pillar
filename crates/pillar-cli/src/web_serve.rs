@@ -2898,6 +2898,86 @@ impl WebAuthContext {
         true
     }
 
+    /// Self-service operational-key ROTATION (ROI P1 "User management &
+    /// lifecycle" roadmap A2): the caller rotates their OWN operational key on
+    /// demand under their EXISTING unlock factor (`password`) — no password
+    /// change, no admin authority, no new TLA+ gate. It first PROVES the caller
+    /// currently holds the live operational key by delegated-signing a
+    /// rotation-intent payload with that key ([`NodeCustodyVerifier::sign_op_for`]),
+    /// which unlocks the offer under `password` and so FAILS CLOSED on a wrong
+    /// password or a contained (revoked-offer) caller — the same cryptographic
+    /// re-proof the delegated admin tier uses, applied to the caller's own key.
+    /// On success it mints a FRESH operational key from OS entropy under the
+    /// SAME password ([`Self::iam_mint_offer`] via the shared mint/rotate/revoke
+    /// primitive), which REVOKES the prior offer first (the superseded key is
+    /// cryptographically dead — its old sealed material can never unlock again).
+    /// Returns the NEW operational public key (hex) so the caller can observe
+    /// that the key genuinely changed. The unlock password is unchanged, so the
+    /// user keeps logging in with it. `Err` carries an HTTP-ready failure.
+    pub fn iam_rotate_operational_key(
+        &mut self,
+        handle: &str,
+        password: &str,
+        at: u64,
+    ) -> Result<String, HttpResponse> {
+        if !self.users.contains_key(handle) {
+            return Err(text_response(404, "Not Found", "DENIED no-profile".to_owned()));
+        }
+        // PROVE the caller holds the CURRENT operational key under `password`:
+        // a delegated sign over a rotation-intent payload. A wrong password or a
+        // contained caller (no live offer) fails closed here — nothing is minted.
+        let intent = format!("selfservice-opkey-rotation:{handle}");
+        let mut step_up = pillar_key_distribution::StepUpToken::fresh();
+        if let Err(e) =
+            self.verifier
+                .sign_op_for(handle, password, intent.as_bytes(), &mut step_up)
+        {
+            return Err(text_response(
+                403,
+                "Forbidden",
+                format!("REFUSED opkey-rotation {e:?}"),
+            ));
+        }
+        // Mint a FRESH operational key under the SAME password (fresh entropy
+        // cid + secret); the shared mint revokes the prior offer first.
+        let offer_material = match fresh_offer_material(handle) {
+            Ok(m) => m,
+            Err(()) => {
+                return Err(text_response(
+                    500,
+                    "Internal Server Error",
+                    "RNG-FAILURE".to_owned(),
+                ))
+            }
+        };
+        // `force = false` mints an OPERATIONAL key and journals a
+        // `PasswordChanged`-shaped record (the offer supersession), reusing the
+        // exact replayable primitive a self password change already rides — here
+        // the password value is simply re-used rather than changed.
+        let (cid, secret) = offer_material;
+        let minted = self.iam_mint_offer(handle, password, cid, &secret, true);
+        let new_public = minted
+            .public
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        pillar_iam::apply_op(
+            &mut self.users,
+            pillar_iam::UserOp::PasswordChanged {
+                handle: handle.to_owned(),
+                at,
+            },
+        );
+        self.record(&PortalOp::UserPasswordSet {
+            handle: handle.to_owned(),
+            sealed_offer: Vec::new(),
+            force_password_change: false,
+            minted,
+            at,
+        });
+        Ok(new_public)
+    }
+
     /// Clear the required-passkey onboarding action once the user's first
     /// credential registers. No-op if `handle` has no record or no such action.
     pub fn iam_passkey_enrolled(&mut self, handle: &str, at: u64) {
@@ -6929,6 +7009,11 @@ pub static ROUTES: &[RouteSpec] = &[
         handler: dispatch_profile_update,
     },
     RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/profile/rotate-key"),
+        handler: dispatch_profile_rotate_key,
+    },
+    RouteSpec {
         method: "GET",
         path: PathMatch::Exact("/portal/sessions"),
         handler: |ctx, _peer, request| dispatch_sessions_view(ctx, request),
@@ -8427,6 +8512,46 @@ fn dispatch_profile_update(
         )
     } else {
         text_response(404, "Not Found", "DENIED no-profile".to_owned())
+    }
+}
+
+/// Self-service operational-key rotation: `POST /portal/profile/rotate-key`,
+/// body `<token>\n<password>`. The caller rotates their OWN operational key on
+/// demand under their EXISTING unlock factor — a fresh key is minted from OS
+/// entropy and the prior key is revoked (cryptographically dead), with NO
+/// password change and NO admin authority (never an act on another user). The
+/// caller must re-prove their current password: it is verified by delegated-
+/// signing a rotation-intent payload with the LIVE operational key
+/// ([`WebAuthContext::iam_rotate_operational_key`]), so a wrong password or a
+/// contained caller (revoked offer) is refused `403` and nothing is minted. On
+/// success the NEW operational public key is returned (`ROTATED opkey=<hex>`),
+/// letting the caller confirm the key genuinely changed; the caller keeps
+/// logging in with the SAME password.
+fn dispatch_profile_rotate_key(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let password = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if password.is_empty() {
+        return text_response(400, "Bad Request", "MISSING password".to_owned());
+    }
+    let at = ctx.iam_now();
+    match ctx.iam_rotate_operational_key(&caller, password, at) {
+        Ok(new_public) => text_response(200, "OK", format!("ROTATED opkey={new_public}")),
+        Err(resp) => resp,
     }
 }
 
