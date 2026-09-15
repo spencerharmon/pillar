@@ -535,6 +535,77 @@ pub struct WebAuthContext {
     /// the SAME signed event DAG every `Kv`/`Doc`/`Sql`/`Object` write already
     /// appends to.
     log_index: BTreeMap<String, Vec<(EventId, pillar_keyedstore::Hlc)>>,
+    /// Failed-attempt lockout counter over the fail-closed `/login` admit path
+    /// (ROI P1 roadmap B3). A per-identifier counter/threshold layered IN
+    /// FRONT of the unchanged admit decision: N consecutive DENIED admits lock
+    /// the account (refused before the admit path is consulted), a lock
+    /// auto-expires after a cooldown, an admin can unlock immediately, and a
+    /// successful admit clears the counter. No new authority path / TLA+ gate.
+    lockout: pillar_web::account_lockout::LockoutGate,
+    /// Token-bucket rate limiter over the sensitive unauthenticated endpoints
+    /// (`/login`, `/nonce`, reset-request) so an attacker cannot spin the
+    /// admit/nonce/reset machinery arbitrarily fast — nor use a flood of
+    /// distinct identifiers to sidestep the per-identifier lockout.
+    rate_limiter: pillar_web::account_lockout::RateLimiter,
+}
+
+/// Whole seconds since the Unix epoch — the real monotone-enough wall clock
+/// the lockout/rate-limit gates consume for cooldown/refill timing. The gates
+/// themselves are pure (they take `now` as an argument); this is the single
+/// place the live server reads the clock.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The failed-attempt lockout policy, overridable via environment for
+/// operators (and deterministic acceptance tests): `PILLAR_LOCKOUT_MAX_FAILURES`
+/// (consecutive DENIED admits that trip a lock) and `PILLAR_LOCKOUT_SECS` (the
+/// auto-expiry cooldown). Absent/invalid values fall back to the library
+/// default (5 failures / 15 minutes).
+fn lockout_policy_from_env() -> pillar_web::account_lockout::LockoutPolicy {
+    let mut policy = pillar_web::account_lockout::LockoutPolicy::default();
+    if let Some(n) = std::env::var("PILLAR_LOCKOUT_MAX_FAILURES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+    {
+        policy.max_failures = n;
+    }
+    if let Some(secs) = std::env::var("PILLAR_LOCKOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        policy.lockout_secs = secs;
+    }
+    policy
+}
+
+/// The sensitive-endpoint rate limiter, with the `PILLAR_RATELIMIT_DISABLE`
+/// escape hatch that removes every class policy (an unconfigured class is
+/// unlimited) so acceptance tests exercising the LOCKOUT gate are not first
+/// blocked by the rate limiter. Defaults are conservative burst/refill pairs.
+fn rate_limiter_from_env() -> pillar_web::account_lockout::RateLimiter {
+    use pillar_web::account_lockout::{RateLimitPolicy, RateLimiter, RequestClass};
+    if std::env::var("PILLAR_RATELIMIT_DISABLE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return RateLimiter::new();
+    }
+    RateLimiter::new()
+        // Login: allow a small burst, refill slowly — a human retrying a
+        // mistyped password is fine; a scripted flood is throttled well before
+        // (and in concert with) lockout.
+        .with_policy(RequestClass::Login, RateLimitPolicy::new(10, 1))
+        // Nonce issuance (keyed by client): a challenge is cheap but unbounded
+        // issuance is a DoS lever — cap the rate.
+        .with_policy(RequestClass::Nonce, RateLimitPolicy::new(30, 5))
+        // Reset-request: deliberately stingy — password-reset initiation is a
+        // spam/enumeration vector.
+        .with_policy(RequestClass::ResetRequest, RateLimitPolicy::new(5, 1))
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -1151,6 +1222,8 @@ impl WebAuthContext {
             objects: crate::object_inspection::ObjectStore::new(),
             collection_placement: BTreeMap::new(),
             log_index: BTreeMap::new(),
+            lockout: pillar_web::account_lockout::LockoutGate::new(lockout_policy_from_env()),
+            rate_limiter: rate_limiter_from_env(),
         }
     }
 
@@ -6737,11 +6810,21 @@ fn dispatch_cli_config_export(
     resp
 }
 
-fn dispatch_nonce(
-    ctx: &mut WebAuthContext,
-    _peer: &SocketAddr,
-    _req: &HttpRequest,
-) -> HttpResponse {
+fn dispatch_nonce(ctx: &mut WebAuthContext, peer: &SocketAddr, _req: &HttpRequest) -> HttpResponse {
+    use pillar_web::account_lockout::RequestClass;
+    // Rate-limit nonce issuance per client address: a challenge is cheap, but
+    // unbounded issuance is a DoS/enumeration lever.
+    let key = peer.ip().to_string();
+    if !ctx
+        .rate_limiter
+        .allow(&key, RequestClass::Nonce, now_secs())
+    {
+        return text_response(
+            429,
+            "Too Many Requests",
+            "DENIED rate-limited nonce".to_owned(),
+        );
+    }
     let nonce = ctx.verifier.issue_nonce(u64::MAX);
     text_response(
         200,
@@ -6812,7 +6895,7 @@ pub static ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "POST",
         path: PathMatch::Exact("/login"),
-        handler: |ctx, _peer, request| dispatch_login(ctx, request),
+        handler: |ctx, peer, request| dispatch_login(ctx, peer, request),
     },
     RouteSpec {
         method: "POST",
@@ -6943,6 +7026,11 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "POST",
         path: PathMatch::Exact("/portal/users/reset-password"),
         handler: dispatch_users_reset_password,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/users/unlock"),
+        handler: dispatch_users_unlock,
     },
     RouteSpec {
         method: "POST",
@@ -9029,6 +9117,60 @@ fn dispatch_users_reset_password(
     }
 }
 
+/// Admin unlock of a lockout: `POST /portal/users/unlock`, body
+/// `<admin_password>\n<token>\n<target_identifier>`. Clears the failed-attempt
+/// lockout counter/lock for `target_identifier` immediately (auto-expiry
+/// aside), so an operator can restore a legitimately locked-out user without
+/// waiting the cooldown.
+///
+/// Authority is anchored on the SAME delegated-signed `iam:users:write` path
+/// admin invite/reset use: the node signs an (idempotent `Enable`) control op
+/// on the admin's behalf via
+/// [`pillar_web::node_custody::NodeCustodyVerifier::sign_op_for`] — requiring
+/// the admin's OWN password + a fresh step-up and routing through the
+/// `iam:users:write`-gated `control_op` — so an unprivileged caller can never
+/// clear another user's lockout. The lockout counter is a runtime throttle
+/// (not a signed IAM record), so no NEW signed op kind or TLA+ gate is
+/// introduced; only the existing authority is reused to gate the clear.
+fn dispatch_users_unlock(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
+    let token = lines.next().unwrap_or("").trim();
+    let target = lines.next().unwrap_or("").trim().to_owned();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if target.is_empty() {
+        return text_response(400, "Bad Request", "MISSING target".to_owned());
+    }
+    // Prove `iam:users:write` authority through the delegated-signed tier
+    // (idempotent `Enable` — a no-op on an Active user, but it exercises the
+    // exact signature + RBAC gate). Only on success do we clear the lockout.
+    let op = pillar_ops::UserOp::Enable {
+        handle: target.clone(),
+    };
+    if let Err(resp) = dispatch_delegated_user_op(ctx, &caller, &admin_password, op) {
+        return resp;
+    }
+    let cleared = ctx.lockout.admin_unlock(&target);
+    text_response(
+        200,
+        "OK",
+        format!("UNLOCKED handle={target} cleared={cleared}"),
+    )
+}
+
 /// Self-service email-triggered password reset (`um-email-selfservice-reset`,
 /// ROI P1 "User management & lifecycle" roadmap B1): `POST
 /// /portal/users/forgot-password`, body `<email>`. UNAUTHENTICATED — a
@@ -10446,7 +10588,11 @@ fn dispatch_webauthn_authenticate_finish(
 /// Drive one node-side custody login: parse the TWO fields (identifier +
 /// password), issue nothing here (the client already fetched a nonce), and let
 /// the node resolve+strip+unlock+sign+admit SERVER-SIDE.
-fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+fn dispatch_login(
+    ctx: &mut WebAuthContext,
+    _peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
     // Body: the shared `pillar_web_api::LoginRequest` wire framing
     // "<identifier>\n<password>\n<nonce_id>". The client fetched the nonce
     // via GET /nonce and echoes its id so the server can bind the login to
@@ -10460,6 +10606,35 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
 
     if identifier.is_empty() || password.is_empty() {
         return text_response(401, "Unauthorized", "DENIED missing-field".to_owned());
+    }
+
+    use pillar_web::account_lockout::{LockoutRefusal, RequestClass};
+    let now = now_secs();
+
+    // Rate-limit login attempts per identifier (in concert with lockout). A
+    // scripted flood is throttled here before it can even burn the admit path
+    // or the lockout counter.
+    if !ctx
+        .rate_limiter
+        .allow(&identifier, RequestClass::Login, now)
+    {
+        return text_response(
+            429,
+            "Too Many Requests",
+            "DENIED rate-limited login".to_owned(),
+        );
+    }
+
+    // Failed-attempt lockout: refuse a locked account BEFORE the fail-closed
+    // admit path is ever consulted. A lock auto-expires after its cooldown
+    // (checked inside `check`), so a genuine user is never permanently shut
+    // out by an attacker's failed guesses.
+    if let Err(LockoutRefusal::Locked { retry_after_secs }) = ctx.lockout.check(&identifier, now) {
+        return text_response(
+            403,
+            "Forbidden",
+            format!("DENIED account-locked retry_after_secs={retry_after_secs}"),
+        );
     }
 
     let authority = ctx.authority.clone();
@@ -10486,16 +10661,26 @@ fn dispatch_login(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpRespon
             ) {
                 Ok(session) => session,
                 Err(e) => {
+                    // Count this as a failed attempt for lockout purposes.
+                    ctx.lockout.record_failure(&identifier, now);
                     let reason = login_reason(&e);
                     return text_response(401, "Unauthorized", format!("DENIED {reason}"));
                 }
             }
         }
         Err(e) => {
+            // A DENIED admit increments the per-identifier failure counter and
+            // may trip the lockout — the "counter/threshold over the existing
+            // fail-closed admit path".
+            ctx.lockout.record_failure(&identifier, now);
             let reason = login_reason(&e);
             return text_response(401, "Unauthorized", format!("DENIED {reason}"));
         }
     };
+
+    // A successful admit clears any accumulated failure count / lock for this
+    // identifier — proof the real user is back.
+    ctx.lockout.record_success(&identifier);
 
     let handle = session.handle.clone();
     // Disabled accounts never obtain a session (`DisabledNeverActive`),
