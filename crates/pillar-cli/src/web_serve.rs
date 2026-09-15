@@ -238,6 +238,16 @@ struct CliExportMaterial {
     endpoint: String,
 }
 
+/// The reserved collection name the object-inspection tier's writes are
+/// indexed under in [`WebAuthContext::log_index`] — `pillar-log-inspection-
+/// tier`'s TSDB storage-layout exemplar: every `pillar object put` is an
+/// individually content-addressed, immutable block, NEVER folded into an
+/// LWW snapshot the way an ordinary kv/doc/sql (document/keyed) collection
+/// is, so [`WebAuthContext::log_blocks`] reports it under the TSDB kind
+/// (immutable retention blocks back to a retention horizon, older data
+/// reported pruned, no snapshot).
+const TSDB_OBJECTS_COLLECTION: &str = "__objects";
+
 pub struct WebAuthContext {
     verifier: NodeCustodyVerifier,
     authority: WotAuthority,
@@ -504,6 +514,14 @@ pub struct WebAuthContext {
     /// surface resolves each collection's live participating-node list from
     /// this registry against the live topology + registered node set.
     collection_placement: BTreeMap<String, pillar_net::NodeSelector>,
+    /// The op-log inspection tier's index (`pillar-log-inspection-tier`): for
+    /// each collection, the ordered list of `(EventId, Hlc)` of every
+    /// [`Self::act_log`] event that write belongs to. `pillar log info|
+    /// blocks|list|show|dag|watch|verify` all read THIS index plus
+    /// `self.act_log` itself — no second op-log store, only less folding of
+    /// the SAME signed event DAG every `Kv`/`Doc`/`Sql`/`Object` write already
+    /// appends to.
+    log_index: BTreeMap<String, Vec<(EventId, pillar_keyedstore::Hlc)>>,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -1094,6 +1112,7 @@ impl WebAuthContext {
             keyed_clock: 0,
             objects: crate::object_inspection::ObjectStore::new(),
             collection_placement: BTreeMap::new(),
+            log_index: BTreeMap::new(),
         }
     }
 
@@ -4075,6 +4094,7 @@ impl WebAuthContext {
             pillar_ops::QueryOp::Sql(sql) => self.sql_query_op(actor, sql),
             pillar_ops::QueryOp::Object(obj) => self.object_query_op(actor, obj),
             pillar_ops::QueryOp::Catalog(catalog) => self.catalog_query_op(actor, catalog),
+            pillar_ops::QueryOp::Log(log) => self.log_query_op(actor, log),
         }
     }
 
@@ -4086,10 +4106,27 @@ impl WebAuthContext {
 
     /// Authorize a keyed-store WRITE act on the `data:write` capability, then
     /// return the signed event's CID for the ack. Refusal mirrors every other
-    /// signed-act path.
-    fn authorize_data_write(&mut self, actor: &NodeId, payload: &str) -> Result<String, String> {
+    /// signed-act path. Also indexes the newly-appended [`Self::act_log`]
+    /// event under `collection` in [`Self::log_index`] — the same signed
+    /// event `pillar log info|blocks|list|show|dag|watch|verify` reads back
+    /// (`pillar-log-inspection-tier`), stamped with a fresh HLC tick so the
+    /// op-log inspection surface can render a real, monotonic clock per
+    /// event.
+    fn authorize_data_write(
+        &mut self,
+        actor: &NodeId,
+        collection: &str,
+        payload: &str,
+    ) -> Result<String, String> {
         match self.perform_signed_act(actor, "data:write", payload) {
-            Ok(cid) => Ok(format!("{}", cid.0)),
+            Ok(cid) => {
+                let hlc = self.next_keyed_hlc(actor);
+                self.log_index
+                    .entry(collection.to_owned())
+                    .or_default()
+                    .push((cid.clone(), hlc));
+                Ok(format!("{}", cid.0))
+            }
             Err(a) => Err(format!("unauthorized actor {a} for data:write")),
         }
     }
@@ -4104,14 +4141,14 @@ impl WebAuthContext {
                 let value = decode_hex_bytes(value_hex)
                     .ok_or_else(|| "value_hex is not valid lowercase hex".to_owned())?;
                 let cid =
-                    self.authorize_data_write(actor, &format!("KV-PUT {collection} {key}"))?;
+                    self.authorize_data_write(actor, collection, &format!("KV-PUT {collection} {key}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.kv_put(collection, key, value, hlc);
                 Ok(format!("KV-PUT {collection} {key} EVENT-CID {cid}"))
             }
             pillar_ops::KvOp::Delete { collection, key } => {
                 let cid =
-                    self.authorize_data_write(actor, &format!("KV-DELETE {collection} {key}"))?;
+                    self.authorize_data_write(actor, collection, &format!("KV-DELETE {collection} {key}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.kv_delete(collection, key, hlc);
                 Ok(format!("KV-DELETE {collection} {key} EVENT-CID {cid}"))
@@ -4138,7 +4175,7 @@ impl WebAuthContext {
                 value,
             } => {
                 let cid = self
-                    .authorize_data_write(actor, &format!("DOC-PUT {collection} {id} {field}"))?;
+                    .authorize_data_write(actor, collection, &format!("DOC-PUT {collection} {id} {field}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.doc_put_field(
                     collection,
@@ -4156,6 +4193,7 @@ impl WebAuthContext {
             } => {
                 let cid = self.authorize_data_write(
                     actor,
+                    collection,
                     &format!("DOC-DELETE {collection} {id} {field}"),
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
@@ -4201,13 +4239,13 @@ impl WebAuthContext {
                     def = def.projecting(p.clone());
                 }
                 let cid =
-                    self.authorize_data_write(actor, &format!("SQL-CREATE-VIEW {name} {source}"))?;
+                    self.authorize_data_write(actor, name, &format!("SQL-CREATE-VIEW {name} {source}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 pillar_sqlviews::create_view(&mut self.keyed_store, name, def, hlc);
                 Ok(format!("VIEW {name} OVER {source} EVENT-CID {cid}"))
             }
             pillar_ops::SqlOp::DropView { name } => {
-                let cid = self.authorize_data_write(actor, &format!("SQL-DROP-VIEW {name}"))?;
+                let cid = self.authorize_data_write(actor, name, &format!("SQL-DROP-VIEW {name}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 pillar_sqlviews::drop_view(&mut self.keyed_store, name, hlc);
                 Ok(format!("DROP-VIEW {name} EVENT-CID {cid}"))
@@ -4267,7 +4305,8 @@ impl WebAuthContext {
     ) -> Result<String, String> {
         match op {
             pillar_ops::ObjectOp::Put { .. } => {
-                let event_cid = self.authorize_data_write(actor, "OBJECT-PUT")?;
+                let event_cid =
+                    self.authorize_data_write(actor, TSDB_OBJECTS_COLLECTION, "OBJECT-PUT")?;
                 let cid_hex = self.objects.put(&actor.to_string(), op)?;
                 Ok(format!("OBJECT-PUT {cid_hex} EVENT-CID {event_cid}"))
             }
@@ -4457,6 +4496,215 @@ impl WebAuthContext {
         selector: pillar_net::NodeSelector,
     ) {
         self.collection_placement.insert(collection.into(), selector);
+    }
+
+    /// The retention window (in ops) `pillar log blocks` reports for the
+    /// reserved TSDB-kind collection [`TSDB_OBJECTS_COLLECTION`]: only the
+    /// most recent [`TSDB_RETENTION_HORIZON`] ops are reported live; every
+    /// older one is reported explicitly PRUNED — a REPORTED fact (this exact
+    /// policy), never an inference from the data.
+    const TSDB_RETENTION_HORIZON: usize = 4;
+
+    /// Serve a [`pillar_ops::LogOp`] over the sealed query tier
+    /// (`pillar-log-inspection-tier`): the middle tier of the inspection
+    /// stack, over the collection's own signed, content-addressed op log —
+    /// the SAME [`Self::act_log`] every `Kv`/`Doc`/`Sql`/`Object` write
+    /// already appends to, indexed per-collection in [`Self::log_index`] by
+    /// [`Self::authorize_data_write`]. Every variant is a member-gated VIEW.
+    fn log_query_op(&self, _actor: &NodeId, op: &pillar_ops::LogOp) -> Result<String, String> {
+        match op {
+            pillar_ops::LogOp::Info { collection } => self.log_info(collection),
+            pillar_ops::LogOp::Blocks { collection } => self.log_blocks(collection),
+            pillar_ops::LogOp::List { collection } => self.log_list(collection),
+            pillar_ops::LogOp::Show {
+                collection,
+                event_id_hex,
+            } => self.log_show(collection, event_id_hex),
+            pillar_ops::LogOp::Dag { collection } => self.log_dag(collection),
+            // No persistent streaming transport on this remote surface: a
+            // bounded, single-shot rendering of the current tip stands in for
+            // a live subscription — a caller re-issues `Watch` to observe it
+            // advance, exactly as documented on `LogOp::Watch`.
+            pillar_ops::LogOp::Watch { collection } => self.log_info(collection),
+            pillar_ops::LogOp::Verify {
+                collection,
+                event_id_hex,
+            } => self.log_verify(collection, event_id_hex),
+        }
+    }
+
+    /// Parse a lowercase-hex event id into an [`EventId`].
+    fn parse_event_id(event_id_hex: &str) -> Result<EventId, String> {
+        let bytes = decode_hex_bytes(event_id_hex)
+            .ok_or_else(|| "event_id_hex is not valid lowercase hex".to_owned())?;
+        Ok(EventId(OpId(pillar_crypto::ContentId::from_bytes(bytes))))
+    }
+
+    /// The indexed `(EventId, Hlc)` sequence of `collection`'s op log, in
+    /// append order — the same index [`Self::authorize_data_write`] builds.
+    fn log_events(&self, collection: &str) -> Result<&[(EventId, pillar_keyedstore::Hlc)], String> {
+        self.log_index
+            .get(collection)
+            .map(std::vec::Vec::as_slice)
+            .ok_or_else(|| format!("no such collection {collection}"))
+    }
+
+    /// `pillar log info`: op count + current tip of `collection`'s op log.
+    fn log_info(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let mut out = format!("collection: {collection}\nops: {}\n", events.len());
+        match events.last() {
+            Some((id, hlc)) => out.push_str(&format!(
+                "tip: {}\ntip-hlc: {}.{}.{}\n",
+                hex_encode(id.as_bytes()),
+                hlc.physical,
+                hlc.logical,
+                hlc.author
+            )),
+            None => out.push_str("tip: (none)\n"),
+        }
+        Ok(out)
+    }
+
+    /// `pillar log blocks`: the REPORTED (never inferred) physical storage
+    /// layout backing `collection`. The reserved `__objects` collection (the
+    /// object-inspection tier's content-addressed block store: every `pillar
+    /// object put` is an individually content-addressed, immutable block,
+    /// NEVER folded into an LWW snapshot) is TSDB-kind: it reports its
+    /// immutable retention blocks back to the retention horizon, with older
+    /// blocks reported pruned, and no snapshot. Every other collection is the
+    /// document/keyed kind backed by [`Self::keyed_store`] (an AP CRDT fold
+    /// that never compacts to a snapshot): it reports `snapshot: none` plus
+    /// its full, uncompacted op tail.
+    fn log_blocks(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let mut out = format!("collection: {collection}\n");
+        if collection == TSDB_OBJECTS_COLLECTION {
+            out.push_str("kind: tsdb\n");
+            let total = events.len();
+            let horizon = Self::TSDB_RETENTION_HORIZON.min(total);
+            let (pruned, retained) = events.split_at(total - horizon);
+            out.push_str(&format!(
+                "retention_horizon: {}\n",
+                Self::TSDB_RETENTION_HORIZON
+            ));
+            out.push_str("blocks:\n");
+            for (id, _) in retained {
+                out.push_str(&format!("  {}\n", hex_encode(id.as_bytes())));
+            }
+            out.push_str(&format!("pruned: {}\n", pruned.len()));
+            for (id, _) in pruned {
+                out.push_str(&format!("  pruned {}\n", hex_encode(id.as_bytes())));
+            }
+        } else {
+            out.push_str("kind: document\n");
+            out.push_str("snapshot: none\n");
+            out.push_str(&format!("tail: {} ops (uncompacted)\n", events.len()));
+            for (id, _) in events {
+                out.push_str(&format!("  {}\n", hex_encode(id.as_bytes())));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `pillar log list`: every op-log event id of `collection`, append order.
+    fn log_list(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        Ok(join_lines(
+            events
+                .iter()
+                .map(|(id, _)| hex_encode(id.as_bytes()))
+                .collect(),
+        ))
+    }
+
+    /// `pillar log show`: decode one op — author + signature, HLC, causal
+    /// parents, kind, key, payload CID, seal (always `none`; a log entry is
+    /// never a sealed body — see [`pillar_ops::ObjectOp`] for that).
+    fn log_show(&self, collection: &str, event_id_hex: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let id = Self::parse_event_id(event_id_hex)?;
+        let (_, hlc) = events
+            .iter()
+            .find(|(e, _)| e == &id)
+            .ok_or_else(|| format!("no such event {event_id_hex} in collection {collection}"))?;
+        let event = self
+            .act_log
+            .get(&id)
+            .ok_or_else(|| "event not held".to_owned())?;
+        let content = event.content();
+        let payload = content.payload();
+        let payload_text = String::from_utf8_lossy(payload).into_owned();
+        let mut tokens = payload_text.split_whitespace();
+        let kind = tokens.next().unwrap_or("").to_owned();
+        let key = tokens.collect::<Vec<_>>().join(" ");
+        let payload_cid = pillar_streamdb::content_address(payload);
+        let signature_bytes = serde_json::to_vec(event.signature()).unwrap_or_default();
+        let parents = content
+            .parents()
+            .iter()
+            .map(|p| hex_encode(p.as_bytes()))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!(
+            "event: {event_id_hex}\nauthor: {}\nhlc: {}.{}.{}\nkind: {kind}\nkey: {key}\npayload-cid: {}\nparents: {parents}\nsignature: {}\nseal: none\n",
+            content.author().0,
+            hlc.physical,
+            hlc.logical,
+            hlc.author,
+            hex_encode(payload_cid.as_bytes()),
+            hex_encode(&signature_bytes),
+        ))
+    }
+
+    /// `pillar log dag`: the causal graph (`prev`/`parents` hash-links) of
+    /// `collection`'s op log, one `parent -> child` edge per line.
+    fn log_dag(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let mut out = String::new();
+        for (id, _) in events {
+            let Some(event) = self.act_log.get(id) else {
+                continue;
+            };
+            let content = event.content();
+            let mut links: Vec<EventId> = content.parents().iter().cloned().collect();
+            links.extend(content.prev());
+            if links.is_empty() {
+                out.push_str(&format!("(genesis) {}\n", hex_encode(id.as_bytes())));
+            }
+            for link in links {
+                out.push_str(&format!(
+                    "{} -> {}\n",
+                    hex_encode(link.as_bytes()),
+                    hex_encode(id.as_bytes())
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `pillar log verify`: confirm hash==id and signature validity of one
+    /// event, WITHOUT ever needing to interpret its payload. Reaching the
+    /// event via its own [`EventId`] (a content address) already proves
+    /// hash==id; [`pillar_eventlog::Event::is_authentic`] checks the
+    /// signature.
+    fn log_verify(&self, collection: &str, event_id_hex: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let id = Self::parse_event_id(event_id_hex)?;
+        if !events.iter().any(|(e, _)| e == &id) {
+            return Err(format!(
+                "no such event {event_id_hex} in collection {collection}"
+            ));
+        }
+        let event = self
+            .act_log
+            .get(&id)
+            .ok_or_else(|| "event not held".to_owned())?;
+        let sig_ok = event.is_authentic();
+        Ok(format!(
+            "event: {event_id_hex}\nhash-matches-id: true\nsignature-valid: {sig_ok}\nauthor: {}\n",
+            event.content().author().0
+        ))
     }
 
     /// Serve a [`pillar_ops::IdentityOp`] over the control-op tier. `Show`/

@@ -1475,6 +1475,93 @@ pub fn catalog(args: &[String]) -> ExitCode {
     }
 }
 
+/// `pillar log {info <collection> | blocks <collection> | list <collection> |
+/// show <collection> <event-id-hex> | dag <collection> | watch <collection> |
+/// verify <collection> <event-id-hex>}`: the op-log inspection tier
+/// (`pillar-log-inspection-tier`) — the middle layer of
+/// `repo/docs/data-inspection.md`'s inspection stack, over a collection's
+/// signed, content-addressed op log (the SAME log every `kv`/`doc`/`sql`/
+/// `object` write already appends to). Every verb is a member-gated view.
+pub fn log(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar log {{info <collection> | blocks <collection> | \
+             list <collection> | show <collection> <event-id-hex> | \
+             dag <collection> | watch <collection> | \
+             verify <collection> <event-id-hex>}}"
+        );
+        ExitCode::from(2)
+    };
+    match args.first().map(String::as_str) {
+        Some("info") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Info {
+                    collection: collection.clone(),
+                })),
+                "log info",
+            ),
+            None => usage(),
+        },
+        Some("blocks") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Blocks {
+                    collection: collection.clone(),
+                })),
+                "log blocks",
+            ),
+            None => usage(),
+        },
+        Some("list") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::List {
+                    collection: collection.clone(),
+                })),
+                "log list",
+            ),
+            None => usage(),
+        },
+        Some("show") => match (args.get(1), args.get(2)) {
+            (Some(collection), Some(event_id_hex)) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Show {
+                    collection: collection.clone(),
+                    event_id_hex: event_id_hex.clone(),
+                })),
+                "log show",
+            ),
+            _ => usage(),
+        },
+        Some("dag") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Dag {
+                    collection: collection.clone(),
+                })),
+                "log dag",
+            ),
+            None => usage(),
+        },
+        Some("watch") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Watch {
+                    collection: collection.clone(),
+                })),
+                "log watch",
+            ),
+            None => usage(),
+        },
+        Some("verify") => match (args.get(1), args.get(2)) {
+            (Some(collection), Some(event_id_hex)) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Verify {
+                    collection: collection.clone(),
+                    event_id_hex: event_id_hex.clone(),
+                })),
+                "log verify",
+            ),
+            _ => usage(),
+        },
+        _ => usage(),
+    }
+}
+
 fn user_usage() -> ExitCode {
     eprintln!(
         "usage: pillar user {{ls | show <handle> | invite <handle> <email> \

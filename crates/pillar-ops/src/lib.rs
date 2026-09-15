@@ -697,6 +697,76 @@ pub enum QueryOp {
     /// member-gated VIEW folded from the live `__catalog` collection + the
     /// keyed store's live collections + the collection-placement registry.
     Catalog(CatalogOp),
+    /// The op-log inspection tier (`pillar log ...`, `pillar-log-inspection-
+    /// tier`): the middle layer of the inspection stack in
+    /// `docs/data-inspection.md` -- a collection's signed, content-addressed
+    /// op log (the SAME `EventLog` every `Kv`/`Doc`/`Sql`/`Object` write
+    /// already appends to), one hop above the raw content-addressed blocks
+    /// [`ObjectOp`] exposes and one hop below the folded document/kv/sql
+    /// view.
+    Log(LogOp),
+}
+
+/// The op-log inspection ops (`pillar log info|blocks|list|show|dag|watch|
+/// verify`). Every variant is a member-gated VIEW -- the op log itself is
+/// written only as a side effect of a `Kv`/`Doc`/`Sql`/`Object` write, never
+/// directly through this surface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum LogOp {
+    /// Summary: op count + current tip(s) of `collection`'s op log.
+    Info {
+        /// The collection whose op log is inspected.
+        collection: String,
+    },
+    /// The REPORTED (never inferred) physical storage layout backing
+    /// `collection`: a document/keyed collection reports its snapshot CID (or
+    /// `none` when never compacted) plus its live op tail; a TSDB collection
+    /// reports its immutable retention blocks back to the retention horizon,
+    /// with older data pruned and no snapshot.
+    Blocks {
+        /// The collection to report the storage layout of.
+        collection: String,
+    },
+    /// Every op-log event id (lowercase hex content address) of `collection`,
+    /// in append order.
+    List {
+        /// The collection whose op log is listed.
+        collection: String,
+    },
+    /// Decode one op: author + signature, HLC, causal parents, kind, key,
+    /// payload CID, and seal (always `none` -- op-log entries are never
+    /// sealed bodies; see [`ObjectOp`] for a sealed block).
+    Show {
+        /// The collection the event belongs to.
+        collection: String,
+        /// The event's content-addressed id, lowercase hex.
+        event_id_hex: String,
+    },
+    /// Render the causal graph (`prev`/`parents` hash-links) of
+    /// `collection`'s op log, so concurrent CRDT-merged branches are visible
+    /// at the log level.
+    Dag {
+        /// The collection whose causal graph is rendered.
+        collection: String,
+    },
+    /// The current tip(s) of `collection`'s op log -- a bounded, single-shot
+    /// stand-in for a live subscription (there is no persistent streaming
+    /// transport on this remote surface): a caller re-issues `Watch` to
+    /// observe the tip advance.
+    Watch {
+        /// The collection to watch.
+        collection: String,
+    },
+    /// Confirm hash==id and signature validity of one event WITHOUT ever
+    /// needing to interpret its (possibly opaque) payload -- the log-level
+    /// analogue of [`ObjectOp::Verify`].
+    Verify {
+        /// The collection the event belongs to.
+        collection: String,
+        /// The event's content-addressed id, lowercase hex.
+        event_id_hex: String,
+    },
 }
 
 /// The visibility class of a `pillar object put` block: whether the body
@@ -1026,6 +1096,10 @@ impl QueryOp {
             QueryOp::Object(op) => !matches!(op, ObjectOp::Put { .. }),
             // Every catalog op is a read-only introspection VIEW.
             QueryOp::Catalog(_) => true,
+            // Every log op is a read-only introspection VIEW — the op log
+            // itself is written only as a side effect of a Kv/Doc/Sql/Object
+            // write, never directly through this surface.
+            QueryOp::Log(_) => true,
         }
     }
 }
@@ -1595,6 +1669,41 @@ mod tests {
                 op
             );
             assert!(op.is_read(), "object view is a read: {op:?}");
+        }
+    }
+
+    #[test]
+    fn log_op_round_trips_and_is_always_a_read() {
+        for op in [
+            QueryOp::Log(LogOp::Info {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Blocks {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::List {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Show {
+                collection: "users".into(),
+                event_id_hex: "aa".into(),
+            }),
+            QueryOp::Log(LogOp::Dag {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Watch {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Verify {
+                collection: "users".into(),
+                event_id_hex: "aa".into(),
+            }),
+        ] {
+            assert_eq!(
+                QueryOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "log op is always a read: {op:?}");
         }
     }
 
