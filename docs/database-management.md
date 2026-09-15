@@ -371,6 +371,13 @@ but writes to it are still authorized by role, and its records remain signed and
 
 ---
 
+## Going deeper: the op log and raw objects
+
+Everything above is a **folded view**. To see how a collection is actually stored — its op
+log, whether it uses the document *snapshot + tail* or time-series *retention-block* layout,
+and each content-addressed IPFS object by CID — use the `pillar log` and `pillar object`
+tiers documented in [`data-inspection.md`](data-inspection.md).
+
 ## Command reference
 
 | Command | Purpose |
@@ -382,6 +389,9 @@ but writes to it are still authorized by role, and its records remain signed and
 | `pillar obs query '<PSL>'` | time-series queries |
 | `pillar apply -f <file>` / `pillar get` / `pillar describe` / `pillar delete` | resources (collections, views, bindings, defaults) |
 | `pillar rbac grant \| revoke` | access control |
+| `pillar log … ` / `pillar object …` | inspect the op log, storage layout, and raw CID objects beneath the views (see [`data-inspection.md`](data-inspection.md)) |
 
-See also [`cli-surface.md`](cli-surface.md) for the overall CLI conventions and
+See also [`cli-surface.md`](cli-surface.md) for the overall CLI conventions,
+[`data-inspection.md`](data-inspection.md) for inspecting the op log / storage layout /
+IPFS objects beneath these views, and
 [`papers/pillar-data-layer.md`](papers/pillar-data-layer.md) for the architecture.
