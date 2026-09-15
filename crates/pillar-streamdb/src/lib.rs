@@ -240,6 +240,30 @@ impl Op {
     }
 }
 
+/// A caller-supplied superseding policy for [`OpLog::compact_reclaiming`].
+///
+/// The generic [`OpLog`] is payload-opaque — it has no idea whether one op's
+/// bytes "supersede" another's — so real space reclamation is only safe when
+/// a caller who DOES understand its own payload semantics (e.g. the keyed
+/// store's per-field last-writer-wins fold) supplies one. Implement this
+/// trait to say which ops compete (`group_key`) and, among competitors, which
+/// one wins (`priority`); [`OpLog::compact_reclaiming`] discards every
+/// non-winner.
+pub trait ReclaimPolicy {
+    /// The competing group this op belongs to (e.g. a keyed store's
+    /// `(collection, id, field)`), or `None` if this op is not subject to
+    /// reclamation under this policy — such an op is NEVER discarded.
+    fn group_key(&self, op: &Op) -> Option<Vec<u8>>;
+
+    /// A byte-lexicographically comparable priority within `group_key`'s
+    /// group: strictly higher bytes win. Only ever called for an op
+    /// `group_key` returned `Some` for. Must encode the SAME total order the
+    /// caller's own fold uses to pick a winner (e.g. the keyed store's HLC
+    /// `happens_after`), or compaction and the live fold could disagree on
+    /// which op is authoritative.
+    fn priority(&self, op: &Op) -> Vec<u8>;
+}
+
 /// A grow-only, content-addressed op-log: `log[n]` in the spec.
 ///
 /// Backed by a `BTreeMap` keyed on [`OpId`] so the per-partition materialized
@@ -327,9 +351,78 @@ impl OpLog {
     /// state. The snapshot carries the full op set (compaction repackages,
     /// never discards) so a peer that bootstraps from it plus the log's tail
     /// ends up with exactly this set.
+    ///
+    /// This is the conservative, payload-opaque compaction: the generic log
+    /// has no notion of "superseded" for an arbitrary byte payload, so it
+    /// never discards. A caller whose payloads carry their OWN superseding
+    /// semantics (per-key last-writer-wins, tombstones — e.g. the keyed
+    /// store's per-field fold) reclaims real space with
+    /// [`OpLog::compact_reclaiming`] instead.
     #[must_use]
     pub fn compact(&self) -> Snapshot {
         Snapshot::new(self.root(), self.ops.clone())
+    }
+
+    /// Compact this log into a [`Snapshot`] that DISCARDS any op fully
+    /// subsumed by `policy` — the space-reclaiming counterpart of
+    /// [`OpLog::compact`].
+    ///
+    /// `policy` groups ops that compete over the same logical slot (e.g. a
+    /// keyed store's `(collection, id, field)`) and, within a group, orders
+    /// them by priority (e.g. HLC); every op EXCEPT the highest-priority one
+    /// in its group is safely discardable, because no fold over the
+    /// surviving set can ever observe it: the fold `specs/KeyedStore.tla`
+    /// proves (`DeterministicLWWTiebreak`) is a pure function of the
+    /// *winning* op per group, and dropping every other op for that group
+    /// cannot change any read of the winner. An op `policy` assigns no group
+    /// to (`ReclaimPolicy::group_key` returns `None`) is NEVER discarded —
+    /// exactly [`OpLog::compact`]'s behavior for that op.
+    ///
+    /// Because [`OpLog::bootstrap`] simply unions a snapshot's ops with a
+    /// tail, and the per-group winner of `kept ∪ tail` always equals the
+    /// per-group winner of `discarded ∪ kept ∪ tail` (the discarded ops were,
+    /// by construction, never the max within their group at snapshot time,
+    /// and adding MORE candidates to a max computation cannot make a
+    /// strictly-smaller candidate the max), a peer that bootstraps from this
+    /// snapshot plus the tail reconstructs the IDENTICAL per-group winner —
+    /// and therefore the identical materialized keyed-store view — as a peer
+    /// that replayed every op individually. No per-op verifiability,
+    /// convergence, or CAP-policy guarantee is weakened: every surviving op
+    /// is still content-addressed and individually verifiable, and the
+    /// resulting op set still folds to a real, deterministic Merkle root.
+    #[must_use]
+    pub fn compact_reclaiming(&self, policy: &dyn ReclaimPolicy) -> Snapshot {
+        // group_key -> (priority, OpId) of the current best-known winner.
+        // OpId is included in the comparison purely as a deterministic
+        // tiebreak so the result never depends on BTreeMap iteration nuance.
+        let mut winners: BTreeMap<Vec<u8>, (Vec<u8>, OpId)> = BTreeMap::new();
+        let mut kept: BTreeMap<OpId, Op> = BTreeMap::new();
+
+        for op in self.ops.values() {
+            match policy.group_key(op) {
+                None => {
+                    // Not subject to reclamation: always kept.
+                    kept.insert(op.id.clone(), op.clone());
+                }
+                Some(key) => {
+                    let candidate = (policy.priority(op), op.id.clone());
+                    match winners.get(&key) {
+                        Some(current_best) if *current_best >= candidate => {}
+                        _ => {
+                            winners.insert(key, candidate);
+                        }
+                    }
+                }
+            }
+        }
+        for (_, (_, winner_id)) in winners {
+            if let Some(op) = self.ops.get(&winner_id) {
+                kept.insert(winner_id, op.clone());
+            }
+        }
+
+        let root = fold_root(&kept.values().collect::<Vec<_>>());
+        Snapshot::new(root, kept)
     }
 
     /// Bootstrap a fresh log from a [`Snapshot`] plus the tail of ops
@@ -1052,6 +1145,131 @@ mod tests {
         let restored = OpLog::bootstrap(&snapshot, &[]);
         assert!(restored.is_empty());
         assert_eq!(restored.root(), empty.root());
+    }
+
+    /// Toy [`ReclaimPolicy`]: payloads are `"<key>:<priority>:<body>"`; ops
+    /// sharing `key` compete, higher `priority` (as a decimal string, decoded
+    /// then re-encoded big-endian so lexicographic byte order matches
+    /// numeric order) wins.
+    struct KeyPriorityPolicy;
+    impl ReclaimPolicy for KeyPriorityPolicy {
+        fn group_key(&self, op: &Op) -> Option<Vec<u8>> {
+            let s = std::str::from_utf8(op.payload()).ok()?;
+            let key = s.split(':').next()?;
+            Some(key.as_bytes().to_vec())
+        }
+        fn priority(&self, op: &Op) -> Vec<u8> {
+            let s = std::str::from_utf8(op.payload()).unwrap();
+            let prio: u64 = s.split(':').nth(1).unwrap().parse().unwrap();
+            prio.to_be_bytes().to_vec()
+        }
+    }
+
+    /// `compact_reclaiming` DISCARDS every op except the highest-priority one
+    /// per group — genuine space reclamation, not mere repackaging: once a
+    /// key has been superseded, the snapshot is strictly smaller than the
+    /// full op count.
+    #[test]
+    fn compact_reclaiming_discards_superseded_ops_in_the_same_group() {
+        let mut log = OpLog::new();
+        log.append(b"k:1:old".to_vec());
+        log.append(b"k:2:new".to_vec());
+        log.append(b"other:1:unrelated".to_vec());
+        assert_eq!(log.len(), 3);
+
+        let snapshot = log.compact_reclaiming(&KeyPriorityPolicy);
+        // Only the winner for "k" (priority 2) and the sole "other" op
+        // survive — the superseded "k:1:old" is reclaimed.
+        assert_eq!(snapshot.len(), 2, "superseded op must be discarded");
+        assert!(snapshot.len() < log.len());
+    }
+
+    /// An op the policy assigns no group to is NEVER discarded — exactly
+    /// [`OpLog::compact`]'s conservative behavior for that op.
+    #[test]
+    fn compact_reclaiming_never_discards_an_ungrouped_op() {
+        struct NoGroups;
+        impl ReclaimPolicy for NoGroups {
+            fn group_key(&self, _op: &Op) -> Option<Vec<u8>> {
+                None
+            }
+            fn priority(&self, _op: &Op) -> Vec<u8> {
+                unreachable!("group_key always returns None")
+            }
+        }
+        let mut log = OpLog::new();
+        log.append(b"a".to_vec());
+        log.append(b"b".to_vec());
+        let snapshot = log.compact_reclaiming(&NoGroups);
+        assert_eq!(snapshot.len(), log.len());
+    }
+
+    /// `bootstrap` from a RECLAIMING snapshot plus the tail appended since
+    /// reconstructs the IDENTICAL per-group winner as continuing to hold
+    /// full history — the reclaimed op's absence never changes any read,
+    /// exactly as `OpLog::compact_reclaiming`'s contract requires. This is
+    /// the reclaiming counterpart of
+    /// `bootstrap_from_snapshot_and_tail_matches_full_history`, proving the
+    /// space savings (`snapshot.len() + tail.len() < full history len`) come
+    /// with no loss of the materialized view.
+    #[test]
+    fn bootstrap_from_reclaiming_snapshot_matches_full_history_winner() {
+        let mut source = OpLog::new();
+        source.append(b"k:1:old".to_vec());
+        source.append(b"k:2:mid".to_vec());
+        // Snapshot AFTER two competing writes for "k" — only "k:2:mid"
+        // should survive.
+        let snapshot = source.compact_reclaiming(&KeyPriorityPolicy);
+        assert!(
+            snapshot.len() < source.len(),
+            "the superseded k:1:old must be reclaimed"
+        );
+
+        // Keep writing — a THIRD, still-higher-priority write for "k", plus
+        // an unrelated op — forming the tail.
+        let tail_op_1 = Op::new(b"k:3:newest".to_vec());
+        let tail_op_2 = Op::new(b"other:1:unrelated".to_vec());
+        source.append(tail_op_1.payload().to_vec());
+        source.append(tail_op_2.payload().to_vec());
+
+        let fresh_peer = OpLog::bootstrap(&snapshot, &[tail_op_1, tail_op_2]);
+
+        // Full history (never compacted) as the ground truth.
+        let mut full_history = OpLog::new();
+        full_history.append(b"k:1:old".to_vec());
+        full_history.append(b"k:2:mid".to_vec());
+        full_history.append(b"k:3:newest".to_vec());
+        full_history.append(b"other:1:unrelated".to_vec());
+
+        // The reclaiming peer holds strictly fewer ops than full history...
+        assert!(fresh_peer.len() < full_history.len());
+        // ...yet the per-group WINNER (the materialized view a keyed-store
+        // fold reads) is identical: the same "k" winner and "other" winner
+        // survive under both.
+        let winner_for = |log: &OpLog, key: &str| -> Option<String> {
+            log.order()
+                .into_iter()
+                .filter(|op| {
+                    std::str::from_utf8(op.payload())
+                        .unwrap()
+                        .starts_with(&format!("{key}:"))
+                })
+                .max_by_key(|op| {
+                    std::str::from_utf8(op.payload())
+                        .unwrap()
+                        .split(':')
+                        .nth(1)
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .map(|op| std::str::from_utf8(op.payload()).unwrap().to_string())
+        };
+        assert_eq!(winner_for(&fresh_peer, "k"), winner_for(&full_history, "k"));
+        assert_eq!(
+            winner_for(&fresh_peer, "other"),
+            winner_for(&full_history, "other")
+        );
     }
 
     /// Safe-by-default: a stream with no declared policy behaves as

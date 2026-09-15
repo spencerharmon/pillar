@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use pillar_streamdb::{Op, OpLog, PersistError, PersistentStream};
+pub use pillar_streamdb::{Op, OpLog, PersistError, PersistentStream, Snapshot};
 
 /// A Hybrid Logical Clock stamp: `(physical, logical, author)`.
 ///
@@ -398,6 +398,86 @@ impl KeyedStore {
     fn append_op(&mut self, op: KeyedOp) -> pillar_streamdb::OpId {
         self.log.append(op.encode())
     }
+
+    // ------------------------------------------------------------------
+    // Space-reclaiming compaction — the per-field LWW/tombstone
+    // instantiation of `OpLog::compact_reclaiming`.
+    // ------------------------------------------------------------------
+
+    /// Compact this store's op log into a [`Snapshot`] that DISCARDS every
+    /// op superseded under the per-field LWW/tombstone fold — genuine space
+    /// reclamation, not mere repackaging: once a field has been written more
+    /// than once (or tombstoned then never revived), `snapshot.len() <
+    /// self.log().len()`.
+    ///
+    /// Correctness: exactly one op survives per `(collection, id, field)` —
+    /// the one [`Hlc::happens_after`] never beats, i.e. the SAME op
+    /// [`KeyedStore::winner`] would pick — so [`KeyedStore::from_log`] over a
+    /// [`OpLog::bootstrap`] of this snapshot plus any subsequent tail folds
+    /// to the IDENTICAL live value for every field as the un-compacted
+    /// history: a discarded op could only ever have been out-voted at read
+    /// time, so its absence changes no `kv_get`/`doc_get_field` result. No
+    /// per-op verifiability, convergence, or CAP posture guarantee is
+    /// weakened — the surviving op for each field remains fully
+    /// content-addressed and individually verifiable.
+    #[must_use]
+    pub fn compact_reclaiming(&self) -> Snapshot {
+        self.log.compact_reclaiming(&KeyedFieldReclaimPolicy)
+    }
+
+    /// Rebuild a store from a [`Snapshot`] (as produced by
+    /// [`KeyedStore::compact_reclaiming`] or [`OpLog::compact`]) plus the log
+    /// tail appended since — the keyed-store counterpart of
+    /// [`OpLog::bootstrap`], folding straight to a usable [`KeyedStore`].
+    #[must_use]
+    pub fn bootstrap(snapshot: &Snapshot, tail: &[Op]) -> Self {
+        KeyedStore::from_log(OpLog::bootstrap(snapshot, tail))
+    }
+}
+
+/// The [`pillar_streamdb::ReclaimPolicy`] instantiating streamdb's generic
+/// reclaiming compaction with the keyed store's own per-field LWW/tombstone
+/// superseding rule: ops targeting the same `(collection, id, field)`
+/// compete, and the one with the highest [`Hlc`] (per
+/// [`Hlc::happens_after`]) wins — identical to [`KeyedStore::winner`]'s own
+/// comparator, so compaction and the live fold can never disagree on which
+/// op is authoritative.
+struct KeyedFieldReclaimPolicy;
+
+impl pillar_streamdb::ReclaimPolicy for KeyedFieldReclaimPolicy {
+    fn group_key(&self, op: &Op) -> Option<Vec<u8>> {
+        let k = KeyedOp::decode(op.payload())?;
+        // A simple length-prefixed concatenation avoids any ambiguity from a
+        // field/id/collection name containing the separator byte.
+        let mut key = Vec::new();
+        for part in [
+            k.collection.as_bytes(),
+            k.id.as_bytes(),
+            k.field.as_bytes(),
+        ] {
+            key.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            key.extend_from_slice(part);
+        }
+        Some(key)
+    }
+
+    fn priority(&self, op: &Op) -> Vec<u8> {
+        // KeyedOp::decode already succeeded in `group_key` for this op (the
+        // trait contract only calls `priority` after `group_key` returned
+        // `Some`); an op that fails to decode here would be a payload that
+        // is not actually a `KeyedOp`, which cannot happen through this
+        // policy's own `group_key`.
+        let k = KeyedOp::decode(op.payload()).expect("payload decoded by group_key");
+        // Fixed-width big-endian physical/logical preserves numeric order
+        // under byte-lexicographic comparison; the author bytes then break
+        // ties exactly as `Hlc::happens_after`'s `&other.author` compare
+        // does (`String`'s `Ord` is byte-lexicographic).
+        let mut bytes = Vec::with_capacity(8 + 8 + k.hlc.author.len());
+        bytes.extend_from_slice(&k.hlc.physical.to_be_bytes());
+        bytes.extend_from_slice(&k.hlc.logical.to_be_bytes());
+        bytes.extend_from_slice(k.hlc.author.as_bytes());
+        bytes
+    }
 }
 
 /// The keyed store persisted over the existing streamdb IPFS-backed op-log
@@ -668,6 +748,66 @@ mod keyed_store {
         assert!(hlc(1, 5, "n1").happens_after(&hlc(1, 4, "n9")), "logical dominates within physical");
         assert!(hlc(1, 1, "n2").happens_after(&hlc(1, 1, "n1")), "author breaks a full tie");
         assert!(!hlc(1, 1, "n1").happens_after(&hlc(1, 1, "n1")), "irreflexive");
+    }
+
+    #[test]
+    fn compact_reclaiming_discards_superseded_writes_and_shrinks_the_log() {
+        // Three writes to the SAME field, plus one write to a different
+        // field — only two ops (the winners of each field) should survive.
+        let mut s = KeyedStore::new();
+        s.kv_put("c", "k", b"v1".to_vec(), hlc(1, 0, "n1"));
+        s.kv_put("c", "k", b"v2".to_vec(), hlc(2, 0, "n1"));
+        s.kv_put("c", "k", b"v3".to_vec(), hlc(3, 0, "n1"));
+        s.kv_put("c", "other", b"unrelated".to_vec(), hlc(1, 0, "n1"));
+        assert_eq!(s.log().len(), 4);
+
+        let snapshot = s.compact_reclaiming();
+        assert_eq!(
+            snapshot.len(),
+            2,
+            "only the winner for each field should survive compaction"
+        );
+        assert!(snapshot.len() < s.log().len(), "must reclaim real space");
+    }
+
+    #[test]
+    fn bootstrap_from_reclaiming_snapshot_yields_identical_keyed_view() {
+        let mut s = KeyedStore::new();
+        s.kv_put("c", "k", b"old".to_vec(), hlc(1, 0, "n1"));
+        s.kv_put("c", "k", b"newer".to_vec(), hlc(2, 0, "n1"));
+        s.doc_put_field("docs", "d1", "a", Value::Scalar(b"1".to_vec()), hlc(1, 0, "n1"));
+        s.doc_put_field("docs", "d1", "a", Value::Scalar(b"2".to_vec()), hlc(2, 0, "n1"));
+        s.doc_delete_field("docs", "d1", "b", hlc(1, 0, "n1"));
+
+        let snapshot = s.compact_reclaiming();
+        assert!(snapshot.len() < s.log().len());
+
+        // A tail write appended AFTER the snapshot was taken.
+        let tail_op = Op::new(
+            KeyedOp {
+                collection: "c".to_string(),
+                id: "k".to_string(),
+                field: KV_FIELD.to_string(),
+                hlc: hlc(3, 0, "n1"),
+                kind: OpKind::Put(Value::Scalar(b"newest".to_vec())),
+            }
+            .encode(),
+        );
+
+        let restored = KeyedStore::bootstrap(&snapshot, &[tail_op]);
+
+        // Identical live values to what the un-compacted store (plus the
+        // same tail write) would show.
+        s.kv_put("c", "k", b"newest".to_vec(), hlc(3, 0, "n1"));
+        assert_eq!(restored.kv_get("c", "k"), s.kv_get("c", "k"));
+        assert_eq!(
+            restored.doc_get_field("docs", "d1", "a"),
+            s.doc_get_field("docs", "d1", "a")
+        );
+        assert_eq!(
+            restored.doc_get_field("docs", "d1", "b"),
+            s.doc_get_field("docs", "d1", "b")
+        );
     }
 
     #[test]
