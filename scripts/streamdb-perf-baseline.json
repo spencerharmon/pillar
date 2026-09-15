@@ -1,0 +1,11 @@
+{
+  "_comment": "Tracked streamdb dual-profile performance baseline. Produced by scripts/streamdb-perf-benchmark.sh from crates/pillar-streamdb/tests/perf_benchmark.rs on a debug build (offline `cargo test` sandbox). PUBLIC is the unencrypted throughput/latency CEILING and fixed baseline; CELL-ENCRYPTED is the guaranteed-confidentiality profile; op_delta_us is the first-class AEAD seal-overhead metric (encrypted - public, per op, microseconds). Numbers are debug-build and machine-relative, so the harness compares against a generous regression tolerance rather than an exact match: a run REGRESSES only when a latency metric exceeds baseline * (1 + tolerance). A future tuning task SHRINKS op_delta_us within the safety envelope and lowers these numbers (re-record the baseline in the same commit).",
+  "ops": 2000,
+  "payload_len": 256,
+  "tolerance": 0.50,
+  "public_op_us": 695.84,
+  "encrypted_op_us": 970.65,
+  "op_delta_us": 274.81,
+  "public_fold_ns_per_op": 6682.50,
+  "encrypted_fold_ns_per_op": 6270.26
+}
