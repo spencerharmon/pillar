@@ -167,6 +167,14 @@ pub struct UserRecord {
     /// retired key is never the record's live key and never unlocks a live
     /// session again; it is kept only for the audit trail.
     pub retired_operational_keys: Vec<SealedOperationalKey>,
+    /// Whether `email` has been confirmed as reachable by this user
+    /// (`um-email-selfservice-reset`). Additive: `false` for every
+    /// pre-existing/pre-options record (`#[serde(default)]`). ONLY a
+    /// verified email may be used as the lookup key for the self-service
+    /// "forgot password" flow — an unverified email never leaks whether an
+    /// account exists, and can never trigger a re-enrollment offer.
+    #[serde(default)]
+    pub verified_email: bool,
 }
 
 /// One durable IAM mutation. Journaled by the host exactly like a `PortalOp`
@@ -267,6 +275,12 @@ pub enum UserOp {
         sealed: SealedOperationalKey,
         at: u64,
     },
+    /// Marks the record's email as verified (`um-email-selfservice-reset`):
+    /// the ONLY lookup key the self-service "forgot password" flow ever
+    /// matches against, so an email that was never proven reachable can
+    /// never mint a re-enrollment offer for the account. A no-op (via
+    /// [`apply_op`]) if the handle is unknown.
+    EmailVerified { handle: String, at: u64 },
 }
 
 impl UserOp {
@@ -285,7 +299,8 @@ impl UserOp {
             | UserOp::GroupRemove { handle, .. }
             | UserOp::StatusChange { handle, .. }
             | UserOp::ProvisionOperationalKey { handle, .. }
-            | UserOp::AdminReset { handle, .. } => handle,
+            | UserOp::AdminReset { handle, .. }
+            | UserOp::EmailVerified { handle, .. } => handle,
         }
     }
 }
@@ -318,6 +333,7 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
                 updated_at: at,
                 sealed_operational_key: None,
                 retired_operational_keys: Vec::new(),
+                verified_email: false,
             });
         }
         UserOp::PasskeyEnrolled { handle, at } => {
@@ -392,7 +408,53 @@ pub fn apply_op(records: &mut BTreeMap<String, UserRecord>, op: UserOp) {
                 admin_reset::apply_admin_reset(record, sealed, at);
             }
         }
+        UserOp::EmailVerified { handle, at } => {
+            if let Some(record) = records.get_mut(&handle) {
+                record.verified_email = true;
+                record.updated_at = at;
+            }
+        }
     }
+}
+
+/// Error building a [`UserOp::EmailVerified`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EmailVerifyError {
+    /// No record exists for this handle.
+    UnknownUser,
+}
+
+/// Build the op marking `handle`'s email verified. Pure — see
+/// [`invite_user`]'s doc for the sign-then-apply contract the caller must
+/// follow.
+pub fn mark_email_verified(
+    records: &BTreeMap<String, UserRecord>,
+    handle: &str,
+    at: u64,
+) -> Result<UserOp, EmailVerifyError> {
+    if !records.contains_key(handle) {
+        return Err(EmailVerifyError::UnknownUser);
+    }
+    Ok(UserOp::EmailVerified {
+        handle: handle.to_owned(),
+        at,
+    })
+}
+
+/// Find the (at most one) record whose `email` case-sensitively matches
+/// `email` AND whose email is [`UserRecord::verified_email`] — the ONLY
+/// lookup path the self-service "forgot password" flow
+/// (`um-email-selfservice-reset`) uses, so an unverified or nonexistent
+/// email can never distinguish "no such account" from "found but
+/// unverified" (both look identical to the caller: no match).
+#[must_use]
+pub fn find_by_verified_email<'a>(
+    records: &'a BTreeMap<String, UserRecord>,
+    email: &str,
+) -> Option<&'a UserRecord> {
+    records
+        .values()
+        .find(|r| r.verified_email && r.email == email)
 }
 
 /// Rebuild the full user-record map from an ordered [`UserOp`] sequence — the
