@@ -6936,6 +6936,11 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/portal/users/bulk-invite"),
+        handler: dispatch_users_bulk_invite,
+    },
+    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/portal/users/reset-password"),
         handler: dispatch_users_reset_password,
     },
@@ -8736,6 +8741,148 @@ fn dispatch_users_invite(
         }
         Err(resp) => resp,
     }
+}
+
+/// One parsed row of a bulk/CSV invite batch: `handle,email[,password,
+/// force_password_change,require_passkey,verified_email]`. Trailing fields
+/// are optional and follow the same Keycloak-style defaults as the
+/// single-invite endpoint (force-change ON unless `false`, require-passkey
+/// OFF unless `true`, verified-email OFF unless `true`).
+struct BulkInviteRow {
+    handle: String,
+    email: String,
+    password: Option<String>,
+    force_password_change: bool,
+    require_passkey: bool,
+    verified_email: bool,
+}
+
+/// Split one CSV row on commas. No quoting/escaping support — handles and
+/// emails never legitimately contain a comma, so a bare `split(',')` is
+/// sufficient for this batching convenience (it reuses the proven per-row
+/// invite path; it introduces no new authority or parsing surface).
+fn parse_bulk_invite_row(line: &str) -> Result<BulkInviteRow, String> {
+    let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
+    if fields.len() < 2 {
+        return Err("MALFORMED-ROW expected at least handle,email".to_owned());
+    }
+    let handle = fields[0].to_owned();
+    let email = fields[1].to_owned();
+    if handle.is_empty() {
+        return Err("MALFORMED-ROW empty handle".to_owned());
+    }
+    let password = fields.get(2).filter(|p| !p.is_empty()).map(|p| p.to_string());
+    let force_password_change = fields.get(3).map(|f| *f != "false").unwrap_or(true);
+    let require_passkey = fields.get(4).map(|f| *f == "true").unwrap_or(false);
+    let verified_email = fields.get(5).map(|f| *f == "true").unwrap_or(false);
+    Ok(BulkInviteRow {
+        handle,
+        email,
+        password,
+        force_password_change,
+        require_passkey,
+        verified_email,
+    })
+}
+
+/// Bulk/CSV admin invite of NEW users: `POST /portal/users/bulk-invite`, body
+/// `<admin_password>\n<token>\n<csv row>\n<csv row>\n...` where each CSV row
+/// is `handle,email[,password,force_password_change,require_passkey,
+/// verified_email]` (see [`parse_bulk_invite_row`]). Batches the SAME
+/// delegated-signed [`dispatch_delegated_user_op`] path the single-user
+/// `/portal/users/invite` endpoint already uses, row by row: one admin
+/// re-authentication (`<admin_password>`) covers the whole batch, exactly as
+/// a human operator would type the password once and paste a CSV. This is
+/// batching CONVENIENCE ONLY — no new authority and no new TLA+ gate; every
+/// row still goes through the identical `iam:users:write`-gated,
+/// delegated-signature-verified `user_op` mutation.
+///
+/// PARTIAL-BATCH TOLERANT: a malformed row or a per-row failure (e.g.
+/// `already exists`) does NOT abort the batch — every remaining row is still
+/// attempted. The response is one line per row, in the SAME order as the
+/// input:
+/// - `<handle> OK <password>` — invited; `<password>` is the temp password
+///   (either the row's explicit one or the freshly generated one).
+/// - `<handle> FAILED <reason>` — this row failed; every other row still ran.
+/// A wrong admin password fails EVERY row identically (`FAILED REFUSED
+/// delegated-sign ...`), since the delegated signature is verified once per
+/// row using the same caller/password pair — the response still enumerates
+/// each row for a uniform, machine-parseable report.
+fn dispatch_users_bulk_invite(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
+    let token = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let mut report = String::new();
+    let mut any_row = false;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        any_row = true;
+        let row = match parse_bulk_invite_row(line) {
+            Ok(row) => row,
+            Err(reason) => {
+                report.push_str(&format!("{line} FAILED {reason}\n"));
+                continue;
+            }
+        };
+        let (password, generated_password_err) = match row.password {
+            Some(p) => (p, None),
+            None => match generate_temp_password() {
+                Ok(p) => (p, None),
+                Err(()) => (String::new(), Some("RNG-FAILURE")),
+            },
+        };
+        if let Some(reason) = generated_password_err {
+            report.push_str(&format!("{} FAILED {reason}\n", row.handle));
+            continue;
+        }
+        let op = pillar_ops::UserOp::Invite {
+            handle: row.handle.clone(),
+            email: row.email.clone(),
+            force_password_change: row.force_password_change,
+            require_passkey: row.require_passkey,
+            password: Some(password.clone()),
+        };
+        match dispatch_delegated_user_op(ctx, &caller, &admin_password, op) {
+            Ok(_detail) => {
+                if row.verified_email {
+                    let at = ctx.iam_now();
+                    ctx.iam_verify_email(&row.handle, at);
+                }
+                report.push_str(&format!("{} OK {password}\n", row.handle));
+            }
+            Err(resp) if resp.body.contains("already exists") => {
+                report.push_str(&format!("{} FAILED already-exists\n", row.handle));
+            }
+            Err(resp) => {
+                report.push_str(&format!(
+                    "{} FAILED {}\n",
+                    row.handle,
+                    resp.body.trim()
+                ));
+            }
+        }
+    }
+    if !any_row {
+        return text_response(400, "Bad Request", "MISSING csv-rows".to_owned());
+    }
+    text_response(200, "OK", report)
 }
 
 /// Self profile read: `GET /portal/profile?token=...`. Renders
