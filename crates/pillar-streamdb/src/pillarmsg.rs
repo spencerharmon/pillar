@@ -22,10 +22,43 @@
 
 use pillar_crypto::cell::{cell_open_convergent, cell_seal_convergent, CellGroupKey};
 use pillar_crypto::sign::{sign, verify};
-use pillar_crypto::{CellId, CryptoError, SigningPublicKey, SigningSecretKey};
+use pillar_crypto::{CellId, Ciphertext, CryptoError, SigningPublicKey, SigningSecretKey};
 
 use pillar_wire::envelope::EnvelopeError;
 use pillar_wire::{Body, PillarMessage, Visibility};
+
+/// A collection's confidentiality class — a VISIBILITY choice, independent of
+/// [`Visibility`] (which governs DHT-reach only, see `pillar_wire::store::Visibility`)
+/// and independent of RBAC (which still gates writes either way).
+///
+/// [`Confidentiality::CellEncrypted`] is the existing/default behavior: a
+/// `StreamOp`'s payload is AEAD-sealed to the cell group key
+/// ([`cell_seal_convergent`]) before signing, so only a cell member holding
+/// [`CellGroupKey`] can recover the plaintext.
+///
+/// [`Confidentiality::Public`] elides the AEAD seal and NOTHING else: the
+/// payload is still canonical-CBOR-encoded exactly as before, still
+/// Ed25519-signed ([`sign`]), and the resulting bytes are still
+/// content-addressed / chained into the Merkle-DAG segment exactly like a
+/// cell-encrypted op — a keyless reader recovers the cleartext payload
+/// directly and can still verify the signature and content address. RBAC
+/// (`pillar-rbac`) is unaffected: it still authorizes WRITES the same way
+/// for either class; `Public` only drops the READ confidentiality barrier
+/// that AEAD sealing otherwise provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Confidentiality {
+    /// AEAD-sealed to the cell group key (existing/default behavior).
+    CellEncrypted,
+    /// No confidentiality seal: the record is world-readable cleartext, but
+    /// still signed, content-addressed, and Merkle-DAG verifiable.
+    Public,
+}
+
+impl Default for Confidentiality {
+    fn default() -> Self {
+        Confidentiality::CellEncrypted
+    }
+}
 
 /// Domain separator for the convergent seal — keeps a streamdb op's
 /// convergent-equality leak (two sealed ops are provably byte-identical)
@@ -33,7 +66,7 @@ use pillar_wire::{Body, PillarMessage, Visibility};
 /// signal sealed under the same cell key (`obs-signal-pillarmsg-ipfs`).
 const STREAM_OP_SEAL_DOMAIN: &[u8] = b"pillar-streamdb/stream-op-v1";
 
-/// A fault building or opening a `PillarMessage::StreamOp` envelope.
+    /// A fault building or opening a `PillarMessage::StreamOp` envelope.
 #[derive(Debug)]
 pub enum StreamOpMessageError {
     /// The sealed body did not decode to a [`Body::StreamOp`] variant (a
@@ -45,6 +78,9 @@ pub enum StreamOpMessageError {
     /// open, this is also the "non-member cannot open" case: opening with the
     /// wrong cell group key fails AEAD authentication here.
     Crypto(CryptoError),
+    /// [`Confidentiality::CellEncrypted`] was requested but no
+    /// [`CellGroupKey`] was supplied to seal/open under.
+    MissingGroupKey,
 }
 
 impl std::fmt::Display for StreamOpMessageError {
@@ -55,6 +91,10 @@ impl std::fmt::Display for StreamOpMessageError {
             }
             StreamOpMessageError::Envelope(e) => write!(f, "envelope error: {e}"),
             StreamOpMessageError::Crypto(e) => write!(f, "crypto error: {e}"),
+            StreamOpMessageError::MissingGroupKey => write!(
+                f,
+                "cell-encrypted confidentiality requires a cell group key"
+            ),
         }
     }
 }
@@ -84,17 +124,27 @@ impl From<EnvelopeError> for StreamOpMessageError {
 /// [`StreamOpMessageError::Crypto`] if sealing or signing fails.
 pub fn seal_stream_op(
     payload: &[u8],
-    group: &CellGroupKey,
+    group: Option<&CellGroupKey>,
     cell: CellId,
     signer: SigningPublicKey,
     secret: &SigningSecretKey,
     visibility: Visibility,
+    confidentiality: Confidentiality,
 ) -> Result<PillarMessage, StreamOpMessageError> {
     let body = Body::StreamOp(payload.to_vec());
     let plaintext = body.to_canonical_cbor()?;
-    let aad = PillarMessage::header_aad(visibility, &cell);
-    let body_sealed = cell_seal_convergent(group, &plaintext, STREAM_OP_SEAL_DOMAIN, &aad)
-        .map_err(StreamOpMessageError::Crypto)?;
+    let body_sealed = match confidentiality {
+        Confidentiality::CellEncrypted => {
+            let group = group.ok_or(StreamOpMessageError::MissingGroupKey)?;
+            let aad = PillarMessage::header_aad(visibility, &cell);
+            cell_seal_convergent(group, &plaintext, STREAM_OP_SEAL_DOMAIN, &aad)
+                .map_err(StreamOpMessageError::Crypto)?
+        }
+        // Public: elide the AEAD seal and nothing else — the canonical-CBOR
+        // plaintext bytes travel as-is in the `body_sealed` slot, still
+        // signed and content-addressed exactly like a sealed body below.
+        Confidentiality::Public => Ciphertext::from_bytes(plaintext),
+    };
     let signature = sign(secret, &PillarMessage::signing_material(&body_sealed))
         .map_err(StreamOpMessageError::Crypto)?;
     Ok(PillarMessage::new(
@@ -121,7 +171,8 @@ pub fn seal_stream_op(
 /// if the opened body is a different `PillarMessage` body kind.
 pub fn open_stream_op(
     msg: &PillarMessage,
-    group: &CellGroupKey,
+    group: Option<&CellGroupKey>,
+    confidentiality: Confidentiality,
 ) -> Result<Vec<u8>, StreamOpMessageError> {
     verify(
         &msg.signer,
@@ -129,9 +180,17 @@ pub fn open_stream_op(
         &msg.signature,
     )
     .map_err(StreamOpMessageError::Crypto)?;
-    let aad = PillarMessage::header_aad(msg.visibility, &msg.cell);
-    let plaintext =
-        cell_open_convergent(group, &msg.body_sealed, &aad).map_err(StreamOpMessageError::Crypto)?;
+    let plaintext = match confidentiality {
+        Confidentiality::CellEncrypted => {
+            let group = group.ok_or(StreamOpMessageError::MissingGroupKey)?;
+            let aad = PillarMessage::header_aad(msg.visibility, &msg.cell);
+            cell_open_convergent(group, &msg.body_sealed, &aad)
+                .map_err(StreamOpMessageError::Crypto)?
+        }
+        // Public: no seal was ever applied — the signed bytes ARE the
+        // canonical-CBOR plaintext. No group key needed (or used) to read.
+        Confidentiality::Public => msg.body_sealed.as_bytes().to_vec(),
+    };
     let body = Body::from_canonical_cbor(&plaintext)?;
     match body {
         Body::StreamOp(payload) => Ok(payload),
@@ -148,13 +207,22 @@ pub fn open_stream_op(
 /// envelope encode failure.
 pub fn encode_stream_op_segment_payload(
     payload: &[u8],
-    group: &CellGroupKey,
+    group: Option<&CellGroupKey>,
     cell: CellId,
     signer: SigningPublicKey,
     secret: &SigningSecretKey,
     visibility: Visibility,
+    confidentiality: Confidentiality,
 ) -> Result<Vec<u8>, StreamOpMessageError> {
-    let msg = seal_stream_op(payload, group, cell, signer, secret, visibility)?;
+    let msg = seal_stream_op(
+        payload,
+        group,
+        cell,
+        signer,
+        secret,
+        visibility,
+        confidentiality,
+    )?;
     Ok(msg.to_canonical_cbor()?)
 }
 
@@ -175,10 +243,11 @@ pub fn encode_stream_op_segment_payload(
 /// payload can never hit this path since it never attempts to open anything.
 pub fn decode_stream_op_segment_payload(
     bytes: &[u8],
-    group: &CellGroupKey,
+    group: Option<&CellGroupKey>,
+    confidentiality: Confidentiality,
 ) -> Result<Vec<u8>, StreamOpMessageError> {
     match PillarMessage::from_canonical_cbor(bytes) {
-        Ok(msg) => open_stream_op(&msg, group),
+        Ok(msg) => open_stream_op(&msg, group, confidentiality),
         // Malformed / unsupported version: not a v2 envelope at all -> read
         // the legacy v1 shape, the bare op payload itself.
         Err(_) => Ok(bytes.to_vec()),
@@ -213,17 +282,19 @@ mod tests {
         let payload = b"streamdb op payload".to_vec();
         let msg = seal_stream_op(
             &payload,
-            &group,
+            Some(&group),
             cell,
             signer,
             &secret,
             Visibility::Cell,
+            Confidentiality::CellEncrypted,
         )
         .expect("seal");
 
         let encoded = msg.to_canonical_cbor().expect("encode");
         let decoded = PillarMessage::from_canonical_cbor(&encoded).expect("decode");
-        let opened = open_stream_op(&decoded, &group).expect("open");
+        let opened =
+            open_stream_op(&decoded, Some(&group), Confidentiality::CellEncrypted).expect("open");
         assert_eq!(opened, payload);
     }
 
@@ -238,20 +309,22 @@ mod tests {
 
         let a = encode_stream_op_segment_payload(
             &payload,
-            &group,
+            Some(&group),
             cell.clone(),
             signer.clone(),
             &secret,
             Visibility::Cell,
+            Confidentiality::CellEncrypted,
         )
         .expect("seal a");
         let b = encode_stream_op_segment_payload(
             &payload,
-            &group,
+            Some(&group),
             cell,
             signer,
             &secret,
             Visibility::Cell,
+            Confidentiality::CellEncrypted,
         )
         .expect("seal b");
 
@@ -269,8 +342,12 @@ mod tests {
     fn legacy_v1_bare_payload_is_read_compat() {
         let (group, _cell, _signer, _secret) = fixture("cell-a", "author-a");
         let legacy_payload = b"pre-migration raw op bytes".to_vec();
-        let decoded =
-            decode_stream_op_segment_payload(&legacy_payload, &group).expect("read-compat decode");
+        let decoded = decode_stream_op_segment_payload(
+            &legacy_payload,
+            Some(&group),
+            Confidentiality::CellEncrypted,
+        )
+        .expect("read-compat decode");
         assert_eq!(decoded, legacy_payload);
     }
 
@@ -280,14 +357,82 @@ mod tests {
     fn non_member_cannot_open_cell_sealed_op() {
         let (group, cell, signer, secret) = fixture("cell-a", "author-a");
         let payload = b"secret op".to_vec();
-        let msg = seal_stream_op(&payload, &group, cell, signer, &secret, Visibility::Cell)
-            .expect("seal");
+        let msg = seal_stream_op(
+            &payload,
+            Some(&group),
+            cell,
+            signer,
+            &secret,
+            Visibility::Cell,
+            Confidentiality::CellEncrypted,
+        )
+        .expect("seal");
 
         let wrong_group = group_key_from_seed(&Seed::from_bytes(b"cell-b".to_vec()))
             .expect("wrong cell key");
         assert!(
-            open_stream_op(&msg, &wrong_group).is_err(),
+            open_stream_op(
+                &msg,
+                Some(&wrong_group),
+                Confidentiality::CellEncrypted
+            )
+            .is_err(),
             "wrong cell key must not open the sealed body"
+        );
+    }
+
+    /// HARD INVARIANT: a `Public` op elides the AEAD seal and NOTHING else —
+    /// a keyless reader (no `CellGroupKey` at all) recovers the exact
+    /// cleartext payload, and the envelope's signature still verifies (it is
+    /// checked unconditionally inside `open_stream_op` before any seal logic
+    /// runs).
+    #[test]
+    fn public_op_is_readable_with_no_group_key_but_still_signed() {
+        let (_group, cell, signer, secret) = fixture("cell-a", "author-a");
+        let payload = b"world-readable op".to_vec();
+        let msg = seal_stream_op(
+            &payload,
+            None,
+            cell,
+            signer,
+            &secret,
+            Visibility::Public,
+            Confidentiality::Public,
+        )
+        .expect("seal public (no group key needed)");
+
+        let encoded = msg.to_canonical_cbor().expect("encode");
+        let decoded = PillarMessage::from_canonical_cbor(&encoded).expect("decode");
+        let opened =
+            open_stream_op(&decoded, None, Confidentiality::Public).expect("open with no key");
+        assert_eq!(opened, payload, "public op recovers exact cleartext");
+    }
+
+    /// A tampered public (unsealed) body still fails signature verification
+    /// — public drops confidentiality only, never integrity/authenticity.
+    #[test]
+    fn tampered_public_op_fails_signature_verification() {
+        let (_group, cell, signer, secret) = fixture("cell-a", "author-a");
+        let payload = b"world-readable op".to_vec();
+        let mut msg = seal_stream_op(
+            &payload,
+            None,
+            cell,
+            signer,
+            &secret,
+            Visibility::Public,
+            Confidentiality::Public,
+        )
+        .expect("seal public");
+        // Flip a byte in the (unsealed, plaintext) body — the signature must
+        // no longer verify.
+        let mut tampered = msg.body_sealed.as_bytes().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        msg.body_sealed = Ciphertext::from_bytes(tampered);
+        assert!(
+            open_stream_op(&msg, None, Confidentiality::Public).is_err(),
+            "tampered public body must fail signature verification"
         );
     }
 }
