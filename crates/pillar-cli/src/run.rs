@@ -1301,6 +1301,14 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 };
                 ctx.replay(&persisted_ops);
 
+                // Self-register this node as a live cell member in the topology
+                // registry, so the catalog-introspection surface's placement
+                // resolution (`data-placement-collection-tags`) reports a real
+                // participating-node list: a solo node IS the participating node
+                // for every whole-cell-placed collection. Idempotent — a replay
+                // that already registered it just refreshes the entry.
+                ctx.topology_register_node("pillar-node", "ok", 1);
+
                 let ctx = std::sync::Arc::new(std::sync::Mutex::new(ctx));
 
                 // The `psl-message-api` pillar-UDP and QUIC tiers

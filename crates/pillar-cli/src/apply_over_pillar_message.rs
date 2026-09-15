@@ -1258,6 +1258,50 @@ pub fn sql(args: &[String]) -> ExitCode {
     }
 }
 
+/// `pillar catalog {databases | collections | views | describe <collection>}`:
+/// the catalog-introspection surface, every verb a member-gated VIEW folded
+/// live from the `__catalog` collection + the keyed store's live collections +
+/// the collection-placement registry over the sealed query tier. Discovery is
+/// a query, not hard-coded help.
+pub fn catalog(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar catalog {{databases | collections | views | describe <collection>}}"
+        );
+        ExitCode::from(2)
+    };
+    match args.first().map(String::as_str) {
+        Some("databases") => print_view(
+            query_op(&pillar_ops::QueryOp::Catalog(
+                pillar_ops::CatalogOp::Databases,
+            )),
+            "catalog databases",
+        ),
+        Some("collections") => print_view(
+            query_op(&pillar_ops::QueryOp::Catalog(
+                pillar_ops::CatalogOp::Collections,
+            )),
+            "catalog collections",
+        ),
+        Some("views") => print_view(
+            query_op(&pillar_ops::QueryOp::Catalog(pillar_ops::CatalogOp::Views)),
+            "catalog views",
+        ),
+        Some("describe") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Catalog(
+                    pillar_ops::CatalogOp::Describe {
+                        collection: collection.clone(),
+                    },
+                )),
+                "catalog describe",
+            ),
+            None => usage(),
+        },
+        _ => usage(),
+    }
+}
+
 fn user_usage() -> ExitCode {
     eprintln!(
         "usage: pillar user {{ls | show <handle> | invite <handle> <email> \
