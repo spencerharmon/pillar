@@ -1475,6 +1475,93 @@ pub fn catalog(args: &[String]) -> ExitCode {
     }
 }
 
+/// `pillar log {info <collection> | blocks <collection> | list <collection> |
+/// show <collection> <event-id-hex> | dag <collection> | watch <collection> |
+/// verify <collection> <event-id-hex>}`: the op-log inspection tier
+/// (`pillar-log-inspection-tier`) — the middle layer of
+/// `repo/docs/data-inspection.md`'s inspection stack, over a collection's
+/// signed, content-addressed op log (the SAME log every `kv`/`doc`/`sql`/
+/// `object` write already appends to). Every verb is a member-gated view.
+pub fn log(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar log {{info <collection> | blocks <collection> | \
+             list <collection> | show <collection> <event-id-hex> | \
+             dag <collection> | watch <collection> | \
+             verify <collection> <event-id-hex>}}"
+        );
+        ExitCode::from(2)
+    };
+    match args.first().map(String::as_str) {
+        Some("info") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Info {
+                    collection: collection.clone(),
+                })),
+                "log info",
+            ),
+            None => usage(),
+        },
+        Some("blocks") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Blocks {
+                    collection: collection.clone(),
+                })),
+                "log blocks",
+            ),
+            None => usage(),
+        },
+        Some("list") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::List {
+                    collection: collection.clone(),
+                })),
+                "log list",
+            ),
+            None => usage(),
+        },
+        Some("show") => match (args.get(1), args.get(2)) {
+            (Some(collection), Some(event_id_hex)) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Show {
+                    collection: collection.clone(),
+                    event_id_hex: event_id_hex.clone(),
+                })),
+                "log show",
+            ),
+            _ => usage(),
+        },
+        Some("dag") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Dag {
+                    collection: collection.clone(),
+                })),
+                "log dag",
+            ),
+            None => usage(),
+        },
+        Some("watch") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Watch {
+                    collection: collection.clone(),
+                })),
+                "log watch",
+            ),
+            None => usage(),
+        },
+        Some("verify") => match (args.get(1), args.get(2)) {
+            (Some(collection), Some(event_id_hex)) => print_view(
+                query_op(&pillar_ops::QueryOp::Log(pillar_ops::LogOp::Verify {
+                    collection: collection.clone(),
+                    event_id_hex: event_id_hex.clone(),
+                })),
+                "log verify",
+            ),
+            _ => usage(),
+        },
+        _ => usage(),
+    }
+}
+
 fn user_usage() -> ExitCode {
     eprintln!(
         "usage: pillar user {{ls | show <handle> | invite <handle> <email> \
@@ -1808,6 +1895,122 @@ pub fn caps(args: &[String]) -> ExitCode {
         candidates,
     };
     print_view(control_op(&pillar_ops::ControlOp::Trust(op)), "caps")
+}
+
+/// `pillar role {add <name> --grant <cap>… | rm <name> | list | show <name>}`:
+/// named capability-set management over pillar-message. Acts gated on
+/// `iam:roles:write`; list/show are member-gated views.
+pub fn role(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar role {{add <name> --grant <cap>… | rm <name> | list | show <name>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("list") | None => pillar_ops::IamOp::RoleList,
+        Some("show") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::RoleShow { name: name.clone() },
+            None => return usage(),
+        },
+        Some("add") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::RoleAdd {
+                name: name.clone(),
+                capabilities: multi_flag(args, "--grant"),
+            },
+            None => return usage(),
+        },
+        Some("rm") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::RoleRm { name: name.clone() },
+            None => return usage(),
+        },
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Iam(op)), "role")
+}
+
+/// `pillar group {add <name> --role <r>… | add-member <name> <handle> | rm
+/// <name> | list | show <name>}`: managed-group membership over pillar-message.
+/// Acts gated on `iam:groups:write`; list/show are member-gated views.
+pub fn group(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar group {{add <name> --role <r>… | add-member <name> <handle> | \
+             rm <name> | list | show <name>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("list") | None => pillar_ops::IamOp::GroupList,
+        Some("show") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::GroupShow { name: name.clone() },
+            None => return usage(),
+        },
+        Some("add") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::GroupAdd {
+                name: name.clone(),
+                roles: multi_flag(args, "--role"),
+            },
+            None => return usage(),
+        },
+        Some("add-member") => match (args.get(1), args.get(2)) {
+            (Some(name), Some(handle)) => pillar_ops::IamOp::GroupAddMember {
+                name: name.clone(),
+                handle: handle.clone(),
+            },
+            _ => return usage(),
+        },
+        Some("rm") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::GroupRm { name: name.clone() },
+            None => return usage(),
+        },
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Iam(op)), "group")
+}
+
+/// `pillar oauth {register <client-id> --type <public|confidential> --redirect
+/// <uri>… --scope <s>… --grant <g>… | list | show <client-id>}`: OAuth/OIDC
+/// client-registry management over pillar-message. Register gated on
+/// `iam:oauth:write`; list/show are member-gated views.
+pub fn oauth(args: &[String]) -> ExitCode {
+    let flag = |f: &str| {
+        args.iter()
+            .position(|a| a == f)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let usage = || {
+        eprintln!(
+            "usage: pillar oauth {{register <client-id> --type <public|confidential> \
+             --redirect <uri>… --scope <s>… --grant <g>… | list | show <client-id>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("list") | None => pillar_ops::IamOp::OauthList,
+        Some("show") => match args.get(1) {
+            Some(id) => pillar_ops::IamOp::OauthShow {
+                client_id: id.clone(),
+            },
+            None => return usage(),
+        },
+        Some("register") => match args.get(1) {
+            Some(id) => {
+                let client_type = flag("--type").unwrap_or_else(|| "public".to_owned());
+                pillar_ops::IamOp::OauthRegister {
+                    client_id: id.clone(),
+                    client_type,
+                    redirect_uris: multi_flag(args, "--redirect"),
+                    scopes: multi_flag(args, "--scope"),
+                    grants: multi_flag(args, "--grant"),
+                }
+            }
+            None => return usage(),
+        },
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Iam(op)), "oauth")
 }
 
 #[cfg(test)]

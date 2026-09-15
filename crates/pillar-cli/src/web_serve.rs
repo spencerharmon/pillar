@@ -238,6 +238,16 @@ struct CliExportMaterial {
     endpoint: String,
 }
 
+/// The reserved collection name the object-inspection tier's writes are
+/// indexed under in [`WebAuthContext::log_index`] — `pillar-log-inspection-
+/// tier`'s TSDB storage-layout exemplar: every `pillar object put` is an
+/// individually content-addressed, immutable block, NEVER folded into an
+/// LWW snapshot the way an ordinary kv/doc/sql (document/keyed) collection
+/// is, so [`WebAuthContext::log_blocks`] reports it under the TSDB kind
+/// (immutable retention blocks back to a retention horizon, older data
+/// reported pruned, no snapshot).
+const TSDB_OBJECTS_COLLECTION: &str = "__objects";
+
 pub struct WebAuthContext {
     verifier: NodeCustodyVerifier,
     authority: WotAuthority,
@@ -364,6 +374,19 @@ pub struct WebAuthContext {
     /// [`RbacDecider`] every signed act routes through consults, so a
     /// wire-issued grant and a web-issued one land in one authority source.
     grants: Vec<pillar_rbac::ExplicitGrant>,
+    /// Named, admin-defined capability sets (`pillar role …`) over
+    /// [`pillar_iam::rbac_bridge::Role`], keyed by role name — the live
+    /// substrate the IAM roles panel drives; a signed act per mutation gated on
+    /// `iam:roles:write`.
+    iam_roles: BTreeMap<String, pillar_iam::rbac_bridge::Role>,
+    /// Admin-managed group membership (`pillar group …`) over
+    /// [`pillar_iam::rbac_bridge::ManagedGroup`], keyed by group name; a signed
+    /// act per mutation gated on `iam:groups:write`.
+    iam_groups: BTreeMap<String, pillar_iam::rbac_bridge::ManagedGroup>,
+    /// The node's OAuth/OIDC client registry (`pillar oauth …`) over
+    /// [`pillar_oidc::client_registry::ClientRegistry`]; a signed act per
+    /// registration gated on `iam:oauth:write`.
+    oauth: pillar_oidc::client_registry::ClientRegistry,
     /// The key & offer UI's substrate (ROI "Web portal / UI rework": custody
     /// migration, rotation, seal/escrow, revoke) — a signed act per
     /// operation, keyed by handle. No server-side database: this is an
@@ -504,6 +527,14 @@ pub struct WebAuthContext {
     /// surface resolves each collection's live participating-node list from
     /// this registry against the live topology + registered node set.
     collection_placement: BTreeMap<String, pillar_net::NodeSelector>,
+    /// The op-log inspection tier's index (`pillar-log-inspection-tier`): for
+    /// each collection, the ordered list of `(EventId, Hlc)` of every
+    /// [`Self::act_log`] event that write belongs to. `pillar log info|
+    /// blocks|list|show|dag|watch|verify` all read THIS index plus
+    /// `self.act_log` itself — no second op-log store, only less folding of
+    /// the SAME signed event DAG every `Kv`/`Doc`/`Sql`/`Object` write already
+    /// appends to.
+    log_index: BTreeMap<String, Vec<(EventId, pillar_keyedstore::Hlc)>>,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -1072,6 +1103,9 @@ impl WebAuthContext {
             session_clock: 0,
             trust: TrustStore::new(owner_for_trust),
             grants: Vec::new(),
+            iam_roles: BTreeMap::new(),
+            iam_groups: BTreeMap::new(),
+            oauth: pillar_oidc::client_registry::ClientRegistry::default(),
             custody: BTreeMap::new(),
             act_log: EventLog::new(),
             resource_platform,
@@ -1094,6 +1128,7 @@ impl WebAuthContext {
             keyed_clock: 0,
             objects: crate::object_inspection::ObjectStore::new(),
             collection_placement: BTreeMap::new(),
+            log_index: BTreeMap::new(),
         }
     }
 
@@ -3760,6 +3795,212 @@ impl WebAuthContext {
             pillar_ops::ControlOp::User(u) => self.user_op(actor, u),
             pillar_ops::ControlOp::Cluster(c) => self.cluster_op(actor, c),
             pillar_ops::ControlOp::Trust(t) => self.trust_op(actor, t),
+            pillar_ops::ControlOp::Iam(i) => self.iam_op(actor, i),
+        }
+    }
+
+    /// Serve a [`pillar_ops::IamOp`] over the control-op tier. `RoleList`/
+    /// `RoleShow`/`GroupList`/`GroupShow`/`OauthList`/`OauthShow` are
+    /// member-gated VIEWS; `RoleAdd`/`RoleRm`/`GroupAdd`/`GroupAddMember`/
+    /// `GroupRm`/`OauthRegister` are capability-gated signed acts
+    /// (`perform_signed_act` on `iam:roles:write` / `iam:groups:write` /
+    /// `iam:oauth:write`) mutating the node's live role set, managed-group set,
+    /// and OAuth client registry respectively — the SAME substrate the IAM
+    /// admin panels drive.
+    fn iam_op(&mut self, actor: &NodeId, op: &pillar_ops::IamOp) -> Result<String, String> {
+        use pillar_iam::rbac_bridge::{ManagedGroup, Role};
+        use pillar_oidc::client_registry::{self, ClientOp, ClientType, GrantType};
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            // ---- ROLE VIEWS ----
+            pillar_ops::IamOp::RoleList => {
+                let mut body = String::new();
+                for (name, role) in &self.iam_roles {
+                    let caps: Vec<&str> = role.capabilities.iter().map(String::as_str).collect();
+                    body.push_str(&format!("{name}\t{}\n", caps.join(",")));
+                }
+                Ok(body)
+            }
+            pillar_ops::IamOp::RoleShow { name } => match self.iam_roles.get(name) {
+                Some(role) => {
+                    let caps: Vec<&str> = role.capabilities.iter().map(String::as_str).collect();
+                    Ok(format!("ROLE {name}\nCAPABILITIES {}", caps.join(",")))
+                }
+                None => Err(format!("no such role {name}")),
+            },
+            // ---- GROUP VIEWS ----
+            pillar_ops::IamOp::GroupList => {
+                let mut body = String::new();
+                for name in self.iam_groups.keys() {
+                    body.push_str(&format!("{name}\n"));
+                }
+                Ok(body)
+            }
+            pillar_ops::IamOp::GroupShow { name } => match self.iam_groups.get(name) {
+                Some(group) => {
+                    let roles: Vec<&str> = group.roles.iter().map(String::as_str).collect();
+                    let members: Vec<&str> = group.members.iter().map(String::as_str).collect();
+                    Ok(format!(
+                        "GROUP {name}\nROLES {}\nMEMBERS {}",
+                        roles.join(","),
+                        members.join(",")
+                    ))
+                }
+                None => Err(format!("no such group {name}")),
+            },
+            // ---- OAUTH VIEWS ----
+            pillar_ops::IamOp::OauthList => {
+                let mut body = String::new();
+                for client_id in self.oauth.clients.keys() {
+                    body.push_str(&format!("{client_id}\n"));
+                }
+                Ok(body)
+            }
+            pillar_ops::IamOp::OauthShow { client_id } => match self.oauth.clients.get(client_id) {
+                Some(c) => {
+                    let redirects: Vec<&str> = c.redirect_uris.iter().map(String::as_str).collect();
+                    let scopes: Vec<&str> = c.allowed_scopes.iter().map(String::as_str).collect();
+                    let grants: Vec<String> =
+                        c.allowed_grants.iter().map(|g| format!("{g:?}")).collect();
+                    Ok(format!(
+                        "CLIENT {client_id}\nTYPE {:?}\nREDIRECTS {}\nSCOPES {}\nGRANTS {}",
+                        c.client_type,
+                        redirects.join(","),
+                        scopes.join(","),
+                        grants.join(",")
+                    ))
+                }
+                None => Err(format!("no such client {client_id}")),
+            },
+            // ---- ROLE ACTS ----
+            pillar_ops::IamOp::RoleAdd { name, capabilities } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_ROLES_WRITE_CAPABILITY,
+                        &format!("ROLE-ADD {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:roles:write"))?;
+                self.iam_roles
+                    .insert(name.clone(), Role::new(name.clone(), capabilities.clone()));
+                Ok(format!("ROLE {name} EVENT-CID {}", cid.0))
+            }
+            pillar_ops::IamOp::RoleRm { name } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_ROLES_WRITE_CAPABILITY,
+                        &format!("ROLE-RM {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:roles:write"))?;
+                if self.iam_roles.remove(name).is_none() {
+                    return Err(format!("no such role {name}"));
+                }
+                Ok(format!("REMOVED {name} EVENT-CID {}", cid.0))
+            }
+            // ---- GROUP ACTS ----
+            pillar_ops::IamOp::GroupAdd { name, roles } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_GROUPS_WRITE_CAPABILITY,
+                        &format!("GROUP-ADD {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:groups:write"))?;
+                self.iam_groups
+                    .insert(name.clone(), ManagedGroup::new(name.clone(), roles.clone()));
+                Ok(format!("GROUP {name} EVENT-CID {}", cid.0))
+            }
+            pillar_ops::IamOp::GroupAddMember { name, handle } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_GROUPS_WRITE_CAPABILITY,
+                        &format!("GROUP-ADD-MEMBER {name} {handle}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:groups:write"))?;
+                let group = self
+                    .iam_groups
+                    .get_mut(name)
+                    .ok_or_else(|| format!("no such group {name}"))?;
+                group.members.insert(handle.clone());
+                Ok(format!("MEMBER {handle} ADDED {name} EVENT-CID {}", cid.0))
+            }
+            pillar_ops::IamOp::GroupRm { name } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_GROUPS_WRITE_CAPABILITY,
+                        &format!("GROUP-RM {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:groups:write"))?;
+                if self.iam_groups.remove(name).is_none() {
+                    return Err(format!("no such group {name}"));
+                }
+                Ok(format!("REMOVED {name} EVENT-CID {}", cid.0))
+            }
+            // ---- OAUTH ACT ----
+            pillar_ops::IamOp::OauthRegister {
+                client_id,
+                client_type,
+                redirect_uris,
+                scopes,
+                grants,
+            } => {
+                let client_type = match client_type.as_str() {
+                    "public" => ClientType::Public,
+                    "confidential" => ClientType::Confidential,
+                    other => {
+                        return Err(format!(
+                            "BAD client type {other}: expected public|confidential"
+                        ))
+                    }
+                };
+                let mut grant_set: std::collections::BTreeSet<GrantType> =
+                    std::collections::BTreeSet::new();
+                for g in grants {
+                    let gt = match g.as_str() {
+                        "authorization_code" | "auth_code" | "code" => GrantType::AuthorizationCode,
+                        "refresh_token" | "refresh" => GrantType::RefreshToken,
+                        "client_credentials" | "client_creds" => GrantType::ClientCredentials,
+                        other => return Err(format!("BAD grant type {other}")),
+                    };
+                    grant_set.insert(gt);
+                }
+                let redirects: std::collections::BTreeSet<String> =
+                    redirect_uris.iter().cloned().collect();
+                let scope_set: std::collections::BTreeSet<String> =
+                    scopes.iter().cloned().collect();
+                // Validate the SAME invariants apply_op preserves before we gate,
+                // so an invalid client is refused at the source.
+                if let Err(e) =
+                    client_registry::validate_registration(client_type, &redirects, &grant_set)
+                {
+                    return Err(format!("DENIED {e:?}"));
+                }
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_oidc::client_registry::OAUTH_WRITE_CAPABILITY,
+                        &format!("OAUTH-REGISTER {client_id}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:oauth:write"))?;
+                let now = self.iam_now();
+                client_registry::apply_op(
+                    &mut self.oauth,
+                    ClientOp::RegisterClient {
+                        client_id: client_id.clone(),
+                        client_type,
+                        redirect_uris: redirects,
+                        allowed_scopes: scope_set,
+                        allowed_grants: grant_set,
+                        at: now,
+                    },
+                );
+                Ok(format!("REGISTERED {client_id} EVENT-CID {}", cid.0))
+            }
         }
     }
 
@@ -4075,6 +4316,7 @@ impl WebAuthContext {
             pillar_ops::QueryOp::Sql(sql) => self.sql_query_op(actor, sql),
             pillar_ops::QueryOp::Object(obj) => self.object_query_op(actor, obj),
             pillar_ops::QueryOp::Catalog(catalog) => self.catalog_query_op(actor, catalog),
+            pillar_ops::QueryOp::Log(log) => self.log_query_op(actor, log),
         }
     }
 
@@ -4086,10 +4328,27 @@ impl WebAuthContext {
 
     /// Authorize a keyed-store WRITE act on the `data:write` capability, then
     /// return the signed event's CID for the ack. Refusal mirrors every other
-    /// signed-act path.
-    fn authorize_data_write(&mut self, actor: &NodeId, payload: &str) -> Result<String, String> {
+    /// signed-act path. Also indexes the newly-appended [`Self::act_log`]
+    /// event under `collection` in [`Self::log_index`] — the same signed
+    /// event `pillar log info|blocks|list|show|dag|watch|verify` reads back
+    /// (`pillar-log-inspection-tier`), stamped with a fresh HLC tick so the
+    /// op-log inspection surface can render a real, monotonic clock per
+    /// event.
+    fn authorize_data_write(
+        &mut self,
+        actor: &NodeId,
+        collection: &str,
+        payload: &str,
+    ) -> Result<String, String> {
         match self.perform_signed_act(actor, "data:write", payload) {
-            Ok(cid) => Ok(format!("{}", cid.0)),
+            Ok(cid) => {
+                let hlc = self.next_keyed_hlc(actor);
+                self.log_index
+                    .entry(collection.to_owned())
+                    .or_default()
+                    .push((cid.clone(), hlc));
+                Ok(format!("{}", cid.0))
+            }
             Err(a) => Err(format!("unauthorized actor {a} for data:write")),
         }
     }
@@ -4104,14 +4363,14 @@ impl WebAuthContext {
                 let value = decode_hex_bytes(value_hex)
                     .ok_or_else(|| "value_hex is not valid lowercase hex".to_owned())?;
                 let cid =
-                    self.authorize_data_write(actor, &format!("KV-PUT {collection} {key}"))?;
+                    self.authorize_data_write(actor, collection, &format!("KV-PUT {collection} {key}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.kv_put(collection, key, value, hlc);
                 Ok(format!("KV-PUT {collection} {key} EVENT-CID {cid}"))
             }
             pillar_ops::KvOp::Delete { collection, key } => {
                 let cid =
-                    self.authorize_data_write(actor, &format!("KV-DELETE {collection} {key}"))?;
+                    self.authorize_data_write(actor, collection, &format!("KV-DELETE {collection} {key}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.kv_delete(collection, key, hlc);
                 Ok(format!("KV-DELETE {collection} {key} EVENT-CID {cid}"))
@@ -4138,7 +4397,7 @@ impl WebAuthContext {
                 value,
             } => {
                 let cid = self
-                    .authorize_data_write(actor, &format!("DOC-PUT {collection} {id} {field}"))?;
+                    .authorize_data_write(actor, collection, &format!("DOC-PUT {collection} {id} {field}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.doc_put_field(
                     collection,
@@ -4156,6 +4415,7 @@ impl WebAuthContext {
             } => {
                 let cid = self.authorize_data_write(
                     actor,
+                    collection,
                     &format!("DOC-DELETE {collection} {id} {field}"),
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
@@ -4201,13 +4461,13 @@ impl WebAuthContext {
                     def = def.projecting(p.clone());
                 }
                 let cid =
-                    self.authorize_data_write(actor, &format!("SQL-CREATE-VIEW {name} {source}"))?;
+                    self.authorize_data_write(actor, name, &format!("SQL-CREATE-VIEW {name} {source}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 pillar_sqlviews::create_view(&mut self.keyed_store, name, def, hlc);
                 Ok(format!("VIEW {name} OVER {source} EVENT-CID {cid}"))
             }
             pillar_ops::SqlOp::DropView { name } => {
-                let cid = self.authorize_data_write(actor, &format!("SQL-DROP-VIEW {name}"))?;
+                let cid = self.authorize_data_write(actor, name, &format!("SQL-DROP-VIEW {name}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 pillar_sqlviews::drop_view(&mut self.keyed_store, name, hlc);
                 Ok(format!("DROP-VIEW {name} EVENT-CID {cid}"))
@@ -4267,7 +4527,8 @@ impl WebAuthContext {
     ) -> Result<String, String> {
         match op {
             pillar_ops::ObjectOp::Put { .. } => {
-                let event_cid = self.authorize_data_write(actor, "OBJECT-PUT")?;
+                let event_cid =
+                    self.authorize_data_write(actor, TSDB_OBJECTS_COLLECTION, "OBJECT-PUT")?;
                 let cid_hex = self.objects.put(&actor.to_string(), op)?;
                 Ok(format!("OBJECT-PUT {cid_hex} EVENT-CID {event_cid}"))
             }
@@ -4457,6 +4718,215 @@ impl WebAuthContext {
         selector: pillar_net::NodeSelector,
     ) {
         self.collection_placement.insert(collection.into(), selector);
+    }
+
+    /// The retention window (in ops) `pillar log blocks` reports for the
+    /// reserved TSDB-kind collection [`TSDB_OBJECTS_COLLECTION`]: only the
+    /// most recent [`TSDB_RETENTION_HORIZON`] ops are reported live; every
+    /// older one is reported explicitly PRUNED — a REPORTED fact (this exact
+    /// policy), never an inference from the data.
+    const TSDB_RETENTION_HORIZON: usize = 4;
+
+    /// Serve a [`pillar_ops::LogOp`] over the sealed query tier
+    /// (`pillar-log-inspection-tier`): the middle tier of the inspection
+    /// stack, over the collection's own signed, content-addressed op log —
+    /// the SAME [`Self::act_log`] every `Kv`/`Doc`/`Sql`/`Object` write
+    /// already appends to, indexed per-collection in [`Self::log_index`] by
+    /// [`Self::authorize_data_write`]. Every variant is a member-gated VIEW.
+    fn log_query_op(&self, _actor: &NodeId, op: &pillar_ops::LogOp) -> Result<String, String> {
+        match op {
+            pillar_ops::LogOp::Info { collection } => self.log_info(collection),
+            pillar_ops::LogOp::Blocks { collection } => self.log_blocks(collection),
+            pillar_ops::LogOp::List { collection } => self.log_list(collection),
+            pillar_ops::LogOp::Show {
+                collection,
+                event_id_hex,
+            } => self.log_show(collection, event_id_hex),
+            pillar_ops::LogOp::Dag { collection } => self.log_dag(collection),
+            // No persistent streaming transport on this remote surface: a
+            // bounded, single-shot rendering of the current tip stands in for
+            // a live subscription — a caller re-issues `Watch` to observe it
+            // advance, exactly as documented on `LogOp::Watch`.
+            pillar_ops::LogOp::Watch { collection } => self.log_info(collection),
+            pillar_ops::LogOp::Verify {
+                collection,
+                event_id_hex,
+            } => self.log_verify(collection, event_id_hex),
+        }
+    }
+
+    /// Parse a lowercase-hex event id into an [`EventId`].
+    fn parse_event_id(event_id_hex: &str) -> Result<EventId, String> {
+        let bytes = decode_hex_bytes(event_id_hex)
+            .ok_or_else(|| "event_id_hex is not valid lowercase hex".to_owned())?;
+        Ok(EventId(OpId(pillar_crypto::ContentId::from_bytes(bytes))))
+    }
+
+    /// The indexed `(EventId, Hlc)` sequence of `collection`'s op log, in
+    /// append order — the same index [`Self::authorize_data_write`] builds.
+    fn log_events(&self, collection: &str) -> Result<&[(EventId, pillar_keyedstore::Hlc)], String> {
+        self.log_index
+            .get(collection)
+            .map(std::vec::Vec::as_slice)
+            .ok_or_else(|| format!("no such collection {collection}"))
+    }
+
+    /// `pillar log info`: op count + current tip of `collection`'s op log.
+    fn log_info(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let mut out = format!("collection: {collection}\nops: {}\n", events.len());
+        match events.last() {
+            Some((id, hlc)) => out.push_str(&format!(
+                "tip: {}\ntip-hlc: {}.{}.{}\n",
+                hex_encode(id.as_bytes()),
+                hlc.physical,
+                hlc.logical,
+                hlc.author
+            )),
+            None => out.push_str("tip: (none)\n"),
+        }
+        Ok(out)
+    }
+
+    /// `pillar log blocks`: the REPORTED (never inferred) physical storage
+    /// layout backing `collection`. The reserved `__objects` collection (the
+    /// object-inspection tier's content-addressed block store: every `pillar
+    /// object put` is an individually content-addressed, immutable block,
+    /// NEVER folded into an LWW snapshot) is TSDB-kind: it reports its
+    /// immutable retention blocks back to the retention horizon, with older
+    /// blocks reported pruned, and no snapshot. Every other collection is the
+    /// document/keyed kind backed by [`Self::keyed_store`] (an AP CRDT fold
+    /// that never compacts to a snapshot): it reports `snapshot: none` plus
+    /// its full, uncompacted op tail.
+    fn log_blocks(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let mut out = format!("collection: {collection}\n");
+        if collection == TSDB_OBJECTS_COLLECTION {
+            out.push_str("kind: tsdb\n");
+            let total = events.len();
+            let horizon = Self::TSDB_RETENTION_HORIZON.min(total);
+            let (pruned, retained) = events.split_at(total - horizon);
+            out.push_str(&format!(
+                "retention_horizon: {}\n",
+                Self::TSDB_RETENTION_HORIZON
+            ));
+            out.push_str("blocks:\n");
+            for (id, _) in retained {
+                out.push_str(&format!("  {}\n", hex_encode(id.as_bytes())));
+            }
+            out.push_str(&format!("pruned: {}\n", pruned.len()));
+            for (id, _) in pruned {
+                out.push_str(&format!("  pruned {}\n", hex_encode(id.as_bytes())));
+            }
+        } else {
+            out.push_str("kind: document\n");
+            out.push_str("snapshot: none\n");
+            out.push_str(&format!("tail: {} ops (uncompacted)\n", events.len()));
+            for (id, _) in events {
+                out.push_str(&format!("  {}\n", hex_encode(id.as_bytes())));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `pillar log list`: every op-log event id of `collection`, append order.
+    fn log_list(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        Ok(join_lines(
+            events
+                .iter()
+                .map(|(id, _)| hex_encode(id.as_bytes()))
+                .collect(),
+        ))
+    }
+
+    /// `pillar log show`: decode one op — author + signature, HLC, causal
+    /// parents, kind, key, payload CID, seal (always `none`; a log entry is
+    /// never a sealed body — see [`pillar_ops::ObjectOp`] for that).
+    fn log_show(&self, collection: &str, event_id_hex: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let id = Self::parse_event_id(event_id_hex)?;
+        let (_, hlc) = events
+            .iter()
+            .find(|(e, _)| e == &id)
+            .ok_or_else(|| format!("no such event {event_id_hex} in collection {collection}"))?;
+        let event = self
+            .act_log
+            .get(&id)
+            .ok_or_else(|| "event not held".to_owned())?;
+        let content = event.content();
+        let payload = content.payload();
+        let payload_text = String::from_utf8_lossy(payload).into_owned();
+        let mut tokens = payload_text.split_whitespace();
+        let kind = tokens.next().unwrap_or("").to_owned();
+        let key = tokens.collect::<Vec<_>>().join(" ");
+        let payload_cid = pillar_streamdb::content_address(payload);
+        let signature_bytes = serde_json::to_vec(event.signature()).unwrap_or_default();
+        let parents = content
+            .parents()
+            .iter()
+            .map(|p| hex_encode(p.as_bytes()))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!(
+            "event: {event_id_hex}\nauthor: {}\nhlc: {}.{}.{}\nkind: {kind}\nkey: {key}\npayload-cid: {}\nparents: {parents}\nsignature: {}\nseal: none\n",
+            content.author().0,
+            hlc.physical,
+            hlc.logical,
+            hlc.author,
+            hex_encode(payload_cid.as_bytes()),
+            hex_encode(&signature_bytes),
+        ))
+    }
+
+    /// `pillar log dag`: the causal graph (`prev`/`parents` hash-links) of
+    /// `collection`'s op log, one `parent -> child` edge per line.
+    fn log_dag(&self, collection: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let mut out = String::new();
+        for (id, _) in events {
+            let Some(event) = self.act_log.get(id) else {
+                continue;
+            };
+            let content = event.content();
+            let mut links: Vec<EventId> = content.parents().iter().cloned().collect();
+            links.extend(content.prev());
+            if links.is_empty() {
+                out.push_str(&format!("(genesis) {}\n", hex_encode(id.as_bytes())));
+            }
+            for link in links {
+                out.push_str(&format!(
+                    "{} -> {}\n",
+                    hex_encode(link.as_bytes()),
+                    hex_encode(id.as_bytes())
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `pillar log verify`: confirm hash==id and signature validity of one
+    /// event, WITHOUT ever needing to interpret its payload. Reaching the
+    /// event via its own [`EventId`] (a content address) already proves
+    /// hash==id; [`pillar_eventlog::Event::is_authentic`] checks the
+    /// signature.
+    fn log_verify(&self, collection: &str, event_id_hex: &str) -> Result<String, String> {
+        let events = self.log_events(collection)?;
+        let id = Self::parse_event_id(event_id_hex)?;
+        if !events.iter().any(|(e, _)| e == &id) {
+            return Err(format!(
+                "no such event {event_id_hex} in collection {collection}"
+            ));
+        }
+        let event = self
+            .act_log
+            .get(&id)
+            .ok_or_else(|| "event not held".to_owned())?;
+        let sig_ok = event.is_authentic();
+        Ok(format!(
+            "event: {event_id_hex}\nhash-matches-id: true\nsignature-valid: {sig_ok}\nauthor: {}\n",
+            event.content().author().0
+        ))
     }
 
     /// Serve a [`pillar_ops::IdentityOp`] over the control-op tier. `Show`/
@@ -7727,6 +8197,86 @@ fn iam_caller_gate(ctx: &WebAuthContext, handle: &str) -> Result<(), HttpRespons
     }
 }
 
+/// Route a single admin user-mutation through the delegated-signed
+/// `ControlOp::User(...)` tier instead of a privileged REST call: the node
+/// signs the op on the caller's behalf via
+/// [`pillar_web::node_custody::NodeCustodyVerifier::sign_op_for`] — requiring
+/// the caller's OWN password plus a fresh, single-use step-up token, exactly
+/// the re-authentication a keyless browser client cannot forge — then
+/// dispatches the SAME [`WebAuthContext::control_op`] -> `user_op` path the
+/// CLI's keyed `pillar user ...` client and the resource-op UDP tier already
+/// use (`crates/pillar-cli/src/apply_over_pillar_message.rs`,
+/// `crates/pillar-cli/src/resource_op_udp_server.rs`). This retires the
+/// REST tier's bespoke `perform_signed_act("iam:users:write", ...)` call for
+/// every admin user-mutation act: the `iam:users:write` RBAC decision is made
+/// exactly ONCE, inside `user_op`, against the delegated signature — never
+/// re-derived here. A Pillar admin user-mutation is never a privileged REST
+/// call to a node.
+///
+/// `iam_caller_gate`'s onboarding-containment check is now belt-and-
+/// suspenders ONLY: a contained caller (forced password change / required
+/// passkey / disabled) already fails CRYPTOGRAPHICALLY here —
+/// `sign_op_for` cannot unlock an offer a require-change/admin-reset/disable
+/// revoked (`NodeCustodyError::NoOfferForUser`) — so a would-be
+/// `iam_caller_gate` denial is logged as an assertion, never itself the
+/// blocking decision.
+fn dispatch_delegated_user_op(
+    ctx: &mut WebAuthContext,
+    caller: &str,
+    caller_password: &str,
+    op: pillar_ops::UserOp,
+) -> Result<String, HttpResponse> {
+    if let Err(resp) = iam_caller_gate(ctx, caller) {
+        // Belt-and-suspenders assertion only: the real gate is the delegated
+        // signature below, which fails closed for a contained caller
+        // (`NodeCustodyError::NoOfferForUser`). Never block on this alone.
+        eprintln!(
+            "iam_caller_gate assertion: {caller} would have been denied (status {} {}); \
+             relying on the delegated-signature gate instead",
+            resp.status,
+            resp.body.trim()
+        );
+    }
+    let control_op = pillar_ops::ControlOp::User(op);
+    let signing_material = match control_op.encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err(text_response(
+                500,
+                "Internal Server Error",
+                format!("ENCODE-FAILURE {e}"),
+            ))
+        }
+    };
+    let mut step_up = pillar_key_distribution::StepUpToken::fresh();
+    let (signature, signer) = match ctx.verifier.sign_op_for(
+        caller,
+        caller_password,
+        &signing_material,
+        &mut step_up,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(text_response(
+                403,
+                "Forbidden",
+                format!("REFUSED delegated-sign {e:?}"),
+            ));
+        }
+    };
+    let crypto_signature = pillar_crypto::Signature::from_bytes(signature.to_wire().to_vec());
+    if pillar_crypto::sign::verify(&signer, &signing_material, &crypto_signature).is_err() {
+        return Err(text_response(
+            500,
+            "Internal Server Error",
+            "DELEGATED-SIGNATURE-VERIFY-FAILED".to_owned(),
+        ));
+    }
+    let actor = bootstrap_subkey(caller).node_id();
+    ctx.control_op(&actor, &control_op)
+        .map_err(|reason| text_response(403, "Forbidden", format!("REFUSED {reason}")))
+}
+
 /// List IAM users: `GET /portal/users?token=...`. One line per user:
 /// `<handle> status=<s> force_password_change=<bool> roles=<r1,r2,...>` — the
 /// exact framing the redesigned Users tile parses (`parse_user_rows`).
@@ -7748,20 +8298,26 @@ fn dispatch_users_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRespo
 }
 
 /// Admin invite of a NEW user: `POST /portal/users/invite`, body
-/// `<token>\n<handle>\n<email>` and OPTIONALLY three more Keycloak-style option
-/// lines `<initial_password>\n<force_password_change>\n<require_passkey>`. When
-/// the password line is empty/absent the node generates a one-time temporary
-/// password and RETURNS it (revealed once to the admin); `force_password_change`
-/// defaults ON (only an explicit `false` disables it) and `require_passkey`
-/// defaults OFF (only an explicit `true` enables it). Gated through
-/// [`WebAuthContext::perform_signed_act`] on `iam:users:write` — the SAME
-/// WoT/RBAC decider every other portal write uses.
+/// `<admin_password>\n<token>\n<handle>\n<email>` and OPTIONALLY three more
+/// Keycloak-style option lines `<initial_password>\n<force_password_change>\n
+/// <require_passkey>`. When the password line is empty/absent the node
+/// generates a one-time temporary password and RETURNS it (revealed once to
+/// the admin); `force_password_change` defaults ON (only an explicit `false`
+/// disables it) and `require_passkey` defaults OFF (only an explicit `true`
+/// enables it). Routed through the delegated-signed `ControlOp::User(Invite)`
+/// tier ([`dispatch_delegated_user_op`]) instead of a privileged REST
+/// mutation: the node signs the op on the admin's behalf
+/// ([`pillar_web::node_custody::NodeCustodyVerifier::sign_op_for`], gated on
+/// `<admin_password>` + a fresh step-up), then applies it through the SAME
+/// `iam:users:write`-gated `user_op` path the CLI's keyed client and the
+/// resource-op UDP tier already use.
 fn dispatch_users_invite(
     ctx: &mut WebAuthContext,
     peer: &SocketAddr,
     request: &HttpRequest,
 ) -> HttpResponse {
     let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
     let token = lines.next().unwrap_or("").trim();
     let handle = lines.next().unwrap_or("").trim();
     let email = lines.next().unwrap_or("").trim();
@@ -7772,17 +8328,15 @@ fn dispatch_users_invite(
     if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
         return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
     }
-    let Some(session) = session else {
+    if session.is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
     if handle.is_empty() {
         return text_response(400, "Bad Request", "MISSING handle".to_owned());
     }
-    if let Some(caller) = iam_caller_handle(ctx, token) {
-        if let Err(resp) = iam_caller_gate(ctx, &caller) {
-            return resp;
-        }
-    }
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
     // Keycloak-style options: force-change defaults ON (only "false" disables),
     // require-passkey defaults OFF (only "true" enables).
     let force_password_change = force_line != "false";
@@ -7797,36 +8351,19 @@ fn dispatch_users_invite(
     } else {
         (pw_line.to_owned(), false)
     };
-    let actor = session.subject.clone();
-    if ctx
-        .perform_signed_act(&actor, "iam:users:write", &format!("USER-INVITE {handle}"))
-        .is_err()
-    {
-        return text_response(
-            403,
-            "Forbidden",
-            format!("REFUSED unauthorized actor {actor} for iam:users:write"),
-        );
-    }
-    let at = ctx.iam_now();
-    let offer_material = match fresh_offer_material(handle) {
-        Ok(m) => m,
-        Err(()) => return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned()),
-    };
-    match ctx.iam_invite(
-        handle,
-        handle.to_owned(),
-        email.to_owned(),
+    let op = pillar_ops::UserOp::Invite {
+        handle: handle.to_owned(),
+        email: email.to_owned(),
         force_password_change,
         require_passkey,
-        &password,
-        offer_material,
-        at,
-    ) {
-        Ok(()) => text_response(200, "OK", password),
-        Err(pillar_iam::InviteError::AlreadyExists) => {
+        password: Some(password.clone()),
+    };
+    match dispatch_delegated_user_op(ctx, &caller, &admin_password, op) {
+        Ok(_detail) => text_response(200, "OK", password),
+        Err(resp) if resp.body.contains("already exists") => {
             text_response(409, "Conflict", "DENIED already-exists".to_owned())
         }
+        Err(resp) => resp,
     }
 }
 
@@ -7900,11 +8437,16 @@ fn dispatch_profile_update(
 ///     user's handle): re-seals the caller's own offer under the new password
 ///     and clears the forced-change onboarding action (the way OUT of
 ///     containment). Session-authenticated (the login already proved password
-///     knowledge); permitted while contained (`OwnPasswordChange`).
-///   * ADMIN reset — body `<token>\n<target_handle>` (the field names ANOTHER
-///     existing user): `iam:users:write`-gated; issues a NEW one-time temporary
-///     password for the target, re-forces their change, and RETURNS the temp
-///     password (revealed once). Registered WebAuthn credentials are untouched.
+///     knowledge); permitted while contained (`OwnPasswordChange`); unchanged
+///     by the delegated-signed wiring below (never a privileged act on
+///     ANOTHER user).
+///   * ADMIN reset — body `<token>\n<target_handle>\n<admin_password>` (the
+///     second field names ANOTHER existing user): routed through the
+///     delegated-signed `ControlOp::User(SetPassword)` tier
+///     ([`dispatch_delegated_user_op`]) instead of a privileged REST call;
+///     issues a NEW one-time temporary password for the target, re-forces
+///     their change, and RETURNS the temp password (revealed once).
+///     Registered WebAuthn credentials are untouched.
 fn dispatch_users_reset_password(
     ctx: &mut WebAuthContext,
     peer: &SocketAddr,
@@ -7913,11 +8455,12 @@ fn dispatch_users_reset_password(
     let mut lines = request.body.lines();
     let token = lines.next().unwrap_or("").trim();
     let field2 = lines.next().unwrap_or("").trim();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
     let session = ctx.login_session_for(token).cloned();
     if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
         return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
     }
-    let Some(session) = session else {
+    if session.is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
     let Some(caller) = iam_caller_handle(ctx, token) else {
@@ -7928,40 +8471,28 @@ fn dispatch_users_reset_password(
     }
     let is_admin_reset = field2 != caller && ctx.iam_users().contains_key(field2);
     if is_admin_reset {
-        if let Err(resp) = iam_caller_gate(ctx, &caller) {
-            return resp;
-        }
-        let actor = session.subject.clone();
-        if ctx
-            .perform_signed_act(&actor, "iam:users:write", &format!("USER-RESET {field2}"))
-            .is_err()
-        {
-            return text_response(
-                403,
-                "Forbidden",
-                format!("REFUSED unauthorized actor {actor} for iam:users:write"),
-            );
-        }
         let temp = match generate_temp_password() {
             Ok(p) => p,
             Err(()) => {
                 return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned())
             }
         };
-        let at = ctx.iam_now();
-        let offer_material = match fresh_offer_material(field2) {
-            Ok(m) => m,
-            Err(()) => {
-                return text_response(500, "Internal Server Error", "RNG-FAILURE".to_owned())
-            }
+        let op = pillar_ops::UserOp::SetPassword {
+            handle: field2.to_owned(),
+            password: temp.clone(),
+            force: true,
         };
-        if ctx.iam_set_password(field2, &temp, true, offer_material, at) {
-            text_response(200, "OK", temp)
-        } else {
-            text_response(404, "Not Found", "DENIED unknown-user".to_owned())
+        match dispatch_delegated_user_op(ctx, &caller, &admin_password, op) {
+            Ok(_detail) => text_response(200, "OK", temp),
+            Err(resp) if resp.body.contains("no user") => {
+                text_response(404, "Not Found", "DENIED unknown-user".to_owned())
+            }
+            Err(resp) => resp,
         }
     } else {
-        // Self password change: field2 is the caller's NEW password.
+        // Self password change: field2 is the caller's NEW password. Never
+        // an admin act on another user, so it stays outside the delegated-
+        // signed tier — the caller mutates only their own record.
         if !ctx.iam_users().contains_key(&caller) {
             return text_response(409, "Conflict", "DENIED no-self-record".to_owned());
         }
@@ -8007,10 +8538,13 @@ fn dispatch_users_action_dry_run(ctx: &WebAuthContext, request: &HttpRequest) ->
 }
 
 /// A single-target admin lifecycle act (`POST /portal/users/{disable,enable,
-/// require-password-change}`, body `<token>\n<handle>`), gated on
-/// `iam:users:write`. `disable` also revokes the target's live sessions
-/// (`DisabledNeverActive`); `enable` restores `Active`; `require-password-change`
-/// sets the forced-change onboarding action.
+/// require-password-change}`, body `<admin_password>\n<token>\n<handle>`).
+/// Routed through the delegated-signed `ControlOp::User(...)`
+/// tier ([`dispatch_delegated_user_op`]) instead of a privileged REST
+/// mutation: `disable` also revokes the target's live sessions
+/// (`DisabledNeverActive`, done inside `user_op`); `enable` restores
+/// `Active`; `require-password-change` sets the forced-change onboarding
+/// action.
 fn dispatch_users_lifecycle(
     ctx: &mut WebAuthContext,
     peer: &SocketAddr,
@@ -8018,56 +8552,39 @@ fn dispatch_users_lifecycle(
     action: UserLifecycleAction,
 ) -> HttpResponse {
     let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
     let token = lines.next().unwrap_or("").trim();
     let handle = lines.next().unwrap_or("").trim();
     let session = ctx.login_session_for(token).cloned();
     if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
         return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
     }
-    let Some(session) = session else {
+    if session.is_none() {
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
-    };
+    }
     if handle.is_empty() {
         return text_response(400, "Bad Request", "MISSING handle".to_owned());
     }
-    if let Some(caller) = iam_caller_handle(ctx, token) {
-        if let Err(resp) = iam_caller_gate(ctx, &caller) {
-            return resp;
-        }
-    }
-    let actor = session.subject.clone();
-    if ctx
-        .perform_signed_act(
-            &actor,
-            "iam:users:write",
-            &format!("USER-{action:?} {handle}"),
-        )
-        .is_err()
-    {
-        return text_response(
-            403,
-            "Forbidden",
-            format!("REFUSED unauthorized actor {actor} for iam:users:write"),
-        );
-    }
-    let at = ctx.iam_now();
-    let ok = match action {
-        UserLifecycleAction::Disable => {
-            let ok = ctx.iam_set_status(handle, pillar_iam::UserStatus::Disabled, at);
-            if ok {
-                ctx.iam_revoke_user_sessions(handle);
-            }
-            ok
-        }
-        UserLifecycleAction::Enable => {
-            ctx.iam_set_status(handle, pillar_iam::UserStatus::Active, at)
-        }
-        UserLifecycleAction::RequireChange => ctx.iam_require_change(handle, at),
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
-    if ok {
-        text_response(200, "OK", format!("USER {handle} {action:?}"))
-    } else {
-        text_response(404, "Not Found", "DENIED unknown-user".to_owned())
+    let op = match action {
+        UserLifecycleAction::Disable => pillar_ops::UserOp::Disable {
+            handle: handle.to_owned(),
+        },
+        UserLifecycleAction::Enable => pillar_ops::UserOp::Enable {
+            handle: handle.to_owned(),
+        },
+        UserLifecycleAction::RequireChange => pillar_ops::UserOp::RequireChange {
+            handle: handle.to_owned(),
+        },
+    };
+    match dispatch_delegated_user_op(ctx, &caller, &admin_password, op) {
+        Ok(_detail) => text_response(200, "OK", format!("USER {handle} {action:?}")),
+        Err(resp) if resp.body.contains("no user") => {
+            text_response(404, "Not Found", "DENIED unknown-user".to_owned())
+        }
+        Err(resp) => resp,
     }
 }
 
@@ -9700,7 +10217,7 @@ mod tests {
 
     // A node that already custodies an offer for alice, WoT-chained + admitted.
     fn provisioned_ctx() -> (WebAuthContext, NodeSubkey) {
-        let subkey = NodeSubkey::from("op-subkey-alice");
+        let subkey = bootstrap_subkey("alice@pillar");
         let mut ctx = WebAuthContext::new(
             ORIGIN,
             NodeId::from("this-node"),
@@ -9711,7 +10228,7 @@ mod tests {
         ctx.admit_subject(subkey.node_id(), 4);
         ctx.provision_offer(
             "alice@pillar",
-            "Alice",
+            "alice@pillar",
             Cid::from("cid-alice"),
             subkey.clone(),
             PASSWORD,
@@ -10226,7 +10743,7 @@ mod tests {
         let login_resp = post(&mut ctx, "/login", &login_body);
         assert_eq!(login_resp.status, 200, "login body: {}", login_resp.body);
         assert!(
-            login_resp.body.starts_with("OK Alice"),
+            login_resp.body.starts_with("OK alice@pillar"),
             "the node greets the user by handle: {}",
             login_resp.body
         );
@@ -10293,7 +10810,7 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\nbob\nbob@example.com"),
+            &format!("{PASSWORD}\n{admin}\nbob\nbob@example.com"),
         );
         assert_eq!(invite.status, 200, "invite: {}", invite.body);
         let temp = invite.body.trim().to_owned();
@@ -10328,7 +10845,7 @@ mod tests {
         let contained = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{bob}\neve\neve@example.com"),
+            &format!("wrong-password\n{bob}\neve\neve@example.com"),
         );
         assert_eq!(
             contained.status, 403,
@@ -10367,7 +10884,7 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\ncarol\ncarol@example.com\ncarol-initial-pw\nfalse\nfalse"),
+            &format!("{PASSWORD}\n{admin}\ncarol\ncarol@example.com\ncarol-initial-pw\nfalse\nfalse"),
         );
         assert_eq!(invite.status, 200, "invite: {}", invite.body);
 
@@ -10395,7 +10912,7 @@ mod tests {
         let bad = post(
             &mut ctx,
             "/portal/users/invite",
-            "bad-token\nbob\nbob@example.com",
+            "irrelevant\nbad-token\nbob\nbob@example.com",
         );
         assert!(
             bad.status == 401 || bad.status == 403,
@@ -10408,14 +10925,14 @@ mod tests {
         let ok = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\nbob\nbob@example.com"),
+            &format!("{PASSWORD}\n{admin}\nbob\nbob@example.com"),
         );
         assert_eq!(ok.status, 200);
         // Second invite of the same handle conflicts.
         let dup = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\nbob\nbob@example.com"),
+            &format!("{PASSWORD}\n{admin}\nbob\nbob@example.com"),
         );
         assert_eq!(
             dup.status, 409,
@@ -10434,14 +10951,14 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\ndan\ndan@example.com\ndan-pw\nfalse\nfalse"),
+            &format!("{PASSWORD}\n{admin}\ndan\ndan@example.com\ndan-pw\nfalse\nfalse"),
         );
         assert_eq!(invite.status, 200);
         // Admin resets dan (field2 = "dan", an existing OTHER user).
         let reset = post(
             &mut ctx,
             "/portal/users/reset-password",
-            &format!("{admin}\ndan"),
+            &format!("{admin}\ndan\n{PASSWORD}"),
         );
         assert_eq!(reset.status, 200, "admin reset: {}", reset.body);
         let new_temp = reset.body.trim().to_owned();
@@ -10467,7 +10984,7 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\nfay\nfay@example.com\nfay-pw\nfalse\nfalse"),
+            &format!("{PASSWORD}\n{admin}\nfay\nfay@example.com\nfay-pw\nfalse\nfalse"),
         );
         assert_eq!(invite.status, 200);
         // Fay can log in while active.
@@ -10481,7 +10998,7 @@ mod tests {
         assert_eq!(dry.body.trim(), "PREDICTED ALLOW", "dry-run: {}", dry.body);
 
         // Disable fay → login now refused.
-        let dis = post(&mut ctx, "/portal/users/disable", &format!("{admin}\nfay"));
+        let dis = post(&mut ctx, "/portal/users/disable", &format!("{PASSWORD}\n{admin}\nfay"));
         assert_eq!(dis.status, 200, "disable: {}", dis.body);
         let list = get(&mut ctx, &format!("/portal/users?token={admin}"));
         assert!(
@@ -10510,7 +11027,7 @@ mod tests {
         );
 
         // Enable → login works again.
-        let en = post(&mut ctx, "/portal/users/enable", &format!("{admin}\nfay"));
+        let en = post(&mut ctx, "/portal/users/enable", &format!("{PASSWORD}\n{admin}\nfay"));
         assert_eq!(en.status, 200, "enable: {}", en.body);
         let _fay2 = login_token(&mut ctx, "fay", "fay-pw");
 
@@ -10518,7 +11035,7 @@ mod tests {
         let req = post(
             &mut ctx,
             "/portal/users/require-password-change",
-            &format!("{admin}\nfay"),
+            &format!("{PASSWORD}\n{admin}\nfay"),
         );
         assert_eq!(req.status, 200, "require-change: {}", req.body);
         let list2 = get(&mut ctx, &format!("/portal/users?token={admin}"));
@@ -10543,7 +11060,7 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\ngina\ngina@example.com"),
+            &format!("{PASSWORD}\n{admin}\ngina\ngina@example.com"),
         );
         assert_eq!(invite.status, 200, "invite: {}", invite.body);
         let temp = invite.body.trim().to_owned();
@@ -10578,7 +11095,7 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\nhugo\nhugo@example.com\nhugo-pw\nfalse\nfalse"),
+            &format!("{PASSWORD}\n{admin}\nhugo\nhugo@example.com\nhugo-pw\nfalse\nfalse"),
         );
         assert_eq!(invite.status, 200);
         // Hugo has an operational key under hugo-pw.
@@ -10587,7 +11104,7 @@ mod tests {
         let reset = post(
             &mut ctx,
             "/portal/users/reset-password",
-            &format!("{admin}\nhugo"),
+            &format!("{admin}\nhugo\n{PASSWORD}"),
         );
         assert_eq!(reset.status, 200, "admin reset: {}", reset.body);
         let new_temp = reset.body.trim().to_owned();
@@ -10615,7 +11132,7 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{admin}\niris\niris@example.com\niris-pw\nfalse\nfalse"),
+            &format!("{PASSWORD}\n{admin}\niris\niris@example.com\niris-pw\nfalse\nfalse"),
         );
         assert_eq!(invite.status, 200, "invite: {}", invite.body);
         // Iris holds an operational key under iris-pw.
@@ -10625,7 +11142,7 @@ mod tests {
         let req = post(
             &mut ctx,
             "/portal/users/require-password-change",
-            &format!("{admin}\niris"),
+            &format!("{PASSWORD}\n{admin}\niris"),
         );
         assert_eq!(req.status, 200, "require-change: {}", req.body);
 
@@ -11146,7 +11663,7 @@ mod tests {
         let invite = post(
             &mut node_a,
             "/portal/users/invite",
-            &format!("{admin}\niris\niris@example.com"),
+            &format!("{PASSWORD}\n{admin}\niris\niris@example.com"),
         );
         assert_eq!(invite.status, 200, "invite: {}", invite.body);
         let temp = invite.body.trim().to_owned();
@@ -11229,7 +11746,7 @@ mod tests {
             post(
                 &mut node_a,
                 "/portal/users/invite",
-                &format!("{admin}\nj\nj@example.com\nj-pw\nfalse\nfalse"),
+                &format!("{PASSWORD}\n{admin}\nj\nj@example.com\nj-pw\nfalse\nfalse"),
             )
             .status,
             200
@@ -11239,7 +11756,7 @@ mod tests {
             post(
                 &mut node_a,
                 "/portal/users/require-password-change",
-                &format!("{admin}\nj"),
+                &format!("{PASSWORD}\n{admin}\nj"),
             )
             .status,
             200

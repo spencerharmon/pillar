@@ -197,6 +197,90 @@ pub enum ControlOp {
     /// trust …`) over the node's live trust store, WoT authority, and explicit
     /// grant set — the SAME substrate the web trust/attestation panels drive.
     Trust(TrustOp),
+    /// IAM role / group / oauth-client management (`pillar role|group|oauth …`)
+    /// over the node's live role set, managed-group set, and OAuth client
+    /// registry — the SAME substrate the IAM admin panels drive.
+    Iam(IamOp),
+}
+
+/// IAM role / group / oauth-client ops (`pillar role|group|oauth …`) over the
+/// node's live role set, managed-group set, and OAuth client registry. `*Add`/
+/// `*Rm`/`AddMember`/`Register` are signed acts (gated on `iam:roles:write` /
+/// `iam:groups:write` / `iam:oauth:write`); `*List`/`*Show` are member-gated
+/// VIEWS.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum IamOp {
+    /// Create/replace a named capability set (`pillar role add <name> --grant
+    /// <cap>…`).
+    RoleAdd {
+        /// The role name.
+        name: String,
+        /// The capabilities the role grants.
+        capabilities: Vec<String>,
+    },
+    /// Remove a role (`pillar role rm <name>`).
+    RoleRm {
+        /// The role name.
+        name: String,
+    },
+    /// List every role (`pillar role list`).
+    RoleList,
+    /// Show one role's capabilities (`pillar role show <name>`).
+    RoleShow {
+        /// The role name.
+        name: String,
+    },
+    /// Create a managed group bound to `roles` (`pillar group add <name>
+    /// --role <r>…`).
+    GroupAdd {
+        /// The group name.
+        name: String,
+        /// The roles the group confers.
+        roles: Vec<String>,
+    },
+    /// Add a member handle to a group (`pillar group add-member <name>
+    /// <handle>`).
+    GroupAddMember {
+        /// The group name.
+        name: String,
+        /// The member handle to add.
+        handle: String,
+    },
+    /// Remove a group (`pillar group rm <name>`).
+    GroupRm {
+        /// The group name.
+        name: String,
+    },
+    /// List every group (`pillar group list`).
+    GroupList,
+    /// Show one group's roles + members (`pillar group show <name>`).
+    GroupShow {
+        /// The group name.
+        name: String,
+    },
+    /// Register an OAuth/OIDC client (`pillar oauth register <client-id>
+    /// --type <public|confidential> --redirect <uri>… --scope <s>… --grant
+    /// <g>…`).
+    OauthRegister {
+        /// The stable public client id.
+        client_id: String,
+        /// `public` or `confidential`.
+        client_type: String,
+        /// The redirect-URI allow-list.
+        redirect_uris: Vec<String>,
+        /// The permitted scopes.
+        scopes: Vec<String>,
+        /// The permitted grant-type tokens.
+        grants: Vec<String>,
+    },
+    /// List every registered client (`pillar oauth list`).
+    OauthList,
+    /// Show one client's registration (`pillar oauth show <client-id>`).
+    OauthShow {
+        /// The client id.
+        client_id: String,
+    },
 }
 
 /// Trust-artifact + explicit-grant ops (`pillar attest|grant|caps|trust …`)
@@ -656,6 +740,14 @@ impl ControlOp {
                         | TrustOp::Caps { .. }
                         | TrustOp::Path { .. },
                 )
+                | ControlOp::Iam(
+                    IamOp::RoleList
+                        | IamOp::RoleShow { .. }
+                        | IamOp::GroupList
+                        | IamOp::GroupShow { .. }
+                        | IamOp::OauthList
+                        | IamOp::OauthShow { .. },
+                )
         )
     }
 }
@@ -697,6 +789,76 @@ pub enum QueryOp {
     /// member-gated VIEW folded from the live `__catalog` collection + the
     /// keyed store's live collections + the collection-placement registry.
     Catalog(CatalogOp),
+    /// The op-log inspection tier (`pillar log ...`, `pillar-log-inspection-
+    /// tier`): the middle layer of the inspection stack in
+    /// `docs/data-inspection.md` -- a collection's signed, content-addressed
+    /// op log (the SAME `EventLog` every `Kv`/`Doc`/`Sql`/`Object` write
+    /// already appends to), one hop above the raw content-addressed blocks
+    /// [`ObjectOp`] exposes and one hop below the folded document/kv/sql
+    /// view.
+    Log(LogOp),
+}
+
+/// The op-log inspection ops (`pillar log info|blocks|list|show|dag|watch|
+/// verify`). Every variant is a member-gated VIEW -- the op log itself is
+/// written only as a side effect of a `Kv`/`Doc`/`Sql`/`Object` write, never
+/// directly through this surface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum LogOp {
+    /// Summary: op count + current tip(s) of `collection`'s op log.
+    Info {
+        /// The collection whose op log is inspected.
+        collection: String,
+    },
+    /// The REPORTED (never inferred) physical storage layout backing
+    /// `collection`: a document/keyed collection reports its snapshot CID (or
+    /// `none` when never compacted) plus its live op tail; a TSDB collection
+    /// reports its immutable retention blocks back to the retention horizon,
+    /// with older data pruned and no snapshot.
+    Blocks {
+        /// The collection to report the storage layout of.
+        collection: String,
+    },
+    /// Every op-log event id (lowercase hex content address) of `collection`,
+    /// in append order.
+    List {
+        /// The collection whose op log is listed.
+        collection: String,
+    },
+    /// Decode one op: author + signature, HLC, causal parents, kind, key,
+    /// payload CID, and seal (always `none` -- op-log entries are never
+    /// sealed bodies; see [`ObjectOp`] for a sealed block).
+    Show {
+        /// The collection the event belongs to.
+        collection: String,
+        /// The event's content-addressed id, lowercase hex.
+        event_id_hex: String,
+    },
+    /// Render the causal graph (`prev`/`parents` hash-links) of
+    /// `collection`'s op log, so concurrent CRDT-merged branches are visible
+    /// at the log level.
+    Dag {
+        /// The collection whose causal graph is rendered.
+        collection: String,
+    },
+    /// The current tip(s) of `collection`'s op log -- a bounded, single-shot
+    /// stand-in for a live subscription (there is no persistent streaming
+    /// transport on this remote surface): a caller re-issues `Watch` to
+    /// observe the tip advance.
+    Watch {
+        /// The collection to watch.
+        collection: String,
+    },
+    /// Confirm hash==id and signature validity of one event WITHOUT ever
+    /// needing to interpret its (possibly opaque) payload -- the log-level
+    /// analogue of [`ObjectOp::Verify`].
+    Verify {
+        /// The collection the event belongs to.
+        collection: String,
+        /// The event's content-addressed id, lowercase hex.
+        event_id_hex: String,
+    },
 }
 
 /// The visibility class of a `pillar object put` block: whether the body
@@ -1026,6 +1188,10 @@ impl QueryOp {
             QueryOp::Object(op) => !matches!(op, ObjectOp::Put { .. }),
             // Every catalog op is a read-only introspection VIEW.
             QueryOp::Catalog(_) => true,
+            // Every log op is a read-only introspection VIEW — the op log
+            // itself is written only as a side effect of a Kv/Doc/Sql/Object
+            // write, never directly through this surface.
+            QueryOp::Log(_) => true,
         }
     }
 }
@@ -1425,6 +1591,60 @@ mod tests {
     }
 
     #[test]
+    fn control_op_iam_round_trip_and_classify() {
+        let acts = [
+            ControlOp::Iam(IamOp::RoleAdd {
+                name: "deployer".into(),
+                capabilities: vec!["resource:apply".into(), "obs:read".into()],
+            }),
+            ControlOp::Iam(IamOp::RoleRm {
+                name: "deployer".into(),
+            }),
+            ControlOp::Iam(IamOp::GroupAdd {
+                name: "ops".into(),
+                roles: vec!["deployer".into()],
+            }),
+            ControlOp::Iam(IamOp::GroupAddMember {
+                name: "ops".into(),
+                handle: "alice".into(),
+            }),
+            ControlOp::Iam(IamOp::GroupRm { name: "ops".into() }),
+            ControlOp::Iam(IamOp::OauthRegister {
+                client_id: "portal".into(),
+                client_type: "public".into(),
+                redirect_uris: vec!["https://example.com/cb".into()],
+                scopes: vec!["openid".into()],
+                grants: vec!["authorization_code".into()],
+            }),
+        ];
+        for op in &acts {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                *op
+            );
+            assert!(!op.is_read(), "iam acts are not reads: {op:?}");
+        }
+        for op in [
+            ControlOp::Iam(IamOp::RoleList),
+            ControlOp::Iam(IamOp::RoleShow {
+                name: "deployer".into(),
+            }),
+            ControlOp::Iam(IamOp::GroupList),
+            ControlOp::Iam(IamOp::GroupShow { name: "ops".into() }),
+            ControlOp::Iam(IamOp::OauthList),
+            ControlOp::Iam(IamOp::OauthShow {
+                client_id: "portal".into(),
+            }),
+        ] {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "iam views are reads: {op:?}");
+        }
+    }
+
+    #[test]
     fn control_op_trust_round_trip_and_classify() {
         let acts = [
             ControlOp::Trust(TrustOp::Edge {
@@ -1595,6 +1815,41 @@ mod tests {
                 op
             );
             assert!(op.is_read(), "object view is a read: {op:?}");
+        }
+    }
+
+    #[test]
+    fn log_op_round_trips_and_is_always_a_read() {
+        for op in [
+            QueryOp::Log(LogOp::Info {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Blocks {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::List {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Show {
+                collection: "users".into(),
+                event_id_hex: "aa".into(),
+            }),
+            QueryOp::Log(LogOp::Dag {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Watch {
+                collection: "users".into(),
+            }),
+            QueryOp::Log(LogOp::Verify {
+                collection: "users".into(),
+                event_id_hex: "aa".into(),
+            }),
+        ] {
+            assert_eq!(
+                QueryOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "log op is always a read: {op:?}");
         }
     }
 
