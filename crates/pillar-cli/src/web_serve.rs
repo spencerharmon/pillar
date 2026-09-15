@@ -687,6 +687,13 @@ enum PortalOp {
     WebauthnRevoke {
         credential_id: Vec<u8>,
     },
+    /// A user-initiated credential relabel: purely cosmetic (never touches
+    /// `sign_count`/`last_used_at`/ownership), journaled so a renamed
+    /// credential's label survives a node restart.
+    WebauthnRename {
+        credential_id: Vec<u8>,
+        label: String,
+    },
     /// Resource-plane `apply` (declarative workload upsert) — the durable
     /// counterpart of [`WebAuthContext::resource_apply`], so a restarted node
     /// rehydrates every workload manifest the portal ever applied, not just
@@ -1430,6 +1437,21 @@ impl WebAuthContext {
             }
             PortalOp::WebauthnRevoke { credential_id } => {
                 self.webauthn_rp.revoke(&credential_id);
+            }
+            PortalOp::WebauthnRename { credential_id, label } => {
+                // Replay is best-effort: an unknown/revoked credential (e.g. a
+                // rename racing a since-replayed revoke) is a harmless no-op.
+                let owners: Vec<String> = self
+                    .webauthn_rp
+                    .record(&credential_id)
+                    .map(|r| r.user_handle.clone())
+                    .into_iter()
+                    .collect();
+                if let Some(handle) = owners.first() {
+                    let _ = self
+                        .webauthn_rp
+                        .rename_credential(handle, &credential_id, &label);
+                }
             }
             PortalOp::ResourceApply {
                 actor,
@@ -6846,6 +6868,11 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/webauthn/credentials/name"),
+        handler: |ctx, _peer, request| dispatch_webauthn_credentials_name(ctx, request),
+    },
+    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/bootstrap/request/node"),
         handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, true),
     },
@@ -10164,6 +10191,46 @@ fn dispatch_webauthn_credentials_revoke(
     ctx.webauthn_rp.revoke(&cred);
     let id = pillar_crypto::webauthn::base64url_encode(&cred);
     text_response(200, "OK", format!("REVOKED {id}"))
+}
+
+/// `POST /webauthn/credentials/name` — the management surface's rename
+/// (relabel). Body: `<session-token>\n<credential-id-b64url>\n<label>`.
+/// Requires a LIVE session and that the credential belong to the caller (same
+/// ownership predicate as revoke/list — a user may rename only their own).
+/// Purely cosmetic: never touches `sign_count`, `last_used_at`, or the
+/// no-lockout guard (unlike revoke, renaming the last credential is always
+/// allowed — it does not disable 2FA). Journaled (`WebauthnRename`) so the
+/// label survives a restart. Returns `RENAMED <id-b64url> <label>` (`-` if the
+/// label was cleared to empty).
+fn dispatch_webauthn_credentials_name(
+    ctx: &mut WebAuthContext,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let token = lines.next().unwrap_or("").trim();
+    let cred_b64 = lines.next().unwrap_or("").trim();
+    let label = lines.next().unwrap_or("").trim();
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let subject = session.subject.to_string();
+    let Ok(cred) = pillar_crypto::webauthn::base64url_decode(cred_b64) else {
+        return text_response(400, "Bad Request", "MALFORMED base64url".to_owned());
+    };
+    // A user may rename ONLY their own credential; refuse (404, not 403, so an
+    // attacker cannot probe another user's credential ids) otherwise.
+    if !ctx.webauthn_rp.user_owns_credential(&subject, &cred) {
+        return text_response(404, "Not Found", "DENIED unknown-credential".to_owned());
+    }
+    ctx.record(&PortalOp::WebauthnRename {
+        credential_id: cred.clone(),
+        label: label.to_owned(),
+    });
+    let renamed = ctx.webauthn_rp.rename_credential(&subject, &cred, label);
+    debug_assert!(renamed, "ownership already checked above");
+    let id = pillar_crypto::webauthn::base64url_encode(&cred);
+    let shown = if label.is_empty() { "-" } else { label };
+    text_response(200, "OK", format!("RENAMED {id} {shown}"))
 }
 
 /// `POST /webauthn/authenticate/begin` — mint a fresh, single-use, time-bounded
