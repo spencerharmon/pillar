@@ -1,31 +1,19 @@
 //! Acceptance test — `data-query-portal-explore-panels`.
 //!
-//! ROI Priority 1 data-layer doctrine — the UI half of
-//! `data-query-tier-remote-surface`: a browse/query panel per primitive (K/V,
-//! Document, SQL-view) in the portal/Explore UI, rendering the SAME live
-//! `WebAuthContext::keyed_store` substrate the query tier's `pillar kv`/
-//! `pillar doc`/`pillar sql` CLI verbs read/write — never a second store,
-//! never a mutation shim.
+//! ROI Priority 1 data-layer doctrine, UI half of
+//! `data-query-tier-remote-surface`: a read-only browse/query panel per
+//! primitive (K/V, Document, SQL-view) in the portal, rendering the SAME live
+//! `WebAuthContext::keyed_store` substrate the `pillar kv`/`pillar doc`/
+//! `pillar sql` query-tier CLI verbs already read over pillar-UDP — never a
+//! second store, never a mutation shim.
 //!
-//! Black-box: this suite is a black-box HTTP observer exactly like
-//! `portal_swarm_surface` — it speaks only real HTTP/1.1 over a real TCP
-//! socket to a node web surface bound on an ephemeral loopback port and served
-//! by the production `web_serve::serve` accept loop. It seeds the keyed store
-//! by invoking [`pillar_cli::web_serve::WebAuthContext::query_op`] directly —
-//! the EXACT dispatch function the sealed pillar-UDP query tier calls on a
-//! `Body::QueryOp` frame (proven live end-to-end by
-//! `data_query_tier_remote_surface`) — so the seed writes ride the SAME
-//! decider/store the browse routes below read, never a second path. It then
-//! asserts the new read-only portal browse routes
-//! (`GET /portal/data/{kv,doc,sql}`) return the LIVE K/V keys, document
-//! fields, and materialized view rows, and that they are gated behind an
-//! admitted session exactly like every other portal read.
-//!
-//! RED if a browse route ever misses a seeded key/field/row, if it accepts an
-//! unauthenticated caller, or if it diverges from the query tier's own
-//! decider (e.g. reads across membership). GREEN when the portal Explore
-//! panels and the `pillar kv`/`doc`/`sql` CLI verbs drive the SAME live
-//! substrate over the real served surface.
+//! Black-box: boots the real compiled `pillar` binary as a subprocess, seeds
+//! the keyed store over the REAL query tier (the same `query_op` client path
+//! `data_query_tier_remote_surface` proves), then drives the new
+//! `/portal/data/{kv,doc,sql}/*` browse routes as a real HTTP/1.1 client would
+//! — asserting the routes return the LIVE K/V keys, document fields, and
+//! materialized view rows, and that they are session-gated like every other
+//! portal capability.
 //!
 //! `#[cfg(feature = "acceptance")]`-gated; run via `cargo test -p pillar-cli
 //! --test data_query_portal_explore_panels --features acceptance`.
@@ -33,176 +21,195 @@
 #![cfg(feature = "acceptance")]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpStream};
-use std::time::Duration;
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
-use pillar_cli::web_serve::{bind, serve, WebAuthContext};
-use pillar_core::NodeId;
-use pillar_identity::NodeSubkey;
+use pillar_cli::apply_over_pillar_message::query_op;
 use pillar_ops::{DocOp, KvOp, QueryOp, SqlOp};
-use pillar_web::node_custody::Cid;
 
-const PASSWORD: &str = "correct horse battery staple - data query portal explore";
-const SECRET: &str = "operational-key-material-data-query-portal-explore";
+const PASSWORD: &str = "correct horse battery staple 2026 explore panels";
+const HANDLE: &str = "spencer";
 
-/// One HTTP response the black-box client parsed off the wire.
 struct HttpResponse {
     status: u16,
-    session_token: Option<String>,
     body: String,
 }
 
-/// Send one real HTTP/1.1 request to `addr` and read the full response back —
-/// the black-box client's ONLY view of the node.
-fn http(addr: &str, method: &str, path: &str, body: &str) -> HttpResponse {
-    let mut stream = TcpStream::connect(addr).expect("connect to served surface");
+fn http(port: u16, method: &str, path: &str, body: &str) -> Option<HttpResponse> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("read timeout");
+        .ok()?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(request.as_bytes()).expect("write request");
-    stream.flush().expect("flush");
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.flush().ok()?;
 
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
+    stream.read_to_end(&mut raw).ok()?;
     let text = String::from_utf8_lossy(&raw).into_owned();
 
     let mut reader = BufReader::new(text.as_bytes());
     let mut status_line = String::new();
-    reader.read_line(&mut status_line).expect("status line");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    reader.read_line(&mut status_line).ok()?;
+    let status: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
 
-    let mut session_token = None;
     loop {
         let mut header = String::new();
-        reader.read_line(&mut header).expect("header line");
+        reader.read_line(&mut header).ok()?;
         if header == "\r\n" || header.is_empty() {
             break;
-        }
-        if let Some(v) = header.strip_prefix("X-Pillar-Session: ") {
-            session_token = Some(v.trim().to_owned());
         }
     }
     let mut resp_body = String::new();
     reader.read_to_string(&mut resp_body).ok();
 
-    HttpResponse {
+    Some(HttpResponse {
         status,
-        session_token,
         body: resp_body,
+    })
+}
+
+fn free_tcp_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("claim free tcp port")
+}
+
+fn free_udp_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .map(|a| a.port())
+        .expect("claim free udp port")
+}
+
+/// A booted `pillar node run` subprocess with its HTTPS (SETUP + portal) and
+/// resource-op pillar-UDP tiers bound; killed on drop.
+struct Node {
+    child: Child,
+    http_port: u16,
+    resource_op_port: u16,
+    data_dir: std::path::PathBuf,
+}
+
+impl Node {
+    fn boot(data_dir: &std::path::Path) -> Node {
+        let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pillar"));
+        let http_port = free_tcp_port();
+        let resource_op_port = free_udp_port();
+        let child = Command::new(bin)
+            .arg("node")
+            .arg("run")
+            .env("PILLAR_DATA_DIR", data_dir)
+            .env("PILLAR_LISTEN", "/ip4/127.0.0.1/tcp/0")
+            .env("PILLAR_WEB_BIND", "127.0.0.1")
+            .env("PILLAR_WEB_PORT", http_port.to_string())
+            .env(
+                "PILLAR_RESOURCE_OP_UDP_BIND",
+                format!("127.0.0.1:{resource_op_port}"),
+            )
+            .env("RUST_LOG", "error")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pillar node run");
+        let node = Node {
+            child,
+            http_port,
+            resource_op_port,
+            data_dir: data_dir.to_path_buf(),
+        };
+        node.await_ready(Duration::from_secs(20));
+        node
+    }
+
+    fn await_ready(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(resp) = http(self.http_port, "GET", "/bootstrap/status", "") {
+                if resp.status == 200 {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "pillar node run did not serve /bootstrap/status within {within:?} on port {}",
+                    self.http_port
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn post(&self, path: &str, body: &str) -> HttpResponse {
+        http(self.http_port, "POST", path, body).expect("POST succeeds")
+    }
+
+    fn get(&self, path: &str) -> HttpResponse {
+        http(self.http_port, "GET", path, "").expect("GET succeeds")
+    }
+
+    fn resource_op_addr(&self) -> SocketAddr {
+        format!("127.0.0.1:{}", self.resource_op_port)
+            .parse()
+            .unwrap()
+    }
+
+    /// The raw on-disk identity key bytes — reproduces the node's `cell_id`/
+    /// `cell_group_key` derivation with no RPC.
+    fn identity_key_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.data_dir.join("identity.key")).expect("read identity.key")
     }
 }
 
-/// Stand a real node web surface up on an ephemeral loopback port, admit +
-/// provision a user so the black-box client can log in, and seed the live
-/// keyed store (K/V + Document + a materialized SQL view) by dispatching real
-/// `QueryOp`s through [`WebAuthContext::query_op`] — the SAME function the
-/// sealed query tier calls. Returns `(addr, token)`.
-fn serve_seeded() -> (String, String) {
-    let listener = bind(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0).expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
-
-    let subkey = NodeSubkey::from("op-subkey-alice-data-query");
-    let mut ctx = WebAuthContext::new(
-        "https://node.example.com",
-        NodeId::from("this-node"),
-        "this-node-secret",
-        NodeId::from("owner"),
-        4,
-    );
-    let actor = subkey.node_id();
-    ctx.admit_subject(actor.clone(), 4);
-    ctx.provision_offer(
-        "alice@node",
-        "Alice",
-        Cid::from("cid-alice-data-query"),
-        subkey,
-        PASSWORD,
-        SECRET,
-    );
-
-    // Seed K/V: a live collection with two keys.
-    ctx.query_op(
-        &actor,
-        &QueryOp::Kv(KvOp::Put {
-            collection: "settings".to_owned(),
-            key: "theme".to_owned(),
-            value_hex: hex_encode(b"dark"),
-        }),
-    )
-    .expect("seed kv put theme");
-    ctx.query_op(
-        &actor,
-        &QueryOp::Kv(KvOp::Put {
-            collection: "settings".to_owned(),
-            key: "locale".to_owned(),
-            value_hex: hex_encode(b"en-US"),
-        }),
-    )
-    .expect("seed kv put locale");
-
-    // Seed a Document: one id with two fields.
-    ctx.query_op(
-        &actor,
-        &QueryOp::Doc(DocOp::PutField {
-            collection: "users".to_owned(),
-            id: "u1".to_owned(),
-            field: "name".to_owned(),
-            value: "Alice".to_owned(),
-        }),
-    )
-    .expect("seed doc put field name");
-    ctx.query_op(
-        &actor,
-        &QueryOp::Doc(DocOp::PutField {
-            collection: "users".to_owned(),
-            id: "u1".to_owned(),
-            field: "role".to_owned(),
-            value: "admin".to_owned(),
-        }),
-    )
-    .expect("seed doc put field role");
-
-    // Seed a materialized SQL view over the document collection.
-    ctx.query_op(
-        &actor,
-        &QueryOp::Sql(SqlOp::CreateView {
-            name: "admins".to_owned(),
-            source: "users".to_owned(),
-            filter_field: Some("role".to_owned()),
-            filter_value: Some("admin".to_owned()),
-            project: None,
-        }),
-    )
-    .expect("seed sql create view");
-
-    std::thread::spawn(move || serve(listener, &mut ctx));
-    // Give the accept loop a moment to start.
-    std::thread::sleep(Duration::from_millis(100));
-
-    let token = login(&addr);
-    (addr, token)
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        let _ = write!(out, "{b:02x}");
     }
     out
 }
 
-/// The real node-side custody login over HTTP: `GET /nonce`, then `POST /login`
-/// (two fields + nonce id). Returns the admitted session token.
-fn login(addr: &str) -> String {
-    let nonce = http(addr, "GET", "/nonce", "");
+fn hex_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16).unwrap();
+        let lo = (chunk[1] as char).to_digit(16).unwrap();
+        out.push(((hi << 4) | lo) as u8);
+    }
+    out
+}
+
+/// Reproduce the node's `cell_id`/seed derivation from the on-disk identity
+/// key bytes alone (mirrors `data_query_tier_remote_surface`'s
+/// `cell_material`).
+fn cell_material(identity_key_bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut seed_bytes = b"pillar-streamdb/segment-signer/v1:".to_vec();
+    seed_bytes.extend_from_slice(identity_key_bytes);
+    let mut cell_id_bytes = b"pillar-streamdb/cell-id/v1:".to_vec();
+    cell_id_bytes.extend_from_slice(&seed_bytes);
+    (cell_id_bytes, seed_bytes)
+}
+
+/// The real node-side custody login over HTTP: `GET /nonce`, then `POST
+/// /login` (two fields + nonce id). Returns the admitted session token (read
+/// off the `X-Pillar-Session` response header via `raw_response`, since the
+/// minimal `http()` client above discards headers).
+fn login(node: &Node) -> String {
+    let nonce = node.get("/nonce");
     assert_eq!(nonce.status, 200, "nonce: {}", nonce.body);
     let id: u64 = nonce
         .body
@@ -210,157 +217,243 @@ fn login(addr: &str) -> String {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("nonce id");
-    let resp = http(addr, "POST", "/login", &format!("alice@node\n{PASSWORD}\n{id}"));
-    assert_eq!(resp.status, 200, "login: {}", resp.body);
-    resp.session_token.expect("session token")
+    raw_response(
+        node.http_port,
+        "POST",
+        "/login",
+        &format!("{HANDLE}\n{PASSWORD}\n{id}"),
+    )
+    .expect("login carries a session token")
+}
+
+/// A login round-trip that returns the `X-Pillar-Session` header value.
+fn raw_response(port: u16, method: &str, path: &str, body: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.flush().ok()?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("X-Pillar-Session: ") {
+            return Some(v.trim().to_owned());
+        }
+    }
+    None
 }
 
 #[test]
-fn kv_browse_returns_live_collections_keys_and_value() {
-    let (addr, token) = serve_seeded();
+fn explore_panels_render_the_live_kv_doc_and_sql_view_data_over_the_portal() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let node = Node::boot(data_dir.path());
 
-    // No collection: lists the live collections.
-    let collections = http(&addr, "GET", &format!("/portal/data/kv?token={token}"), "");
-    assert_eq!(collections.status, 200, "kv collections: {}", collections.body);
+    // --- SETUP: bootstrap a cell + first user, admit this test's own signing
+    // key for the query tier.
+    let create_cell = node.post("/bootstrap/create-cell", "cell-genesis");
+    assert_eq!(create_cell.status, 200, "create-cell: {}", create_cell.body);
+    let create_user = node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
+    assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
+
+    let signer_seed = pillar_crypto::Seed::from_bytes(b"explore-panels-e2e-signer".to_vec());
+    let (signer_public, signer_secret) =
+        pillar_crypto::sign::signing_keypair_from_seed(&signer_seed).expect("signing keypair");
+    let subject_hex = hex_encode(signer_public.as_bytes());
+    let admit = node.post("/bootstrap/admit-resource-signer", &subject_hex);
+    assert_eq!(admit.status, 200, "admit-resource-signer: {}", admit.body);
+
+    let (cell_id_bytes, seed_bytes) = cell_material(&node.identity_key_bytes());
+    std::env::set_var(
+        "PILLAR_RESOURCE_OP_ADDR",
+        node.resource_op_addr().to_string(),
+    );
+    std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
+    std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
+    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(signer_secret.as_bytes()),
+    );
+
+    // --- Seed the K/V, Document, and SQL-view primitives over the REAL query
+    // tier (pillar-UDP) — never touching the portal.
+    query_op(&QueryOp::Kv(KvOp::Put {
+        collection: "config".into(),
+        key: "greeting".into(),
+        value_hex: hex_encode(b"hello portal"),
+    }))
+    .expect("kv put over pillar-UDP");
+    query_op(&QueryOp::Kv(KvOp::Put {
+        collection: "config".into(),
+        key: "farewell".into(),
+        value_hex: hex_encode(b"bye"),
+    }))
+    .expect("second kv put");
+
+    for (id, name, status) in [
+        ("u1", "alice", "on"),
+        ("u2", "bob", "off"),
+        ("u3", "carol", "on"),
+    ] {
+        query_op(&QueryOp::Doc(DocOp::PutField {
+            collection: "users".into(),
+            id: id.into(),
+            field: "name".into(),
+            value: name.into(),
+        }))
+        .expect("doc put name");
+        query_op(&QueryOp::Doc(DocOp::PutField {
+            collection: "users".into(),
+            id: id.into(),
+            field: "status".into(),
+            value: status.into(),
+        }))
+        .expect("doc put status");
+    }
+
+    query_op(&QueryOp::Sql(SqlOp::CreateView {
+        name: "active_users".into(),
+        source: "users".into(),
+        filter_field: Some("status".into()),
+        filter_value: Some("on".into()),
+        project: Some(vec!["name".into()]),
+    }))
+    .expect("sql create-view over pillar-UDP");
+
+    // --- Log into the PORTAL (a distinct trust boundary from the query
+    // tier's signer) to obtain a session token for the browse routes.
+    let token = login(&node);
+
+    // === K/V Explore panel ===================================================
+    let cols = node.get(&format!("/portal/data/kv/collections?token={token}"));
+    assert_eq!(cols.status, 200, "kv collections: {}", cols.body);
     assert!(
-        collections.body.contains("COLLECTION settings"),
-        "must list the live collection, got: {}",
-        collections.body
+        cols.body.lines().any(|c| c == "config"),
+        "kv collections must list the live 'config' collection: {}",
+        cols.body
     );
 
-    // Collection only: lists the live keys.
-    let keys = http(
-        &addr,
-        "GET",
-        &format!("/portal/data/kv?token={token}&collection=settings"),
-        "",
-    );
+    let keys = node.get(&format!("/portal/data/kv/keys?token={token}&collection=config"));
     assert_eq!(keys.status, 200, "kv keys: {}", keys.body);
-    assert!(
-        keys.body.contains("KEY theme") && keys.body.contains("KEY locale"),
-        "must list the live keys, got: {}",
-        keys.body
+    let key_set: std::collections::BTreeSet<_> = keys.body.lines().collect();
+    assert!(key_set.contains("greeting"), "kv keys: {}", keys.body);
+    assert!(key_set.contains("farewell"), "kv keys: {}", keys.body);
+
+    let got = node.get(&format!(
+        "/portal/data/kv/get?token={token}&collection=config&key=greeting"
+    ));
+    assert_eq!(got.status, 200, "kv get: {}", got.body);
+    assert_eq!(
+        hex_decode(got.body.trim()),
+        b"hello portal",
+        "kv get must return the LIVE value written over the query tier; got {:?}",
+        got.body
     );
 
-    // Collection + key: returns the live value, hex-encoded.
-    let value = http(
-        &addr,
-        "GET",
-        &format!("/portal/data/kv?token={token}&collection=settings&key=theme"),
-        "",
-    );
-    assert_eq!(value.status, 200, "kv value: {}", value.body);
-    assert!(
-        value.body.contains(&format!("VALUE {}", hex_encode(b"dark"))),
-        "must return the live value, got: {}",
-        value.body
-    );
+    let missing = node.get(&format!(
+        "/portal/data/kv/get?token={token}&collection=config&key=nonexistent"
+    ));
+    assert_eq!(missing.status, 404, "kv get of a missing key must 404");
 
-    // A missing key 404s.
-    let missing = http(
-        &addr,
-        "GET",
-        &format!("/portal/data/kv?token={token}&collection=settings&key=nope"),
-        "",
-    );
-    assert_eq!(missing.status, 404, "missing key: {}", missing.body);
-}
-
-#[test]
-fn doc_browse_returns_live_ids_and_fields() {
-    let (addr, token) = serve_seeded();
-
-    // Collection only: lists the live document ids.
-    let ids = http(
-        &addr,
-        "GET",
-        &format!("/portal/data/doc?token={token}&collection=users"),
-        "",
-    );
+    // === Document Explore panel ==============================================
+    let ids = node.get(&format!("/portal/data/doc/ids?token={token}&collection=users"));
     assert_eq!(ids.status, 200, "doc ids: {}", ids.body);
-    assert!(
-        ids.body.contains("ID u1"),
-        "must list the live document id, got: {}",
-        ids.body
-    );
+    let id_set: std::collections::BTreeSet<_> = ids.body.lines().collect();
+    for want in ["u1", "u2", "u3"] {
+        assert!(id_set.contains(want), "doc ids: {}", ids.body);
+    }
 
-    // Collection + id: lists the live fields.
-    let fields = http(
-        &addr,
-        "GET",
-        &format!("/portal/data/doc?token={token}&collection=users&id=u1"),
-        "",
-    );
+    let fields = node.get(&format!(
+        "/portal/data/doc/fields?token={token}&collection=users&id=u1"
+    ));
     assert_eq!(fields.status, 200, "doc fields: {}", fields.body);
+    let field_set: std::collections::BTreeSet<_> = fields.body.lines().collect();
     assert!(
-        fields.body.contains("FIELD name") && fields.body.contains("FIELD role"),
-        "must list the live fields, got: {}",
+        field_set.contains("name") && field_set.contains("status"),
+        "doc fields: {}",
         fields.body
     );
 
-    // Collection + id + field: returns the live value.
-    let value = http(
-        &addr,
-        "GET",
-        &format!("/portal/data/doc?token={token}&collection=users&id=u1&field=name"),
-        "",
-    );
-    assert_eq!(value.status, 200, "doc field value: {}", value.body);
-    assert!(
-        value.body.contains("VALUE Alice"),
-        "must return the live field value, got: {}",
-        value.body
+    let name = node.get(&format!(
+        "/portal/data/doc/get?token={token}&collection=users&id=u1&field=name"
+    ));
+    assert_eq!(name.status, 200, "doc get: {}", name.body);
+    assert_eq!(
+        name.body.trim(),
+        "alice",
+        "doc get must return the LIVE field value written over the query tier"
     );
 
-    // Missing `collection` is a 400.
-    let missing_collection = http(&addr, "GET", &format!("/portal/data/doc?token={token}"), "");
-    assert_eq!(missing_collection.status, 400, "missing collection: {}", missing_collection.body);
-}
-
-#[test]
-fn sql_browse_returns_live_views_and_materialized_rows() {
-    let (addr, token) = serve_seeded();
-
-    // No name: lists the live views.
-    let views = http(&addr, "GET", &format!("/portal/data/sql?token={token}"), "");
+    // === SQL-view Explore panel ==============================================
+    let views = node.get(&format!("/portal/data/sql/views?token={token}"));
     assert_eq!(views.status, 200, "sql views: {}", views.body);
     assert!(
-        views.body.contains("VIEW admins"),
-        "must list the live view, got: {}",
+        views.body.lines().any(|v| v == "active_users"),
+        "sql views: {}",
         views.body
     );
 
-    // Name: materializes the live rows — the seeded admin document.
-    let rows = http(&addr, "GET", &format!("/portal/data/sql?token={token}&name=admins"), "");
-    assert_eq!(rows.status, 200, "sql view rows: {}", rows.body);
+    let rows = node.get(&format!("/portal/data/sql/view?token={token}&name=active_users"));
+    assert_eq!(rows.status, 200, "sql view: {}", rows.body);
+    let row_ids: std::collections::BTreeSet<_> = rows
+        .body
+        .lines()
+        .filter_map(|l| l.split('\t').next())
+        .collect();
+    assert!(row_ids.contains("u1"), "active view includes u1 (on): {}", rows.body);
+    assert!(row_ids.contains("u3"), "active view includes u3 (on): {}", rows.body);
     assert!(
-        rows.body.contains("ROW u1") && rows.body.contains("role=admin"),
-        "must return the live materialized row, got: {}",
+        !row_ids.contains("u2"),
+        "active view excludes u2 (off): {}",
+        rows.body
+    );
+    assert!(
+        rows.body.contains("name=alice"),
+        "projected name for u1: {}",
+        rows.body
+    );
+    assert!(
+        rows.body.contains("name=carol"),
+        "projected name for u3: {}",
         rows.body
     );
 
-    // An unknown view 404s.
-    let unknown = http(&addr, "GET", &format!("/portal/data/sql?token={token}&name=nope"), "");
-    assert_eq!(unknown.status, 404, "unknown view: {}", unknown.body);
+    let missing_view = node.get(&format!("/portal/data/sql/view?token={token}&name=no-such-view"));
+    assert_eq!(missing_view.status, 404, "materializing an unknown view must 404");
 }
 
 #[test]
-fn all_three_browse_routes_are_gated_behind_an_admitted_session() {
-    let (addr, _token) = serve_seeded();
+fn explore_panel_routes_refuse_an_unauthenticated_caller() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let node = Node::boot(data_dir.path());
 
-    let kv = http(&addr, "GET", "/portal/data/kv", "");
-    assert_eq!(kv.status, 401, "unauthenticated kv browse must be 401: {}", kv.body);
-
-    let doc = http(&addr, "GET", "/portal/data/doc?collection=users", "");
-    assert_eq!(doc.status, 401, "unauthenticated doc browse must be 401: {}", doc.body);
-
-    let sql = http(&addr, "GET", "/portal/data/sql", "");
-    assert_eq!(sql.status, 401, "unauthenticated sql browse must be 401: {}", sql.body);
-
-    let bad_token = http(&addr, "GET", "/portal/data/kv?token=not-a-real-session", "");
+    // No session at all.
+    let no_session = node.get("/portal/data/kv/collections");
     assert_eq!(
-        bad_token.status, 401,
-        "a bad session token must be 401: {}",
-        bad_token.body
+        no_session.status, 401,
+        "unauthenticated kv/collections must be 401, got {}: {}",
+        no_session.status, no_session.body
+    );
+
+    // A bad session token.
+    let bad_session = node.get("/portal/data/sql/views?token=not-a-real-session");
+    assert_eq!(
+        bad_session.status, 401,
+        "unauthenticated sql/views must be 401, got {}: {}",
+        bad_session.status, bad_session.body
+    );
+
+    let bad_doc = node.get("/portal/data/doc/ids?token=not-a-real-session&collection=users");
+    assert_eq!(
+        bad_doc.status, 401,
+        "unauthenticated doc/ids must be 401, got {}: {}",
+        bad_doc.status, bad_doc.body
     );
 }

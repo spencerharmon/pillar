@@ -20,6 +20,7 @@ pub mod auth;
 pub mod command_palette;
 pub mod console;
 pub mod dashboard;
+pub mod data_explore;
 pub mod explore;
 pub mod iam_console;
 pub mod obs_console;

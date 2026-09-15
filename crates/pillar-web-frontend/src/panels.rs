@@ -240,48 +240,6 @@ pub const ALL_PANELS: &[PanelSpec] = &[
             },
         ],
     },
-    // The `data-query-portal-explore-panels` primitives: a read-only browse
-    // panel per `data-query-tier-remote-surface` query-tier primitive (K/V,
-    // Document, SQL view), each rendering the SAME live
-    // `WebAuthContext::keyed_store` substrate the `pillar kv`/`pillar doc`/
-    // `pillar sql` CLI verbs act on — never a second store, never a mutation
-    // shim. Each panel's `list_path` fetches the top-level browse (every live
-    // collection / a view's rows require a `?collection=`/`?name=` query
-    // param the richer console UI supplies; the generic list view here shows
-    // the top-level browse a bare `GET` returns).
-    PanelSpec {
-        id: "data-kv",
-        title: "Data: Key / Value",
-        list_path: "/portal/data/kv",
-        line_prefix: "COLLECTION ",
-        actions: &[PanelAction {
-            method: "GET",
-            path: "/portal/data/kv",
-            label: "Refresh",
-        }],
-    },
-    PanelSpec {
-        id: "data-doc",
-        title: "Data: Documents",
-        list_path: "/portal/data/doc",
-        line_prefix: "ID ",
-        actions: &[PanelAction {
-            method: "GET",
-            path: "/portal/data/doc",
-            label: "Refresh",
-        }],
-    },
-    PanelSpec {
-        id: "data-sql",
-        title: "Data: SQL Views",
-        list_path: "/portal/data/sql",
-        line_prefix: "VIEW ",
-        actions: &[PanelAction {
-            method: "GET",
-            path: "/portal/data/sql",
-            label: "Refresh",
-        }],
-    },
 ];
 
 /// The shared line-prefix response parser every `/portal/*`/`/bootstrap/*`
@@ -495,9 +453,6 @@ mod tests {
             "resource-workload",
             "topology-explorer",
             "observability",
-            "data-kv",
-            "data-doc",
-            "data-sql",
         ] {
             assert!(ids.contains(&expected), "missing panel: {expected}");
         }
@@ -619,35 +574,5 @@ mod tests {
         let spec = find("domains");
         assert_eq!(spec.list_path, "/portal/domains");
         assert_eq!(spec.primary_action().path, "/portal/domains/grant");
-    }
-
-    #[test]
-    fn data_kv_panel_parses_collections_and_wires_refresh() {
-        let spec = find("data-kv");
-        assert_eq!(spec.list_path, "/portal/data/kv");
-        assert_eq!(spec.primary_action().path, "/portal/data/kv");
-        let rows = parse_lines("COLLECTION settings\nCOLLECTION users\n", spec.line_prefix);
-        assert_eq!(
-            rows,
-            vec!["settings".to_string(), "users".to_string()]
-        );
-    }
-
-    #[test]
-    fn data_doc_panel_parses_document_ids_and_wires_refresh() {
-        let spec = find("data-doc");
-        assert_eq!(spec.list_path, "/portal/data/doc");
-        assert_eq!(spec.primary_action().path, "/portal/data/doc");
-        let rows = parse_lines("ID u1\nID u2\n", spec.line_prefix);
-        assert_eq!(rows, vec!["u1".to_string(), "u2".to_string()]);
-    }
-
-    #[test]
-    fn data_sql_panel_parses_view_names_and_wires_refresh() {
-        let spec = find("data-sql");
-        assert_eq!(spec.list_path, "/portal/data/sql");
-        assert_eq!(spec.primary_action().path, "/portal/data/sql");
-        let rows = parse_lines("VIEW admins\n", spec.line_prefix);
-        assert_eq!(rows, vec!["admins".to_string()]);
     }
 }
