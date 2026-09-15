@@ -471,6 +471,48 @@ pub enum QueryOp {
     Doc(DocOp),
     /// SQL views over the Document store (`pillar sql …`).
     Sql(SqlOp),
+    /// Catalog introspection (`pillar catalog …` / `SHOW TABLES` /
+    /// `DESCRIBE <t>` / `SELECT … FROM __catalog`) — `catalog-introspection-
+    /// surface`. The catalog is a queryable collection: every verb here is a
+    /// member-gated VIEW folding the node's live `__catalog` collection plus
+    /// the keyed-store's live collection set, never a hard-coded help path.
+    Catalog(CatalogOp),
+}
+
+/// Catalog-introspection ops (`pillar catalog databases|collections|describe|
+/// views`, and their SQL-native equivalents `SHOW TABLES`/`DESCRIBE <t>`/
+/// `SELECT … FROM __catalog`). All VIEWS — discovery is a query over the live
+/// `__catalog` Document collection and the keyed-store's live collection set,
+/// never a separate hard-coded registry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum CatalogOp {
+    /// List the databases in the cell (the `<db>` prefix of every
+    /// `<db>.<name>`-shaped collection).
+    Databases,
+    /// List every collection, optionally narrowed to one database, each with
+    /// its surface (`keyed`).
+    Collections {
+        /// Narrow to collections under this database prefix, or `None` for
+        /// every collection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+    },
+    /// The full introspection card for one collection: surface, schema,
+    /// consistency, visibility, and placement tags + live participating-node
+    /// list.
+    Describe {
+        /// The collection to describe.
+        collection: String,
+    },
+    /// List materialized views and their source collection, optionally
+    /// narrowed to one database.
+    Views {
+        /// Narrow to views whose name falls under this database prefix, or
+        /// `None` for every view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+    },
 }
 
 /// K/V surface ops (`pillar kv put|get|delete|keys|collections`). `Put`/
@@ -643,6 +685,8 @@ impl QueryOp {
                 DocOp::GetField { .. } | DocOp::Fields { .. } | DocOp::Ids { .. }
             ),
             QueryOp::Sql(op) => matches!(op, SqlOp::View { .. } | SqlOp::Views),
+            // Every catalog verb is a read: discovery never mutates state.
+            QueryOp::Catalog(_) => true,
         }
     }
 }
@@ -1024,6 +1068,15 @@ mod tests {
                 name: "active".into(),
             }),
             QueryOp::Sql(SqlOp::Views),
+            QueryOp::Catalog(CatalogOp::Databases),
+            QueryOp::Catalog(CatalogOp::Collections { database: None }),
+            QueryOp::Catalog(CatalogOp::Collections {
+                database: Some("app".into()),
+            }),
+            QueryOp::Catalog(CatalogOp::Describe {
+                collection: "app.users".into(),
+            }),
+            QueryOp::Catalog(CatalogOp::Views { database: None }),
         ] {
             assert_eq!(QueryOp::decode(&op.encode().expect("encode")).expect("decode"), op);
             assert!(op.is_read(), "query view is a read: {op:?}");

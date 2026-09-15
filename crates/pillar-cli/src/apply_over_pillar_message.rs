@@ -1254,6 +1254,135 @@ pub fn sql(args: &[String]) -> ExitCode {
             query_op(&pillar_ops::QueryOp::Sql(pillar_ops::SqlOp::Views)),
             "sql views",
         ),
+        // SQL-native catalog-introspection equivalents
+        // (`catalog-introspection-surface`): `SHOW TABLES`, `DESCRIBE <t>`,
+        // `SELECT … FROM __catalog` — recognized as a single raw SQL-text
+        // argument (`pillar sql "SHOW TABLES"`) distinct from the verb forms
+        // above, and answered by folding the SAME `__catalog`
+        // Document collection over the `Catalog` query-op verbs, never a
+        // separate help/registry code path.
+        Some(text) if sql_text::is_catalog_sql(text) => sql_text::run(text),
+        _ => usage(),
+    }
+}
+
+/// SQL-native parsing for the catalog-introspection equivalents the design
+/// doc (`repo/docs/database-management.md`) specifies: `SHOW TABLES`,
+/// `DESCRIBE <collection>`, `SELECT … FROM __catalog [WHERE …]`. Deliberately
+/// narrow (three fixed shapes, no general SQL grammar) — every shape folds
+/// the SAME `Catalog` query-op verbs `pillar catalog` uses, so the catalog
+/// stays one queryable collection with two front-ends, never two code paths.
+mod sql_text {
+    use std::process::ExitCode;
+
+    use super::{print_view, query_op};
+
+    /// Whether `text` is one of the three recognized catalog-SQL shapes
+    /// (case-insensitive), as opposed to the verb-based `sql` subcommands
+    /// (`create-view`/`drop-view`/`view`/`views`) handled above.
+    pub(super) fn is_catalog_sql(text: &str) -> bool {
+        let upper = text.trim().to_ascii_uppercase();
+        upper == "SHOW TABLES"
+            || upper.starts_with("DESCRIBE ")
+            || (upper.starts_with("SELECT") && upper.contains("FROM __CATALOG"))
+    }
+
+    /// Dispatch a recognized catalog-SQL statement to its `Catalog` query-op
+    /// equivalent and print the result exactly like the verb forms.
+    pub(super) fn run(text: &str) -> ExitCode {
+        let trimmed = text.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper == "SHOW TABLES" {
+            return print_view(
+                query_op(&pillar_ops::QueryOp::Catalog(
+                    pillar_ops::CatalogOp::Collections { database: None },
+                )),
+                "sql SHOW TABLES",
+            );
+        }
+        if let Some(rest) = trimmed.get(9..) {
+            if upper.starts_with("DESCRIBE ") {
+                let collection = rest.trim().trim_end_matches(';').to_owned();
+                return print_view(
+                    query_op(&pillar_ops::QueryOp::Catalog(
+                        pillar_ops::CatalogOp::Describe { collection },
+                    )),
+                    "sql DESCRIBE",
+                );
+            }
+        }
+        // `SELECT … FROM __catalog [WHERE …]` — the catalog IS a queryable
+        // Document collection: answer with the same live collection listing
+        // `SHOW TABLES`/`catalog collections` folds. A `WHERE` clause, if
+        // present, is not yet evaluated (no general SQL predicate engine
+        // ships with this task); every live catalog row is returned.
+        print_view(
+            query_op(&pillar_ops::QueryOp::Catalog(
+                pillar_ops::CatalogOp::Collections { database: None },
+            )),
+            "sql SELECT … FROM __catalog",
+        )
+    }
+}
+
+/// `pillar catalog {databases | collections [--database <db>] | describe
+/// <collection> | views [--database <db>]}`: the catalog-introspection
+/// surface (`catalog-introspection-surface`) over the SAME sealed query tier
+/// `pillar kv`/`doc`/`sql` ride. Every verb is a member-gated VIEW folding the
+/// node's live collection set / `__catalog` view catalog — discovery is a
+/// query, never hard-coded help text.
+pub fn catalog(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar catalog {{databases | collections [--database <db>] | \
+             describe <collection> | views [--database <db>]}}"
+        );
+        ExitCode::from(2)
+    };
+    let database_flag = |rest: &[String]| -> Option<String> {
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i] == "--database" {
+                return rest.get(i + 1).cloned();
+            }
+            i += 1;
+        }
+        None
+    };
+    match args.first().map(String::as_str) {
+        Some("databases") => print_view(
+            query_op(&pillar_ops::QueryOp::Catalog(pillar_ops::CatalogOp::Databases)),
+            "catalog databases",
+        ),
+        Some("collections") => {
+            let database = database_flag(&args[1..]).or_else(|| args.get(1).cloned());
+            print_view(
+                query_op(&pillar_ops::QueryOp::Catalog(
+                    pillar_ops::CatalogOp::Collections { database },
+                )),
+                "catalog collections",
+            )
+        }
+        Some("describe") => match args.get(1) {
+            Some(collection) => print_view(
+                query_op(&pillar_ops::QueryOp::Catalog(
+                    pillar_ops::CatalogOp::Describe {
+                        collection: collection.clone(),
+                    },
+                )),
+                "catalog describe",
+            ),
+            None => usage(),
+        },
+        Some("views") => {
+            let database = database_flag(&args[1..]).or_else(|| args.get(1).cloned());
+            print_view(
+                query_op(&pillar_ops::QueryOp::Catalog(
+                    pillar_ops::CatalogOp::Views { database },
+                )),
+                "catalog views",
+            )
+        }
         _ => usage(),
     }
 }
