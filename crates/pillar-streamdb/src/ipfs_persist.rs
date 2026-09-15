@@ -36,7 +36,9 @@ use pillar_crypto::{
     SigningSecretKey,
 };
 
-use crate::pillarmsg::{decode_stream_op_segment_payload, encode_stream_op_segment_payload};
+use crate::pillarmsg::{
+    decode_stream_op_segment_payload, encode_stream_op_segment_payload, Confidentiality,
+};
 use crate::store::{Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, Visibility};
 use crate::{PolicyViolation, StoreError, Stream};
 
@@ -152,7 +154,15 @@ pub struct IpfsPersistentStream {
     /// rehydrated-without-cell-key handle (mirrors `secret: None` — held
     /// read-only until a caller supplies it), in which case a `v2` segment
     /// cannot be opened (only a legacy `v1` bare payload can still be read).
+    /// Also `None` — legitimately, not merely "not yet supplied" — for a
+    /// [`Confidentiality::Public`] stream, which needs no group key at all.
     group: Option<CellGroupKey>,
+    /// This stream's confidentiality class (`data-placement-collection-tags`
+    /// / `public-visibility-class`): [`Confidentiality::CellEncrypted`] (the
+    /// default) AEAD-seals every op to `group`; [`Confidentiality::Public`]
+    /// elides the seal — signing, content-addressing, and Merkle-DAG
+    /// verifiability are unaffected either way.
+    confidentiality: Confidentiality,
 }
 
 impl IpfsPersistentStream {
@@ -181,6 +191,54 @@ impl IpfsPersistentStream {
         group: CellGroupKey,
         policy: Option<ViewPolicy>,
     ) -> Self {
+        Self::genesis_with_confidentiality(
+            owner,
+            secret,
+            visibility,
+            cell,
+            Some(group),
+            Confidentiality::CellEncrypted,
+            policy,
+        )
+    }
+
+    /// Start a brand-new (empty) [`Confidentiality::Public`] IPFS-persisted
+    /// stream: ops are still signed + content-addressed exactly like a
+    /// cell-encrypted stream, but carry NO AEAD seal — no [`CellGroupKey`] is
+    /// required (or used) to write OR read. `public-visibility-class`'s
+    /// "public collection" constructor.
+    #[must_use]
+    pub fn genesis_public(
+        owner: SigningPublicKey,
+        secret: SigningSecretKey,
+        cell: CellId,
+        policy: Option<ViewPolicy>,
+    ) -> Self {
+        Self::genesis_with_confidentiality(
+            owner,
+            secret,
+            Visibility::Public,
+            cell,
+            None,
+            Confidentiality::Public,
+            policy,
+        )
+    }
+
+    /// The full constructor [`Self::genesis`]/[`Self::genesis_with_policy`]/
+    /// [`Self::genesis_public`] all delegate to: an explicit
+    /// [`Confidentiality`] class plus an optional cell group key (required
+    /// iff `confidentiality` is [`Confidentiality::CellEncrypted`]).
+    #[must_use]
+    pub fn genesis_with_confidentiality(
+        owner: SigningPublicKey,
+        secret: SigningSecretKey,
+        visibility: Visibility,
+        cell: CellId,
+        group: Option<CellGroupKey>,
+        confidentiality: Confidentiality,
+        policy: Option<ViewPolicy>,
+    ) -> Self {
         let stream = match policy {
             Some(p) => Stream::with_policy(p),
             None => Stream::new(),
@@ -195,7 +253,8 @@ impl IpfsPersistentStream {
             head: None,
             ttl_secs: 3600,
             cell,
-            group: Some(group),
+            group,
+            confidentiality,
         }
     }
 
@@ -274,8 +333,12 @@ impl IpfsPersistentStream {
                         .ok_or(IpfsPersistError::Store(StoreError::NotFound))?;
                     let (prev, segment_payload) =
                         decode_segment(seg.bytes()).ok_or(IpfsPersistError::Corrupt)?;
-                    let payload = decode_stream_op_segment_payload(&segment_payload, &group)
-                        .map_err(IpfsPersistError::StreamOpMessage)?;
+                    let payload = decode_stream_op_segment_payload(
+                        &segment_payload,
+                        Some(&group),
+                        Confidentiality::CellEncrypted,
+                    )
+                    .map_err(IpfsPersistError::StreamOpMessage)?;
                     payloads_newest_first.push(payload);
                     cursor = prev;
                 }
@@ -293,6 +356,7 @@ impl IpfsPersistentStream {
                     ttl_secs: head.ttl_secs(),
                     cell,
                     group: Some(group),
+                    confidentiality: Confidentiality::CellEncrypted,
                 })
             }
             None => Ok(IpfsPersistentStream {
@@ -306,6 +370,7 @@ impl IpfsPersistentStream {
                 ttl_secs: 3600,
                 cell,
                 group: Some(group),
+                confidentiality: Confidentiality::CellEncrypted,
             }),
         }
     }
@@ -314,6 +379,12 @@ impl IpfsPersistentStream {
     #[must_use]
     pub fn owner(&self) -> &SigningPublicKey {
         &self.owner
+    }
+
+    /// This stream's confidentiality class.
+    #[must_use]
+    pub fn confidentiality(&self) -> Confidentiality {
+        self.confidentiality
     }
 
     /// The current head [`Cid`] (the latest segment), if any op has been
@@ -360,7 +431,15 @@ impl IpfsPersistentStream {
         effect: SideEffect,
     ) -> Result<crate::OpId, IpfsPersistError> {
         let secret = self.secret.as_ref().ok_or(IpfsPersistError::ReadOnly)?;
-        let group = self.group.as_ref().ok_or(IpfsPersistError::ReadOnly)?;
+        // A group key is required only for a `CellEncrypted` stream; a
+        // `Public` stream legitimately holds none (`self.group` is `None`)
+        // and needs none to seal (there is no seal).
+        let group = match self.confidentiality {
+            Confidentiality::CellEncrypted => {
+                Some(self.group.as_ref().ok_or(IpfsPersistError::ReadOnly)?)
+            }
+            Confidentiality::Public => None,
+        };
         let policy = self.stream.policy();
         if !policy.admits(effect) {
             return Err(IpfsPersistError::Policy(PolicyViolation::new(
@@ -376,6 +455,7 @@ impl IpfsPersistentStream {
             self.owner.clone(),
             secret,
             self.visibility,
+            self.confidentiality,
         )
         .map_err(IpfsPersistError::StreamOpMessage)?;
         let segment_bytes = encode_segment(self.head.as_ref(), &sealed_payload);
@@ -472,6 +552,45 @@ impl IpfsPersistentStream {
         cell: CellId,
         group: Option<CellGroupKey>,
     ) -> Result<Self, IpfsPersistError> {
+        Self::rehydrate_with_confidentiality(
+            owner,
+            head,
+            source,
+            cell,
+            group,
+            Confidentiality::CellEncrypted,
+        )
+    }
+
+    /// As [`Self::rehydrate`], but for a [`Confidentiality::Public`] stream:
+    /// every segment is opened via the signed-but-unsealed `StreamOp` path
+    /// (signature verified, no group key involved at all) rather than the
+    /// legacy raw-bytes fallback [`Self::rehydrate`] uses when `group` is
+    /// `None`.
+    pub fn rehydrate_public(
+        owner: SigningPublicKey,
+        head: &HeadRecord,
+        source: &impl SegmentSource,
+        cell: CellId,
+    ) -> Result<Self, IpfsPersistError> {
+        Self::rehydrate_with_confidentiality(
+            owner,
+            head,
+            source,
+            cell,
+            None,
+            Confidentiality::Public,
+        )
+    }
+
+    fn rehydrate_with_confidentiality(
+        owner: SigningPublicKey,
+        head: &HeadRecord,
+        source: &impl SegmentSource,
+        cell: CellId,
+        group: Option<CellGroupKey>,
+        confidentiality: Confidentiality,
+    ) -> Result<Self, IpfsPersistError> {
         head.verify().map_err(IpfsPersistError::Store)?;
         if head.owner().as_bytes() != owner.as_bytes() {
             return Err(IpfsPersistError::WrongOwner);
@@ -485,10 +604,20 @@ impl IpfsPersistentStream {
             let seg = store.get(&cid, source)?;
             let (prev, segment_payload) =
                 decode_segment(seg.bytes()).ok_or(IpfsPersistError::Corrupt)?;
-            let payload = match &group {
-                Some(g) => decode_stream_op_segment_payload(&segment_payload, g)
+            let payload = match confidentiality {
+                Confidentiality::Public => {
+                    decode_stream_op_segment_payload(&segment_payload, None, confidentiality)
+                        .map_err(IpfsPersistError::StreamOpMessage)?
+                }
+                Confidentiality::CellEncrypted => match &group {
+                    Some(g) => decode_stream_op_segment_payload(
+                        &segment_payload,
+                        Some(g),
+                        confidentiality,
+                    )
                     .map_err(IpfsPersistError::StreamOpMessage)?,
-                None => segment_payload,
+                    None => segment_payload,
+                },
             };
             payloads_newest_first.push(payload);
             store.pin(&cid)?;
@@ -512,6 +641,7 @@ impl IpfsPersistentStream {
             ttl_secs: head.ttl_secs(),
             cell,
             group,
+            confidentiality,
         })
     }
 
