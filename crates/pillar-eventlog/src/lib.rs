@@ -495,6 +495,70 @@ impl EventLog {
         self.events.get(id)
     }
 
+    /// Every held event in a DETERMINISTIC chronological order: a topological
+    /// walk of the causal DAG (an event never appears before any of its
+    /// `prev`/`parents` links), ties broken by `(author, seq)` so the order is
+    /// stable across runs and platforms and independent of insertion order.
+    ///
+    /// This is the read-side complement of [`Self::append`]: it lets a caller
+    /// (e.g. a per-subject audit timeline) fold the signed act log into a real
+    /// chronological history without reaching into the private index.
+    #[must_use]
+    pub fn events_in_causal_order(&self) -> Vec<&Event> {
+        // Kahn topological sort over the happens-before edges (link -> event),
+        // with a deterministic tie-break so concurrent events are ordered
+        // reproducibly by (author, seq).
+        let mut remaining_deps: BTreeMap<EventId, usize> = BTreeMap::new();
+        let mut dependents: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
+        for (id, event) in &self.events {
+            let links: Vec<EventId> = event
+                .content
+                .links()
+                .into_iter()
+                .filter(|l| self.events.contains_key(l))
+                .collect();
+            remaining_deps.insert(id.clone(), links.len());
+            for link in links {
+                dependents.entry(link).or_default().push(id.clone());
+            }
+        }
+        // Deterministic ready-set ordered by (author, seq, id).
+        let sort_key = |id: &EventId| -> (String, u64, EventId) {
+            let c = &self.events[id].content;
+            (c.author.0.clone(), c.seq, id.clone())
+        };
+        let mut ready: Vec<EventId> = remaining_deps
+            .iter()
+            .filter(|(_, n)| **n == 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ready.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        let mut order: Vec<&Event> = Vec::with_capacity(self.events.len());
+        while let Some(next) = ready.first().cloned() {
+            ready.remove(0);
+            order.push(&self.events[&next]);
+            if let Some(children) = dependents.get(&next) {
+                let mut newly_ready = Vec::new();
+                for child in children {
+                    if let Some(n) = remaining_deps.get_mut(child) {
+                        *n -= 1;
+                        if *n == 0 {
+                            newly_ready.push(child.clone());
+                        }
+                    }
+                }
+                for child in newly_ready {
+                    let key = sort_key(&child);
+                    let pos = ready
+                        .binary_search_by(|probe| sort_key(probe).cmp(&key))
+                        .unwrap_or_else(|e| e);
+                    ready.insert(pos, child);
+                }
+            }
+        }
+        order
+    }
+
     /// The current tip (latest event id) of `author`, if it has published.
     #[must_use]
     pub fn tip(&self, author: &Author) -> Option<EventId> {

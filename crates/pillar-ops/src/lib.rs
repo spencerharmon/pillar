@@ -557,6 +557,18 @@ pub enum IdentityOp {
 pub enum UserOp {
     /// Every IAM user: `<handle> status=<s> force_password_change=<b> roles=…`.
     List,
+    /// The per-user AUDIT TIMELINE (`um-per-user-audit-timeline`, ROI P1 "User
+    /// management & lifecycle" roadmap D1): a chronological, cryptographically
+    /// VERIFIABLE (hash==id + valid signature) history of every signed
+    /// user-admin act (`USER-INVITE`/`USER-DISABLE`/`USER-ENABLE`/
+    /// `USER-REQUIRE-CHANGE`/`USER-RESET`) that named `handle`, folded from the
+    /// node's signed `act_log` — the SAME signed events `perform_signed_act`
+    /// appends on every `iam:users:write` mutation. A member-gated VIEW (no new
+    /// authority, no new event, read-only).
+    AuditTimeline {
+        /// The subject user whose admin-act history is rendered.
+        handle: String,
+    },
     /// One IAM user's row.
     Show {
         /// The user handle.

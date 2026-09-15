@@ -952,6 +952,10 @@ pub fn user(args: &[String]) -> ExitCode {
             Some(h) => pillar_ops::UserOp::Show { handle: h.clone() },
             None => return user_usage(),
         },
+        Some("audit") | Some("timeline") => match args.get(1) {
+            Some(h) => pillar_ops::UserOp::AuditTimeline { handle: h.clone() },
+            None => return user_usage(),
+        },
         Some("invite") => match (args.get(1), args.get(2)) {
             (Some(handle), Some(email)) => pillar_ops::UserOp::Invite {
                 handle: handle.clone(),
@@ -1052,6 +1056,18 @@ pub fn query_op(op: &pillar_ops::QueryOp) -> Result<String, String> {
     } else {
         Err(ack.strip_prefix("ERR ").unwrap_or(&ack).to_owned())
     }
+}
+
+/// Send a [`pillar_ops::UserOp`] over the control-op tier (`ControlOp::User`)
+/// and unwrap its ack to the payload text — the public sibling of
+/// [`query_op`] for IAM user views/acts. Used by `pillar user …` and the
+/// `um-per-user-audit-timeline` acceptance harness to exercise the real
+/// remote control-op surface end to end.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason (`ERR ` stripped).
+pub fn user_op(op: &pillar_ops::UserOp) -> Result<String, String> {
+    control_op(&pillar_ops::ControlOp::User(op.clone()))
 }
 
 /// Lowercase-hex-encode a K/V value byte string for the wire.
