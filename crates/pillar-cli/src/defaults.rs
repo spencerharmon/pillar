@@ -207,6 +207,34 @@ pub fn available_count(advisory: &[DefaultAdvisory]) -> usize {
         .count()
 }
 
+/// The bootstrap-guaranteed default `RetentionPolicy` manifests every fresh
+/// cell materializes at cell-creation time — the Default ResourceSet's
+/// deliverable half of "default resources ship as first-class resources via
+/// bootstrap" (ROI Priority 1). Unlike [`shipped_default_bundle`]'s advisory
+/// use (a net-new "Available" offer an operator opts into later), these are
+/// rendered as [`crate::resource::FLOOR_LABEL`] objects: applied for real at
+/// bootstrap, so their EXISTENCE never depends on an operator adopting them,
+/// and [`crate::resource::ResourcePlane::delete`] refuses to remove one
+/// (existence self-heals by never actually vanishing). The operator may still
+/// freely EDIT the spec of a floor object — only its existence is pinned, not
+/// its content — exactly as an implicitly-created collection reads its
+/// defaults from an editable policy rather than a hardcoded floor.
+#[must_use]
+pub fn bootstrap_default_manifests() -> Vec<Crd> {
+    let bundle = shipped_default_bundle();
+    bundle
+        .policies
+        .iter()
+        .map(|p| {
+            let mut crd = p.to_crd(bundle.version);
+            crd.metadata
+                .labels
+                .insert(crate::resource::FLOOR_LABEL.to_owned(), "true".to_owned());
+            crd
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

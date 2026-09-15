@@ -230,6 +230,16 @@ impl Platform {
         self.log.len()
     }
 
+    /// Replace the WoT authority graph an already-populated platform decides
+    /// against, WITHOUT discarding any previously emitted event/store state —
+    /// the update half of admitting a new subject after the plane already
+    /// holds bootstrap-seeded resources (e.g. the Default ResourceSet's floor
+    /// `RetentionPolicy` set), which the previous "rebuild a fresh `Platform`"
+    /// approach would have silently wiped.
+    pub fn set_authority(&mut self, authority: WotAuthority) {
+        self.authority = authority;
+    }
+
     /// Whether the acting node may perform `capability`, per the SAME
     /// [`RbacDecider`] the controller enforces and the UI predicts.
     #[must_use]

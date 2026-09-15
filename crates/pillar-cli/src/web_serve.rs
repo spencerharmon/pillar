@@ -3293,11 +3293,14 @@ impl WebAuthContext {
         self.authority.issue_edge(root, subject.clone(), level);
         self.actor.refresh(&self.authority);
         // Mirror the admission into the resource plane's authority so the
-        // logged-in subject is an authorized resource actor too, and rebuild
-        // the plane's platform over the updated authority. Admission always
-        // precedes any resource act (login happens before the UI acts), so no
-        // already-emitted resource event is ever discarded here — asserted by
-        // rebuilding only while the plane's event log is still empty.
+        // logged-in subject is an authorized resource actor too. When the
+        // plane already holds bootstrap-seeded events (e.g. the Default
+        // ResourceSet's floor `RetentionPolicy` set applied at `create_cell`
+        // time), rebuilding a FRESH `Platform` would silently discard them —
+        // so refresh the authority IN PLACE via `set_authority` instead,
+        // preserving every already-emitted event; only an empty plane is
+        // still rebuilt outright (equivalent, cheaper, and covers the
+        // never-yet-admitted-anyone startup case).
         let resource_root = self.resource_authority.owner().clone();
         self.resource_authority
             .issue_edge(resource_root, subject, level);
@@ -3308,6 +3311,9 @@ impl WebAuthContext {
                 default_resource_class_policies(&RbacCapability(RESOURCE_CAP.to_owned())),
                 Vec::new(),
             );
+        } else {
+            self.resource_platform
+                .set_authority(self.resource_authority.clone());
         }
     }
 
@@ -4563,7 +4569,34 @@ impl WebAuthContext {
             cell: cell_id.clone(),
         });
         self.announce_cell_name(&cell_id);
+        self.seed_default_resourceset_floor();
         Ok(())
+    }
+
+    /// Materialize the Default ResourceSet's bootstrap-guaranteed floor
+    /// objects — the default `RetentionPolicy` set
+    /// ([`crate::defaults::bootstrap_default_manifests`]) — as real, applied
+    /// resources on the SAME signed resource plane a manifest apply uses, so
+    /// they appear via `pillar get`/`pillar apply -f -` (edit) exactly like
+    /// any other resource. The Default ResourceSet itself needs no explicit
+    /// manifest: [`crate::resourceset::collect_resourcesets`] synthesizes it
+    /// implicitly from these live `RetentionPolicy` resources. Best-effort by
+    /// construction (the owner always authorizes its own cell's resource
+    /// plane), so a failure here would be an internal bug, not an operator
+    /// condition — logged rather than propagated to keep `create_cell`
+    /// infallible on this step.
+    fn seed_default_resourceset_floor(&mut self) {
+        let actor = self.resource_authority.owner().clone();
+        let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
+        for manifest in crate::defaults::bootstrap_default_manifests() {
+            if let Err(e) = plane.apply(&actor, RESOURCE_CAP, manifest.clone()) {
+                debug_assert!(
+                    false,
+                    "bootstrap floor seed {}/{} failed: {e}",
+                    manifest.kind, manifest.metadata.name
+                );
+            }
+        }
     }
 
     /// Push the operator's real cell name into the live observability substrate
