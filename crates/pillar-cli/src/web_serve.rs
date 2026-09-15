@@ -3738,6 +3738,107 @@ impl WebAuthContext {
             pillar_ops::ControlOp::Obs(o) => self.obs_op(actor, o),
             pillar_ops::ControlOp::Identity(i) => self.identity_op(actor, i),
             pillar_ops::ControlOp::User(u) => self.user_op(actor, u),
+            pillar_ops::ControlOp::Cluster(c) => self.cluster_op(actor, c),
+        }
+    }
+
+    /// Serve a [`pillar_ops::ClusterOp`] over the control-op tier. `RequestList`/
+    /// `TopologyTree`/`NodesAt`/`Domains`/`Members` are member-gated views; the
+    /// request submit/approve/reject variants are member-gated acts over the
+    /// SAME live [`BootstrapRequestQueue`] the `/portal/request/*` routes drive
+    /// (an authenticated, WoT-reachable signer IS an authorized member — the
+    /// SAME rule the HTTP decide path applies via `queue.add_member`).
+    fn cluster_op(&mut self, actor: &NodeId, op: &pillar_ops::ClusterOp) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            pillar_ops::ClusterOp::TopologyTree { tier } => Ok(self.topology_tree(tier)),
+            pillar_ops::ClusterOp::NodesAt { tier, value } => {
+                Ok(self.topology_nodes_at(tier, value).join("\n"))
+            }
+            pillar_ops::ClusterOp::Domains => {
+                let mut body = String::new();
+                for (domain, cells) in self.domain_cells() {
+                    body.push_str(&format!("DOMAIN {} CELLS {}\n", domain, cells.join(",")));
+                }
+                Ok(body)
+            }
+            pillar_ops::ClusterOp::Members => {
+                let mut body = String::new();
+                for (handle, role) in self.members() {
+                    body.push_str(&format!("{handle}\t{role}\n"));
+                }
+                Ok(body)
+            }
+            pillar_ops::ClusterOp::RequestList => {
+                let queue = self.requests.as_ref().ok_or("no cell yet".to_owned())?;
+                let mut body = String::new();
+                for req in queue.pending() {
+                    let kind = match req.kind() {
+                        BootstrapRequestKind::Node => "node",
+                        BootstrapRequestKind::User => "user",
+                    };
+                    body.push_str(&format!("{} {} {}\n", req.id().0, kind, req.subject().0));
+                }
+                Ok(body)
+            }
+            pillar_ops::ClusterOp::RequestSubmitUser {
+                subject,
+                custody,
+                labels,
+            } => {
+                let custody = parse_custody_field(custody.as_deref().unwrap_or(""));
+                let queue = self.requests.as_mut().ok_or("no cell yet".to_owned())?;
+                let id = queue.submit_user(NodeId::from(subject.as_str()), custody, labels.clone());
+                Ok(format!("REQUEST {}", id.0))
+            }
+            pillar_ops::ClusterOp::RequestSubmitNode {
+                subject,
+                peer_id,
+                version,
+                os,
+                public_key_cid,
+                custody,
+                pub_addrs,
+                priv_addrs,
+                labels,
+            } => {
+                let custody = parse_custody_field(custody.as_deref().unwrap_or(""));
+                let mut identity = NodeIdentity::new(peer_id.clone());
+                identity.version = version.clone();
+                identity.os = os.clone();
+                identity.public_key_cid = public_key_cid.clone();
+                identity.public_addrs = pub_addrs.clone();
+                identity.private_addrs = priv_addrs.clone();
+                let queue = self.requests.as_mut().ok_or("no cell yet".to_owned())?;
+                let id = queue.submit_node(
+                    NodeId::from(subject.as_str()),
+                    identity,
+                    custody,
+                    labels.clone(),
+                );
+                Ok(format!("REQUEST {}", id.0))
+            }
+            pillar_ops::ClusterOp::RequestApprove { id } => {
+                let member = actor.clone();
+                let queue = self.requests.as_mut().ok_or("no cell yet".to_owned())?;
+                queue.add_member(member.clone());
+                match queue.approve(BootstrapRequestId(*id), &member) {
+                    Ok(Some(sealed)) => Ok(format!("APPROVED {}", sealed.cid)),
+                    Ok(None) => Ok(format!("ESCROWED {id}")),
+                    Err(e) => Err(request_reason(&e).to_owned()),
+                }
+            }
+            pillar_ops::ClusterOp::RequestReject { id } => {
+                let member = actor.clone();
+                let queue = self.requests.as_mut().ok_or("no cell yet".to_owned())?;
+                queue.add_member(member.clone());
+                match queue.reject(BootstrapRequestId(*id), &member) {
+                    Ok(()) => Ok(format!("REJECTED {id}")),
+                    Err(e) => Err(request_reason(&e).to_owned()),
+                }
+            }
         }
     }
 
@@ -3750,11 +3851,7 @@ impl WebAuthContext {
     /// [`Self::perform_signed_act`] — the SAME decider every other resource act
     /// rides. The ack detail carries the folded view text (`OK <payload>`); a
     /// refusal is `Err(<reason>)`.
-    pub fn query_op(
-        &mut self,
-        actor: &NodeId,
-        op: &pillar_ops::QueryOp,
-    ) -> Result<String, String> {
+    pub fn query_op(&mut self, actor: &NodeId, op: &pillar_ops::QueryOp) -> Result<String, String> {
         // Every query op — read or write — requires the signer to be a
         // recognized cell member (fail-closed), exactly as the resource-op read
         // tier gates on membership.
@@ -3806,11 +3903,12 @@ impl WebAuthContext {
                 self.keyed_store.kv_delete(collection, key, hlc);
                 Ok(format!("KV-DELETE {collection} {key} EVENT-CID {cid}"))
             }
-            pillar_ops::KvOp::Get { collection, key } => match self.keyed_store.kv_get(collection, key)
-            {
-                Some(v) => Ok(hex_encode_bytes(&v)),
-                None => Err(format!("no live key {key} in collection {collection}")),
-            },
+            pillar_ops::KvOp::Get { collection, key } => {
+                match self.keyed_store.kv_get(collection, key) {
+                    Some(v) => Ok(hex_encode_bytes(&v)),
+                    None => Err(format!("no live key {key} in collection {collection}")),
+                }
+            }
             pillar_ops::KvOp::Keys { collection } => {
                 Ok(join_lines(self.keyed_store.kv_keys(collection)))
             }
@@ -3826,10 +3924,8 @@ impl WebAuthContext {
                 field,
                 value,
             } => {
-                let cid = self.authorize_data_write(
-                    actor,
-                    &format!("DOC-PUT {collection} {id} {field}"),
-                )?;
+                let cid = self
+                    .authorize_data_write(actor, &format!("DOC-PUT {collection} {id} {field}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.doc_put_field(
                     collection,
@@ -3850,7 +3946,8 @@ impl WebAuthContext {
                     &format!("DOC-DELETE {collection} {id} {field}"),
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
-                self.keyed_store.doc_delete_field(collection, id, field, hlc);
+                self.keyed_store
+                    .doc_delete_field(collection, id, field, hlc);
                 Ok(format!(
                     "DOC-DELETE {collection} {id} {field} EVENT-CID {cid}"
                 ))
@@ -3913,7 +4010,6 @@ impl WebAuthContext {
             }
         }
     }
-
 
     /// Serve a [`pillar_ops::IdentityOp`] over the control-op tier. `Show`/
     /// `Domains` are member-gated views over the live identity log; `Enroll`/

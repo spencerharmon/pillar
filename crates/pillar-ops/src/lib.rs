@@ -189,6 +189,10 @@ pub enum ControlOp {
     /// IAM user views + lifecycle acts (`pillar user …`) over the node's live
     /// IAM user store.
     User(UserOp),
+    /// Cluster bootstrap-request queue + topology views (`pillar cluster …` /
+    /// `pillar request …`) over the node's live request queue + topology
+    /// registry.
+    Cluster(ClusterOp),
 }
 
 /// Portal-member management ops (`pillar member ls|add|role`). A `List` is a
@@ -392,6 +396,74 @@ pub enum UserOp {
     },
 }
 
+/// Cluster ops (`pillar cluster …` / `pillar request …`). `RequestList`/
+/// `TopologyTree`/`NodesAt`/`Domains`/`Members` are member-gated VIEWS; the
+/// request submit/approve/reject variants are member-gated acts over the live
+/// bootstrap-request queue (the SAME queue the `/portal/request/*` routes use).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum ClusterOp {
+    /// The pending bootstrap requests: `<id> <kind> <subject>` per line.
+    RequestList,
+    /// File a NODE join request for `subject`.
+    RequestSubmitNode {
+        /// The joining node's subject id.
+        subject: String,
+        /// The libp2p peer id.
+        peer_id: String,
+        /// The node's version string.
+        version: String,
+        /// The node's OS string.
+        os: String,
+        /// The content-addressed public key id.
+        public_key_cid: String,
+        /// The custody-kind token (defaults to password when absent).
+        custody: Option<String>,
+        /// Public dial addresses.
+        pub_addrs: Vec<String>,
+        /// Private dial addresses.
+        priv_addrs: Vec<String>,
+        /// Topology labels.
+        labels: Vec<String>,
+    },
+    /// File a USER join request for `subject`.
+    RequestSubmitUser {
+        /// The joining user's subject id.
+        subject: String,
+        /// The custody-kind token (defaults to password when absent).
+        custody: Option<String>,
+        /// Topology labels.
+        labels: Vec<String>,
+    },
+    /// Approve a pending request (node approval seals the cell key; user
+    /// approval escrows the offer).
+    RequestApprove {
+        /// The request id.
+        id: u64,
+    },
+    /// Reject a pending request.
+    RequestReject {
+        /// The request id.
+        id: u64,
+    },
+    /// The topology tree rolled up to `tier`.
+    TopologyTree {
+        /// The rollup tier.
+        tier: String,
+    },
+    /// The nodes at a `tier`=`value` topology facet.
+    NodesAt {
+        /// The topology tier.
+        tier: String,
+        /// The tier value.
+        value: String,
+    },
+    /// The domain (naming-only) grouping: each domain's cells.
+    Domains,
+    /// This cell's members and their roles.
+    Members,
+}
+
 impl ControlOp {
     /// Encode to a control-op payload: a single [`CONTROL_OP_CODEC_VERSION`]
     /// byte followed by the canonical JSON of the op. Deterministic, like
@@ -438,6 +510,11 @@ impl ControlOp {
                 | ControlOp::Identity(IdentityOp::Domains)
                 | ControlOp::User(UserOp::List)
                 | ControlOp::User(UserOp::Show { .. })
+                | ControlOp::Cluster(ClusterOp::RequestList)
+                | ControlOp::Cluster(ClusterOp::TopologyTree { .. })
+                | ControlOp::Cluster(ClusterOp::NodesAt { .. })
+                | ControlOp::Cluster(ClusterOp::Domains)
+                | ControlOp::Cluster(ClusterOp::Members)
         )
     }
 }
@@ -634,10 +711,9 @@ impl QueryOp {
     #[must_use]
     pub fn is_read(&self) -> bool {
         match self {
-            QueryOp::Kv(op) => matches!(
-                op,
-                KvOp::Get { .. } | KvOp::Keys { .. } | KvOp::Collections
-            ),
+            QueryOp::Kv(op) => {
+                matches!(op, KvOp::Get { .. } | KvOp::Keys { .. } | KvOp::Collections)
+            }
             QueryOp::Doc(op) => matches!(
                 op,
                 DocOp::GetField { .. } | DocOp::Fields { .. } | DocOp::Ids { .. }
@@ -960,6 +1036,55 @@ mod tests {
     }
 
     #[test]
+    fn control_op_cluster_round_trip() {
+        let acts = [
+            ControlOp::Cluster(ClusterOp::RequestSubmitNode {
+                subject: "node-b".into(),
+                peer_id: "12D3".into(),
+                version: "0.1.0".into(),
+                os: "linux".into(),
+                public_key_cid: "1220ab".into(),
+                custody: Some("password".into()),
+                pub_addrs: vec!["/ip4/192.0.2.1/tcp/4001".into()],
+                priv_addrs: vec![],
+                labels: vec!["region=us".into()],
+            }),
+            ControlOp::Cluster(ClusterOp::RequestSubmitUser {
+                subject: "carol".into(),
+                custody: None,
+                labels: vec![],
+            }),
+            ControlOp::Cluster(ClusterOp::RequestApprove { id: 7 }),
+            ControlOp::Cluster(ClusterOp::RequestReject { id: 8 }),
+        ];
+        for op in &acts {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                *op
+            );
+            assert!(!op.is_read(), "cluster request acts are not reads: {op:?}");
+        }
+        for op in [
+            ControlOp::Cluster(ClusterOp::RequestList),
+            ControlOp::Cluster(ClusterOp::TopologyTree {
+                tier: "region".into(),
+            }),
+            ControlOp::Cluster(ClusterOp::NodesAt {
+                tier: "region".into(),
+                value: "us".into(),
+            }),
+            ControlOp::Cluster(ClusterOp::Domains),
+            ControlOp::Cluster(ClusterOp::Members),
+        ] {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "cluster views are reads: {op:?}");
+        }
+    }
+
+    #[test]
     fn query_op_round_trips_and_classifies_read_vs_write() {
         let acts = [
             QueryOp::Kv(KvOp::Put {
@@ -1025,7 +1150,10 @@ mod tests {
             }),
             QueryOp::Sql(SqlOp::Views),
         ] {
-            assert_eq!(QueryOp::decode(&op.encode().expect("encode")).expect("decode"), op);
+            assert_eq!(
+                QueryOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
             assert!(op.is_read(), "query view is a read: {op:?}");
         }
     }
