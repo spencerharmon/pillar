@@ -1268,6 +1268,135 @@ fn user_usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Collect every value of a repeatable `--flag <v>` occurrence.
+fn multi_flag(args: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `pillar request {ls | approve <id> | reject <id> | submit-user <subject>
+/// [--custody <k>] [--label <l>]… | submit-node <subject> --peer-id <p>
+/// --version <v> --os <o> --pubkey <cid> [--custody <k>] [--pub <a>]…
+/// [--priv <a>]… [--label <l>]…}`: bootstrap-request queue over pillar-message.
+pub fn request(args: &[String]) -> ExitCode {
+    let flag = |f: &str| {
+        args.iter()
+            .position(|a| a == f)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let op = match args.first().map(String::as_str) {
+        None | Some("ls") | Some("list") => pillar_ops::ClusterOp::RequestList,
+        Some("approve") => match args.get(1).and_then(|s| s.parse::<u64>().ok()) {
+            Some(id) => pillar_ops::ClusterOp::RequestApprove { id },
+            None => {
+                eprintln!("usage: pillar request approve <id>");
+                return ExitCode::from(2);
+            }
+        },
+        Some("reject") => match args.get(1).and_then(|s| s.parse::<u64>().ok()) {
+            Some(id) => pillar_ops::ClusterOp::RequestReject { id },
+            None => {
+                eprintln!("usage: pillar request reject <id>");
+                return ExitCode::from(2);
+            }
+        },
+        Some("submit-user") => match args.get(1) {
+            Some(subject) => pillar_ops::ClusterOp::RequestSubmitUser {
+                subject: subject.clone(),
+                custody: flag("--custody"),
+                labels: multi_flag(args, "--label"),
+            },
+            None => {
+                eprintln!(
+                    "usage: pillar request submit-user <subject> [--custody <k>] [--label <l>]…"
+                );
+                return ExitCode::from(2);
+            }
+        },
+        Some("submit-node") => {
+            let (Some(subject), Some(peer_id), Some(version), Some(os), Some(public_key_cid)) = (
+                args.get(1).cloned(),
+                flag("--peer-id"),
+                flag("--version"),
+                flag("--os"),
+                flag("--pubkey"),
+            ) else {
+                eprintln!(
+                    "usage: pillar request submit-node <subject> --peer-id <p> --version <v> \
+                     --os <o> --pubkey <cid> [--custody <k>] [--pub <a>]… [--priv <a>]… \
+                     [--label <l>]…"
+                );
+                return ExitCode::from(2);
+            };
+            pillar_ops::ClusterOp::RequestSubmitNode {
+                subject,
+                peer_id,
+                version,
+                os,
+                public_key_cid,
+                custody: flag("--custody"),
+                pub_addrs: multi_flag(args, "--pub"),
+                priv_addrs: multi_flag(args, "--priv"),
+                labels: multi_flag(args, "--label"),
+            }
+        }
+        Some(other) => {
+            eprintln!(
+                "usage: pillar request {{ls | approve <id> | reject <id> | \
+                 submit-user <subject> … | submit-node <subject> …}}  (got `{other}`)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Cluster(op)), "request")
+}
+
+/// `pillar topology {tree <tier> | nodes <tier> <value> | domains | members}`:
+/// topology + domain + membership views over pillar-message.
+pub fn topology(args: &[String]) -> ExitCode {
+    let op = match args.first().map(String::as_str) {
+        Some("tree") => match args.get(1) {
+            Some(tier) => pillar_ops::ClusterOp::TopologyTree { tier: tier.clone() },
+            None => {
+                eprintln!("usage: pillar topology tree <tier>");
+                return ExitCode::from(2);
+            }
+        },
+        Some("nodes") => match (args.get(1), args.get(2)) {
+            (Some(tier), Some(value)) => pillar_ops::ClusterOp::NodesAt {
+                tier: tier.clone(),
+                value: value.clone(),
+            },
+            _ => {
+                eprintln!("usage: pillar topology nodes <tier> <value>");
+                return ExitCode::from(2);
+            }
+        },
+        Some("domains") => pillar_ops::ClusterOp::Domains,
+        Some("members") => pillar_ops::ClusterOp::Members,
+        _ => {
+            eprintln!(
+                "usage: pillar topology {{tree <tier> | nodes <tier> <value> | \
+                 domains | members}}"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Cluster(op)), "topology")
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;

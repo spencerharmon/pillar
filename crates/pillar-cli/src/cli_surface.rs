@@ -146,7 +146,11 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "request",
-        handler: cluster_stream,
+        handler: |_v, args| crate::apply_over_pillar_message::request(args),
+    },
+    VerbSpec {
+        name: "topology",
+        handler: |_v, args| crate::apply_over_pillar_message::topology(args),
     },
     VerbSpec {
         name: "stream",
