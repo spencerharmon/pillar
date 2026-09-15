@@ -181,13 +181,35 @@ kind: Collection
 metadata:
   name: app.users
 spec:
-  visibility: cell-encrypted
+  visibility: cell-encrypted    # cell-encrypted | recipient-sealed | public
   consistency: relaxed          # relaxed (AP) | strict (CP)
 ```
 
 ```
 pillar apply -f app-users.collection.yaml
 ```
+
+### Public (unencrypted) collections
+
+Set `visibility: public` for data you want the world to read — for example a SaaS
+service's live metrics or a status page — or when you run a private, network-isolated
+swarm and prefer swarm-level isolation over per-record encryption for the extra
+throughput. A public collection carries no confidentiality seal, so its records are
+readable by anyone; only the encryption is dropped — every record is still signed,
+content-addressed, and independently verifiable, and writes are still authorized by role.
+
+```yaml
+apiVersion: data.pillar/v1
+kind: Collection
+metadata:
+  name: svc.metrics
+spec:
+  visibility: public
+```
+
+Because a public collection skips the encrypt/decrypt step, it is also the fastest
+profile — pillar uses public vs cell-encrypted collections as the two ends of its
+performance baseline.
 
 ### Placing a collection on specific nodes
 
@@ -344,7 +366,8 @@ Two things gate every read:
 
 Sealed material follows its visibility class: secrets and recipient-sealed bodies are opaque
 unless you hold the key, so a collection may be listable while its sensitive contents are not
-readable to you.
+readable to you. A `public` collection has no read barrier — anyone can read its records —
+but writes to it are still authorized by role, and its records remain signed and verifiable.
 
 ---
 
