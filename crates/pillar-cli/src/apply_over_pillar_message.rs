@@ -938,6 +938,7 @@ pub fn identity(args: &[String]) -> ExitCode {
 }
 
 /// `pillar user {ls | show <handle> | audit <handle> | security-events [kind]
+/// | login-observe <handle> <origin> <lat> <lon> [--at <secs>]
 /// | invite <handle> <email> [--password <p>]
 /// [--no-force-change] [--require-passkey] | disable <handle> | enable <handle>
 /// | require-change <handle> | set-password <handle> <password> [--force]}`:
@@ -962,6 +963,31 @@ pub fn user(args: &[String]) -> ExitCode {
         },
         Some("security-events") => pillar_ops::UserOp::SecurityEventsFeed {
             kind: args.get(1).cloned(),
+        },
+        Some("login-observe") => match (args.get(1), args.get(2), args.get(3), args.get(4)) {
+            (Some(handle), Some(origin), Some(lat), Some(lon)) => {
+                let at = flag("--at")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    });
+                pillar_ops::UserOp::LoginObserve {
+                    handle: handle.clone(),
+                    origin: origin.clone(),
+                    lat: lat.clone(),
+                    lon: lon.clone(),
+                    at,
+                }
+            }
+            _ => {
+                eprintln!(
+                    "usage: pillar user login-observe <handle> <origin> <lat> <lon> [--at <secs>]"
+                );
+                return ExitCode::from(2);
+            }
         },
         Some("invite") => match (args.get(1), args.get(2)) {
             (Some(handle), Some(email)) => pillar_ops::UserOp::Invite {
@@ -1588,7 +1614,8 @@ pub fn log(args: &[String]) -> ExitCode {
 fn user_usage() -> ExitCode {
     eprintln!(
         "usage: pillar user {{ls | show <handle> | audit <handle> | \
-         security-events [kind] | invite <handle> <email> \
+         security-events [kind] | login-observe <handle> <origin> <lat> <lon> [--at <secs>] | \
+         invite <handle> <email> \
          [--password <p>] [--no-force-change] [--require-passkey] | disable <handle> | \
          enable <handle> | require-change <handle> | set-password <handle> <password> \
          [--force]}}"
