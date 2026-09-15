@@ -49,6 +49,12 @@ pub use rbac_bridge::{
     IAM_GROUPS_WRITE_CAPABILITY, IAM_ROLES_WRITE_CAPABILITY, SENSITIVE_OPS_STEP_UP_MAX_AGE_SECS,
 };
 
+pub mod expiring_grants;
+pub use expiring_grants::{
+    authorize_capability_at, effective_capabilities_at, record_with_live_grants, ExpiringGrant,
+    GrantOp, GrantSet,
+};
+
 pub mod password_lifecycle;
 pub use password_lifecycle::{
     admit_gated_action, complete_self_password_change, evaluate_login_password_age,
