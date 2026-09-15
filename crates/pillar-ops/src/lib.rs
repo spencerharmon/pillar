@@ -569,6 +569,24 @@ pub enum UserOp {
         /// The subject user whose admin-act history is rendered.
         handle: String,
     },
+    /// The cell-wide SECURITY EVENTS FEED (`um-security-events-feed`, ROI P1
+    /// "User management & lifecycle" roadmap D2): a chronological, filterable,
+    /// cryptographically VERIFIABLE (hash==id + valid signature) derived view
+    /// over the SAME signed `act_log` [`Self::AuditTimeline`] folds — but
+    /// cell-wide (every subject, not one handle) and restricted to the acts
+    /// this feed classifies as security-relevant: account lockouts/restores
+    /// (`USER-DISABLE`/`USER-ENABLE`), privilege elevations
+    /// (`MEMBER-ADD`/`MEMBER-ROLE`), identity key rotations
+    /// (`IDENTITY-ROTATE`), and session revocations
+    /// (`SESSION-REVOKE`/`SESSION-REVOKE-ALL`). Read-only (no new authority, no
+    /// new event); `kind` optionally narrows to ONE category
+    /// (`lockout`/`elevation`/`rotation`/`revocation`); `None` renders every
+    /// category.
+    SecurityEventsFeed {
+        /// Optional category filter (`lockout`/`elevation`/`rotation`/
+        /// `revocation`); `None` renders every security-relevant category.
+        kind: Option<String>,
+    },
     /// One IAM user's row.
     Show {
         /// The user handle.
@@ -740,6 +758,8 @@ impl ControlOp {
                 | ControlOp::Identity(IdentityOp::Domains)
                 | ControlOp::User(UserOp::List)
                 | ControlOp::User(UserOp::Show { .. })
+                | ControlOp::User(UserOp::AuditTimeline { .. })
+                | ControlOp::User(UserOp::SecurityEventsFeed { .. })
                 | ControlOp::Cluster(ClusterOp::RequestList)
                 | ControlOp::Cluster(ClusterOp::TopologyTree { .. })
                 | ControlOp::Cluster(ClusterOp::NodesAt { .. })
