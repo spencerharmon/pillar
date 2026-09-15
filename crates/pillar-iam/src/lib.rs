@@ -36,6 +36,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use pillar_core::NodeId;
 use pillar_rbac::{Capability, Decision, RbacDecider, Request, ResourceClass};
 
+pub mod document_migration;
+pub use document_migration::{
+    record_projection, DocumentUserStore, IAM_USERS_COLLECTION,
+};
+
 pub mod rbac_bridge;
 pub use rbac_bridge::{
     authorize_effective_capability, effective_capabilities, iam_credentials_manage_capability,
