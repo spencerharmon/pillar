@@ -590,6 +590,10 @@ pub enum QueryOp {
     /// `pillar-object-inspection-tier`): the bottom layer of the inspection
     /// stack, addressing any content-addressed block by CID.
     Object(ObjectOp),
+    /// Catalog-introspection surface (`pillar catalog …`) — every variant a
+    /// member-gated VIEW folded from the live `__catalog` collection + the
+    /// keyed store's live collections + the collection-placement registry.
+    Catalog(CatalogOp),
 }
 
 /// The visibility class of a `pillar object put` block: whether the body
@@ -691,6 +695,36 @@ pub enum ObjectOp {
     Verify {
         /// The block's CID, lowercase hex multihash.
         cid_hex: String,
+    },
+}
+
+/// Catalog-introspection ops (`pillar catalog databases|collections|views|
+/// describe`). Every variant is a member-gated VIEW that emits no signed
+/// event — discovery is a QUERY folded from the live `__catalog` Document
+/// collection plus the keyed store's live collections, never hard-coded help.
+///
+/// A `Describe` answer reports, per collection, its SURFACE (keyed → kv/doc/
+/// sql vs tsdb → obs/psl), its live SCHEMA (folded field names), its
+/// CONSISTENCY class (AP/CP), its VISIBILITY class, and its PLACEMENT tags +
+/// the LIVE participating-node list resolved from the collection-placement
+/// registry (`data-placement-collection-tags`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum CatalogOp {
+    /// List every logical database (the namespace prefix of a collection name,
+    /// the part before the first `.`; a bare name is its own database).
+    Databases,
+    /// List every live collection (keyed store collections + defined views),
+    /// excluding the `__catalog` system collection itself.
+    Collections,
+    /// List every view currently defined in the catalog (the SQL-native
+    /// `SHOW TABLES` over the folded `__catalog` collection).
+    Views,
+    /// Describe one collection's full introspection surface: surface class,
+    /// schema, consistency, visibility, placement tags + participating nodes.
+    Describe {
+        /// The collection (or view) to describe.
+        collection: String,
     },
 }
 
@@ -818,6 +852,22 @@ pub enum SqlOp {
     },
     /// List every view currently defined in the catalog.
     Views,
+    /// `SHOW TABLES` — the SQL-native alias for listing every view/table
+    /// defined in the catalog (folds the `__catalog` collection). Member-gated
+    /// VIEW, identical answer to [`SqlOp::Views`].
+    ShowTables,
+    /// `DESCRIBE <table>` — the SQL-native alias for describing one catalog
+    /// entry's definition (source, filter, projection), folded from the
+    /// `__catalog` collection. Member-gated VIEW.
+    DescribeTable {
+        /// The view/table name to describe.
+        table: String,
+    },
+    /// `SELECT * FROM __catalog` — the SQL-native catalog query: materialize
+    /// the `__catalog` system collection itself as rows (name → def), proving
+    /// the catalog IS a queryable collection, not a hard-coded surface.
+    /// Member-gated VIEW.
+    SelectCatalog,
 }
 
 impl QueryOp {
@@ -862,8 +912,17 @@ impl QueryOp {
                 op,
                 DocOp::GetField { .. } | DocOp::Fields { .. } | DocOp::Ids { .. }
             ),
-            QueryOp::Sql(op) => matches!(op, SqlOp::View { .. } | SqlOp::Views),
+            QueryOp::Sql(op) => matches!(
+                op,
+                SqlOp::View { .. }
+                    | SqlOp::Views
+                    | SqlOp::ShowTables
+                    | SqlOp::DescribeTable { .. }
+                    | SqlOp::SelectCatalog
+            ),
             QueryOp::Object(op) => !matches!(op, ObjectOp::Put { .. }),
+            // Every catalog op is a read-only introspection VIEW.
+            QueryOp::Catalog(_) => true,
         }
     }
 }

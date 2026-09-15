@@ -492,6 +492,13 @@ pub struct WebAuthContext {
     /// content-addressed block by CID over the sealed query tier. `pillar
     /// object put/stat/links/get/cat/verify` all act on THIS store.
     objects: crate::object_inspection::ObjectStore,
+    /// The collection-placement registry (`data-placement-collection-tags`):
+    /// each entry binds a collection to a [`pillar_net::NodeSelector`] over
+    /// attested node tags. A collection with no registered entry defaults to
+    /// whole-cell placement (every cell node). The catalog-introspection
+    /// surface resolves each collection's live participating-node list from
+    /// this registry against the live topology + registered node set.
+    collection_placement: BTreeMap<String, pillar_net::NodeSelector>,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -1080,6 +1087,7 @@ impl WebAuthContext {
             keyed_store: pillar_keyedstore::KeyedStore::new(),
             keyed_clock: 0,
             objects: crate::object_inspection::ObjectStore::new(),
+            collection_placement: BTreeMap::new(),
         }
     }
 
@@ -3869,6 +3877,7 @@ impl WebAuthContext {
             pillar_ops::QueryOp::Doc(doc) => self.doc_query_op(actor, doc),
             pillar_ops::QueryOp::Sql(sql) => self.sql_query_op(actor, sql),
             pillar_ops::QueryOp::Object(obj) => self.object_query_op(actor, obj),
+            pillar_ops::QueryOp::Catalog(catalog) => self.catalog_query_op(actor, catalog),
         }
     }
 
@@ -4015,6 +4024,31 @@ impl WebAuthContext {
             pillar_ops::SqlOp::Views => {
                 Ok(join_lines(pillar_sqlviews::list_views(&self.keyed_store)))
             }
+            // `SHOW TABLES` — SQL-native alias for listing catalog entries,
+            // folded from the same live `__catalog` collection as `Views`.
+            pillar_ops::SqlOp::ShowTables => {
+                Ok(join_lines(pillar_sqlviews::list_views(&self.keyed_store)))
+            }
+            // `DESCRIBE <table>` — SQL-native catalog-entry definition, folded
+            // from the `__catalog` collection (source / filter / projection).
+            pillar_ops::SqlOp::DescribeTable { table } => {
+                match pillar_sqlviews::view_def(&self.keyed_store, table) {
+                    Some(def) => Ok(render_view_def(table, &def)),
+                    None => Err(format!("no such table {table}")),
+                }
+            }
+            // `SELECT * FROM __catalog` — the catalog IS a queryable collection:
+            // materialize the `__catalog` system collection itself, one row per
+            // defined view (`name\tdef=<source[/filter][/project]>`).
+            pillar_ops::SqlOp::SelectCatalog => {
+                let mut lines = Vec::new();
+                for name in pillar_sqlviews::list_views(&self.keyed_store) {
+                    if let Some(def) = pillar_sqlviews::view_def(&self.keyed_store, &name) {
+                        lines.push(format!("{name}\t{}", view_def_summary(&def)));
+                    }
+                }
+                Ok(join_lines(lines))
+            }
         }
     }
 
@@ -4059,6 +4093,173 @@ impl WebAuthContext {
             } => self.objects.cat(cid_hex, sealing_secret_hex.as_deref()),
             pillar_ops::ObjectOp::Verify { cid_hex } => self.objects.verify(cid_hex),
         }
+    }
+
+    /// The catalog-introspection surface (`pillar catalog …`) — every op a
+    /// member-gated VIEW folded from the live `__catalog` collection + the
+    /// keyed store's live collections + the collection-placement registry.
+    /// Discovery is a QUERY, never hard-coded help.
+    fn catalog_query_op(
+        &self,
+        _actor: &NodeId,
+        op: &pillar_ops::CatalogOp,
+    ) -> Result<String, String> {
+        match op {
+            pillar_ops::CatalogOp::Databases => Ok(join_lines(self.catalog_databases())),
+            pillar_ops::CatalogOp::Collections => Ok(join_lines(self.catalog_collections())),
+            pillar_ops::CatalogOp::Views => {
+                Ok(join_lines(pillar_sqlviews::list_views(&self.keyed_store)))
+            }
+            pillar_ops::CatalogOp::Describe { collection } => self.catalog_describe(collection),
+        }
+    }
+
+    /// Every logical database: the namespace prefix of a live collection name
+    /// (the part before the first `.`); a bare collection name is its own
+    /// database. The `__catalog` system collection is excluded.
+    fn catalog_databases(&self) -> Vec<String> {
+        let mut dbs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for c in self.catalog_collections() {
+            let db = c.split('.').next().unwrap_or(&c).to_owned();
+            dbs.insert(db);
+        }
+        dbs.into_iter().collect()
+    }
+
+    /// Every live collection the catalog knows: the keyed store's live
+    /// collections (excluding the `__catalog` system collection) UNION the
+    /// defined views. Sorted, deduplicated.
+    fn catalog_collections(&self) -> Vec<String> {
+        let mut cols: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for c in self.keyed_store.collections() {
+            if c != pillar_sqlviews::CATALOG_COLLECTION {
+                cols.insert(c);
+            }
+        }
+        for v in pillar_sqlviews::list_views(&self.keyed_store) {
+            cols.insert(v);
+        }
+        cols.into_iter().collect()
+    }
+
+    /// Describe one collection's full introspection surface: SURFACE class
+    /// (keyed → kv/doc/sql), live SCHEMA (folded field/key names), CONSISTENCY
+    /// class (AP — the keyed store is a CRDT LWW fold), VISIBILITY class
+    /// (cell-encrypted by default), and PLACEMENT tags + the LIVE
+    /// participating-node list resolved from the placement registry against
+    /// the live topology + registered node set.
+    fn catalog_describe(&self, collection: &str) -> Result<String, String> {
+        // A view (a `__catalog` entry) is an `sql` surface; a live keyed-store
+        // collection is `kv` and/or `doc`; anything else is unknown.
+        let view = pillar_sqlviews::view_def(&self.keyed_store, collection);
+        let live_collections = self.keyed_store.collections();
+        let is_live = live_collections.iter().any(|c| c == collection);
+        if view.is_none() && !is_live {
+            return Err(format!("no such collection {collection}"));
+        }
+
+        let mut body = String::new();
+        body.push_str(&format!("COLLECTION {collection}\n"));
+
+        // SURFACE
+        let (surface, sub) = if let Some(def) = &view {
+            ("keyed", format!("sql source={}", def.source))
+        } else {
+            let has_kv = !self.keyed_store.kv_keys(collection).is_empty();
+            let has_doc = !self.keyed_store.doc_ids(collection).is_empty();
+            let sub = match (has_kv, has_doc) {
+                (true, true) => "kv,doc".to_owned(),
+                (true, false) => "kv".to_owned(),
+                (false, true) => "doc".to_owned(),
+                (false, false) => "kv".to_owned(),
+            };
+            ("keyed", sub)
+        };
+        body.push_str(&format!("SURFACE {surface} {sub}\n"));
+
+        // SCHEMA — the folded field/key names.
+        let schema = if let Some(def) = &view {
+            // A view's schema is its projection, else the union of its source's
+            // live document fields.
+            match &def.project {
+                Some(p) => p.clone(),
+                None => self.collection_doc_schema(&def.source),
+            }
+        } else if !self.keyed_store.kv_keys(collection).is_empty() {
+            self.keyed_store.kv_keys(collection)
+        } else {
+            self.collection_doc_schema(collection)
+        };
+        body.push_str(&format!("SCHEMA {}\n", schema.join(",")));
+
+        // CONSISTENCY — the keyed store is an AP CRDT (per-field LWW fold).
+        body.push_str("CONSISTENCY AP\n");
+
+        // VISIBILITY — cell-encrypted (the default confidentiality class).
+        body.push_str("VISIBILITY cell\n");
+
+        // PLACEMENT tags + LIVE participating nodes (from the registry).
+        let selector = self
+            .collection_placement
+            .get(collection)
+            .cloned()
+            .unwrap_or_else(pillar_net::NodeSelector::whole_cell);
+        let placement = pillar_net::CollectionPlacement::new(collection, selector.clone());
+        let tags: Vec<String> = if selector.is_whole_cell() {
+            vec!["whole-cell".to_owned()]
+        } else {
+            selector
+                .tags()
+                .iter()
+                .map(pillar_topology::Label::resource)
+                .collect()
+        };
+        body.push_str(&format!("PLACEMENT {}\n", tags.join(",")));
+        let nodes = self.collection_participating_nodes(&placement);
+        body.push_str(&format!("NODES {}\n", nodes.join(",")));
+
+        Ok(body)
+    }
+
+    /// The union of the live document field names across every id of
+    /// `collection`, in canonical sorted order — a collection's folded schema.
+    fn collection_doc_schema(&self, collection: &str) -> Vec<String> {
+        let mut fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for id in self.keyed_store.doc_ids(collection) {
+            for f in self.keyed_store.doc_fields(collection, &id) {
+                fields.insert(f);
+            }
+        }
+        fields.into_iter().collect()
+    }
+
+    /// The live participating-node list for a collection placement: the
+    /// registered cell node set (`topology_nodes`) narrowed by the placement's
+    /// selector against the LIVE attested topology. Sorted.
+    fn collection_participating_nodes(
+        &self,
+        placement: &pillar_net::CollectionPlacement,
+    ) -> Vec<String> {
+        let cell_members: std::collections::BTreeSet<NodeId> = self
+            .topology_nodes
+            .keys()
+            .map(|n| NodeId::from(n.as_str()))
+            .collect();
+        placement
+            .node_set(&self.topology, &cell_members)
+            .into_iter()
+            .map(|n| n.to_string())
+            .collect()
+    }
+
+    /// Register (or replace) a collection's placement selector in the registry.
+    /// A collection with no registered entry defaults to whole-cell placement.
+    pub fn register_collection_placement(
+        &mut self,
+        collection: impl Into<String>,
+        selector: pillar_net::NodeSelector,
+    ) {
+        self.collection_placement.insert(collection.into(), selector);
     }
 
     /// Serve a [`pillar_ops::IdentityOp`] over the control-op tier. `Show`/
@@ -5694,6 +5895,25 @@ fn render_rows(rows: &[pillar_sqlviews::Row]) -> String {
     }
     out
 }
+
+/// A one-line summary of a view/table definition: `source[/filter=f:v][/project=a,b]`.
+fn view_def_summary(def: &pillar_sqlviews::ViewDef) -> String {
+    let mut s = format!("source={}", def.source);
+    if let Some(f) = &def.filter {
+        let v = String::from_utf8_lossy(&f.value);
+        s.push_str(&format!(" filter={}={}", f.field, v));
+    }
+    if let Some(p) = &def.project {
+        s.push_str(&format!(" project={}", p.join(",")));
+    }
+    s
+}
+
+/// Render a `DESCRIBE <table>` ack: the table name plus its folded definition.
+fn render_view_def(name: &str, def: &pillar_sqlviews::ViewDef) -> String {
+    format!("TABLE {name}\n{}\n", view_def_summary(def))
+}
+
 
 /// `POST /portal/profile/cli-config` — body `<token>`: an authenticated user
 /// downloads a ready-to-use `config.yaml` for the `pillar` CLI. Mints a FRESH,
