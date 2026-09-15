@@ -23,21 +23,33 @@
   description = "pillar node — reproducible OCI image via nix flake";
 
   inputs = {
-    # Pinned to a specific nixpkgs revision shipping rustc 1.89.0 + LLVM 19.1.7,
-    # NOT the floating nixos-unstable ref. nixos-unstable had advanced to
-    # rustc 1.97.1 + LLVM 21.1.8, whose ScalarEvolution/LoopIdiomRecognize
-    # passes crash rustc with `SIGILL: illegal instruction` under
-    # `-C opt-level=3` on an AVX2-only host — an intermittent, run-to-run
-    # miscompile that broke `.#pillar-oci-image` (and every consumer that builds
-    # a local image-under-test, incl. the pillar-integration scenario harness).
-    # This pin picks the newest LLVM-19 nixpkgs whose rustc (1.89.0) still
-    # satisfies the workspace's minimum-rustc requirements (aes 0.9 / time 0.3 /
-    # ctap-hid-fido2 need >= 1.88/1.89); the older nixos-25.05 release (rustc
-    # 1.86.0) is too old. LLVM 19.1.7 compiles the whole workspace cleanly on
-    # AVX2, making the OCI image build deterministic again, and a fixed rev (not
-    # a floating channel) keeps the toolchain stable across rebuilds. See
-    # docs/pillar-oci-image-llvm21-sigill-fix-pillar-oci-image-llvm21-sigill-fix.md.
-    nixpkgs.url = "github:NixOS/nixpkgs/5bf69abfad9feaa47ebc5cec0c7dc1029db8fb92";
+    # Pinned to a specific nixpkgs revision shipping rustc 1.91.1, NOT the
+    # floating nixos-unstable ref. Two distinct toolchain miscompiles bound the
+    # acceptable window on this AVX2 host, and 1.91.1 is the release that clears
+    # BOTH:
+    #   * TOO NEW — nixos-unstable had advanced to rustc 1.97.1 + LLVM 21.1.8,
+    #     whose ScalarEvolution/LoopIdiomRecognize passes crash rustc with
+    #     `SIGILL: illegal instruction` under `-C opt-level=3` on an AVX2-only
+    #     host — an intermittent, run-to-run miscompile that broke
+    #     `.#pillar-oci-image` (and every consumer that builds a local
+    #     image-under-test, incl. the pillar-integration scenario harness). See
+    #     docs/pillar-oci-image-llvm21-sigill-fix-pillar-oci-image-llvm21-sigill-fix.md.
+    #   * TOO OLD — the former pin (rustc 1.89.0 + LLVM 19.1.7,
+    #     5bf69abfad9feaa47ebc5cec0c7dc1029db8fb92) was chosen to dodge that
+    #     SIGILL, but rustc 1.89.0's OWN binary SIGSEGVs (signal 11, in the
+    #     `mir_built`/`check_call_recursion` MIR frontend) compiling
+    #     `proc-macro2` 1.0.107 on this host — a 100%-deterministic, stack-size-
+    #     independent (unaffected by RUST_MIN_STACK up to 1 GiB) compiler crash
+    #     that blocked EVERY workspace build (native `.#pillar` and the wasm
+    #     `pillar-frontend` stage of `.#pillar-oci-image` alike). See
+    #     docs/pillar-oci-image-frontend-wasm-stack-fix-... in the beehive layer.
+    # nixos-25.11 (rustc 1.91.1) compiles `proc-macro2` cleanly (verified:
+    # rustc 1.91.1 builds the exact 1.0.107 lib.rs to exit 0 where 1.89.0
+    # SIGSEGVs 15/15) AND its LLVM predates the 21.x SIGILL, so the whole
+    # workspace and the reproducible OCI image build succeed again on AVX2. A
+    # fixed rev (not a floating channel) keeps the toolchain stable across
+    # rebuilds.
+    nixpkgs.url = "github:NixOS/nixpkgs/b6018f87da91d19d0ab4cf979885689b469cdd41";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
