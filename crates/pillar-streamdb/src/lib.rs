@@ -76,8 +76,52 @@ pub use ipfs_persist::{IpfsPersistError, IpfsPersistentStream};
 pub mod pillarmsg;
 pub use pillarmsg::{
     decode_stream_op_segment_payload, encode_stream_op_segment_payload, open_stream_op,
-    seal_stream_op, StreamOpMessageError,
+    seal_stream_op, Confidentiality, StreamOpMessageError,
 };
+
+/// A collection's declared confidentiality/visibility-class policy
+/// (`public-visibility-class`) — the CollectionPolicy attribute a catalog
+/// visibility-class report surfaces as user-viewable/editable. It carries
+/// ONLY the confidentiality axis today (which
+/// [`pillarmsg::Confidentiality`] an [`IpfsPersistentStream`] backing the
+/// collection is constructed/rehydrated with); node PLACEMENT (which nodes
+/// hold the collection) is a separate, orthogonal policy
+/// (`pillar_net::CollectionPlacement`, `data-placement-collection-tags`).
+///
+/// Defaults to [`Confidentiality::CellEncrypted`] — the ROI's stated
+/// default — so a collection is opt-IN to `public`, never opt-out of
+/// confidentiality by omission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct CollectionPolicy {
+    /// This collection's confidentiality class.
+    pub confidentiality: Confidentiality,
+}
+
+impl CollectionPolicy {
+    /// The default `cell-encrypted` collection policy.
+    #[must_use]
+    pub fn cell_encrypted() -> Self {
+        CollectionPolicy {
+            confidentiality: Confidentiality::CellEncrypted,
+        }
+    }
+
+    /// A `public` (unsealed) collection policy: no AEAD/cell-group-key
+    /// confidentiality seal, world-readable, but per-op signing and
+    /// content-addressing are unaffected — see [`Confidentiality::Public`].
+    #[must_use]
+    pub fn public() -> Self {
+        CollectionPolicy {
+            confidentiality: Confidentiality::Public,
+        }
+    }
+
+    /// Whether this collection's records carry no confidentiality seal.
+    #[must_use]
+    pub fn is_public(&self) -> bool {
+        matches!(self.confidentiality, Confidentiality::Public)
+    }
+}
 
 /// A durable op-log both persistent stream implementations satisfy, so
 /// transport-level sync ([`pillar_net::apply_op_sync`]) can drive EITHER the

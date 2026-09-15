@@ -388,6 +388,26 @@ pub fn owns_node(authority: &WotAuthority, user_primary: &NodeId, node: &NodeId)
     authority.owns(user_primary, node)
 }
 
+/// Whether a read of a collection carrying `confidentiality` is authorized
+/// WITHOUT going through [`RbacDecider::decide`] at all
+/// (`public-visibility-class`).
+///
+/// A `cell-encrypted` collection's read barrier is cryptographic, not
+/// RBAC: [`RbacDecider`] never gates reads of it either — a non-member
+/// simply cannot open the AEAD seal (see `pillar_streamdb::pillarmsg`).
+/// A `public` collection drops that cryptographic barrier entirely, so its
+/// reads are genuinely, unconditionally open to anyone who can reach the
+/// bytes — this function makes that explicit rather than leaving it an
+/// unstated absence. WRITES to either class are UNCHANGED: they still go
+/// through [`RbacDecider::decide`] exactly as before; this function has no
+/// bearing on writes.
+#[must_use]
+pub fn is_public_collection_read_allowed(
+    confidentiality: pillar_streamdb::Confidentiality,
+) -> bool {
+    matches!(confidentiality, pillar_streamdb::Confidentiality::Public)
+}
+
 /// A typed, non-fatal RBAC error: every RBAC failure mode is a value a
 /// caller can match on and fail the single request/action closed (deny)
 /// with, never a `panic!` that would crash the whole process/thread for a

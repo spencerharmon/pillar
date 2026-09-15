@@ -24,6 +24,9 @@ pillar-web = { path = "../pillar-web" }
 pillar-observability = { path = "../pillar-observability" }
 pillar-surface-inventory = { path = "../pillar-surface-inventory" }
 pillar-streamdb = { path = "../pillar-streamdb" }
+pillar-rbac = { path = "../pillar-rbac" }
+pillar-wot-authority = { path = "../pillar-wot-authority" }
+pillar-wire = { path = "../pillar-wire" }
 pillar-topology = { path = "../pillar-topology" }
 libp2p = { version = "0.56", features = [
     "noise",
