@@ -248,6 +248,24 @@ struct CliExportMaterial {
 /// reported pruned, no snapshot).
 const TSDB_OBJECTS_COLLECTION: &str = "__objects";
 
+/// The reserved per-user collection prefix `pillar-log-inspection-tier`'s
+/// `pillar log info|blocks|list|show|dag|watch|verify` reads a user's
+/// admin-act audit timeline under (`um-per-user-audit-timeline`): every
+/// `pillar user invite|disable|enable|require-change|set-password` admin act
+/// on `handle` is indexed, in ADDITION to the global [`WebAuthContext::
+/// act_log`] it is signed into, under `{USER_AUDIT_COLLECTION_PREFIX}
+/// {handle}` in [`WebAuthContext::log_index`] — the SAME chronological,
+/// verifiable (hash==CID + signature) op-log surface `pillar log` already
+/// serves for `kv`/`doc`/`sql`/`object` writes, so a per-user admin history
+/// is queryable with NO new op, NO new authority, and NO new TLA+ gate.
+const USER_AUDIT_COLLECTION_PREFIX: &str = "__user:";
+
+/// The reserved per-user audit-log collection name for `handle` — see
+/// [`USER_AUDIT_COLLECTION_PREFIX`].
+fn user_audit_collection(handle: &str) -> String {
+    format!("{USER_AUDIT_COLLECTION_PREFIX}{handle}")
+}
+
 pub struct WebAuthContext {
     verifier: NodeCustodyVerifier,
     authority: WotAuthority,
@@ -4377,6 +4395,22 @@ impl WebAuthContext {
         pillar_keyedstore::Hlc::new(self.keyed_clock, 0, actor.to_string())
     }
 
+    /// Index an already-appended [`Self::act_log`] event (`cid`, an
+    /// `iam:users:write` admin act by `actor` on `handle`) under `handle`'s
+    /// reserved per-user collection ([`user_audit_collection`]) in
+    /// [`Self::log_index`], stamped with a fresh HLC tick — same mechanism
+    /// [`Self::authorize_data_write`] uses for `kv`/`doc`/`sql`/`object`
+    /// writes, so `pillar log info|blocks|list|show|dag|watch|verify` over
+    /// `__user:<handle>` renders this user's admin-act audit timeline with
+    /// no new op and no new authority gate.
+    fn index_user_audit_event(&mut self, actor: &NodeId, handle: &str, cid: &EventId) {
+        let hlc = self.next_keyed_hlc(actor);
+        self.log_index
+            .entry(user_audit_collection(handle))
+            .or_default()
+            .push((cid.clone(), hlc));
+    }
+
     /// Authorize a keyed-store WRITE act on the `data:write` capability, then
     /// return the signed event's CID for the ack. Refusal mirrors every other
     /// signed-act path. Also indexes the newly-appended [`Self::act_log`]
@@ -5085,6 +5119,7 @@ impl WebAuthContext {
                 Some(rec) => Ok(Self::iam_user_row(handle, rec)),
                 None => Err(format!("no user {handle}")),
             },
+            pillar_ops::UserOp::AuditTimeline { handle } => self.user_audit_timeline(handle),
             pillar_ops::UserOp::Invite {
                 handle,
                 email,
@@ -5103,6 +5138,7 @@ impl WebAuthContext {
                 let cid = self
                     .perform_signed_act(actor, "iam:users:write", &format!("USER-INVITE {handle}"))
                     .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                self.index_user_audit_event(actor, handle, &cid);
                 let at = self.iam_now();
                 let offer_material =
                     fresh_offer_material(handle).map_err(|()| "offer RNG failure".to_owned())?;
@@ -5130,6 +5166,7 @@ impl WebAuthContext {
                 let cid = self
                     .perform_signed_act(actor, "iam:users:write", &format!("USER-DISABLE {handle}"))
                     .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                self.index_user_audit_event(actor, handle, &cid);
                 let at = self.iam_now();
                 if self.iam_set_status(handle, pillar_iam::UserStatus::Disabled, at) {
                     self.iam_revoke_user_sessions(handle);
@@ -5142,6 +5179,7 @@ impl WebAuthContext {
                 let cid = self
                     .perform_signed_act(actor, "iam:users:write", &format!("USER-ENABLE {handle}"))
                     .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                self.index_user_audit_event(actor, handle, &cid);
                 let at = self.iam_now();
                 if self.iam_set_status(handle, pillar_iam::UserStatus::Active, at) {
                     Ok(format!("USER {handle} Active EVENT-CID {}", cid.0))
@@ -5157,6 +5195,7 @@ impl WebAuthContext {
                         &format!("USER-REQUIRE-CHANGE {handle}"),
                     )
                     .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                self.index_user_audit_event(actor, handle, &cid);
                 let at = self.iam_now();
                 if self.iam_require_change(handle, at) {
                     Ok(format!("USER {handle} RequireChange EVENT-CID {}", cid.0))
@@ -5172,6 +5211,7 @@ impl WebAuthContext {
                 let cid = self
                     .perform_signed_act(actor, "iam:users:write", &format!("USER-RESET {handle}"))
                     .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                self.index_user_audit_event(actor, handle, &cid);
                 let at = self.iam_now();
                 let offer_material =
                     fresh_offer_material(handle).map_err(|()| "offer RNG failure".to_owned())?;
@@ -5182,6 +5222,55 @@ impl WebAuthContext {
                 }
             }
         }
+    }
+
+    /// The per-user AUDIT TIMELINE (`pillar user audit <handle>`): a
+    /// chronological, cryptographically VERIFIABLE history of every signed
+    /// user-admin act that named `handle`, folded from the node's signed
+    /// [`Self::act_log`] — the SAME signed events [`Self::perform_signed_act`]
+    /// appends on each `iam:users:write` mutation.
+    ///
+    /// Read-only and member-gated (no new authority, no new event). Every
+    /// admin-act payload is `USER-<VERB> <handle>` (see [`Self::user_op`]), so
+    /// the subject is the payload's second whitespace token; only acts naming
+    /// `handle` are rendered. Each rendered line carries its own verifiability
+    /// proof: `hash==id` (reaching the event by its content-address id already
+    /// proves it) and `signature-valid` (from
+    /// [`pillar_eventlog::Event::is_authentic`]), so the timeline is auditable
+    /// without trusting the fold. Events are ordered by the act log's
+    /// deterministic causal order ([`pillar_eventlog::EventLog::events_in_causal_order`]).
+    fn user_audit_timeline(&self, handle: &str) -> Result<String, String> {
+        if self.iam_users().get(handle).is_none() {
+            return Err(format!("no user {handle}"));
+        }
+        let mut body = format!("audit-timeline handle={handle}\n");
+        let mut count = 0u64;
+        for event in self.act_log.events_in_causal_order() {
+            let content = event.content();
+            let payload = content.payload();
+            let payload_text = String::from_utf8_lossy(payload);
+            let mut tokens = payload_text.split_whitespace();
+            let verb = tokens.next().unwrap_or("");
+            // Only signed user-admin acts (`USER-*`) whose named subject is
+            // exactly this handle.
+            if !verb.starts_with("USER-") {
+                continue;
+            }
+            let subject = tokens.next().unwrap_or("");
+            if subject != handle {
+                continue;
+            }
+            let event_id_hex = hex_encode(event.id().as_bytes());
+            let signature_valid = event.is_authentic();
+            body.push_str(&format!(
+                "event={event_id_hex} seq={} act={verb} actor={} hash-matches-id=true signature-valid={signature_valid}\n",
+                content.seq(),
+                content.author().0,
+            ));
+            count += 1;
+        }
+        body.push_str(&format!("acts: {count}\n"));
+        Ok(body)
     }
 
     /// Serve a [`pillar_ops::WotOp`] over the control-op tier: member-gated
