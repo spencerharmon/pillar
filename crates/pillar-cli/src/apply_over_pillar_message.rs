@@ -814,7 +814,9 @@ pub fn obs(args: &[String]) -> ExitCode {
         eprintln!(
             "usage: pillar obs {{explore <kind> | query <kind> [filter] | \
              live-explore <kind> | live-kinds | psl <query…> | metric-names | \
-             label-keys | label-values <key> | retention}}"
+             label-keys | label-values <key> | retention | retention-set <body…> | \
+             recording <spec…> | alert <spec…> | dashboard-save <name> <spec…> | \
+             dashboard-get <id>}}"
         );
         ExitCode::from(2)
     };
@@ -850,6 +852,47 @@ pub fn obs(args: &[String]) -> ExitCode {
             None => return usage(),
         },
         Some("retention") => pillar_ops::ObsOp::RetentionGet,
+        Some("retention-set") => {
+            if args.len() < 2 {
+                return usage();
+            }
+            pillar_ops::ObsOp::RetentionSet {
+                body: args[1..].join(" "),
+            }
+        }
+        Some("recording") => {
+            if args.len() < 2 {
+                return usage();
+            }
+            pillar_ops::ObsOp::Recording {
+                spec: args[1..].join(" "),
+            }
+        }
+        Some("alert") => {
+            if args.len() < 2 {
+                return usage();
+            }
+            pillar_ops::ObsOp::Alert {
+                spec: args[1..].join(" "),
+            }
+        }
+        Some("dashboard-save") => match args.get(1) {
+            Some(name) if args.len() >= 3 => pillar_ops::ObsOp::DashboardSave {
+                name: name.clone(),
+                spec: args[2..].join(" "),
+            },
+            _ => {
+                eprintln!("usage: pillar obs dashboard-save <name> <spec…>");
+                return ExitCode::from(2);
+            }
+        },
+        Some("dashboard-get") => match args.get(1) {
+            Some(id) => pillar_ops::ObsOp::DashboardGet { id: id.clone() },
+            None => {
+                eprintln!("usage: pillar obs dashboard-get <id>");
+                return ExitCode::from(2);
+            }
+        },
         _ => return usage(),
     };
     print_view(control_op(&pillar_ops::ControlOp::Obs(op)), "obs")

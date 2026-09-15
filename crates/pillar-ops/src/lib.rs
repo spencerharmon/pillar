@@ -315,6 +315,33 @@ pub enum ObsOp {
     },
     /// The current retention policy.
     RetentionGet,
+    /// Set the retention policy from a spec `body`.
+    RetentionSet {
+        /// The retention spec body.
+        body: String,
+    },
+    /// Install/update a recording rule from `spec`.
+    Recording {
+        /// The recording-rule spec.
+        spec: String,
+    },
+    /// Install/update an alert rule from `spec`.
+    Alert {
+        /// The alert-rule spec.
+        spec: String,
+    },
+    /// Save a dashboard `name` with layout `spec`.
+    DashboardSave {
+        /// The dashboard name.
+        name: String,
+        /// The dashboard layout spec.
+        spec: String,
+    },
+    /// Read back a saved dashboard by its content-addressed hex id.
+    DashboardGet {
+        /// The dashboard content-addressed hex id.
+        id: String,
+    },
 }
 
 /// Global-identity ops (`pillar identity …`). `Show`/`Domains` are member-gated
@@ -505,7 +532,18 @@ impl ControlOp {
                 | ControlOp::Session(SessionOp::List { .. })
                 | ControlOp::Session(SessionOp::Show { .. })
                 | ControlOp::Wot(_)
-                | ControlOp::Obs(_)
+                | ControlOp::Obs(
+                    ObsOp::Explore { .. }
+                        | ObsOp::Query { .. }
+                        | ObsOp::LiveExplore { .. }
+                        | ObsOp::LiveKinds
+                        | ObsOp::Psl { .. }
+                        | ObsOp::MetricNames
+                        | ObsOp::LabelKeys
+                        | ObsOp::LabelValues { .. }
+                        | ObsOp::RetentionGet
+                        | ObsOp::DashboardGet { .. },
+                )
                 | ControlOp::Identity(IdentityOp::Show)
                 | ControlOp::Identity(IdentityOp::Domains)
                 | ControlOp::User(UserOp::List)
@@ -984,6 +1022,39 @@ mod tests {
             );
             assert!(op.is_read(), "wot/obs ops are views: {op:?}");
         }
+    }
+
+    #[test]
+    fn control_op_obs_acts_round_trip_and_are_not_reads() {
+        for op in [
+            ControlOp::Obs(ObsOp::RetentionSet {
+                body: "metric=30d".into(),
+            }),
+            ControlOp::Obs(ObsOp::Recording {
+                spec: "rule x = sum(y)".into(),
+            }),
+            ControlOp::Obs(ObsOp::Alert {
+                spec: "alert z when q > 1".into(),
+            }),
+            ControlOp::Obs(ObsOp::DashboardSave {
+                name: "slo".into(),
+                spec: "{panels:[]}".into(),
+            }),
+        ] {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(!op.is_read(), "obs acts are not reads: {op:?}");
+        }
+        let get = ControlOp::Obs(ObsOp::DashboardGet {
+            id: "1220ab".into(),
+        });
+        assert_eq!(
+            ControlOp::decode(&get.encode().expect("encode")).expect("decode"),
+            get
+        );
+        assert!(get.is_read(), "dashboard get is a read");
     }
 
     #[test]

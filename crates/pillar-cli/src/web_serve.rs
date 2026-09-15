@@ -4264,6 +4264,55 @@ impl WebAuthContext {
                 self.live_obs_label_values(key).ok_or_else(no_live)
             }
             pillar_ops::ObsOp::RetentionGet => self.live_obs_get_retention().ok_or_else(no_live),
+            pillar_ops::ObsOp::RetentionSet { body } => {
+                self.perform_signed_act(actor, "obs:retention:write", "OBS-RETENTION-SET")
+                    .map_err(|a| format!("unauthorized actor {a} for obs:retention:write"))?;
+                match self.live_obs_set_retention(body) {
+                    Some(Ok(text)) => Ok(text),
+                    Some(Err(e)) => Err(e),
+                    None => Err(no_live()),
+                }
+            }
+            pillar_ops::ObsOp::Recording { spec } => {
+                self.perform_signed_act(actor, "obs:recording:write", "OBS-RECORDING")
+                    .map_err(|a| format!("unauthorized actor {a} for obs:recording:write"))?;
+                match self.live_obs_recording(spec) {
+                    Some(Ok(text)) => Ok(text),
+                    Some(Err(e)) => Err(e),
+                    None => Err(no_live()),
+                }
+            }
+            pillar_ops::ObsOp::Alert { spec } => {
+                self.perform_signed_act(actor, "obs:alert:write", "OBS-ALERT")
+                    .map_err(|a| format!("unauthorized actor {a} for obs:alert:write"))?;
+                match self.live_obs_alert(spec) {
+                    Some(Ok(text)) => Ok(text),
+                    Some(Err(e)) => Err(e),
+                    None => Err(no_live()),
+                }
+            }
+            pillar_ops::ObsOp::DashboardSave { name, spec } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "obs:dashboards:write",
+                        &format!("OBS-DASHBOARD {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for obs:dashboards:write"))?;
+                let (dash_cid, tip) =
+                    self.save_observability_dashboard(&actor.to_string(), name, spec);
+                Ok(format!(
+                    "OBS-DASHBOARD-CID {dash_cid} TIP {tip} EVENT-CID {}",
+                    cid.0
+                ))
+            }
+            pillar_ops::ObsOp::DashboardGet { id } => match self.get_observability_dashboard(id) {
+                Some(view) => Ok(format!(
+                    "OBS-DASHBOARD-SIGNER {}\nOBS-DASHBOARD-NAME {}\nOBS-DASHBOARD-CONTENT {}\n",
+                    view.signer, view.name, view.content
+                )),
+                None => Err(format!("no dashboard {id}")),
+            },
         }
     }
 
