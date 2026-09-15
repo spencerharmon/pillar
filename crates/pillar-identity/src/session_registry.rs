@@ -54,8 +54,18 @@ pub struct Session {
     /// The principal (e.g. a device/op-key identity) this session was minted
     /// for.
     pub principal: String,
+    /// The device/origin this session was minted from (e.g. a user agent,
+    /// device label, or client IP) — the "device inventory" column of
+    /// `session ls`. `"unknown"` for a session minted via the legacy
+    /// [`SessionRegistry::mint`] (no origin supplied).
+    pub origin: String,
     /// Logical mint timestamp.
     pub issued_at: u64,
+    /// Logical timestamp of this session's most recent observed activity
+    /// (mint time until [`SessionRegistry::touch`] is called). Distinct from
+    /// `issued_at`: `issued_at` never changes after mint, `last_seen`
+    /// advances on every touch — the "last-seen" column of `session ls`.
+    pub last_seen: u64,
     /// Logical expiry timestamp; the session admits nothing at or after this.
     pub expiry: u64,
     /// The global revocation epoch in effect at mint time (this session's
@@ -207,18 +217,51 @@ impl SessionRegistry {
         issued_at: u64,
         expiry: u64,
     ) -> Session {
+        self.mint_with_origin(principal, id, issued_at, expiry, "unknown")
+    }
+
+    /// Mint a session exactly as [`SessionRegistry::mint`], additionally
+    /// stamping the device/origin (`origin`, e.g. a user agent, device
+    /// label, or client IP) the login was observed from — the "device
+    /// inventory" column of `session ls`. `last_seen` is initialized to
+    /// `issued_at`.
+    pub fn mint_with_origin(
+        &mut self,
+        principal: impl Into<String>,
+        id: impl Into<String>,
+        issued_at: u64,
+        expiry: u64,
+        origin: impl Into<String>,
+    ) -> Session {
         let principal = principal.into();
         let id = id.into();
         let session = Session {
             id,
             principal,
+            origin: origin.into(),
             issued_at,
+            last_seen: issued_at,
             expiry,
             mint_epoch: self.rev_epoch,
             revoked_epoch: None,
         };
         self.put(&session);
         session
+    }
+
+    /// Record activity on `principal`'s `id` session as of logical time
+    /// `now` — advances its `last_seen` watermark. A no-op (returns `false`)
+    /// if no such slot exists; never resurrects a revoked/expired session
+    /// (its record is updated but its admission state is untouched).
+    pub fn touch(&mut self, principal: &str, id: &str, now: u64) -> bool {
+        match self.get(principal, id) {
+            Some(mut session) => {
+                session.last_seen = now;
+                self.put(&session);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Individually revoke session `id` of `principal` (`revoke <id>`):
@@ -257,6 +300,40 @@ impl SessionRegistry {
             .into_iter()
             .collect();
         for id in ids {
+            if let Some(mut session) = self.get(principal, &id) {
+                if session.revoked_epoch.is_none() {
+                    session.revoked_epoch = Some(new_epoch);
+                    self.put(&session);
+                }
+            }
+        }
+    }
+
+    /// Selective sign-out-everywhere-but-here for `principal` (`revoke
+    /// --all-but-current`): bumps the global epoch ONCE and stamps every
+    /// currently-active session slot belonging to `principal` EXCEPT
+    /// `keep_id` as revoked at that same new epoch — a single epoch-stamped
+    /// sweep, exactly like [`SessionRegistry::revoke_all`], with one slot
+    /// exempted. `keep_id` need not currently exist or be active; the sweep
+    /// simply never touches that id.
+    ///
+    /// As with `revoke_all`, a session minted for `principal` AFTER this
+    /// call (into any slot, including a swept one) carries a strictly later
+    /// `mint_epoch` and so is never counted among the swept set.
+    pub fn revoke_all_but_current(&mut self, principal: &str, keep_id: &str) {
+        self.rev_epoch += 1;
+        let new_epoch = self.rev_epoch;
+        let ids: Vec<String> = self
+            .by_principal
+            .get(principal)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for id in ids {
+            if id == keep_id {
+                continue;
+            }
             if let Some(mut session) = self.get(principal, &id) {
                 if session.revoked_epoch.is_none() {
                     session.revoked_epoch = Some(new_epoch);
@@ -608,5 +685,104 @@ mod tests {
         // field changed.
         reg.revoke_one("alice", "s1").unwrap();
         assert_eq!(reg.kv_keys().len(), 3);
+    }
+
+    /// `mint_with_origin` stamps the device/origin; the legacy `mint`
+    /// defaults to `"unknown"`; `touch` advances `last_seen` without
+    /// disturbing `issued_at`/mint generation/admission.
+    #[test]
+    fn mint_with_origin_stamps_device_and_touch_advances_last_seen() {
+        let mut reg = SessionRegistry::new();
+
+        let legacy = reg.mint("alice", "s1", 0, 1000);
+        assert_eq!(legacy.origin, "unknown");
+        assert_eq!(legacy.last_seen, 0);
+
+        let phone = reg.mint_with_origin("alice", "s2", 0, 1000, "iphone-15/198.51.100.7");
+        assert_eq!(phone.origin, "iphone-15/198.51.100.7");
+        assert_eq!(phone.last_seen, 0);
+        assert_eq!(phone.issued_at, 0);
+
+        assert!(reg.touch("alice", "s2", 42));
+        let touched = reg.show("alice", "s2").unwrap();
+        assert_eq!(touched.last_seen, 42, "touch advances last_seen");
+        assert_eq!(touched.issued_at, 0, "touch never changes issued_at");
+        assert_eq!(touched.origin, "iphone-15/198.51.100.7");
+        assert!(touched.is_active(43), "touch does not itself admit/revoke");
+
+        assert!(
+            !reg.touch("alice", "ghost", 42),
+            "touching a nonexistent slot is a no-op, not an error"
+        );
+    }
+
+    /// `revoke_all_but_current` sweeps every OTHER active session for the
+    /// principal under one epoch, leaving `keep_id` untouched and still
+    /// admitting — while an unrelated principal is entirely unaffected. A
+    /// subsequent fresh mint into a swept slot is a genuinely new
+    /// generation, exactly as `revoke_all` guarantees.
+    #[test]
+    fn revoke_all_but_current_keeps_only_the_named_session() {
+        let mut reg = SessionRegistry::new();
+        reg.mint("alice", "s1", 0, 1000);
+        reg.mint("alice", "s2", 0, 1000);
+        reg.mint("alice", "s3", 0, 1000);
+        reg.mint("bob", "s1", 0, 1000);
+
+        let epoch_before = reg.rev_epoch();
+        reg.revoke_all_but_current("alice", "s2");
+        assert_eq!(
+            reg.rev_epoch(),
+            epoch_before + 1,
+            "revoke_all_but_current is a single atomic epoch bump"
+        );
+
+        let mut view = SessionView::new();
+        view.refresh(&reg);
+        assert_eq!(
+            view.admit(&reg, "alice", "s1", 10),
+            Err(AdmitError::Revoked)
+        );
+        assert!(
+            view.admit(&reg, "alice", "s2", 10).is_ok(),
+            "the kept (current) session must still admit"
+        );
+        assert_eq!(
+            view.admit(&reg, "alice", "s3", 10),
+            Err(AdmitError::Revoked)
+        );
+        // bob is untouched by alice's sweep.
+        assert!(view.admit(&reg, "bob", "s1", 10).is_ok());
+
+        let active: Vec<String> = reg.ls("alice", 10).into_iter().map(|s| s.id).collect();
+        assert_eq!(active, vec!["s2".to_string()], "only the kept session remains active");
+
+        // A fresh mint into a swept slot is a strictly newer generation.
+        let fresh = reg.mint("alice", "s1", 20, 1000);
+        assert!(fresh.mint_epoch > 0);
+        assert!(!fresh.is_revoked());
+    }
+
+    /// `revoke_all_but_current` naming a `keep_id` that does not exist (or
+    /// belongs to no active session) is not an error — it degrades to a full
+    /// `revoke_all` of every session the principal actually holds.
+    #[test]
+    fn revoke_all_but_current_with_unknown_keep_id_revokes_everything() {
+        let mut reg = SessionRegistry::new();
+        reg.mint("alice", "s1", 0, 1000);
+        reg.mint("alice", "s2", 0, 1000);
+
+        reg.revoke_all_but_current("alice", "no-such-slot");
+
+        let mut view = SessionView::new();
+        view.refresh(&reg);
+        assert_eq!(
+            view.admit(&reg, "alice", "s1", 10),
+            Err(AdmitError::Revoked)
+        );
+        assert_eq!(
+            view.admit(&reg, "alice", "s2", 10),
+            Err(AdmitError::Revoked)
+        );
     }
 }

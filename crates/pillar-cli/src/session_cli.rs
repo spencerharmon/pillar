@@ -306,8 +306,14 @@ pub struct SessionRow {
     pub id: String,
     /// The owning principal.
     pub principal: String,
+    /// The device/origin this session was minted from (e.g. a user agent,
+    /// device label, or client IP) — the "device inventory" column.
+    /// `"unknown"` for a session minted before device tracking existed.
+    pub origin: String,
     /// Logical mint timestamp.
     pub issued_at: u64,
+    /// Logical timestamp of this session's most recent observed activity.
+    pub last_seen: u64,
     /// Logical expiry timestamp (exclusive).
     pub expiry: u64,
     /// Logical time remaining until expiry as of the render clock (`0` if
@@ -323,7 +329,9 @@ impl SessionRow {
         SessionRow {
             id: session.id.clone(),
             principal: session.principal.clone(),
+            origin: session.origin.clone(),
             issued_at: session.issued_at,
+            last_seen: session.last_seen,
             expiry: session.expiry,
             expires_in: session.expiry.saturating_sub(now),
             is_current: current == Some(session.id.as_str()),
@@ -397,6 +405,13 @@ impl SessionCli {
         &self.registry
     }
 
+    /// Mutable access to the underlying registry — e.g. to
+    /// [`SessionRegistry::touch`] a session's `last_seen` watermark on
+    /// observed activity. Not itself a `session` command.
+    pub fn registry_mut(&mut self) -> &mut SessionRegistry {
+        &mut self.registry
+    }
+
     /// Mint a session for `principal` at slot `id` (models a successful
     /// node-side custody login). Thin pass-through to the proven
     /// [`SessionRegistry::mint`]; not itself a `session` command.
@@ -408,6 +423,22 @@ impl SessionCli {
         expiry: u64,
     ) -> Session {
         self.registry.mint(principal, id, issued_at, expiry)
+    }
+
+    /// Mint a session exactly as [`SessionCli::mint`], additionally stamping
+    /// the device/origin the login was observed from (models a node-side
+    /// custody login carrying a user agent / device label / client IP) —
+    /// thin pass-through to [`SessionRegistry::mint_with_origin`].
+    pub fn mint_with_origin(
+        &mut self,
+        principal: impl Into<String>,
+        id: impl Into<String>,
+        issued_at: u64,
+        expiry: u64,
+        origin: impl Into<String>,
+    ) -> Session {
+        self.registry
+            .mint_with_origin(principal, id, issued_at, expiry, origin)
     }
 
     // ---- VIEWS (sign nothing) ------------------------------------------
@@ -551,6 +582,44 @@ impl SessionCli {
             .append(&Author(caller.to_owned()), payload.into_bytes());
         Ok(event)
     }
+
+    /// `pillar session revoke --all-but-current <keep_id>`: atomic,
+    /// selective sign-out-everywhere-but-here for `target`. An ACT — routes
+    /// through the decider, and only on ALLOW emits ONE signed revocation
+    /// event and sweeps every one of `target`'s sessions EXCEPT `keep_id`
+    /// under a SINGLE new epoch
+    /// ([`SessionRegistry::revoke_all_but_current`]): one bump, one event,
+    /// every other device revoked, the caller's own (current) session left
+    /// admitting.
+    ///
+    /// Returns the [`EventId`] of the single signed revocation event.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionCliError::Unauthorized`] (nothing signed/appended) if `caller`
+    /// may not reach `target`.
+    pub fn revoke_all_but_current(
+        &mut self,
+        caller: &str,
+        target: &str,
+        keep_id: &str,
+    ) -> Result<EventId, SessionCliError> {
+        if !self.decider.may_reach(caller, target) {
+            return Err(SessionCliError::Unauthorized {
+                caller: caller.to_owned(),
+                target: target.to_owned(),
+            });
+        }
+        self.registry.revoke_all_but_current(target, keep_id);
+        let epoch = self.registry.rev_epoch();
+        let payload = format!(
+            "session-revoke-all-but-current\tprincipal={target}\tkeep={keep_id}\tepoch={epoch}"
+        );
+        let event = self
+            .log
+            .append(&Author(caller.to_owned()), payload.into_bytes());
+        Ok(event)
+    }
 }
 
 #[cfg(test)]
@@ -670,6 +739,94 @@ mod tests {
         );
         // bob is untouched.
         assert!(view.admit(cli.registry(), "bob", "s1", 10).is_ok());
+    }
+
+    /// `ls` renders the origin/device column and `last_seen`, distinct from
+    /// `issued_at`, once the session has been touched.
+    #[test]
+    fn ls_projects_origin_and_last_seen() {
+        let mut cli = SessionCli::new();
+        cli.mint_with_origin("alice", "s1", 0, 1000, "chrome/macos/198.51.100.9");
+        cli.registry_mut().touch("alice", "s1", 7);
+
+        let rows = cli.ls("alice", "alice", 10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].origin, "chrome/macos/198.51.100.9");
+        assert_eq!(rows[0].issued_at, 0);
+        assert_eq!(rows[0].last_seen, 7);
+    }
+
+    /// `revoke --all-but-current` emits exactly ONE signed event and revokes
+    /// every OTHER device session for the principal, leaving the named
+    /// current session admitting — the device-inventory selective revoke.
+    #[test]
+    fn revoke_all_but_current_revokes_every_other_device() {
+        let mut cli = SessionCli::new();
+        cli.mint_with_origin("alice", "laptop", 0, 1000, "chrome/macos");
+        cli.mint_with_origin("alice", "phone", 0, 1000, "safari/ios");
+        cli.mint_with_origin("alice", "tablet", 0, 1000, "safari/ipados");
+        cli.mint("bob", "s1", 0, 1000);
+
+        let epoch_before = cli.registry().rev_epoch();
+        let event = cli.revoke_all_but_current("alice", "alice", "laptop").unwrap();
+
+        assert_eq!(cli.log().len(), 1, "exactly one signed event");
+        assert!(cli.log().get(&event).unwrap().is_authentic());
+        assert_eq!(
+            cli.registry().rev_epoch(),
+            epoch_before + 1,
+            "revoke-all-but-current is a single atomic epoch bump"
+        );
+
+        let mut view = SessionView::new();
+        view.refresh(cli.registry());
+        assert!(
+            view.admit(cli.registry(), "alice", "laptop", 10).is_ok(),
+            "the kept (current) device must still admit"
+        );
+        assert_eq!(
+            view.admit(cli.registry(), "alice", "phone", 10),
+            Err(AdmitError::Revoked)
+        );
+        assert_eq!(
+            view.admit(cli.registry(), "alice", "tablet", 10),
+            Err(AdmitError::Revoked)
+        );
+        // bob is untouched.
+        assert!(view.admit(cli.registry(), "bob", "s1", 10).is_ok());
+
+        let active: Vec<String> = cli
+            .ls("alice", "alice", 10, Some("laptop"))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(active, vec!["laptop".to_string()]);
+    }
+
+    /// Selectively revoking another principal's OTHER devices without an
+    /// admin grant is REFUSED and signs/appends NOTHING.
+    #[test]
+    fn cross_principal_revoke_all_but_current_requires_admin_grant() {
+        let mut cli = SessionCli::new();
+        cli.mint("bob", "s1", 0, 1000);
+        cli.mint("bob", "s2", 0, 1000);
+
+        let err = cli
+            .revoke_all_but_current("mallory", "bob", "s1")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SessionCliError::Unauthorized {
+                caller: "mallory".into(),
+                target: "bob".into(),
+            }
+        );
+        assert_eq!(cli.log().len(), 0, "an unauthorized act emits nothing");
+        let mut view = SessionView::new();
+        view.refresh(cli.registry());
+        assert!(view.admit(cli.registry(), "bob", "s1", 10).is_ok());
+        assert!(view.admit(cli.registry(), "bob", "s2", 10).is_ok());
     }
 
     /// Revoking ANOTHER principal's session without an admin grant is REFUSED
