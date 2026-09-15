@@ -35,6 +35,7 @@ pub mod cli_surface;
 pub mod cluster;
 pub mod config_export;
 pub mod defaults;
+pub mod foundational_guardrails;
 pub mod health;
 pub mod iam_cli;
 pub mod identity_trust_cli;
