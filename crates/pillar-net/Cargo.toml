@@ -91,6 +91,15 @@ pillar-observability = { path = "../pillar-observability" }
 # neither pillar-net nor anything that does, so this edge is acyclic.
 pillar-identity = { path = "../pillar-identity" }
 pillar-keyedstore = { path = "../pillar-keyedstore" }
+# quota-sql-aggregation-migration: quota accounting rides a reservation-event
+# Document collection with a SUM/GROUP BY SQL view over it (pillar-sqlviews),
+# gated by the CP co-partitioned fence (pillar-streamdb::cofold) so the hard
+# ceiling stays exactly-once rather than an eventually-consistent AP counter.
+# pillar-quota-ledger supplies the budget/attestation types; none of these
+# depend on pillar-net, so these edges are acyclic.
+pillar-quota-ledger = { path = "../pillar-quota-ledger" }
+pillar-sqlviews = { path = "../pillar-sqlviews" }
+pillar-coordination = { path = "../pillar-coordination" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
