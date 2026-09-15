@@ -442,6 +442,211 @@ impl ControlOp {
     }
 }
 
+/// The codec version prefixed to every encoded [`QueryOp`] payload. Kept
+/// SEPARATE from [`OP_CODEC_VERSION`] / [`CONTROL_OP_CODEC_VERSION`] so the
+/// data-query op family evolves independently of the CRUD and control ones.
+pub const QUERY_OP_CODEC_VERSION: u8 = 1;
+
+/// The typed **data-query op** vocabulary (`data-query-tier-remote-surface`):
+/// a real remote read/query surface over a node's keyed store (K/V + Document)
+/// and its SQL views, riding [`pillar_wire::Body::QueryOp`] over the SAME
+/// sealed, signed resource-op tier as [`ResourceOp`] (streamdb CRUD) and
+/// [`ControlOp`] (portal/authority). This is the generalization of the
+/// existing PSL query server into a first-class client query tier: `pillar kv`,
+/// `pillar doc`, and `pillar sql` all emit one of these ops, the node folds the
+/// live view and returns it, and the CLI round-trips a real answer.
+///
+/// Writes (`KvPut`/`KvDelete`/`DocPutField`/`DocDeleteField`/`CreateView`/
+/// `DropView`) are signed acts gated on the AUTHENTICATED signer's
+/// `data:write` authority; reads (every `*Get`/`*Keys`/`*Ids`/`Collections`/
+/// `View`/`ListViews`) are member-gated VIEWS that emit no event. Wasm-safe
+/// (serde only) like the rest of this crate, so the browser client builds the
+/// identical typed op.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryOp {
+    /// Keyed K/V surface (`pillar kv …`).
+    Kv(KvOp),
+    /// Structured Document surface (`pillar doc …`).
+    Doc(DocOp),
+    /// SQL views over the Document store (`pillar sql …`).
+    Sql(SqlOp),
+}
+
+/// K/V surface ops (`pillar kv put|get|delete|keys|collections`). `Put`/
+/// `Delete` are signed acts; `Get`/`Keys`/`Collections` are member-gated VIEWS.
+/// A value travels as a lowercase-hex string so an opaque (possibly non-UTF-8)
+/// K/V payload round-trips faithfully over the text ack.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum KvOp {
+    /// Put an opaque value (`value_hex`) for `key` in `collection`.
+    Put {
+        /// The collection namespace.
+        collection: String,
+        /// The K/V key.
+        key: String,
+        /// The opaque value, lowercase hex.
+        value_hex: String,
+    },
+    /// Delete `key` from `collection` (tombstone).
+    Delete {
+        /// The collection namespace.
+        collection: String,
+        /// The K/V key.
+        key: String,
+    },
+    /// Read the live value of `key` in `collection` (returned as lowercase hex).
+    Get {
+        /// The collection namespace.
+        collection: String,
+        /// The K/V key.
+        key: String,
+    },
+    /// List every live key of `collection`.
+    Keys {
+        /// The collection namespace.
+        collection: String,
+    },
+    /// List every collection with at least one live op.
+    Collections,
+}
+
+/// Document surface ops (`pillar doc put|get|delete|fields|ids`). `Put`/
+/// `Delete` are signed acts; `Get`/`Fields`/`Ids` are member-gated VIEWS. A
+/// field value travels as a UTF-8 scalar string (the common document-leaf
+/// case).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum DocOp {
+    /// Put a scalar `value` for `field` of document `id` in `collection`.
+    PutField {
+        /// The collection namespace.
+        collection: String,
+        /// The document id.
+        id: String,
+        /// The (possibly dotted) field name.
+        field: String,
+        /// The scalar field value (UTF-8 text).
+        value: String,
+    },
+    /// Delete `field` of document `id` in `collection` (tombstone).
+    DeleteField {
+        /// The collection namespace.
+        collection: String,
+        /// The document id.
+        id: String,
+        /// The field name.
+        field: String,
+    },
+    /// Read the live value of `field` (dotted path allowed) of document `id`.
+    GetField {
+        /// The collection namespace.
+        collection: String,
+        /// The document id.
+        id: String,
+        /// The (possibly dotted) field path.
+        field: String,
+    },
+    /// List the live field names of document `id` in `collection`.
+    Fields {
+        /// The collection namespace.
+        collection: String,
+        /// The document id.
+        id: String,
+    },
+    /// List every live document id of `collection`.
+    Ids {
+        /// The collection namespace.
+        collection: String,
+    },
+}
+
+/// SQL-view ops (`pillar sql create-view|drop-view|view|views`). `CreateView`/
+/// `DropView` are signed acts (DDL, written as a `__catalog` document);
+/// `View`/`Views` are member-gated VIEWS that fold the live source collection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum SqlOp {
+    /// `CREATE MATERIALIZED VIEW <name> OVER <source>` (optional equality
+    /// filter `field`=`value`, optional projection `project`).
+    CreateView {
+        /// The view name.
+        name: String,
+        /// The source collection folded into the view.
+        source: String,
+        /// Optional equality-filter field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter_field: Option<String>,
+        /// Optional equality-filter value (UTF-8 scalar text).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter_value: Option<String>,
+        /// Optional projected field paths (`None` keeps every field).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<Vec<String>>,
+    },
+    /// `DROP VIEW <name>`.
+    DropView {
+        /// The view name.
+        name: String,
+    },
+    /// Materialize the view `name` (fold its source live) and return its rows.
+    View {
+        /// The view name.
+        name: String,
+    },
+    /// List every view currently defined in the catalog.
+    Views,
+}
+
+impl QueryOp {
+    /// Encode to a query-op payload: a single [`QUERY_OP_CODEC_VERSION`] byte
+    /// followed by canonical JSON. Deterministic, like [`ResourceOp::encode`].
+    ///
+    /// # Errors
+    /// [`OpCodecError::Encode`] if serialization fails.
+    pub fn encode(&self) -> Result<Vec<u8>, OpCodecError> {
+        let json = serde_json::to_vec(self).map_err(|e| OpCodecError::Encode(e.to_string()))?;
+        let mut out = Vec::with_capacity(1 + json.len());
+        out.push(QUERY_OP_CODEC_VERSION);
+        out.extend_from_slice(&json);
+        Ok(out)
+    }
+
+    /// Decode a query-op payload produced by [`Self::encode`], checking the
+    /// leading codec-version byte.
+    ///
+    /// # Errors
+    /// [`OpCodecError::Empty`] on an empty payload;
+    /// [`OpCodecError::UnsupportedVersion`] on an unknown codec version;
+    /// [`OpCodecError::Decode`] if the body is not a well-formed [`QueryOp`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, OpCodecError> {
+        let (&version, rest) = bytes.split_first().ok_or(OpCodecError::Empty)?;
+        if version != QUERY_OP_CODEC_VERSION {
+            return Err(OpCodecError::UnsupportedVersion(version));
+        }
+        serde_json::from_slice(rest).map_err(|e| OpCodecError::Decode(e.to_string()))
+    }
+
+    /// Whether this op is a read-only VIEW (served from live state, emits no
+    /// signed event) — the wire dispatcher routes reads through the member-
+    /// gated view path and writes through the capability-gated act path.
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        match self {
+            QueryOp::Kv(op) => matches!(
+                op,
+                KvOp::Get { .. } | KvOp::Keys { .. } | KvOp::Collections
+            ),
+            QueryOp::Doc(op) => matches!(
+                op,
+                DocOp::GetField { .. } | DocOp::Fields { .. } | DocOp::Ids { .. }
+            ),
+            QueryOp::Sql(op) => matches!(op, SqlOp::View { .. } | SqlOp::Views),
+        }
+    }
+}
+
 /// A fault encoding or decoding a [`ResourceOp`] payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpCodecError {
@@ -752,6 +957,88 @@ mod tests {
             );
             assert!(op.is_read(), "identity/user views are reads: {op:?}");
         }
+    }
+
+    #[test]
+    fn query_op_round_trips_and_classifies_read_vs_write() {
+        let acts = [
+            QueryOp::Kv(KvOp::Put {
+                collection: "cfg".into(),
+                key: "greeting".into(),
+                value_hex: "68656c6c6f".into(),
+            }),
+            QueryOp::Kv(KvOp::Delete {
+                collection: "cfg".into(),
+                key: "greeting".into(),
+            }),
+            QueryOp::Doc(DocOp::PutField {
+                collection: "users".into(),
+                id: "u1".into(),
+                field: "name".into(),
+                value: "alice".into(),
+            }),
+            QueryOp::Doc(DocOp::DeleteField {
+                collection: "users".into(),
+                id: "u1".into(),
+                field: "name".into(),
+            }),
+            QueryOp::Sql(SqlOp::CreateView {
+                name: "active".into(),
+                source: "users".into(),
+                filter_field: Some("status".into()),
+                filter_value: Some("on".into()),
+                project: Some(vec!["name".into()]),
+            }),
+            QueryOp::Sql(SqlOp::DropView {
+                name: "active".into(),
+            }),
+        ];
+        for op in &acts {
+            let bytes = op.encode().expect("encode");
+            assert_eq!(bytes[0], QUERY_OP_CODEC_VERSION, "version-prefixed");
+            assert_eq!(&QueryOp::decode(&bytes).expect("decode"), op);
+            assert!(!op.is_read(), "query write is not a read: {op:?}");
+        }
+        for op in [
+            QueryOp::Kv(KvOp::Get {
+                collection: "cfg".into(),
+                key: "greeting".into(),
+            }),
+            QueryOp::Kv(KvOp::Keys {
+                collection: "cfg".into(),
+            }),
+            QueryOp::Kv(KvOp::Collections),
+            QueryOp::Doc(DocOp::GetField {
+                collection: "users".into(),
+                id: "u1".into(),
+                field: "name".into(),
+            }),
+            QueryOp::Doc(DocOp::Fields {
+                collection: "users".into(),
+                id: "u1".into(),
+            }),
+            QueryOp::Doc(DocOp::Ids {
+                collection: "users".into(),
+            }),
+            QueryOp::Sql(SqlOp::View {
+                name: "active".into(),
+            }),
+            QueryOp::Sql(SqlOp::Views),
+        ] {
+            assert_eq!(QueryOp::decode(&op.encode().expect("encode")).expect("decode"), op);
+            assert!(op.is_read(), "query view is a read: {op:?}");
+        }
+    }
+
+    #[test]
+    fn query_op_rejects_empty_and_unknown_version() {
+        assert_eq!(QueryOp::decode(&[]), Err(OpCodecError::Empty));
+        let mut bytes = QueryOp::Kv(KvOp::Collections).encode().expect("encode");
+        bytes[0] = 0xFD;
+        assert_eq!(
+            QueryOp::decode(&bytes),
+            Err(OpCodecError::UnsupportedVersion(0xFD))
+        );
     }
 
     #[test]

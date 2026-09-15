@@ -953,6 +953,311 @@ pub fn user(args: &[String]) -> ExitCode {
     print_view(control_op(&pillar_ops::ControlOp::User(op)), "user")
 }
 
+// ---------------------------------------------------------------------------
+// Data-query ops (`pillar_ops::QueryOp`) over the SAME sealed resource-op tier.
+// `pillar kv` / `pillar doc` / `pillar sql`: a real remote read/query surface
+// over the node's keyed store (K/V + Document) and its SQL views —
+// `data-query-tier-remote-surface`. Writes are signed acts; reads member-gated
+// views. Identical dial/seal/sign/open path as `send_op`/`send_control_op`,
+// only the op class (and its seal domain) differ.
+// ---------------------------------------------------------------------------
+
+/// Send a [`pillar_ops::QueryOp`] over pillar-message and return the node's
+/// decoded ack text plus the tier that answered. The query-op sibling of
+/// [`send_op`]/[`send_control_op`].
+///
+/// # Errors
+/// [`SendError`] for a missing/malformed environment, an unreachable node, or a
+/// reply that fails to open/decode.
+pub fn send_query_op(op: &pillar_ops::QueryOp) -> Result<(String, TransportKind), SendError> {
+    let conn = connect().map_err(SendError::Connect)?;
+    let outcome = pillar_client::transport::send_query_op_with_fallback(
+        &tiers(conn.addr),
+        op,
+        &conn.group,
+        conn.cell.clone(),
+        conn.signer,
+        &conn.secret,
+        Visibility::Cell,
+    )
+    .map_err(SendError::Transport)?;
+    use pillar_wire::seal::{CellSeal, ContentSeal};
+    let aad =
+        pillar_wire::PillarMessage::header_aad(outcome.response.visibility, &outcome.response.cell);
+    let plaintext = CellSeal
+        .open(&conn.group, &outcome.response.body_sealed, &aad)
+        .map_err(|_| SendError::UnsealAck)?;
+    match Body::from_canonical_cbor(&plaintext) {
+        Ok(Body::Control(bytes)) => {
+            Ok((String::from_utf8_lossy(&bytes).into_owned(), outcome.tier))
+        }
+        _ => Err(SendError::BadAckBody),
+    }
+}
+
+/// Send a query op and unwrap its ack to the payload text, mapping an `ERR`
+/// ack to `Err`. Mirrors [`read_op`]/[`control_op`] for the query-op class.
+///
+/// # Errors
+/// A transport error string, or the node's refusal reason (`ERR ` stripped).
+pub fn query_op(op: &pillar_ops::QueryOp) -> Result<String, String> {
+    let (ack, _tier) = send_query_op(op).map_err(|e| e.to_string())?;
+    if let Some(payload) = ack.strip_prefix("OK ") {
+        Ok(payload.to_owned())
+    } else if ack == "OK" {
+        Ok(String::new())
+    } else {
+        Err(ack.strip_prefix("ERR ").unwrap_or(&ack).to_owned())
+    }
+}
+
+/// Lowercase-hex-encode a K/V value byte string for the wire.
+fn hex_encode_value(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode a lowercase-hex K/V value ack back to raw bytes.
+fn hex_decode_value(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// `pillar kv {put <collection> <key> <value> | get <collection> <key> |
+/// delete <collection> <key> | keys <collection> | collections}`: the K/V
+/// surface over the sealed query tier (no HTTP). `put`/`delete` are signed
+/// acts; `get`/`keys`/`collections` are member-gated views. A `get`'s value is
+/// printed as raw UTF-8 (falling back to hex) after de-hexing the wire form.
+pub fn kv(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar kv {{put <collection> <key> <value> | get <collection> <key> | \
+             delete <collection> <key> | keys <collection> | collections}}"
+        );
+        ExitCode::from(2)
+    };
+    match args.first().map(String::as_str) {
+        Some("put") => match (args.get(1), args.get(2), args.get(3)) {
+            (Some(c), Some(k), Some(v)) => print_view(
+                query_op(&pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Put {
+                    collection: c.clone(),
+                    key: k.clone(),
+                    value_hex: hex_encode_value(v.as_bytes()),
+                })),
+                "kv put",
+            ),
+            _ => usage(),
+        },
+        Some("get") => match (args.get(1), args.get(2)) {
+            (Some(c), Some(k)) => match query_op(&pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Get {
+                collection: c.clone(),
+                key: k.clone(),
+            })) {
+                Ok(hex) => {
+                    let raw = hex_decode_value(hex.trim()).unwrap_or_default();
+                    match String::from_utf8(raw.clone()) {
+                        Ok(s) => println!("{s}"),
+                        Err(_) => println!("{}", hex.trim()),
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("pillar kv get: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ => usage(),
+        },
+        Some("delete") => match (args.get(1), args.get(2)) {
+            (Some(c), Some(k)) => print_view(
+                query_op(&pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Delete {
+                    collection: c.clone(),
+                    key: k.clone(),
+                })),
+                "kv delete",
+            ),
+            _ => usage(),
+        },
+        Some("keys") => match args.get(1) {
+            Some(c) => print_view(
+                query_op(&pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Keys {
+                    collection: c.clone(),
+                })),
+                "kv keys",
+            ),
+            None => usage(),
+        },
+        Some("collections") => print_view(
+            query_op(&pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Collections)),
+            "kv collections",
+        ),
+        _ => usage(),
+    }
+}
+
+/// `pillar doc {put <collection> <id> <field> <value> | get <collection> <id>
+/// <field> | delete <collection> <id> <field> | fields <collection> <id> |
+/// ids <collection>}`: the structured Document surface over the sealed query
+/// tier. `put`/`delete` are signed acts; the rest are member-gated views.
+pub fn doc(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar doc {{put <collection> <id> <field> <value> | \
+             get <collection> <id> <field> | delete <collection> <id> <field> | \
+             fields <collection> <id> | ids <collection>}}"
+        );
+        ExitCode::from(2)
+    };
+    match args.first().map(String::as_str) {
+        Some("put") => match (args.get(1), args.get(2), args.get(3), args.get(4)) {
+            (Some(c), Some(id), Some(f), Some(v)) => print_view(
+                query_op(&pillar_ops::QueryOp::Doc(pillar_ops::DocOp::PutField {
+                    collection: c.clone(),
+                    id: id.clone(),
+                    field: f.clone(),
+                    value: v.clone(),
+                })),
+                "doc put",
+            ),
+            _ => usage(),
+        },
+        Some("get") => match (args.get(1), args.get(2), args.get(3)) {
+            (Some(c), Some(id), Some(f)) => print_view(
+                query_op(&pillar_ops::QueryOp::Doc(pillar_ops::DocOp::GetField {
+                    collection: c.clone(),
+                    id: id.clone(),
+                    field: f.clone(),
+                })),
+                "doc get",
+            ),
+            _ => usage(),
+        },
+        Some("delete") => match (args.get(1), args.get(2), args.get(3)) {
+            (Some(c), Some(id), Some(f)) => print_view(
+                query_op(&pillar_ops::QueryOp::Doc(pillar_ops::DocOp::DeleteField {
+                    collection: c.clone(),
+                    id: id.clone(),
+                    field: f.clone(),
+                })),
+                "doc delete",
+            ),
+            _ => usage(),
+        },
+        Some("fields") => match (args.get(1), args.get(2)) {
+            (Some(c), Some(id)) => print_view(
+                query_op(&pillar_ops::QueryOp::Doc(pillar_ops::DocOp::Fields {
+                    collection: c.clone(),
+                    id: id.clone(),
+                })),
+                "doc fields",
+            ),
+            _ => usage(),
+        },
+        Some("ids") => match args.get(1) {
+            Some(c) => print_view(
+                query_op(&pillar_ops::QueryOp::Doc(pillar_ops::DocOp::Ids {
+                    collection: c.clone(),
+                })),
+                "doc ids",
+            ),
+            None => usage(),
+        },
+        _ => usage(),
+    }
+}
+
+/// `pillar sql {create-view <name> <source> [--eq <field> <value>]
+/// [--project <f1,f2,…>] | drop-view <name> | view <name> | views}`: SQL views
+/// over the Document store, folded live over the sealed query tier. DDL
+/// (`create-view`/`drop-view`) are signed acts; `view`/`views` are member-gated
+/// views.
+pub fn sql(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar sql {{create-view <name> <source> [--eq <field> <value>] \
+             [--project <f1,f2,…>] | drop-view <name> | view <name> | views}}"
+        );
+        ExitCode::from(2)
+    };
+    match args.first().map(String::as_str) {
+        Some("create-view") => {
+            let (Some(name), Some(source)) = (args.get(1), args.get(2)) else {
+                return usage();
+            };
+            let mut filter_field = None;
+            let mut filter_value = None;
+            let mut project = None;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--eq" => {
+                        let (Some(f), Some(v)) = (args.get(i + 1), args.get(i + 2)) else {
+                            return usage();
+                        };
+                        filter_field = Some(f.clone());
+                        filter_value = Some(v.clone());
+                        i += 3;
+                    }
+                    "--project" => {
+                        let Some(list) = args.get(i + 1) else {
+                            return usage();
+                        };
+                        project = Some(list.split(',').map(str::to_owned).collect());
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            print_view(
+                query_op(&pillar_ops::QueryOp::Sql(pillar_ops::SqlOp::CreateView {
+                    name: name.clone(),
+                    source: source.clone(),
+                    filter_field,
+                    filter_value,
+                    project,
+                })),
+                "sql create-view",
+            )
+        }
+        Some("drop-view") => match args.get(1) {
+            Some(name) => print_view(
+                query_op(&pillar_ops::QueryOp::Sql(pillar_ops::SqlOp::DropView {
+                    name: name.clone(),
+                })),
+                "sql drop-view",
+            ),
+            None => usage(),
+        },
+        Some("view") => match args.get(1) {
+            Some(name) => print_view(
+                query_op(&pillar_ops::QueryOp::Sql(pillar_ops::SqlOp::View {
+                    name: name.clone(),
+                })),
+                "sql view",
+            ),
+            None => usage(),
+        },
+        Some("views") => print_view(
+            query_op(&pillar_ops::QueryOp::Sql(pillar_ops::SqlOp::Views)),
+            "sql views",
+        ),
+        _ => usage(),
+    }
+}
+
 fn user_usage() -> ExitCode {
     eprintln!(
         "usage: pillar user {{ls | show <handle> | invite <handle> <email> \

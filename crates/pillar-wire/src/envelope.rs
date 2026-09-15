@@ -176,6 +176,12 @@ pub enum Body {
     /// [`Self::StreamOp`] (streamdb CRUD) so the node dispatches each op class
     /// on its own tag. The payload is a `ControlOp::encode` byte string.
     ControlOp(Vec<u8>),
+    /// A typed CLI **data-query op** (`pillar_ops::QueryOp`: keyed-store K/V +
+    /// Document reads/writes and SQL views) carried over the sealed resource-op
+    /// tier. Distinct from [`Self::ControlOp`] (portal/authority) and
+    /// [`Self::StreamOp`] (streamdb CRUD) so the node dispatches each op class
+    /// on its own tag. The payload is a `QueryOp::encode` byte string.
+    QueryOp(Vec<u8>),
 }
 
 impl Body {
