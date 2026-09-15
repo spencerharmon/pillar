@@ -106,15 +106,15 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "role",
-        handler: iam_family,
+        handler: |_v, args| crate::apply_over_pillar_message::role(args),
     },
     VerbSpec {
         name: "group",
-        handler: iam_family,
+        handler: |_v, args| crate::apply_over_pillar_message::group(args),
     },
     VerbSpec {
         name: "oauth",
-        handler: iam_family,
+        handler: |_v, args| crate::apply_over_pillar_message::oauth(args),
     },
     VerbSpec {
         name: "login",
@@ -458,18 +458,6 @@ fn login_oidc(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// `pillar {role|group|oauth} …`.
-fn iam_family(verb: &str, _args: &[String]) -> ExitCode {
-    eprintln!(
-        "`pillar {verb} …` reads/acts over a live node's IAM roles/groups/oauth-client substrate \
-         via the pillar_cli::iam_cli library API (RoleCli/GroupCli/OauthCli): every mutation is a \
-         signed op gated on the shared RbacDecider, every write has a --dry-run decider preview, \
-         and `describe` renders the signer + authority + event CID."
-    );
-    eprintln!("Run `pillar --help` for the full verb list of this family.");
-    ExitCode::from(2)
 }
 
 /// `pillar webauthn register|login`.

@@ -364,6 +364,19 @@ pub struct WebAuthContext {
     /// [`RbacDecider`] every signed act routes through consults, so a
     /// wire-issued grant and a web-issued one land in one authority source.
     grants: Vec<pillar_rbac::ExplicitGrant>,
+    /// Named, admin-defined capability sets (`pillar role …`) over
+    /// [`pillar_iam::rbac_bridge::Role`], keyed by role name — the live
+    /// substrate the IAM roles panel drives; a signed act per mutation gated on
+    /// `iam:roles:write`.
+    iam_roles: BTreeMap<String, pillar_iam::rbac_bridge::Role>,
+    /// Admin-managed group membership (`pillar group …`) over
+    /// [`pillar_iam::rbac_bridge::ManagedGroup`], keyed by group name; a signed
+    /// act per mutation gated on `iam:groups:write`.
+    iam_groups: BTreeMap<String, pillar_iam::rbac_bridge::ManagedGroup>,
+    /// The node's OAuth/OIDC client registry (`pillar oauth …`) over
+    /// [`pillar_oidc::client_registry::ClientRegistry`]; a signed act per
+    /// registration gated on `iam:oauth:write`.
+    oauth: pillar_oidc::client_registry::ClientRegistry,
     /// The key & offer UI's substrate (ROI "Web portal / UI rework": custody
     /// migration, rotation, seal/escrow, revoke) — a signed act per
     /// operation, keyed by handle. No server-side database: this is an
@@ -1072,6 +1085,9 @@ impl WebAuthContext {
             session_clock: 0,
             trust: TrustStore::new(owner_for_trust),
             grants: Vec::new(),
+            iam_roles: BTreeMap::new(),
+            iam_groups: BTreeMap::new(),
+            oauth: pillar_oidc::client_registry::ClientRegistry::default(),
             custody: BTreeMap::new(),
             act_log: EventLog::new(),
             resource_platform,
@@ -3760,6 +3776,212 @@ impl WebAuthContext {
             pillar_ops::ControlOp::User(u) => self.user_op(actor, u),
             pillar_ops::ControlOp::Cluster(c) => self.cluster_op(actor, c),
             pillar_ops::ControlOp::Trust(t) => self.trust_op(actor, t),
+            pillar_ops::ControlOp::Iam(i) => self.iam_op(actor, i),
+        }
+    }
+
+    /// Serve a [`pillar_ops::IamOp`] over the control-op tier. `RoleList`/
+    /// `RoleShow`/`GroupList`/`GroupShow`/`OauthList`/`OauthShow` are
+    /// member-gated VIEWS; `RoleAdd`/`RoleRm`/`GroupAdd`/`GroupAddMember`/
+    /// `GroupRm`/`OauthRegister` are capability-gated signed acts
+    /// (`perform_signed_act` on `iam:roles:write` / `iam:groups:write` /
+    /// `iam:oauth:write`) mutating the node's live role set, managed-group set,
+    /// and OAuth client registry respectively — the SAME substrate the IAM
+    /// admin panels drive.
+    fn iam_op(&mut self, actor: &NodeId, op: &pillar_ops::IamOp) -> Result<String, String> {
+        use pillar_iam::rbac_bridge::{ManagedGroup, Role};
+        use pillar_oidc::client_registry::{self, ClientOp, ClientType, GrantType};
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            // ---- ROLE VIEWS ----
+            pillar_ops::IamOp::RoleList => {
+                let mut body = String::new();
+                for (name, role) in &self.iam_roles {
+                    let caps: Vec<&str> = role.capabilities.iter().map(String::as_str).collect();
+                    body.push_str(&format!("{name}\t{}\n", caps.join(",")));
+                }
+                Ok(body)
+            }
+            pillar_ops::IamOp::RoleShow { name } => match self.iam_roles.get(name) {
+                Some(role) => {
+                    let caps: Vec<&str> = role.capabilities.iter().map(String::as_str).collect();
+                    Ok(format!("ROLE {name}\nCAPABILITIES {}", caps.join(",")))
+                }
+                None => Err(format!("no such role {name}")),
+            },
+            // ---- GROUP VIEWS ----
+            pillar_ops::IamOp::GroupList => {
+                let mut body = String::new();
+                for name in self.iam_groups.keys() {
+                    body.push_str(&format!("{name}\n"));
+                }
+                Ok(body)
+            }
+            pillar_ops::IamOp::GroupShow { name } => match self.iam_groups.get(name) {
+                Some(group) => {
+                    let roles: Vec<&str> = group.roles.iter().map(String::as_str).collect();
+                    let members: Vec<&str> = group.members.iter().map(String::as_str).collect();
+                    Ok(format!(
+                        "GROUP {name}\nROLES {}\nMEMBERS {}",
+                        roles.join(","),
+                        members.join(",")
+                    ))
+                }
+                None => Err(format!("no such group {name}")),
+            },
+            // ---- OAUTH VIEWS ----
+            pillar_ops::IamOp::OauthList => {
+                let mut body = String::new();
+                for client_id in self.oauth.clients.keys() {
+                    body.push_str(&format!("{client_id}\n"));
+                }
+                Ok(body)
+            }
+            pillar_ops::IamOp::OauthShow { client_id } => match self.oauth.clients.get(client_id) {
+                Some(c) => {
+                    let redirects: Vec<&str> = c.redirect_uris.iter().map(String::as_str).collect();
+                    let scopes: Vec<&str> = c.allowed_scopes.iter().map(String::as_str).collect();
+                    let grants: Vec<String> =
+                        c.allowed_grants.iter().map(|g| format!("{g:?}")).collect();
+                    Ok(format!(
+                        "CLIENT {client_id}\nTYPE {:?}\nREDIRECTS {}\nSCOPES {}\nGRANTS {}",
+                        c.client_type,
+                        redirects.join(","),
+                        scopes.join(","),
+                        grants.join(",")
+                    ))
+                }
+                None => Err(format!("no such client {client_id}")),
+            },
+            // ---- ROLE ACTS ----
+            pillar_ops::IamOp::RoleAdd { name, capabilities } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_ROLES_WRITE_CAPABILITY,
+                        &format!("ROLE-ADD {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:roles:write"))?;
+                self.iam_roles
+                    .insert(name.clone(), Role::new(name.clone(), capabilities.clone()));
+                Ok(format!("ROLE {name} EVENT-CID {}", cid.0))
+            }
+            pillar_ops::IamOp::RoleRm { name } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_ROLES_WRITE_CAPABILITY,
+                        &format!("ROLE-RM {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:roles:write"))?;
+                if self.iam_roles.remove(name).is_none() {
+                    return Err(format!("no such role {name}"));
+                }
+                Ok(format!("REMOVED {name} EVENT-CID {}", cid.0))
+            }
+            // ---- GROUP ACTS ----
+            pillar_ops::IamOp::GroupAdd { name, roles } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_GROUPS_WRITE_CAPABILITY,
+                        &format!("GROUP-ADD {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:groups:write"))?;
+                self.iam_groups
+                    .insert(name.clone(), ManagedGroup::new(name.clone(), roles.clone()));
+                Ok(format!("GROUP {name} EVENT-CID {}", cid.0))
+            }
+            pillar_ops::IamOp::GroupAddMember { name, handle } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_GROUPS_WRITE_CAPABILITY,
+                        &format!("GROUP-ADD-MEMBER {name} {handle}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:groups:write"))?;
+                let group = self
+                    .iam_groups
+                    .get_mut(name)
+                    .ok_or_else(|| format!("no such group {name}"))?;
+                group.members.insert(handle.clone());
+                Ok(format!("MEMBER {handle} ADDED {name} EVENT-CID {}", cid.0))
+            }
+            pillar_ops::IamOp::GroupRm { name } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_iam::rbac_bridge::IAM_GROUPS_WRITE_CAPABILITY,
+                        &format!("GROUP-RM {name}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:groups:write"))?;
+                if self.iam_groups.remove(name).is_none() {
+                    return Err(format!("no such group {name}"));
+                }
+                Ok(format!("REMOVED {name} EVENT-CID {}", cid.0))
+            }
+            // ---- OAUTH ACT ----
+            pillar_ops::IamOp::OauthRegister {
+                client_id,
+                client_type,
+                redirect_uris,
+                scopes,
+                grants,
+            } => {
+                let client_type = match client_type.as_str() {
+                    "public" => ClientType::Public,
+                    "confidential" => ClientType::Confidential,
+                    other => {
+                        return Err(format!(
+                            "BAD client type {other}: expected public|confidential"
+                        ))
+                    }
+                };
+                let mut grant_set: std::collections::BTreeSet<GrantType> =
+                    std::collections::BTreeSet::new();
+                for g in grants {
+                    let gt = match g.as_str() {
+                        "authorization_code" | "auth_code" | "code" => GrantType::AuthorizationCode,
+                        "refresh_token" | "refresh" => GrantType::RefreshToken,
+                        "client_credentials" | "client_creds" => GrantType::ClientCredentials,
+                        other => return Err(format!("BAD grant type {other}")),
+                    };
+                    grant_set.insert(gt);
+                }
+                let redirects: std::collections::BTreeSet<String> =
+                    redirect_uris.iter().cloned().collect();
+                let scope_set: std::collections::BTreeSet<String> =
+                    scopes.iter().cloned().collect();
+                // Validate the SAME invariants apply_op preserves before we gate,
+                // so an invalid client is refused at the source.
+                if let Err(e) =
+                    client_registry::validate_registration(client_type, &redirects, &grant_set)
+                {
+                    return Err(format!("DENIED {e:?}"));
+                }
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        pillar_oidc::client_registry::OAUTH_WRITE_CAPABILITY,
+                        &format!("OAUTH-REGISTER {client_id}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:oauth:write"))?;
+                let now = self.iam_now();
+                client_registry::apply_op(
+                    &mut self.oauth,
+                    ClientOp::RegisterClient {
+                        client_id: client_id.clone(),
+                        client_type,
+                        redirect_uris: redirects,
+                        allowed_scopes: scope_set,
+                        allowed_grants: grant_set,
+                        at: now,
+                    },
+                );
+                Ok(format!("REGISTERED {client_id} EVENT-CID {}", cid.0))
+            }
         }
     }
 
