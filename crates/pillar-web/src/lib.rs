@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod account_lockout;
 pub mod key_login;
 pub mod node_custody;
 pub mod webauthn;
