@@ -97,11 +97,12 @@ fn usage() -> &'static str {
      \x20 pillar webauthn register --user <handle> [--label L] [--domain D] [--token T] [--rp-id R] [--origin O]\n\
      \x20 pillar webauthn login [--credential-id C] [--domain D] [--token T] [--rp-id R] [--origin O]\n\
      \x20 pillar webauthn list [--domain D] [--token T]\n\
+     \x20 pillar webauthn name --credential-id <b64url> --label <L> [--domain D] [--token T]\n\
      \x20 pillar webauthn revoke --credential-id <b64url> [--yes] [--domain D] [--token T]\n\
      register/login drive the real ceremony over ctap-hid against a locally\n\
      attached hardware authenticator (requires the `passkey` feature); pass\n\
      --rp-id <domain> to register a PORTABLE passkey bound to that domain.\n\
-     list/revoke manage the credential set over HTTP (no hardware needed)."
+     list/name/revoke manage the credential set over HTTP (no hardware needed)."
 }
 
 /// Dispatch `pillar webauthn <sub> …`.
@@ -114,6 +115,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         Some("register") => register(&args[1..]),
         Some("login") => login(&args[1..]),
         Some("list") => list(&args[1..]),
+        Some("name") => name(&args[1..]),
         Some("revoke") => revoke(&args[1..]),
         _ => Err(usage().to_owned()),
     }
@@ -235,6 +237,29 @@ fn list(args: &[String]) -> Result<String, String> {
         }
     }
     Ok(out.trim_end().to_owned())
+}
+
+/// `pillar webauthn name --credential-id <b64url> --label <L>`: rename
+/// (relabel) one of the caller's own credentials over HTTP (no hardware
+/// needed). Purely cosmetic — never affects sign-count, last-used, or
+/// credential validity, and never touches the >=1-credential enforcement
+/// `revoke` guards.
+fn name(args: &[String]) -> Result<String, String> {
+    let parsed = Args::parse(args)?;
+    let credential_id_b64 = parsed
+        .get("credential-id")
+        .ok_or("webauthn name requires --credential-id <b64url> (from `webauthn list`)")?;
+    let label = parsed
+        .get("label")
+        .ok_or("webauthn name requires --label <new-label>")?;
+    let (authority, _host) = domain_from(&parsed)?;
+    let token = token_from(&parsed)?;
+    let body = format!("{token}\n{credential_id_b64}\n{label}");
+    let resp = http(&authority, "POST", "/webauthn/credentials/rename", &body)?;
+    if resp.status != 200 {
+        return Err(format!("credentials/rename refused: {} {}", resp.status, resp.body));
+    }
+    Ok(resp.body)
 }
 
 /// `pillar webauthn revoke --credential-id <b64url> [--yes]`: permanently
@@ -391,6 +416,24 @@ mod tests {
     fn missing_user_flag_is_a_usage_error() {
         let err = register(&[]).unwrap_err();
         assert!(err.contains("--user"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn name_without_credential_id_is_a_usage_error() {
+        let err = name(&["--label".to_owned(), "new-label".to_owned()]).unwrap_err();
+        assert!(err.contains("--credential-id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn name_without_label_is_a_usage_error() {
+        let err = name(&[
+            "--credential-id".to_owned(),
+            "abc".to_owned(),
+            "--domain".to_owned(),
+            "127.0.0.1:1".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--label"), "unexpected error: {err}");
     }
 
     #[test]

@@ -398,6 +398,20 @@ impl RelyingParty {
         self.user_owns_credential(user_handle, credential_id)
             && self.user_credentials(user_handle).len() <= 1
     }
+
+    /// Rename (relabel) a live credential in place. Returns `false` (no-op) if
+    /// the credential is unknown — the caller is expected to have already
+    /// checked [`user_owns_credential`](Self::user_owns_credential) for
+    /// authorization, so this only guards against a concurrent revoke.
+    pub fn rename_credential(&mut self, credential_id: &[u8], label: &str) -> bool {
+        let key = hex(credential_id);
+        if let Some(record) = self.records.get_mut(&key) {
+            record.label = label.to_owned();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
