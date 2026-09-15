@@ -103,6 +103,8 @@ pub mod kv_plane_migration;
 
 pub mod quota_sql_aggregation_migration;
 
+pub mod wot_trust_document_migration;
+
 pub mod collection_placement;
 pub use collection_placement::{
     view_placement, CollectionPlacement, NodeSelector,
