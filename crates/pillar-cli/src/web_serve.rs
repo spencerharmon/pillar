@@ -6204,6 +6204,21 @@ pub static ROUTES: &[RouteSpec] = &[
         path: PathMatch::Exact("/portal/swarm/generate"),
         handler: dispatch_swarm_generate,
     },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/data/kv"),
+        handler: |ctx, _peer, request| dispatch_data_kv_browse(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/data/doc"),
+        handler: |ctx, _peer, request| dispatch_data_doc_browse(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Prefix("/portal/data/sql"),
+        handler: |ctx, _peer, request| dispatch_data_sql_browse(ctx, request),
+    },
 ];
 
 /// The real, currently-served HTTP route table — the exact data
@@ -6266,6 +6281,176 @@ fn dispatch_swarm_generate(
             key.fingerprint()
         ),
     )
+}
+
+/// `GET /portal/data/kv?token=<session>[&collection=<c>[&key=<k>]]` — the K/V
+/// Explore panel's read-only browse over the SAME `WebAuthContext::keyed_store`
+/// substrate the `pillar kv` query-tier verb reads/writes (never a second
+/// store, never a mutation shim — this route only ever dispatches a `KvOp`
+/// READ variant through [`WebAuthContext::query_op`], the exact decider the
+/// sealed query tier uses, so a browse can never expose more than the query
+/// tier itself would authorize).
+///
+/// With no `collection`: lists every live collection (`COLLECTION <name>` per
+/// line). With `collection` only: lists that collection's live keys (`KEY
+/// <name>` per line). With `collection`+`key`: returns that key's live value,
+/// hex-encoded (`VALUE <hex>`), or 404 if the key has no live value.
+fn dispatch_data_kv_browse(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let actor = session.subject.clone();
+    let collection = query_value(&request.path, "collection").map(str::to_owned);
+    let key = query_value(&request.path, "key").map(str::to_owned);
+    match (collection, key) {
+        (None, _) => match ctx.query_op(&actor, &pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Collections)) {
+            Ok(body) => {
+                let mut out = String::new();
+                for line in body.lines() {
+                    out.push_str("COLLECTION ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                text_response(200, "OK", out)
+            }
+            Err(e) => text_response(403, "Forbidden", format!("DENIED {e}")),
+        },
+        (Some(collection), None) => match ctx.query_op(
+            &actor,
+            &pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Keys { collection }),
+        ) {
+            Ok(body) => {
+                let mut out = String::new();
+                for line in body.lines() {
+                    out.push_str("KEY ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                text_response(200, "OK", out)
+            }
+            Err(e) => text_response(403, "Forbidden", format!("DENIED {e}")),
+        },
+        (Some(collection), Some(key)) => match ctx.query_op(
+            &actor,
+            &pillar_ops::QueryOp::Kv(pillar_ops::KvOp::Get { collection, key }),
+        ) {
+            Ok(hex) => text_response(200, "OK", format!("VALUE {hex}\n")),
+            Err(e) => text_response(404, "Not Found", format!("DENIED {e}")),
+        },
+    }
+}
+
+/// `GET /portal/data/doc?token=<session>&collection=<c>[&id=<i>[&field=<f>]]`
+/// — the Document Explore panel's read-only browse, over the SAME keyed store
+/// as [`dispatch_data_kv_browse`] and gated the identical way (a `DocOp` READ
+/// dispatched through [`WebAuthContext::query_op`]). `collection` is
+/// required (400 if absent — a document browse always scopes to one
+/// collection, unlike K/V's top-level `Collections` listing, since the
+/// keyed store has no cross-collection document index).
+///
+/// With `collection` only: lists that collection's live document ids (`ID
+/// <id>` per line). With `collection`+`id`: lists that document's live fields
+/// (`FIELD <name>` per line). With `collection`+`id`+`field`: returns that
+/// field's live value (`VALUE <value>`), or 404 if absent.
+fn dispatch_data_doc_browse(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let actor = session.subject.clone();
+    let Some(collection) = query_value(&request.path, "collection").map(str::to_owned) else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    let id = query_value(&request.path, "id").map(str::to_owned);
+    let field = query_value(&request.path, "field").map(str::to_owned);
+    match (id, field) {
+        (None, _) => match ctx.query_op(
+            &actor,
+            &pillar_ops::QueryOp::Doc(pillar_ops::DocOp::Ids { collection }),
+        ) {
+            Ok(body) => {
+                let mut out = String::new();
+                for line in body.lines() {
+                    out.push_str("ID ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                text_response(200, "OK", out)
+            }
+            Err(e) => text_response(403, "Forbidden", format!("DENIED {e}")),
+        },
+        (Some(id), None) => match ctx.query_op(
+            &actor,
+            &pillar_ops::QueryOp::Doc(pillar_ops::DocOp::Fields { collection, id }),
+        ) {
+            Ok(body) => {
+                let mut out = String::new();
+                for line in body.lines() {
+                    out.push_str("FIELD ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                text_response(200, "OK", out)
+            }
+            Err(e) => text_response(403, "Forbidden", format!("DENIED {e}")),
+        },
+        (Some(id), Some(field)) => match ctx.query_op(
+            &actor,
+            &pillar_ops::QueryOp::Doc(pillar_ops::DocOp::GetField {
+                collection,
+                id,
+                field,
+            }),
+        ) {
+            Ok(value) => text_response(200, "OK", format!("VALUE {value}\n")),
+            Err(e) => text_response(404, "Not Found", format!("DENIED {e}")),
+        },
+    }
+}
+
+/// `GET /portal/data/sql?token=<session>[&name=<view>]` — the SQL-view
+/// Explore panel's read-only browse, over the SAME keyed store + folded
+/// `pillar-sqlviews` layer, gated the identical way (a `SqlOp` READ dispatched
+/// through [`WebAuthContext::query_op`]).
+///
+/// With no `name`: lists every live view (`VIEW <name>` per line). With
+/// `name`: materializes that view's rows (`ROW <id>\t<field>=<value>,…` per
+/// line, the same tab-delimited rendering `pillar sql view` prints), or 404 if
+/// no such view.
+fn dispatch_data_sql_browse(ctx: &mut WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    let Some(session) = ctx.login_session_for(token).cloned() else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let actor = session.subject.clone();
+    let name = query_value(&request.path, "name").map(str::to_owned);
+    match name {
+        None => match ctx.query_op(&actor, &pillar_ops::QueryOp::Sql(pillar_ops::SqlOp::Views)) {
+            Ok(body) => {
+                let mut out = String::new();
+                for line in body.lines() {
+                    out.push_str("VIEW ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                text_response(200, "OK", out)
+            }
+            Err(e) => text_response(403, "Forbidden", format!("DENIED {e}")),
+        },
+        Some(name) => match ctx.query_op(&actor, &pillar_ops::QueryOp::Sql(pillar_ops::SqlOp::View { name })) {
+            Ok(body) => {
+                let mut out = String::new();
+                for line in body.lines() {
+                    out.push_str("ROW ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                text_response(200, "OK", out)
+            }
+            Err(e) => text_response(404, "Not Found", format!("DENIED {e}")),
+        },
+    }
 }
 
 fn dispatch_http(
