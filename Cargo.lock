@@ -3613,8 +3613,11 @@ dependencies = [
 name = "pillar-rbac"
 version = "0.1.0"
 dependencies = [
+ "pillar-coordination",
  "pillar-core",
  "pillar-crypto",
+ "pillar-sqlviews",
+ "pillar-streamdb",
  "pillar-wot-authority",
  "sha2",
 ]

@@ -11,6 +11,9 @@ description = "Single pure RBAC decider over the local materialized view: preced
 pillar-crypto = { path = "../pillar-crypto" }
 pillar-core = { path = "../pillar-core" }
 pillar-wot-authority = { path = "../pillar-wot-authority" }
+pillar-coordination = { path = "../pillar-coordination" }
+pillar-streamdb = { path = "../pillar-streamdb", default-features = false }
+pillar-sqlviews = { path = "../pillar-sqlviews" }
 
 [dev-dependencies]
 sha2 = "0.10"

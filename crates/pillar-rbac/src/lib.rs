@@ -67,11 +67,16 @@ use pillar_wot_authority::WotAuthority;
 
 pub mod sealed_secret_store;
 pub mod key_export;
+pub mod document_sql_migration;
 pub use key_export::{
     authorize_key_export, cell_key_export_capability, key_export_step_up_policy,
     CELL_KEY_EXPORT_CAPABILITY, KEY_EXPORT_STEP_UP_MAX_AGE_SECS,
 };
 pub use sealed_secret_store::{SecretId, SecretRequestError, SecretStore};
+pub use document_sql_migration::{
+    acquire_revoke_epoch, effective_grants, ensure_effective_grants_view, grant_key, put_grant, revoke_grant,
+    EFFECTIVE_GRANTS_VIEW, GRANTS_COLLECTION,
+};
 
 /// One specific, named action the decider may allow or deny.
 ///
