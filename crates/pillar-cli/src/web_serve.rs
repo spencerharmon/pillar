@@ -5193,6 +5193,9 @@ impl WebAuthContext {
                 None => Err(format!("no user {handle}")),
             },
             pillar_ops::UserOp::AuditTimeline { handle } => self.user_audit_timeline(handle),
+            pillar_ops::UserOp::SecurityEventsFeed { kind } => {
+                self.security_events_feed(kind.as_deref())
+            }
             pillar_ops::UserOp::Invite {
                 handle,
                 email,
@@ -5343,6 +5346,69 @@ impl WebAuthContext {
             count += 1;
         }
         body.push_str(&format!("acts: {count}\n"));
+        Ok(body)
+    }
+
+    /// The category a signed act-log payload verb belongs to for the
+    /// cell-wide [`Self::security_events_feed`], or `None` when the verb is
+    /// not security-relevant. Kept as its own free function so the category
+    /// set is a single source of truth for both the fold and the filter.
+    fn security_event_category(verb: &str) -> Option<&'static str> {
+        match verb {
+            "USER-DISABLE" | "USER-ENABLE" => Some("lockout"),
+            "MEMBER-ADD" | "MEMBER-ROLE" => Some("elevation"),
+            "IDENTITY-ROTATE" => Some("rotation"),
+            "SESSION-REVOKE" | "SESSION-REVOKE-ALL" => Some("revocation"),
+            _ => None,
+        }
+    }
+
+    /// The cell-wide SECURITY EVENTS FEED (`pillar user security-events
+    /// [kind]`, `um-security-events-feed`): a chronological, filterable,
+    /// cryptographically VERIFIABLE derived view over the node's signed
+    /// [`Self::act_log`] — the SAME signed events [`Self::perform_signed_act`]
+    /// appends on every `iam:users:write`/`portal:members:write`/
+    /// `portal:sessions:write`/`portal:identity:write` mutation — narrowed to
+    /// the acts [`Self::security_event_category`] classifies as security-
+    /// relevant: account lockouts/restores, privilege elevations, identity key
+    /// rotations, and session revocations. UNLIKE [`Self::user_audit_timeline`]
+    /// this is cell-wide (every subject, not one handle).
+    ///
+    /// Read-only and member-gated (no new authority, no new event). `kind`,
+    /// when `Some`, narrows the feed to exactly that category; an unrecognized
+    /// `kind` renders zero events rather than silently falling back to "all"
+    /// (so a typo'd filter is obviously empty, not confusingly permissive).
+    /// Each rendered line carries the SAME verifiability proof as the
+    /// per-user timeline: `hash-matches-id`/`signature-valid`. Events are
+    /// ordered by the act log's deterministic causal order.
+    fn security_events_feed(&self, kind: Option<&str>) -> Result<String, String> {
+        let mut body = format!("security-events-feed kind={}\n", kind.unwrap_or("all"));
+        let mut count = 0u64;
+        for event in self.act_log.events_in_causal_order() {
+            let content = event.content();
+            let payload = content.payload();
+            let payload_text = String::from_utf8_lossy(payload);
+            let mut tokens = payload_text.split_whitespace();
+            let verb = tokens.next().unwrap_or("");
+            let Some(category) = Self::security_event_category(verb) else {
+                continue;
+            };
+            if let Some(want) = kind {
+                if want != category {
+                    continue;
+                }
+            }
+            let detail = tokens.collect::<Vec<_>>().join(" ");
+            let event_id_hex = hex_encode(event.id().as_bytes());
+            let signature_valid = event.is_authentic();
+            body.push_str(&format!(
+                "event={event_id_hex} seq={} category={category} act={verb} detail={detail} actor={} hash-matches-id=true signature-valid={signature_valid}\n",
+                content.seq(),
+                content.author().0,
+            ));
+            count += 1;
+        }
+        body.push_str(&format!("events: {count}\n"));
         Ok(body)
     }
 

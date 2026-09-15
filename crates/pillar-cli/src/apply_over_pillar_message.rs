@@ -535,12 +535,15 @@ pub fn send_control_op(op: &pillar_ops::ControlOp) -> Result<(String, TransportK
 }
 
 /// Send a control op and unwrap its ack to the payload text, mapping an `ERR`
-/// ack to `Err`. Mirrors [`read_op`] for the control-op class.
+/// ack to `Err`. Mirrors [`read_op`] for the control-op class. `pub` so
+/// acceptance tests (e.g. `um-security-events-feed`) can drive an arbitrary
+/// [`pillar_ops::ControlOp`] (members/session/identity acts) over the real
+/// remote surface, the same way [`user_op`] does for [`pillar_ops::UserOp`].
 ///
 /// # Errors
 /// A transport error string, or the node's refusal reason (unauthorized signer,
 /// not-found, …) with the `ERR ` prefix stripped.
-fn control_op(op: &pillar_ops::ControlOp) -> Result<String, String> {
+pub fn control_op(op: &pillar_ops::ControlOp) -> Result<String, String> {
     let (ack, _tier) = send_control_op(op).map_err(|e| e.to_string())?;
     if let Some(payload) = ack.strip_prefix("OK ") {
         Ok(payload.to_owned())
@@ -934,7 +937,8 @@ pub fn identity(args: &[String]) -> ExitCode {
     print_view(control_op(&pillar_ops::ControlOp::Identity(op)), "identity")
 }
 
-/// `pillar user {ls | show <handle> | invite <handle> <email> [--password <p>]
+/// `pillar user {ls | show <handle> | audit <handle> | security-events [kind]
+/// | invite <handle> <email> [--password <p>]
 /// [--no-force-change] [--require-passkey] | disable <handle> | enable <handle>
 /// | require-change <handle> | set-password <handle> <password> [--force]}`:
 /// IAM user views + lifecycle acts over pillar-message.
@@ -955,6 +959,9 @@ pub fn user(args: &[String]) -> ExitCode {
         Some("audit") | Some("timeline") => match args.get(1) {
             Some(h) => pillar_ops::UserOp::AuditTimeline { handle: h.clone() },
             None => return user_usage(),
+        },
+        Some("security-events") => pillar_ops::UserOp::SecurityEventsFeed {
+            kind: args.get(1).cloned(),
         },
         Some("invite") => match (args.get(1), args.get(2)) {
             (Some(handle), Some(email)) => pillar_ops::UserOp::Invite {
@@ -1580,7 +1587,8 @@ pub fn log(args: &[String]) -> ExitCode {
 
 fn user_usage() -> ExitCode {
     eprintln!(
-        "usage: pillar user {{ls | show <handle> | invite <handle> <email> \
+        "usage: pillar user {{ls | show <handle> | audit <handle> | \
+         security-events [kind] | invite <handle> <email> \
          [--password <p>] [--no-force-change] [--require-passkey] | disable <handle> | \
          enable <handle> | require-change <handle> | set-password <handle> <password> \
          [--force]}}"
