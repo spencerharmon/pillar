@@ -73,6 +73,9 @@ pub enum Section {
     ResourceSets,
     /// The five-signal observability console.
     Observability,
+    /// The data-query Explore console: K/V, Document, and SQL-view browse
+    /// panels over the live `WebAuthContext::keyed_store` substrate.
+    Explore,
     /// Failure-domain / topology explorer.
     Topology,
     /// The signed-in user's OWN account hub: a single tabbed page over the
@@ -109,12 +112,13 @@ pub enum Section {
 impl Section {
     /// Every section in canonical (sidebar) order.
     #[must_use]
-    pub const fn all() -> [Section; 17] {
+    pub const fn all() -> [Section; 18] {
         [
             Section::Overview,
             Section::Resources,
             Section::ResourceSets,
             Section::Observability,
+            Section::Explore,
             Section::Topology,
             Section::Account,
             Section::Identity,
@@ -141,6 +145,7 @@ impl Section {
             Section::Resources => "/resources",
             Section::ResourceSets => "/resource-sets",
             Section::Observability => "/observability",
+            Section::Explore => "/explore",
             Section::Topology => "/topology",
             Section::Account => "/account",
             Section::Identity => "/identity",
@@ -165,6 +170,7 @@ impl Section {
             Section::Resources => "Resources",
             Section::ResourceSets => "Resource Sets",
             Section::Observability => "Observability",
+            Section::Explore => "Explore",
             Section::Topology => "Topology",
             Section::Account => "Account",
             Section::Identity => "Identity",
@@ -190,6 +196,7 @@ impl Section {
             Section::Resources => "▣",
             Section::ResourceSets => "❖",
             Section::Observability => "∿",
+            Section::Explore => "⌕",
             Section::Topology => "⧉",
             Section::Account => "⚙",
             Section::Identity => "⬡",
@@ -213,6 +220,7 @@ impl Section {
             Section::Overview | Section::Resources => NavGroup::Compute,
             Section::ResourceSets => NavGroup::Compute,
             Section::Observability => NavGroup::Observability,
+            Section::Explore => NavGroup::Observability,
             Section::Topology => NavGroup::Topology,
             // The signed-in user's own account (self-service).
             Section::Account
@@ -256,6 +264,7 @@ mod yew_impl {
     use crate::attestation_custody_console::{AttestationWizard, CustodyWizard};
     use crate::auth::{use_auth, AuthAction};
     use crate::command_palette::CommandPalette;
+    use crate::data_explore::ExploreDataConsole;
     use crate::iam_console::{AccountHub, OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile};
     use crate::obs_console::ObservabilityConsole;
     use crate::overview::OverviewConsole;
@@ -381,6 +390,7 @@ mod yew_impl {
                     <ObservabilityTile />
                 </>
             },
+            Section::Explore => html! { <ExploreDataConsole /> },
             Section::Topology => html! { <TopologyConsole /> },
             Section::Account => html! { <AccountHub /> },
             Section::Identity => html! { <IdentityTile /> },
@@ -413,6 +423,7 @@ mod yew_impl {
             Section::Resources => Route::Resources,
             Section::ResourceSets => Route::ResourceSets,
             Section::Observability => Route::Observability,
+            Section::Explore => Route::Explore,
             Section::Topology => Route::Topology,
             Section::Account => Route::Account,
             Section::Identity => Route::Identity,

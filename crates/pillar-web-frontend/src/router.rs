@@ -63,6 +63,10 @@ pub enum Route {
     /// The five-signal observability console.
     #[cfg_attr(feature = "yew", at("/observability"))]
     Observability,
+    /// The data-query Explore console: K/V, Document, and SQL-view browse
+    /// panels over the live `WebAuthContext::keyed_store` substrate.
+    #[cfg_attr(feature = "yew", at("/explore"))]
+    Explore,
     /// Failure-domain / topology explorer.
     #[cfg_attr(feature = "yew", at("/topology"))]
     Topology,
@@ -129,6 +133,7 @@ impl Route {
                 | Route::ResourceSets
                 | Route::ResourceDetail { .. }
                 | Route::Observability
+                | Route::Explore
                 | Route::Topology
                 | Route::Account
                 | Route::Identity
@@ -158,6 +163,7 @@ impl Route {
             Route::Resources => Section::Resources,
             Route::ResourceSets => Section::ResourceSets,
             Route::Observability => Section::Observability,
+            Route::Explore => Section::Explore,
             Route::Topology => Section::Topology,
             Route::Account => Section::Account,
             Route::Identity => Section::Identity,

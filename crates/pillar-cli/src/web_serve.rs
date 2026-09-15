@@ -6108,6 +6108,53 @@ pub static ROUTES: &[RouteSpec] = &[
         path: PathMatch::Exact("/portal/swarm/generate"),
         handler: dispatch_swarm_generate,
     },
+    // --- Data-query Explore panels (K/V browse, Document browse, SQL-view
+    // panel) — read-only portal routes over the SAME live
+    // `WebAuthContext::keyed_store` substrate the `pillar kv`/`pillar doc`/
+    // `pillar sql` query-tier CLI verbs already read (see
+    // `data_query_tier_remote_surface`). These views sign nothing and never
+    // mutate the store — the query tier stays the one authoritative path for
+    // writes (`pillar_message`/resource-op pillar-UDP).
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/kv/collections"),
+        handler: |ctx, _peer, request| dispatch_data_kv_collections(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/kv/keys"),
+        handler: |ctx, _peer, request| dispatch_data_kv_keys(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/kv/get"),
+        handler: |ctx, _peer, request| dispatch_data_kv_get(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/doc/ids"),
+        handler: |ctx, _peer, request| dispatch_data_doc_ids(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/doc/fields"),
+        handler: |ctx, _peer, request| dispatch_data_doc_fields(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/doc/get"),
+        handler: |ctx, _peer, request| dispatch_data_doc_get(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/sql/views"),
+        handler: |ctx, _peer, request| dispatch_data_sql_views(ctx, request),
+    },
+    RouteSpec {
+        method: "GET",
+        path: PathMatch::Exact("/portal/data/sql/view"),
+        handler: |ctx, _peer, request| dispatch_data_sql_view(ctx, request),
+    },
 ];
 
 /// The real, currently-served HTTP route table — the exact data
@@ -6172,6 +6219,141 @@ fn dispatch_swarm_generate(
     )
 }
 
+/// Require an admitted session for a `GET .../portal/data/*` browse route,
+/// reading the `token` query param. Returns the 401 response to short-circuit
+/// with on failure.
+fn require_data_session(ctx: &WebAuthContext, request: &HttpRequest) -> Result<(), HttpResponse> {
+    let token = query_value(&request.path, "token").unwrap_or("");
+    if ctx.login_session_for(token).is_none() {
+        return Err(text_response(
+            401,
+            "Unauthorized",
+            "DENIED not-authenticated".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// `GET /portal/data/kv/collections?token=<s>` — the K/V Explore panel's list
+/// of every live-or-tombstoned collection in the keyed store. A VIEW: reads
+/// the SAME `WebAuthContext::keyed_store` the `pillar kv collections`
+/// query-tier verb reads; signs nothing.
+fn dispatch_data_kv_collections(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    text_response(200, "OK", join_lines(ctx.keyed_store.collections()))
+}
+
+/// `GET /portal/data/kv/keys?token=<s>&collection=<c>` — the live keys in one
+/// K/V collection (one per line).
+fn dispatch_data_kv_keys(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    let Some(collection) = query_value(&request.path, "collection") else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    text_response(200, "OK", join_lines(ctx.keyed_store.kv_keys(collection)))
+}
+
+/// `GET /portal/data/kv/get?token=<s>&collection=<c>&key=<k>` — the live
+/// value at `key` (lowercase hex, matching the `pillar kv get` query-tier
+/// verb's wire framing), or 404 if the key has no live value.
+fn dispatch_data_kv_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    let Some(collection) = query_value(&request.path, "collection") else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    let Some(key) = query_value(&request.path, "key") else {
+        return text_response(400, "Bad Request", "MISSING key".to_owned());
+    };
+    match ctx.keyed_store.kv_get(collection, key) {
+        Some(v) => text_response(200, "OK", hex_encode_bytes(&v)),
+        None => text_response(404, "Not Found", "DENIED no-live-key".to_owned()),
+    }
+}
+
+/// `GET /portal/data/doc/ids?token=<s>&collection=<c>` — the live document ids
+/// in one Document collection (one per line).
+fn dispatch_data_doc_ids(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    let Some(collection) = query_value(&request.path, "collection") else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    text_response(200, "OK", join_lines(ctx.keyed_store.doc_ids(collection)))
+}
+
+/// `GET /portal/data/doc/fields?token=<s>&collection=<c>&id=<i>` — the live
+/// field names on one document (one per line).
+fn dispatch_data_doc_fields(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    let Some(collection) = query_value(&request.path, "collection") else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    let Some(id) = query_value(&request.path, "id") else {
+        return text_response(400, "Bad Request", "MISSING id".to_owned());
+    };
+    text_response(200, "OK", join_lines(ctx.keyed_store.doc_fields(collection, id)))
+}
+
+/// `GET /portal/data/doc/get?token=<s>&collection=<c>&id=<i>&field=<f>` — the
+/// live value of one document field, or 404 if it has no live value.
+fn dispatch_data_doc_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    let Some(collection) = query_value(&request.path, "collection") else {
+        return text_response(400, "Bad Request", "MISSING collection".to_owned());
+    };
+    let Some(id) = query_value(&request.path, "id") else {
+        return text_response(400, "Bad Request", "MISSING id".to_owned());
+    };
+    let Some(field) = query_value(&request.path, "field") else {
+        return text_response(400, "Bad Request", "MISSING field".to_owned());
+    };
+    match ctx.keyed_store.doc_query(collection, id, field) {
+        Some(v) => text_response(200, "OK", render_value(&v)),
+        None => text_response(404, "Not Found", "DENIED no-live-field".to_owned()),
+    }
+}
+
+/// `GET /portal/data/sql/views?token=<s>` — the SQL-view panel's list of every
+/// declared materialized view (one name per line).
+fn dispatch_data_sql_views(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    text_response(
+        200,
+        "OK",
+        join_lines(pillar_sqlviews::list_views(&ctx.keyed_store)),
+    )
+}
+
+/// `GET /portal/data/sql/view?token=<s>&name=<n>` — materializes one SQL view
+/// over the LIVE source collection (folding the real keyed-store events),
+/// rendering `<id>\t<field>=<value>,…` per row — exactly the `pillar sql view`
+/// query-tier verb's rendering. 404 if no such view is declared.
+fn dispatch_data_sql_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_data_session(ctx, request) {
+        return resp;
+    }
+    let Some(name) = query_value(&request.path, "name") else {
+        return text_response(400, "Bad Request", "MISSING name".to_owned());
+    };
+    match pillar_sqlviews::materialize_view(&ctx.keyed_store, name) {
+        Some(rows) => text_response(200, "OK", render_rows(&rows)),
+        None => text_response(404, "Not Found", "DENIED no-such-view".to_owned()),
+    }
+}
+
 fn dispatch_http(
     ctx: &mut WebAuthContext,
     peer: &SocketAddr,
@@ -6227,6 +6409,7 @@ fn is_spa_route(path: &str) -> bool {
             | "/overview"
             | "/resources"
             | "/observability"
+            | "/explore"
             | "/topology"
             | "/identity"
             | "/members"
@@ -9295,6 +9478,7 @@ mod tests {
             "/overview",
             "/resources",
             "/observability",
+            "/explore",
             "/topology",
             "/identity",
             "/members",
@@ -13681,6 +13865,162 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Data-query Explore panels (K/V, Document, SQL-view browse routes) --
+    // read-only views over the SAME live `keyed_store` the `pillar kv`/
+    // `pillar doc`/`pillar sql` query-tier CLI verbs read (see
+    // `data_query_tier_remote_surface`). Seeds the store DIRECTLY (bypassing
+    // the query tier's own signing gate, which is proven elsewhere) so these
+    // tests isolate the portal browse routes' own behavior.
+    #[test]
+    fn data_explore_kv_panel_lists_live_collections_keys_and_values() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let actor = NodeId::from("owner");
+        let hlc = ctx.next_keyed_hlc(&actor);
+        ctx.keyed_store
+            .kv_put("config", "greeting", b"hello".to_vec(), hlc);
+        let hlc2 = ctx.next_keyed_hlc(&actor);
+        ctx.keyed_store
+            .kv_put("config", "farewell", b"bye".to_vec(), hlc2);
+
+        // Unauthenticated is refused.
+        assert_eq!(get(&mut ctx, "/portal/data/kv/collections").status, 401);
+
+        let cols = get(&mut ctx, &format!("/portal/data/kv/collections?token={token}"));
+        assert_eq!(cols.status, 200, "got: {}", cols.body);
+        assert!(cols.body.lines().any(|c| c == "config"), "got: {}", cols.body);
+
+        let keys = get(
+            &mut ctx,
+            &format!("/portal/data/kv/keys?token={token}&collection=config"),
+        );
+        assert_eq!(keys.status, 200, "got: {}", keys.body);
+        assert!(keys.body.contains("greeting"), "got: {}", keys.body);
+        assert!(keys.body.contains("farewell"), "got: {}", keys.body);
+
+        let value = get(
+            &mut ctx,
+            &format!("/portal/data/kv/get?token={token}&collection=config&key=greeting"),
+        );
+        assert_eq!(value.status, 200, "got: {}", value.body);
+        assert_eq!(value.body.trim(), hex_encode(b"hello"), "got: {}", value.body);
+
+        let missing = get(
+            &mut ctx,
+            &format!("/portal/data/kv/get?token={token}&collection=config&key=nope"),
+        );
+        assert_eq!(missing.status, 404, "got: {}", missing.body);
+
+        let missing_collection = get(
+            &mut ctx,
+            &format!("/portal/data/kv/keys?token={token}"),
+        );
+        assert_eq!(
+            missing_collection.status, 400,
+            "collection is required: {}",
+            missing_collection.body
+        );
+    }
+
+    #[test]
+    fn data_explore_doc_panel_lists_live_ids_fields_and_values() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let actor = NodeId::from("owner");
+        for (id, name) in [("u1", "alice"), ("u2", "bob")] {
+            let hlc = ctx.next_keyed_hlc(&actor);
+            ctx.keyed_store.doc_put_field(
+                "users",
+                id,
+                "name",
+                pillar_keyedstore::Value::Scalar(name.as_bytes().to_vec()),
+                hlc,
+            );
+        }
+
+        assert_eq!(
+            get(&mut ctx, "/portal/data/doc/ids?token=nope&collection=users").status,
+            401
+        );
+
+        let ids = get(&mut ctx, &format!("/portal/data/doc/ids?token={token}&collection=users"));
+        assert_eq!(ids.status, 200, "got: {}", ids.body);
+        assert!(ids.body.contains("u1"), "got: {}", ids.body);
+        assert!(ids.body.contains("u2"), "got: {}", ids.body);
+
+        let fields = get(
+            &mut ctx,
+            &format!("/portal/data/doc/fields?token={token}&collection=users&id=u1"),
+        );
+        assert_eq!(fields.status, 200, "got: {}", fields.body);
+        assert!(fields.body.contains("name"), "got: {}", fields.body);
+
+        let value = get(
+            &mut ctx,
+            &format!("/portal/data/doc/get?token={token}&collection=users&id=u1&field=name"),
+        );
+        assert_eq!(value.status, 200, "got: {}", value.body);
+        assert_eq!(value.body.trim(), "alice", "got: {}", value.body);
+
+        let missing = get(
+            &mut ctx,
+            &format!("/portal/data/doc/get?token={token}&collection=users&id=u1&field=nope"),
+        );
+        assert_eq!(missing.status, 404, "got: {}", missing.body);
+    }
+
+    #[test]
+    fn data_explore_sql_panel_lists_views_and_materializes_live_rows() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        let token = login_alice(&mut ctx);
+        let actor = NodeId::from("owner");
+        for (id, name, status) in [("u1", "alice", "on"), ("u2", "bob", "off")] {
+            let hlc = ctx.next_keyed_hlc(&actor);
+            ctx.keyed_store.doc_put_field(
+                "users",
+                id,
+                "name",
+                pillar_keyedstore::Value::Scalar(name.as_bytes().to_vec()),
+                hlc,
+            );
+            let hlc2 = ctx.next_keyed_hlc(&actor);
+            ctx.keyed_store.doc_put_field(
+                "users",
+                id,
+                "status",
+                pillar_keyedstore::Value::Scalar(status.as_bytes().to_vec()),
+                hlc2,
+            );
+        }
+        let mut def = pillar_sqlviews::ViewDef::over("users".to_owned());
+        def = def.filtered_eq("status".to_owned(), b"on".to_vec());
+        def = def.projecting(vec!["name".to_owned()]);
+        let hlc = ctx.next_keyed_hlc(&actor);
+        pillar_sqlviews::create_view(&mut ctx.keyed_store, "active_users", def, hlc);
+
+        assert_eq!(get(&mut ctx, "/portal/data/sql/views?token=nope").status, 401);
+
+        let views = get(&mut ctx, &format!("/portal/data/sql/views?token={token}"));
+        assert_eq!(views.status, 200, "got: {}", views.body);
+        assert!(views.body.contains("active_users"), "got: {}", views.body);
+
+        let rows = get(
+            &mut ctx,
+            &format!("/portal/data/sql/view?token={token}&name=active_users"),
+        );
+        assert_eq!(rows.status, 200, "got: {}", rows.body);
+        assert!(rows.body.contains("u1"), "got: {}", rows.body);
+        assert!(!rows.body.contains("u2"), "excludes off row: {}", rows.body);
+        assert!(rows.body.contains("name=alice"), "got: {}", rows.body);
+
+        let missing_view = get(
+            &mut ctx,
+            &format!("/portal/data/sql/view?token={token}&name=no-such-view"),
+        );
+        assert_eq!(missing_view.status, 404, "got: {}", missing_view.body);
+    }
+
+    // ---------------------------------------------------------------------
     // Per-feature UI CONFIRMATION suite (one test per banked `ui-*` task).
     //
     // Retargeted (yew-panel-migration) off the static `web_login.html`
@@ -13694,6 +14034,7 @@ mod tests {
     // enough -- each test asserts the ACTUAL Yew build's wasm binary
     // contains the feature's `/portal/*`/`/bootstrap/*` endpoint path. Not
     // fakeable with a dead `<div>`: the fetch URL literal only ends up in the
+
     // compiled wasm if a real tile fetch wires it
     // (`crates/pillar-web-frontend/src/portal.rs`).
     // ---------------------------------------------------------------------
@@ -13913,6 +14254,23 @@ mod tests {
     #[test]
     fn ui_confirms_swarm_panel() {
         assert_ui_wires("swarm", &["/portal/swarm", "/portal/swarm/generate"]);
+    }
+
+    #[test]
+    fn ui_confirms_data_query_explore_panels() {
+        assert_ui_wires(
+            "data-query-explore-panels",
+            &[
+                "/portal/data/kv/collections",
+                "/portal/data/kv/keys",
+                "/portal/data/kv/get",
+                "/portal/data/doc/ids",
+                "/portal/data/doc/fields",
+                "/portal/data/doc/get",
+                "/portal/data/sql/views",
+                "/portal/data/sql/view",
+            ],
+        );
     }
 
     #[test]
