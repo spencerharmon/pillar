@@ -82,19 +82,19 @@ pub static VERBS: &[VerbSpec] = &[
     },
     VerbSpec {
         name: "trust",
-        handler: identity_trust,
+        handler: |_v, args| crate::apply_over_pillar_message::trust(args),
     },
     VerbSpec {
         name: "attest",
-        handler: identity_trust,
+        handler: |_v, args| crate::apply_over_pillar_message::attest(args),
     },
     VerbSpec {
         name: "grant",
-        handler: identity_trust,
+        handler: |_v, args| crate::apply_over_pillar_message::grant(args),
     },
     VerbSpec {
         name: "caps",
-        handler: identity_trust,
+        handler: |_v, args| crate::apply_over_pillar_message::caps(args),
     },
     VerbSpec {
         name: "revoke",

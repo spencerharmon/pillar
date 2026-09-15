@@ -359,6 +359,11 @@ pub struct WebAuthContext {
     /// (the `owner` `WebAuthContext::new` was constructed with), which
     /// unconditionally holds every capacity.
     trust: TrustStore,
+    /// The explicit ALLOW/DENY grant set backing `pillar grant add|rm|check|
+    /// who-can` and `pillar caps` — the SAME `Vec<ExplicitGrant>` the shared
+    /// [`RbacDecider`] every signed act routes through consults, so a
+    /// wire-issued grant and a web-issued one land in one authority source.
+    grants: Vec<pillar_rbac::ExplicitGrant>,
     /// The key & offer UI's substrate (ROI "Web portal / UI rework": custody
     /// migration, rotation, seal/escrow, revoke) — a signed act per
     /// operation, keyed by handle. No server-side database: this is an
@@ -1066,6 +1071,7 @@ impl WebAuthContext {
             session_registry: SessionRegistry::new(),
             session_clock: 0,
             trust: TrustStore::new(owner_for_trust),
+            grants: Vec::new(),
             custody: BTreeMap::new(),
             act_log: EventLog::new(),
             resource_platform,
@@ -3753,6 +3759,197 @@ impl WebAuthContext {
             pillar_ops::ControlOp::Identity(i) => self.identity_op(actor, i),
             pillar_ops::ControlOp::User(u) => self.user_op(actor, u),
             pillar_ops::ControlOp::Cluster(c) => self.cluster_op(actor, c),
+            pillar_ops::ControlOp::Trust(t) => self.trust_op(actor, t),
+        }
+    }
+
+    /// Serve a [`pillar_ops::TrustOp`] over the control-op tier. `Audit`/
+    /// `GrantCheck`/`WhoCan`/`Caps`/`Path` are member-gated VIEWS (routed
+    /// through the SAME `RbacDecider`/trust walk every act consults); `Edge`/
+    /// `AttestBuild`/`GrantAdd`/`GrantRm` are capability-gated signed acts
+    /// (`perform_signed_act`) that mutate the node's live WoT authority, trust
+    /// store, and explicit-grant set respectively — the SAME substrate the web
+    /// trust/attestation panels drive.
+    fn trust_op(&mut self, actor: &NodeId, op: &pillar_ops::TrustOp) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            // ---- VIEWS ----
+            pillar_ops::TrustOp::Path { subject } => {
+                let node = NodeId::from(subject.as_str());
+                Ok(match self.authority.reachable_depth(&node) {
+                    Some(d) => format!("DEPTH {d}"),
+                    None => "UNREACHABLE".to_owned(),
+                })
+            }
+            pillar_ops::TrustOp::Audit { cid } => match self.trust.verify(&TrustCid(cid.clone())) {
+                Ok(proof) => {
+                    let mut body = format!("SENTENCE {}\n", proof.sentence);
+                    for c in &proof.chain {
+                        body.push_str(&format!("CHAIN {}\n", c.0));
+                    }
+                    Ok(body)
+                }
+                Err(e) => Err(format!("DENIED {e:?}")),
+            },
+            pillar_ops::TrustOp::GrantCheck {
+                subject,
+                capability,
+            } => {
+                let decider = RbacDecider::new(&self.authority, &[], &self.grants);
+                let decision = decider.decide(&RbacRequest::new(
+                    NodeId::from(subject.as_str()),
+                    RbacCapability::from(capability.as_str()),
+                ));
+                Ok(match decision {
+                    Decision::Allow => "ALLOW".to_owned(),
+                    Decision::Deny => "DENY".to_owned(),
+                })
+            }
+            pillar_ops::TrustOp::WhoCan { capability } => {
+                let cap = RbacCapability::from(capability.as_str());
+                let mut body = String::new();
+                for g in &self.grants {
+                    if g.capability == cap && g.effect == pillar_rbac::GrantEffect::Allow {
+                        body.push_str(&format!("{}\n", g.subject.0));
+                    }
+                }
+                Ok(body)
+            }
+            pillar_ops::TrustOp::Caps {
+                subject,
+                candidates,
+            } => {
+                let decider = RbacDecider::new(&self.authority, &[], &self.grants);
+                let node = NodeId::from(subject.as_str());
+                let mut body = String::new();
+                for cand in candidates {
+                    let cap = RbacCapability::from(cand.as_str());
+                    if decider.decide(&RbacRequest::new(node.clone(), cap)) == Decision::Allow {
+                        body.push_str(&format!("{cand}\n"));
+                    }
+                }
+                Ok(body)
+            }
+            // ---- ACTS ----
+            pillar_ops::TrustOp::Edge { subject, depth } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "wot:edges:write",
+                        &format!("TRUST-EDGE {subject} depth {depth}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for wot:edges:write"))?;
+                self.authority
+                    .issue_edge(actor.clone(), NodeId::from(subject.as_str()), *depth);
+                Ok(format!("EDGE {subject} depth {depth} EVENT-CID {}", cid.0))
+            }
+            pillar_ops::TrustOp::AttestBuild {
+                issuer,
+                capacity,
+                authority,
+                subject,
+                action,
+                resource,
+                quota,
+                scope,
+            } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "trust:attest:write",
+                        &format!("ATTEST-BUILD subject {subject} action {action}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for trust:attest:write"))?;
+                let capacity = if capacity == "self" {
+                    TrustCapacity::SelfCap
+                } else if let Some((role, cap_scope)) = capacity.split_once('@') {
+                    TrustCapacity::Role {
+                        role: role.to_owned(),
+                        scope: cap_scope.to_owned(),
+                    }
+                } else {
+                    return Err("BAD capacity: expected `self` or `<role>@<scope>`".to_owned());
+                };
+                let authority_cid = if authority.is_empty() {
+                    None
+                } else {
+                    Some(TrustCid(authority.clone()))
+                };
+                match self.build_attestation(
+                    NodeId::from(issuer.as_str()),
+                    capacity,
+                    authority_cid,
+                    NodeId::from(subject.as_str()),
+                    action,
+                    resource,
+                    *quota,
+                    scope,
+                ) {
+                    Ok((attest_cid, proof)) => {
+                        let mut body = format!("CID {}\n", attest_cid.0);
+                        body.push_str(&format!("SENTENCE {}\n", proof.sentence));
+                        for c in &proof.chain {
+                            body.push_str(&format!("CHAIN {}\n", c.0));
+                        }
+                        body.push_str(&format!("EVENT-CID {}", cid.0));
+                        Ok(body)
+                    }
+                    Err(e) => Err(format!("DENIED {}", trust_error_reason(&e))),
+                }
+            }
+            pillar_ops::TrustOp::GrantAdd {
+                subject,
+                capability,
+                allow,
+            } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "rbac:grants:write",
+                        &format!("GRANT-ADD {subject} {capability} allow={allow}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for rbac:grants:write"))?;
+                let sub = NodeId::from(subject.as_str());
+                let cap = RbacCapability::from(capability.as_str());
+                self.grants
+                    .retain(|g| !(g.subject == sub && g.capability == cap));
+                self.grants.push(pillar_rbac::ExplicitGrant {
+                    subject: sub,
+                    capability: cap,
+                    effect: if *allow {
+                        pillar_rbac::GrantEffect::Allow
+                    } else {
+                        pillar_rbac::GrantEffect::Deny
+                    },
+                });
+                let eff = if *allow { "allow" } else { "deny" };
+                Ok(format!(
+                    "GRANTED {subject} {capability} {eff} EVENT-CID {}",
+                    cid.0
+                ))
+            }
+            pillar_ops::TrustOp::GrantRm {
+                subject,
+                capability,
+            } => {
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "rbac:grants:write",
+                        &format!("GRANT-RM {subject} {capability}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for rbac:grants:write"))?;
+                let sub = NodeId::from(subject.as_str());
+                let cap = RbacCapability::from(capability.as_str());
+                self.grants
+                    .retain(|g| !(g.subject == sub && g.capability == cap));
+                Ok(format!(
+                    "REMOVED {subject} {capability} EVENT-CID {}",
+                    cid.0
+                ))
+            }
         }
     }
 

@@ -575,6 +575,45 @@ mod tests {
     }
 
     #[test]
+    fn a_trust_op_from_an_unadmitted_signer_is_refused_fail_closed() {
+        let keys = ResourceOpServerKeys::derive(test_keys().0, test_keys().1);
+        let (cell, group) = test_keys();
+        let (signer, secret) =
+            principal_from_seed(&Seed::from_bytes(b"client-h".to_vec())).expect("principal");
+        let op = pillar_ops::ControlOp::Trust(pillar_ops::TrustOp::GrantAdd {
+            subject: "gid:alice".into(),
+            capability: "portal:members:write".into(),
+            allow: true,
+        });
+        let msg = seal_control_op(&op, &cell, &group, signer.signing, &secret.signing);
+        let reply = handle_datagram(
+            &msg.to_canonical_cbor().expect("encode"),
+            &Arc::new(Mutex::new(WebAuthContext::new(
+                "https://test",
+                pillar_core::NodeId::from("pillar-node"),
+                "secret",
+                pillar_core::NodeId::from("pillar-node"),
+                16,
+            ))),
+            &keys,
+        )
+        .expect("an ack is always produced for a decodable envelope");
+        let opened = CellSeal
+            .open(
+                &keys.group,
+                &reply.body_sealed,
+                &PillarMessage::header_aad(reply.visibility, &reply.cell),
+            )
+            .expect("open ack");
+        let Body::Control(text) = Body::from_canonical_cbor(&opened).expect("decode ack body")
+        else {
+            panic!("ack body must be Control");
+        };
+        let text = String::from_utf8(text).expect("utf8");
+        assert!(text.starts_with("ERR unauthorized"), "{text}");
+    }
+
+    #[test]
     fn signer_subject_is_a_pure_function_of_the_verified_pubkey() {
         let (cell, group) = test_keys();
         let (signer, secret) =

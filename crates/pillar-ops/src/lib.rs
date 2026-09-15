@@ -193,6 +193,102 @@ pub enum ControlOp {
     /// `pillar request …`) over the node's live request queue + topology
     /// registry.
     Cluster(ClusterOp),
+    /// Trust-artifact + explicit-grant management (`pillar attest|grant|caps|
+    /// trust …`) over the node's live trust store, WoT authority, and explicit
+    /// grant set — the SAME substrate the web trust/attestation panels drive.
+    Trust(TrustOp),
+}
+
+/// Trust-artifact + explicit-grant ops (`pillar attest|grant|caps|trust …`)
+/// over the node's live [`pillar_trust_artifacts::TrustStore`], WoT authority,
+/// and explicit grant set. `AttestBuild`/`GrantAdd`/`GrantRm`/`Edge` are signed
+/// acts (capacity-checked at signing time / capability-gated); `Audit`/
+/// `GrantCheck`/`WhoCan`/`Caps`/`Path` are member-gated VIEWS that route
+/// through the SAME `RbacDecider`/trust walk every act consults.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum TrustOp {
+    /// Install a WoT trust edge from the signer to `subject`, bounding onward
+    /// delegation at `depth` (`pillar trust <subject> --depth N`).
+    Edge {
+        /// The delegatee subject id.
+        subject: String,
+        /// The onward-delegation depth bound.
+        depth: u8,
+    },
+    /// Issue a capacity-checked attestation (`pillar attest …`). Capacity is
+    /// verified AT SIGNING TIME by the trust store — the issuer must currently
+    /// HOLD the declared capacity.
+    AttestBuild {
+        /// The issuing identity.
+        issuer: String,
+        /// The capacity spec: `self` or `<role>@<scope>`.
+        capacity: String,
+        /// An optional prior attest CID this one is authorized by.
+        authority: String,
+        /// The subject the claim is about.
+        subject: String,
+        /// The permitted action (attest predicate action).
+        action: String,
+        /// The resource the action applies to.
+        resource: String,
+        /// An optional quota budget (`--quota key=N` → the N).
+        quota: Option<u64>,
+        /// The scope the claim is bounded to.
+        scope: String,
+    },
+    /// Add an explicit ALLOW/DENY grant of `capability` to `subject`
+    /// (`pillar grant add <cap> --to <subject> [--allow|--deny]`).
+    GrantAdd {
+        /// The grantee subject id.
+        subject: String,
+        /// The capability string.
+        capability: String,
+        /// Allow (true) or deny (false).
+        allow: bool,
+    },
+    /// Remove any explicit grant for `(subject, capability)`
+    /// (`pillar grant rm <cap> --to <subject>`). Idempotent.
+    GrantRm {
+        /// The grantee subject id.
+        subject: String,
+        /// The capability string.
+        capability: String,
+    },
+    /// Verify an attestation's proof chain (`pillar audit <cid>`).
+    Audit {
+        /// The attest artifact content-address.
+        cid: String,
+    },
+    /// Ask the decider whether `subject` holds `capability`
+    /// (`pillar grant check <cap> --as <subject>`).
+    GrantCheck {
+        /// The subject to probe.
+        subject: String,
+        /// The capability string.
+        capability: String,
+    },
+    /// Every subject with an explicit ALLOW of `capability`
+    /// (`pillar grant who-can <cap>`).
+    WhoCan {
+        /// The capability string.
+        capability: String,
+    },
+    /// The effective ALLOW set the decider computes for `subject` across the
+    /// named `candidates` capability universe (`pillar caps <subject> --probe
+    /// <cap>…`).
+    Caps {
+        /// The subject to compute effective caps for.
+        subject: String,
+        /// The capability universe to probe.
+        candidates: Vec<String>,
+    },
+    /// The reachable trust depth from the authority root to `subject`
+    /// (`pillar trust path <subject>`).
+    Path {
+        /// The subject to resolve.
+        subject: String,
+    },
 }
 
 /// Portal-member management ops (`pillar member ls|add|role`). A `List` is a
@@ -553,6 +649,13 @@ impl ControlOp {
                 | ControlOp::Cluster(ClusterOp::NodesAt { .. })
                 | ControlOp::Cluster(ClusterOp::Domains)
                 | ControlOp::Cluster(ClusterOp::Members)
+                | ControlOp::Trust(
+                    TrustOp::Audit { .. }
+                        | TrustOp::GrantCheck { .. }
+                        | TrustOp::WhoCan { .. }
+                        | TrustOp::Caps { .. }
+                        | TrustOp::Path { .. },
+                )
         )
     }
 }
@@ -1322,6 +1425,67 @@ mod tests {
     }
 
     #[test]
+    fn control_op_trust_round_trip_and_classify() {
+        let acts = [
+            ControlOp::Trust(TrustOp::Edge {
+                subject: "gid:node-b".into(),
+                depth: 3,
+            }),
+            ControlOp::Trust(TrustOp::AttestBuild {
+                issuer: "gid:root".into(),
+                capacity: "role@acme".into(),
+                authority: String::new(),
+                subject: "gid:alice".into(),
+                action: "deploy".into(),
+                resource: "cell/acme".into(),
+                quota: Some(1000),
+                scope: "acme".into(),
+            }),
+            ControlOp::Trust(TrustOp::GrantAdd {
+                subject: "gid:alice".into(),
+                capability: "portal:members:write".into(),
+                allow: true,
+            }),
+            ControlOp::Trust(TrustOp::GrantRm {
+                subject: "gid:alice".into(),
+                capability: "portal:members:write".into(),
+            }),
+        ];
+        for op in &acts {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                *op
+            );
+            assert!(!op.is_read(), "trust acts are not reads: {op:?}");
+        }
+        for op in [
+            ControlOp::Trust(TrustOp::Audit {
+                cid: "1220ab".into(),
+            }),
+            ControlOp::Trust(TrustOp::GrantCheck {
+                subject: "gid:alice".into(),
+                capability: "portal:members:write".into(),
+            }),
+            ControlOp::Trust(TrustOp::WhoCan {
+                capability: "portal:members:write".into(),
+            }),
+            ControlOp::Trust(TrustOp::Caps {
+                subject: "gid:alice".into(),
+                candidates: vec!["portal:members:write".into(), "iam:users:write".into()],
+            }),
+            ControlOp::Trust(TrustOp::Path {
+                subject: "gid:alice".into(),
+            }),
+        ] {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "trust views are reads: {op:?}");
+        }
+    }
+
+    #[test]
     fn query_op_round_trips_and_classifies_read_vs_write() {
         let acts = [
             QueryOp::Kv(KvOp::Put {
@@ -1426,7 +1590,10 @@ mod tests {
                 cid_hex: "cc".into(),
             }),
         ] {
-            assert_eq!(QueryOp::decode(&op.encode().expect("encode")).expect("decode"), op);
+            assert_eq!(
+                QueryOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
             assert!(op.is_read(), "object view is a read: {op:?}");
         }
     }

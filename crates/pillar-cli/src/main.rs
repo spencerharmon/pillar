@@ -38,10 +38,10 @@ fn usage() -> &'static str {
      \x20 pillar user add|invite|rm|rename|suspend|resume|passwd|roles|attestations   cell members (identity_trust_cli::UserCli)\n\
      \x20 pillar key gen|fingerprint|label|custody|rotate|revoke|verify|export|import|escrow|recover   subkeys (identity_trust_cli::KeyCli)\n\
      \x20 pillar offer seal|escrow|resolve|revoke|status         operational-key offers (identity_trust_cli::OfferCli)\n\
-     \x20 pillar trust <id> [--depth N]|path|graph               WoT trust edges (identity_trust_cli::TrustCli)\n\
-     \x20 pillar attest --as <role>@<scope> --subject --allow --quota --in cell   authorization claims (identity_trust_cli::AttestCli)\n\
-     \x20 pillar grant add|rm|check(can-i)|who-can                explicit grants (identity_trust_cli::GrantCli)\n\
-     \x20 pillar caps [<user>]                                    effective capability set (identity_trust_cli::CapsCli)\n\
+     \x20 pillar trust <id> [--depth N]|path <id>                 WoT trust edges over pillar-message (no --token; signing key is the credential)\n\
+     \x20 pillar attest build --as <self|role@scope> --subject <id> --allow <action> <resource> [--quota key=N] --in <scope> | audit <cid>   capacity-checked attestations over pillar-message\n\
+     \x20 pillar grant add|rm <cap> --to <id> | check <cap> --as <id> | who-can <cap>   explicit ALLOW/DENY grants over pillar-message\n\
+     \x20 pillar caps <id> --probe <cap>…                          effective capability set over pillar-message\n\
      \x20 pillar revoke trust|grant|key|attest <ref>               authority-reducing acts (identity_trust_cli::RevokeCli)\n\
      \x20 pillar audit <cid>                                      proof chain + sentence (identity_trust_cli::AuditCli)\n\
      \x20 pillar describe <kind>/<name>             one resource + its envelope provenance, over pillar-message\n\

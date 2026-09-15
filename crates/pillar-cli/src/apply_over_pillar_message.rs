@@ -1614,6 +1614,202 @@ pub fn topology(args: &[String]) -> ExitCode {
     print_view(control_op(&pillar_ops::ControlOp::Cluster(op)), "topology")
 }
 
+/// `pillar trust {<subject> [--depth N] | path <subject>}`: install a WoT
+/// trust edge (act) or read the reachable trust depth (view), over
+/// pillar-message. The signing key is the credential (no `--token`).
+pub fn trust(args: &[String]) -> ExitCode {
+    let flag = |f: &str| {
+        args.iter()
+            .position(|a| a == f)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("path") => match args.get(1) {
+            Some(subject) => pillar_ops::TrustOp::Path {
+                subject: subject.clone(),
+            },
+            None => {
+                eprintln!("usage: pillar trust path <subject>");
+                return ExitCode::from(2);
+            }
+        },
+        Some(subject) if !subject.starts_with("--") => {
+            let depth = match flag("--depth") {
+                Some(d) => match d.parse::<u8>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("pillar trust: --depth must be a u8");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => 1,
+            };
+            pillar_ops::TrustOp::Edge {
+                subject: subject.to_string(),
+                depth,
+            }
+        }
+        _ => {
+            eprintln!("usage: pillar trust {{<subject> [--depth N] | path <subject>}}");
+            return ExitCode::from(2);
+        }
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Trust(op)), "trust")
+}
+
+/// `pillar attest {build --as <self|role@scope> --subject <id> --allow <action>
+/// <resource> [--authority <cid>] [--quota key=N] --in <scope> [--issuer <id>] |
+/// audit <cid>}`: issue a capacity-checked attestation (act) or verify an
+/// attest proof chain (view), over pillar-message.
+pub fn attest(args: &[String]) -> ExitCode {
+    let flag = |f: &str| {
+        args.iter()
+            .position(|a| a == f)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let usage = || {
+        eprintln!(
+            "usage: pillar attest {{build --as <self|role@scope> --subject <id> \
+             --allow <action> <resource> [--authority <cid>] [--quota key=N] \
+             --in <scope> [--issuer <id>] | audit <cid>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("audit") => match args.get(1) {
+            Some(cid) => pillar_ops::TrustOp::Audit { cid: cid.clone() },
+            None => return usage(),
+        },
+        Some("build") => {
+            let capacity = match flag("--as") {
+                Some(c) => c,
+                None => return usage(),
+            };
+            let subject = match flag("--subject") {
+                Some(s) => s,
+                None => return usage(),
+            };
+            let scope = match flag("--in") {
+                Some(s) => s,
+                None => return usage(),
+            };
+            // `--allow <action> <resource>`: the two tokens following --allow.
+            let (action, resource) = match args.iter().position(|a| a == "--allow") {
+                Some(i) => match (args.get(i + 1), args.get(i + 2)) {
+                    (Some(a), Some(r)) => (a.clone(), r.clone()),
+                    _ => return usage(),
+                },
+                None => return usage(),
+            };
+            let issuer = flag("--issuer").unwrap_or_else(|| subject.clone());
+            let authority = flag("--authority").unwrap_or_default();
+            let quota = match flag("--quota") {
+                Some(spec) => match spec
+                    .split_once('=')
+                    .and_then(|(_, n)| n.parse::<u64>().ok())
+                {
+                    Some(n) => Some(n),
+                    None => {
+                        eprintln!("pillar attest: --quota expects key=N (N a u64)");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => None,
+            };
+            pillar_ops::TrustOp::AttestBuild {
+                issuer,
+                capacity,
+                authority,
+                subject,
+                action,
+                resource,
+                quota,
+                scope,
+            }
+        }
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Trust(op)), "attest")
+}
+
+/// `pillar grant {add <cap> --to <subject> [--allow|--deny] | rm <cap> --to
+/// <subject> | check <cap> --as <subject> | who-can <cap>}`: explicit ALLOW/DENY
+/// grant acts + decider views over pillar-message.
+pub fn grant(args: &[String]) -> ExitCode {
+    let has = |f: &str| args.iter().any(|a| a == f);
+    let flag = |f: &str| {
+        args.iter()
+            .position(|a| a == f)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let usage = || {
+        eprintln!(
+            "usage: pillar grant {{add <cap> --to <subject> [--allow|--deny] | \
+             rm <cap> --to <subject> | check <cap> --as <subject> | who-can <cap>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("add") => match (args.get(1), flag("--to")) {
+            (Some(cap), Some(subject)) => pillar_ops::TrustOp::GrantAdd {
+                subject,
+                capability: cap.clone(),
+                allow: !has("--deny"),
+            },
+            _ => return usage(),
+        },
+        Some("rm") => match (args.get(1), flag("--to")) {
+            (Some(cap), Some(subject)) => pillar_ops::TrustOp::GrantRm {
+                subject,
+                capability: cap.clone(),
+            },
+            _ => return usage(),
+        },
+        Some("check") => match (args.get(1), flag("--as")) {
+            (Some(cap), Some(subject)) => pillar_ops::TrustOp::GrantCheck {
+                subject,
+                capability: cap.clone(),
+            },
+            _ => return usage(),
+        },
+        Some("who-can") => match args.get(1) {
+            Some(cap) => pillar_ops::TrustOp::WhoCan {
+                capability: cap.clone(),
+            },
+            None => return usage(),
+        },
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Trust(op)), "grant")
+}
+
+/// `pillar caps <subject> --probe <cap>…`: the effective ALLOW set the decider
+/// computes for `subject` across the named capability universe, over
+/// pillar-message (a view). The decider has no "list all capabilities"
+/// primitive, so the caller names the capabilities to probe.
+pub fn caps(args: &[String]) -> ExitCode {
+    let subject = match args.first() {
+        Some(s) if !s.starts_with("--") => s.clone(),
+        _ => {
+            eprintln!("usage: pillar caps <subject> --probe <cap>… (at least one --probe)");
+            return ExitCode::from(2);
+        }
+    };
+    let candidates = multi_flag(args, "--probe");
+    if candidates.is_empty() {
+        eprintln!("usage: pillar caps <subject> --probe <cap>… (at least one --probe)");
+        return ExitCode::from(2);
+    }
+    let op = pillar_ops::TrustOp::Caps {
+        subject,
+        candidates,
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Trust(op)), "caps")
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;
