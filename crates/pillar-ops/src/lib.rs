@@ -197,6 +197,90 @@ pub enum ControlOp {
     /// trust …`) over the node's live trust store, WoT authority, and explicit
     /// grant set — the SAME substrate the web trust/attestation panels drive.
     Trust(TrustOp),
+    /// IAM role / group / oauth-client management (`pillar role|group|oauth …`)
+    /// over the node's live role set, managed-group set, and OAuth client
+    /// registry — the SAME substrate the IAM admin panels drive.
+    Iam(IamOp),
+}
+
+/// IAM role / group / oauth-client ops (`pillar role|group|oauth …`) over the
+/// node's live role set, managed-group set, and OAuth client registry. `*Add`/
+/// `*Rm`/`AddMember`/`Register` are signed acts (gated on `iam:roles:write` /
+/// `iam:groups:write` / `iam:oauth:write`); `*List`/`*Show` are member-gated
+/// VIEWS.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum IamOp {
+    /// Create/replace a named capability set (`pillar role add <name> --grant
+    /// <cap>…`).
+    RoleAdd {
+        /// The role name.
+        name: String,
+        /// The capabilities the role grants.
+        capabilities: Vec<String>,
+    },
+    /// Remove a role (`pillar role rm <name>`).
+    RoleRm {
+        /// The role name.
+        name: String,
+    },
+    /// List every role (`pillar role list`).
+    RoleList,
+    /// Show one role's capabilities (`pillar role show <name>`).
+    RoleShow {
+        /// The role name.
+        name: String,
+    },
+    /// Create a managed group bound to `roles` (`pillar group add <name>
+    /// --role <r>…`).
+    GroupAdd {
+        /// The group name.
+        name: String,
+        /// The roles the group confers.
+        roles: Vec<String>,
+    },
+    /// Add a member handle to a group (`pillar group add-member <name>
+    /// <handle>`).
+    GroupAddMember {
+        /// The group name.
+        name: String,
+        /// The member handle to add.
+        handle: String,
+    },
+    /// Remove a group (`pillar group rm <name>`).
+    GroupRm {
+        /// The group name.
+        name: String,
+    },
+    /// List every group (`pillar group list`).
+    GroupList,
+    /// Show one group's roles + members (`pillar group show <name>`).
+    GroupShow {
+        /// The group name.
+        name: String,
+    },
+    /// Register an OAuth/OIDC client (`pillar oauth register <client-id>
+    /// --type <public|confidential> --redirect <uri>… --scope <s>… --grant
+    /// <g>…`).
+    OauthRegister {
+        /// The stable public client id.
+        client_id: String,
+        /// `public` or `confidential`.
+        client_type: String,
+        /// The redirect-URI allow-list.
+        redirect_uris: Vec<String>,
+        /// The permitted scopes.
+        scopes: Vec<String>,
+        /// The permitted grant-type tokens.
+        grants: Vec<String>,
+    },
+    /// List every registered client (`pillar oauth list`).
+    OauthList,
+    /// Show one client's registration (`pillar oauth show <client-id>`).
+    OauthShow {
+        /// The client id.
+        client_id: String,
+    },
 }
 
 /// Trust-artifact + explicit-grant ops (`pillar attest|grant|caps|trust …`)
@@ -655,6 +739,14 @@ impl ControlOp {
                         | TrustOp::WhoCan { .. }
                         | TrustOp::Caps { .. }
                         | TrustOp::Path { .. },
+                )
+                | ControlOp::Iam(
+                    IamOp::RoleList
+                        | IamOp::RoleShow { .. }
+                        | IamOp::GroupList
+                        | IamOp::GroupShow { .. }
+                        | IamOp::OauthList
+                        | IamOp::OauthShow { .. },
                 )
         )
     }
@@ -1495,6 +1587,60 @@ mod tests {
                 op
             );
             assert!(op.is_read(), "cluster views are reads: {op:?}");
+        }
+    }
+
+    #[test]
+    fn control_op_iam_round_trip_and_classify() {
+        let acts = [
+            ControlOp::Iam(IamOp::RoleAdd {
+                name: "deployer".into(),
+                capabilities: vec!["resource:apply".into(), "obs:read".into()],
+            }),
+            ControlOp::Iam(IamOp::RoleRm {
+                name: "deployer".into(),
+            }),
+            ControlOp::Iam(IamOp::GroupAdd {
+                name: "ops".into(),
+                roles: vec!["deployer".into()],
+            }),
+            ControlOp::Iam(IamOp::GroupAddMember {
+                name: "ops".into(),
+                handle: "alice".into(),
+            }),
+            ControlOp::Iam(IamOp::GroupRm { name: "ops".into() }),
+            ControlOp::Iam(IamOp::OauthRegister {
+                client_id: "portal".into(),
+                client_type: "public".into(),
+                redirect_uris: vec!["https://example.com/cb".into()],
+                scopes: vec!["openid".into()],
+                grants: vec!["authorization_code".into()],
+            }),
+        ];
+        for op in &acts {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                *op
+            );
+            assert!(!op.is_read(), "iam acts are not reads: {op:?}");
+        }
+        for op in [
+            ControlOp::Iam(IamOp::RoleList),
+            ControlOp::Iam(IamOp::RoleShow {
+                name: "deployer".into(),
+            }),
+            ControlOp::Iam(IamOp::GroupList),
+            ControlOp::Iam(IamOp::GroupShow { name: "ops".into() }),
+            ControlOp::Iam(IamOp::OauthList),
+            ControlOp::Iam(IamOp::OauthShow {
+                client_id: "portal".into(),
+            }),
+        ] {
+            assert_eq!(
+                ControlOp::decode(&op.encode().expect("encode")).expect("decode"),
+                op
+            );
+            assert!(op.is_read(), "iam views are reads: {op:?}");
         }
     }
 

@@ -1897,6 +1897,122 @@ pub fn caps(args: &[String]) -> ExitCode {
     print_view(control_op(&pillar_ops::ControlOp::Trust(op)), "caps")
 }
 
+/// `pillar role {add <name> --grant <cap>… | rm <name> | list | show <name>}`:
+/// named capability-set management over pillar-message. Acts gated on
+/// `iam:roles:write`; list/show are member-gated views.
+pub fn role(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar role {{add <name> --grant <cap>… | rm <name> | list | show <name>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("list") | None => pillar_ops::IamOp::RoleList,
+        Some("show") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::RoleShow { name: name.clone() },
+            None => return usage(),
+        },
+        Some("add") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::RoleAdd {
+                name: name.clone(),
+                capabilities: multi_flag(args, "--grant"),
+            },
+            None => return usage(),
+        },
+        Some("rm") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::RoleRm { name: name.clone() },
+            None => return usage(),
+        },
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Iam(op)), "role")
+}
+
+/// `pillar group {add <name> --role <r>… | add-member <name> <handle> | rm
+/// <name> | list | show <name>}`: managed-group membership over pillar-message.
+/// Acts gated on `iam:groups:write`; list/show are member-gated views.
+pub fn group(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: pillar group {{add <name> --role <r>… | add-member <name> <handle> | \
+             rm <name> | list | show <name>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("list") | None => pillar_ops::IamOp::GroupList,
+        Some("show") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::GroupShow { name: name.clone() },
+            None => return usage(),
+        },
+        Some("add") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::GroupAdd {
+                name: name.clone(),
+                roles: multi_flag(args, "--role"),
+            },
+            None => return usage(),
+        },
+        Some("add-member") => match (args.get(1), args.get(2)) {
+            (Some(name), Some(handle)) => pillar_ops::IamOp::GroupAddMember {
+                name: name.clone(),
+                handle: handle.clone(),
+            },
+            _ => return usage(),
+        },
+        Some("rm") => match args.get(1) {
+            Some(name) => pillar_ops::IamOp::GroupRm { name: name.clone() },
+            None => return usage(),
+        },
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Iam(op)), "group")
+}
+
+/// `pillar oauth {register <client-id> --type <public|confidential> --redirect
+/// <uri>… --scope <s>… --grant <g>… | list | show <client-id>}`: OAuth/OIDC
+/// client-registry management over pillar-message. Register gated on
+/// `iam:oauth:write`; list/show are member-gated views.
+pub fn oauth(args: &[String]) -> ExitCode {
+    let flag = |f: &str| {
+        args.iter()
+            .position(|a| a == f)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let usage = || {
+        eprintln!(
+            "usage: pillar oauth {{register <client-id> --type <public|confidential> \
+             --redirect <uri>… --scope <s>… --grant <g>… | list | show <client-id>}}"
+        );
+        ExitCode::from(2)
+    };
+    let op = match args.first().map(String::as_str) {
+        Some("list") | None => pillar_ops::IamOp::OauthList,
+        Some("show") => match args.get(1) {
+            Some(id) => pillar_ops::IamOp::OauthShow {
+                client_id: id.clone(),
+            },
+            None => return usage(),
+        },
+        Some("register") => match args.get(1) {
+            Some(id) => {
+                let client_type = flag("--type").unwrap_or_else(|| "public".to_owned());
+                pillar_ops::IamOp::OauthRegister {
+                    client_id: id.clone(),
+                    client_type,
+                    redirect_uris: multi_flag(args, "--redirect"),
+                    scopes: multi_flag(args, "--scope"),
+                    grants: multi_flag(args, "--grant"),
+                }
+            }
+            None => return usage(),
+        },
+        _ => return usage(),
+    };
+    print_view(control_op(&pillar_ops::ControlOp::Iam(op)), "oauth")
+}
+
 #[cfg(test)]
 mod resolve_tests {
     use super::resolve_addr;
