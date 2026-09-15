@@ -553,6 +553,30 @@ pub struct WebAuthContext {
     /// the SAME signed event DAG every `Kv`/`Doc`/`Sql`/`Object` write already
     /// appends to.
     log_index: BTreeMap<String, Vec<(EventId, pillar_keyedstore::Hlc)>>,
+    /// Open M-of-N break-glass recoveries, keyed by subject handle
+    /// (`um-mofn-breakglass-recovery-impl`, ROI P1 roadmap A4;
+    /// `specs/BreakGlassRecovery.tla`). Each entry records the declared quorum
+    /// threshold `m` and the SET of distinct currently-authoritative admins who
+    /// have co-signed an approval so far. A recovery FIRES (and its entry is
+    /// removed) only when the approver set first reaches `m` distinct admins,
+    /// at which point the subject's operational key is rotated + revoked and a
+    /// contained one-time credential minted (`iam_set_password(force=true)`).
+    /// A sub-quorum approval set never fires. In-process, exactly like every
+    /// other portal substrate here.
+    recoveries: BTreeMap<String, RecoveryQuorum>,
+}
+
+/// One open M-of-N break-glass recovery: the declared quorum threshold and the
+/// set of distinct admins who have co-signed so far. Mirrors
+/// `specs/BreakGlassRecovery.tla`'s per-subject approval accumulation — a
+/// completed recovery is one whose distinct-approver set reached `m`
+/// (`RecoveryNeedsQuorum` / `SubThresholdNeverRecovers`).
+#[derive(Debug, Clone, Default)]
+struct RecoveryQuorum {
+    /// The quorum threshold M (distinct fresh-admin approvals required).
+    m: u32,
+    /// The distinct admin handles that have co-signed this recovery so far.
+    approvers: std::collections::BTreeSet<String>,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -1169,6 +1193,7 @@ impl WebAuthContext {
             objects: crate::object_inspection::ObjectStore::new(),
             collection_placement: BTreeMap::new(),
             log_index: BTreeMap::new(),
+            recoveries: BTreeMap::new(),
         }
     }
 
@@ -3865,6 +3890,116 @@ impl WebAuthContext {
             pillar_ops::ControlOp::Cluster(c) => self.cluster_op(actor, c),
             pillar_ops::ControlOp::Trust(t) => self.trust_op(actor, t),
             pillar_ops::ControlOp::Iam(i) => self.iam_op(actor, i),
+            pillar_ops::ControlOp::Recovery(r) => self.recovery_op(actor, r),
+        }
+    }
+
+    /// Serve a [`pillar_ops::RecoveryOp`] over the control-op tier: M-of-N
+    /// quorum-authorized break-glass recovery of a locked-out user
+    /// (`um-mofn-breakglass-recovery-impl`, ROI P1 roadmap A4; model-checked by
+    /// `specs/BreakGlassRecovery.tla`). Both arms are signed acts gated on
+    /// `iam:users:write` (the SAME decider every admin user-mutation rides), so
+    /// no non-admin can open or approve a recovery. `Start` opens a recovery for
+    /// a locked-out subject and declares the quorum threshold `m`; each
+    /// `Approve` records the calling admin's distinct co-signature, and the Mth
+    /// DISTINCT approval FIRES the recovery — rotating + revoking the subject's
+    /// operational key and minting a CONTAINED one-time credential
+    /// (`iam_set_password(force=true)`), never regranting more than the
+    /// subject's prior authority. A sub-quorum approval set can never fire
+    /// (`SubThresholdNeverRecovers`): distinct approvers are counted before the
+    /// rotate/mint, exactly like the spec's `Cardinality(approvers) >= M` guard.
+    fn recovery_op(
+        &mut self,
+        actor: &NodeId,
+        op: &pillar_ops::RecoveryOp,
+    ) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            pillar_ops::RecoveryOp::Start { subject, m } => {
+                if *m == 0 {
+                    return Err("recovery quorum threshold m must be >= 1".to_owned());
+                }
+                if !self.iam_users().contains_key(subject) {
+                    return Err(format!("no user {subject}"));
+                }
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "iam:users:write",
+                        &format!("USER-RECOVERY-START {subject}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                self.index_user_audit_event(actor, subject, &cid);
+                // Idempotent re-open: never LOWER an already-declared threshold
+                // under an in-flight recovery (a sub-quorum can never sneak in by
+                // re-opening with a smaller m).
+                let entry = self.recoveries.entry(subject.clone()).or_default();
+                if entry.m < *m {
+                    entry.m = *m;
+                }
+                let have = entry.approvers.len();
+                let need = entry.m;
+                Ok(format!(
+                    "RECOVERY-OPEN subject={subject} m={need} approvals={have} EVENT-CID {}",
+                    cid.0
+                ))
+            }
+            pillar_ops::RecoveryOp::Approve { subject } => {
+                let Some(quorum) = self.recoveries.get(subject) else {
+                    return Err(format!("no open recovery for {subject}"));
+                };
+                let threshold = quorum.m;
+                // Each approval is an `iam:users:write` admin act: the acting
+                // admin cryptographically proved authority to reach this point
+                // (delegated signature at the REST tier / keyed op on the wire),
+                // and the RBAC decider re-confirms it here — the spec's "every
+                // approver is a currently-authoritative admin" fence.
+                let cid = self
+                    .perform_signed_act(
+                        actor,
+                        "iam:users:write",
+                        &format!("USER-RECOVERY-APPROVE {subject}"),
+                    )
+                    .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+                self.index_user_audit_event(actor, subject, &cid);
+                let approver = actor.0.clone();
+                let quorum = self
+                    .recoveries
+                    .get_mut(subject)
+                    .expect("recovery present, just checked");
+                let newly = quorum.approvers.insert(approver);
+                let count = quorum.approvers.len() as u32;
+                if count < threshold {
+                    return Ok(format!(
+                        "RECOVERY-APPROVED subject={subject} approvals={count} m={threshold} \
+                         quorum=pending newly_counted={newly} EVENT-CID {}",
+                        cid.0
+                    ));
+                }
+                // Mth DISTINCT approval: FIRE the recovery. Rotate + revoke the
+                // subject's operational key and mint a CONTAINED one-time
+                // recovery credential (force=true => the subject holds NO usable
+                // operational key until it completes onboarding by changing the
+                // temp password), never regranting more than prior authority.
+                let temp =
+                    generate_temp_password().map_err(|()| "temp-password RNG failure".to_owned())?;
+                let at = self.iam_now();
+                let offer_material =
+                    fresh_offer_material(subject).map_err(|()| "offer RNG failure".to_owned())?;
+                if !self.iam_set_password(subject, &temp, true, offer_material, at) {
+                    return Err(format!("no user {subject}"));
+                }
+                // One-time credential: consume the open recovery so a later
+                // stray approval cannot re-fire it.
+                self.recoveries.remove(subject);
+                Ok(format!(
+                    "RECOVERY-COMPLETE subject={subject} approvals={count} m={threshold} \
+                     TEMP-PASSWORD {temp} EVENT-CID {}",
+                    cid.0
+                ))
+            }
         }
     }
 
@@ -7035,6 +7170,16 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/portal/recovery/start"),
+        handler: dispatch_recovery_start,
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/portal/recovery/approve"),
+        handler: dispatch_recovery_approve,
+    },
+    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/portal/users/forgot-password"),
         handler: dispatch_users_forgot_password,
     },
@@ -8689,7 +8834,26 @@ fn dispatch_delegated_user_op(
             resp.body.trim()
         );
     }
-    let control_op = pillar_ops::ControlOp::User(op);
+    dispatch_delegated_control_op(ctx, caller, caller_password, pillar_ops::ControlOp::User(op))
+}
+
+/// Dispatch ANY [`pillar_ops::ControlOp`] on `caller`'s behalf through the
+/// delegated-signed tier: the node signs the op via
+/// [`pillar_web::node_custody::NodeCustodyVerifier::sign_op_for`] — requiring
+/// `caller`'s OWN password plus a fresh, single-use step-up token, the
+/// re-authentication a keyless browser client cannot forge — then applies it
+/// through the SAME [`WebAuthContext::control_op`] path the CLI's keyed client
+/// and the resource-op UDP tier already use. Generalizes
+/// [`dispatch_delegated_user_op`] so the break-glass recovery routes
+/// (`/portal/recovery/*`) ride the identical crypto-gated path every admin
+/// user-mutation does: a recovery `Start`/`Approve` is never a privileged REST
+/// call, and each approver re-proves its OWN password per co-signature.
+fn dispatch_delegated_control_op(
+    ctx: &mut WebAuthContext,
+    caller: &str,
+    caller_password: &str,
+    control_op: pillar_ops::ControlOp,
+) -> Result<String, HttpResponse> {
     let signing_material = match control_op.encode() {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -9115,6 +9279,96 @@ fn dispatch_users_reset_password(
         } else {
             text_response(404, "Not Found", "DENIED no-profile".to_owned())
         }
+    }
+}
+
+/// Open an M-of-N break-glass recovery for a locked-out user:
+/// `POST /portal/recovery/start`, body
+/// `<admin_password>\n<token>\n<subject>\n<m>`. Routed through the
+/// delegated-signed `ControlOp::Recovery(Start)` tier
+/// ([`dispatch_delegated_control_op`]): the node signs the op on the calling
+/// admin's behalf (gated on `<admin_password>` + a fresh step-up), then applies
+/// it through the SAME `iam:users:write`-gated `recovery_op` path the CLI's
+/// keyed client and the resource-op UDP tier use. No single admin can
+/// unilaterally reset the subject — this only OPENS the recovery; it fires only
+/// on the Mth distinct admin approval.
+fn dispatch_recovery_start(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
+    let token = lines.next().unwrap_or("").trim();
+    let subject = lines.next().unwrap_or("").trim().to_owned();
+    let m_line = lines.next().unwrap_or("").trim();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if subject.is_empty() {
+        return text_response(400, "Bad Request", "MISSING subject".to_owned());
+    }
+    let Ok(m) = m_line.parse::<u32>() else {
+        return text_response(400, "Bad Request", "BAD m".to_owned());
+    };
+    let op = pillar_ops::ControlOp::Recovery(pillar_ops::RecoveryOp::Start {
+        subject: subject.clone(),
+        m,
+    });
+    match dispatch_delegated_control_op(ctx, &caller, &admin_password, op) {
+        Ok(detail) => text_response(200, "OK", detail),
+        Err(resp) if resp.body.contains("no user") => {
+            text_response(404, "Not Found", "DENIED unknown-user".to_owned())
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// Record one admin's co-signature on a subject's open break-glass recovery:
+/// `POST /portal/recovery/approve`, body `<admin_password>\n<token>\n<subject>`.
+/// Routed through the delegated-signed `ControlOp::Recovery(Approve)` tier: the
+/// approving admin re-proves its OWN password per co-signature (a session token
+/// alone never counts as a quorum vote). The Mth DISTINCT admin approval FIRES
+/// the recovery — rotating the subject's key and minting a CONTAINED one-time
+/// recovery credential, returned once as `TEMP-PASSWORD <pw>`.
+fn dispatch_recovery_approve(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
+    let token = lines.next().unwrap_or("").trim();
+    let subject = lines.next().unwrap_or("").trim().to_owned();
+    let session = ctx.login_session_for(token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    }
+    let Some(caller) = iam_caller_handle(ctx, token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    if subject.is_empty() {
+        return text_response(400, "Bad Request", "MISSING subject".to_owned());
+    }
+    let op = pillar_ops::ControlOp::Recovery(pillar_ops::RecoveryOp::Approve {
+        subject: subject.clone(),
+    });
+    match dispatch_delegated_control_op(ctx, &caller, &admin_password, op) {
+        Ok(detail) => text_response(200, "OK", detail),
+        Err(resp) if resp.body.contains("no open recovery") => {
+            text_response(409, "Conflict", "DENIED no-open-recovery".to_owned())
+        }
+        Err(resp) => resp,
     }
 }
 

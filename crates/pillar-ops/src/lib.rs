@@ -201,6 +201,48 @@ pub enum ControlOp {
     /// over the node's live role set, managed-group set, and OAuth client
     /// registry — the SAME substrate the IAM admin panels drive.
     Iam(IamOp),
+    /// M-of-N quorum-authorized break-glass recovery of a locked-out user's
+    /// operational key (`pillar recovery start|approve …`, ROI P1 "User
+    /// management & lifecycle" roadmap A4). No single admin can unilaterally
+    /// reset a subject: a recovery is OPENED by `Start` and only FIRES on the
+    /// Mth distinct fresh-admin `Approve`, at which point the node rotates the
+    /// subject's key (old generation dead forever) and mints a CONTAINED
+    /// one-time recovery credential (no usable authority until onboarding),
+    /// never regranting more than the subject's prior authority. Model-checked
+    /// by `specs/BreakGlassRecovery.tla`.
+    Recovery(RecoveryOp),
+}
+
+/// M-of-N quorum-authorized break-glass recovery ops (`pillar recovery …`),
+/// refining `specs/BreakGlassRecovery.tla`'s `Recover`/`Approve` actions. Each
+/// arm is a signed act gated on `iam:users:write` (the SAME decider every
+/// admin user-mutation rides): a `Start` opens a recovery for a locked-out
+/// subject and declares the quorum threshold `m`; each `Approve` records one
+/// distinct currently-authoritative admin's co-signature, and the Mth distinct
+/// approval FIRES the rotate/revoke/contained-mint. A sub-quorum approval set
+/// can never fire the recovery (`SubThresholdNeverRecovers`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum RecoveryOp {
+    /// Open a break-glass recovery for a locked-out `subject`, declaring the
+    /// M-of-N quorum threshold `m` (the number of distinct fresh-admin
+    /// approvals required before the recovery fires). Re-opening an existing
+    /// open recovery is idempotent (the threshold is not lowered under it).
+    Start {
+        /// The locked-out subject user handle to recover.
+        subject: String,
+        /// The quorum threshold M: distinct fresh-admin approvals required.
+        m: u32,
+    },
+    /// Record one currently-authoritative admin's co-signature on the subject's
+    /// open recovery. The Mth DISTINCT approval fires the recovery: the
+    /// subject's operational key is rotated (old generation retired) and a
+    /// contained one-time recovery credential minted. A repeated approval by an
+    /// admin already counted does not advance the quorum.
+    Approve {
+        /// The subject whose open recovery is being approved.
+        subject: String,
+    },
 }
 
 /// IAM role / group / oauth-client ops (`pillar role|group|oauth …`) over the
