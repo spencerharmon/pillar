@@ -103,6 +103,12 @@ pub mod kv_plane_migration;
 
 pub mod quota_sql_aggregation_migration;
 
+pub mod derived_views_migration;
+pub use derived_views_migration::{
+    attached_routes, dashboard_panels_view, fold_routing_table_into_store,
+    recording_rules_view, route_status_label, ATTACHED_ROUTES_VIEW, ROUTES_COLLECTION,
+};
+
 pub mod collection_placement;
 pub use collection_placement::{
     view_placement, CollectionPlacement, NodeSelector,
