@@ -293,6 +293,64 @@ pub fn send_control_op_with_fallback(
     send_with_fallback(tiers, &msg)
 }
 
+/// The seal domain for a [`pillar_ops::QueryOp`] message — DISTINCT from every
+/// other op class's domain so a query op can never open as a stream/control op
+/// (or be replayed across op classes): each class binds its own domain.
+pub const QUERY_OP_SEAL_DOMAIN: &[u8] = b"pillar-cli/query-op-v1";
+
+/// Seal + sign a [`pillar_ops::QueryOp`] into a [`Body::QueryOp`]-bearing
+/// [`PillarMessage`], mirroring [`seal_control_op`] on the query-op class (its
+/// own [`QUERY_OP_SEAL_DOMAIN`]).
+///
+/// # Errors
+/// [`StreamOpMessageError::Op`] if `op` fails to encode;
+/// [`StreamOpMessageError::Envelope`] if the body fails to serialize;
+/// [`StreamOpMessageError::Crypto`] if sealing or signing fails.
+pub fn seal_query_op(
+    op: &pillar_ops::QueryOp,
+    group: &CellGroupKey,
+    cell: CellId,
+    signer: SigningPublicKey,
+    secret: &SigningSecretKey,
+    visibility: Visibility,
+) -> Result<PillarMessage, StreamOpMessageError> {
+    let payload = op.encode().map_err(StreamOpMessageError::Op)?;
+    let body = Body::QueryOp(payload);
+    let plaintext = body.to_canonical_cbor()?;
+    let aad = PillarMessage::header_aad(visibility, &cell);
+    let body_sealed = CellSeal
+        .seal(group, &plaintext, QUERY_OP_SEAL_DOMAIN, &aad)
+        .map_err(StreamOpMessageError::Crypto)?;
+    let signature = sign(secret, &PillarMessage::signing_material(&body_sealed))
+        .map_err(StreamOpMessageError::Crypto)?;
+    Ok(PillarMessage::new(
+        signer,
+        signature,
+        visibility,
+        cell,
+        body_sealed,
+    ))
+}
+
+/// Seal a [`pillar_ops::QueryOp`] and send it over `tiers`, mirroring
+/// [`send_op_with_fallback`] for the query-op class.
+///
+/// # Errors
+/// A `String` describing a seal failure or total tier unreachability.
+pub fn send_query_op_with_fallback(
+    tiers: &[TierAddr],
+    op: &pillar_ops::QueryOp,
+    group: &CellGroupKey,
+    cell: CellId,
+    signer: SigningPublicKey,
+    secret: &SigningSecretKey,
+    visibility: Visibility,
+) -> Result<SendOutcome, String> {
+    let msg = seal_query_op(op, group, cell, signer, secret, visibility)
+        .map_err(|e| format!("failed to seal query op: {e}"))?;
+    send_with_fallback(tiers, &msg)
+}
+
 fn decode_pillar_message(bytes: &[u8]) -> Result<PillarMessage, Unreachable> {
     PillarMessage::from_canonical_cbor(bytes).map_err(|_| Unreachable)
 }

@@ -250,6 +250,23 @@ fn handle_datagram(
                 Err(reason) => ack_message(keys, false, &reason),
             }
         }
+        Body::QueryOp(payload) => {
+            let op = match pillar_ops::QueryOp::decode(&payload) {
+                Ok(op) => op,
+                Err(e) => return ack_message(keys, false, &format!("MALFORMED-OP {e}")),
+            };
+            let mut guard = match ctx.lock() {
+                Ok(g) => g,
+                Err(_) => return ack_message(keys, false, "POISONED-CONTEXT"),
+            };
+            // The handler is uniform across read/write: it member-gates reads and
+            // `data:write`-gates writes internally, returning the ack detail (the
+            // folded view text) or a refusal reason.
+            match guard.query_op(&actor, &op) {
+                Ok(detail) => ack_message(keys, true, &detail),
+                Err(reason) => ack_message(keys, false, &reason),
+            }
+        }
         _ => ack_message(keys, false, "NOT-A-STREAM-OP"),
     }
 }

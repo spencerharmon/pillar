@@ -34,6 +34,8 @@ pillar-wire = { path = "../pillar-wire" }
 pillar-cells = { path = "../pillar-cells" }
 pillar-ops = { path = "../pillar-ops" }
 pillar-client = { path = "../pillar-client" }
+pillar-keyedstore = { path = "../pillar-keyedstore" }
+pillar-sqlviews = { path = "../pillar-sqlviews" }
 pillar-crypto = { path = "../pillar-crypto", default-features = false }
 pillar-iam = { path = "../pillar-iam" }
 getrandom = "0.2"

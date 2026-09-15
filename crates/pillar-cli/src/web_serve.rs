@@ -476,6 +476,17 @@ pub struct WebAuthContext {
     /// Cell id + seed material the CLI-config export bakes into a `config.yaml`,
     /// plus the resource-op tier port; `None` until wired at boot.
     cli_export: Option<CliExportMaterial>,
+    /// The keyed-store (K/V + Document) substrate the `data-query-tier-remote-
+    /// surface` query tier reads/writes, and the SQL-view layer folds over. The
+    /// SAME in-memory engine `pillar-keyedstore`/`pillar-sqlviews` implement; no
+    /// second store. `pillar kv`/`pillar doc`/`pillar sql` over the sealed query
+    /// tier act on THIS store (writes are signed acts, reads member-gated views),
+    /// and the portal's per-primitive browse/query panels render it.
+    keyed_store: pillar_keyedstore::KeyedStore,
+    /// A monotonic logical counter feeding the HLC stamp of each keyed-store
+    /// write, so successive writes to the same field order deterministically
+    /// (last-writer-wins) without a wall clock.
+    keyed_clock: u64,
 }
 
 /// A thread-shared handle to the node's durable streaming DB — the portal's
@@ -1061,6 +1072,8 @@ impl WebAuthContext {
             replaying: false,
             next_op_seq: 0,
             cli_export: None,
+            keyed_store: pillar_keyedstore::KeyedStore::new(),
+            keyed_clock: 0,
         }
     }
 
@@ -3728,6 +3741,180 @@ impl WebAuthContext {
         }
     }
 
+    /// Serve a [`pillar_ops::QueryOp`] over the sealed query tier
+    /// (`data-query-tier-remote-surface`): the remote read/query surface over
+    /// this node's keyed store (K/V + Document) and its SQL views. Reads
+    /// (`*Get`/`*Keys`/`*Ids`/`Collections`/`View`/`Views`) are member-gated
+    /// VIEWS emitting no event; writes (`*Put`/`*Delete`/`CreateView`/
+    /// `DropView`) are signed acts gated on `data:write` through
+    /// [`Self::perform_signed_act`] — the SAME decider every other resource act
+    /// rides. The ack detail carries the folded view text (`OK <payload>`); a
+    /// refusal is `Err(<reason>)`.
+    pub fn query_op(
+        &mut self,
+        actor: &NodeId,
+        op: &pillar_ops::QueryOp,
+    ) -> Result<String, String> {
+        // Every query op — read or write — requires the signer to be a
+        // recognized cell member (fail-closed), exactly as the resource-op read
+        // tier gates on membership.
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        match op {
+            pillar_ops::QueryOp::Kv(kv) => self.kv_query_op(actor, kv),
+            pillar_ops::QueryOp::Doc(doc) => self.doc_query_op(actor, doc),
+            pillar_ops::QueryOp::Sql(sql) => self.sql_query_op(actor, sql),
+        }
+    }
+
+    /// The next deterministic HLC stamp for a keyed-store write by `actor`.
+    fn next_keyed_hlc(&mut self, actor: &NodeId) -> pillar_keyedstore::Hlc {
+        self.keyed_clock += 1;
+        pillar_keyedstore::Hlc::new(self.keyed_clock, 0, actor.to_string())
+    }
+
+    /// Authorize a keyed-store WRITE act on the `data:write` capability, then
+    /// return the signed event's CID for the ack. Refusal mirrors every other
+    /// signed-act path.
+    fn authorize_data_write(&mut self, actor: &NodeId, payload: &str) -> Result<String, String> {
+        match self.perform_signed_act(actor, "data:write", payload) {
+            Ok(cid) => Ok(format!("{}", cid.0)),
+            Err(a) => Err(format!("unauthorized actor {a} for data:write")),
+        }
+    }
+
+    fn kv_query_op(&mut self, actor: &NodeId, op: &pillar_ops::KvOp) -> Result<String, String> {
+        match op {
+            pillar_ops::KvOp::Put {
+                collection,
+                key,
+                value_hex,
+            } => {
+                let value = decode_hex_bytes(value_hex)
+                    .ok_or_else(|| "value_hex is not valid lowercase hex".to_owned())?;
+                let cid =
+                    self.authorize_data_write(actor, &format!("KV-PUT {collection} {key}"))?;
+                let hlc = self.next_keyed_hlc(actor);
+                self.keyed_store.kv_put(collection, key, value, hlc);
+                Ok(format!("KV-PUT {collection} {key} EVENT-CID {cid}"))
+            }
+            pillar_ops::KvOp::Delete { collection, key } => {
+                let cid =
+                    self.authorize_data_write(actor, &format!("KV-DELETE {collection} {key}"))?;
+                let hlc = self.next_keyed_hlc(actor);
+                self.keyed_store.kv_delete(collection, key, hlc);
+                Ok(format!("KV-DELETE {collection} {key} EVENT-CID {cid}"))
+            }
+            pillar_ops::KvOp::Get { collection, key } => match self.keyed_store.kv_get(collection, key)
+            {
+                Some(v) => Ok(hex_encode_bytes(&v)),
+                None => Err(format!("no live key {key} in collection {collection}")),
+            },
+            pillar_ops::KvOp::Keys { collection } => {
+                Ok(join_lines(self.keyed_store.kv_keys(collection)))
+            }
+            pillar_ops::KvOp::Collections => Ok(join_lines(self.keyed_store.collections())),
+        }
+    }
+
+    fn doc_query_op(&mut self, actor: &NodeId, op: &pillar_ops::DocOp) -> Result<String, String> {
+        match op {
+            pillar_ops::DocOp::PutField {
+                collection,
+                id,
+                field,
+                value,
+            } => {
+                let cid = self.authorize_data_write(
+                    actor,
+                    &format!("DOC-PUT {collection} {id} {field}"),
+                )?;
+                let hlc = self.next_keyed_hlc(actor);
+                self.keyed_store.doc_put_field(
+                    collection,
+                    id,
+                    field,
+                    pillar_keyedstore::Value::Scalar(value.clone().into_bytes()),
+                    hlc,
+                );
+                Ok(format!("DOC-PUT {collection} {id} {field} EVENT-CID {cid}"))
+            }
+            pillar_ops::DocOp::DeleteField {
+                collection,
+                id,
+                field,
+            } => {
+                let cid = self.authorize_data_write(
+                    actor,
+                    &format!("DOC-DELETE {collection} {id} {field}"),
+                )?;
+                let hlc = self.next_keyed_hlc(actor);
+                self.keyed_store.doc_delete_field(collection, id, field, hlc);
+                Ok(format!(
+                    "DOC-DELETE {collection} {id} {field} EVENT-CID {cid}"
+                ))
+            }
+            pillar_ops::DocOp::GetField {
+                collection,
+                id,
+                field,
+            } => match self.keyed_store.doc_query(collection, id, field) {
+                Some(v) => Ok(render_value(&v)),
+                None => Err(format!(
+                    "no live field {field} on document {id} in collection {collection}"
+                )),
+            },
+            pillar_ops::DocOp::Fields { collection, id } => {
+                Ok(join_lines(self.keyed_store.doc_fields(collection, id)))
+            }
+            pillar_ops::DocOp::Ids { collection } => {
+                Ok(join_lines(self.keyed_store.doc_ids(collection)))
+            }
+        }
+    }
+
+    fn sql_query_op(&mut self, actor: &NodeId, op: &pillar_ops::SqlOp) -> Result<String, String> {
+        match op {
+            pillar_ops::SqlOp::CreateView {
+                name,
+                source,
+                filter_field,
+                filter_value,
+                project,
+            } => {
+                let mut def = pillar_sqlviews::ViewDef::over(source.clone());
+                if let (Some(f), Some(v)) = (filter_field, filter_value) {
+                    def = def.filtered_eq(f.clone(), v.clone().into_bytes());
+                }
+                if let Some(p) = project {
+                    def = def.projecting(p.clone());
+                }
+                let cid =
+                    self.authorize_data_write(actor, &format!("SQL-CREATE-VIEW {name} {source}"))?;
+                let hlc = self.next_keyed_hlc(actor);
+                pillar_sqlviews::create_view(&mut self.keyed_store, name, def, hlc);
+                Ok(format!("VIEW {name} OVER {source} EVENT-CID {cid}"))
+            }
+            pillar_ops::SqlOp::DropView { name } => {
+                let cid = self.authorize_data_write(actor, &format!("SQL-DROP-VIEW {name}"))?;
+                let hlc = self.next_keyed_hlc(actor);
+                pillar_sqlviews::drop_view(&mut self.keyed_store, name, hlc);
+                Ok(format!("DROP-VIEW {name} EVENT-CID {cid}"))
+            }
+            pillar_ops::SqlOp::View { name } => {
+                match pillar_sqlviews::materialize_view(&self.keyed_store, name) {
+                    Some(rows) => Ok(render_rows(&rows)),
+                    None => Err(format!("no such view {name}")),
+                }
+            }
+            pillar_ops::SqlOp::Views => {
+                Ok(join_lines(pillar_sqlviews::list_views(&self.keyed_store)))
+            }
+        }
+    }
+
+
     /// Serve a [`pillar_ops::IdentityOp`] over the control-op tier. `Show`/
     /// `Domains` are member-gated views over the live identity log; `Enroll`/
     /// `Rotate`/`Recover` are signed acts gated on `portal:identity:write`
@@ -5249,6 +5436,68 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Decode a lowercase-hex string to bytes for a keyed-store K/V value; `None`
+/// on odd length or a non-hex digit.
+fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// Hex-encode a K/V value for the query-op ack (an opaque value may not be
+/// UTF-8, so it round-trips as hex).
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    hex_encode(bytes)
+}
+
+/// Join a list of names one-per-line for a query-op browse ack.
+fn join_lines(items: Vec<String>) -> String {
+    let mut out = String::new();
+    for i in items {
+        out.push_str(&i);
+        out.push('\n');
+    }
+    out
+}
+
+/// Render one keyed-store [`pillar_keyedstore::Value`] as text for an ack: a
+/// scalar as its UTF-8 (falling back to hex for non-UTF-8 bytes), a nested
+/// value as its JSON debug form.
+fn render_value(v: &pillar_keyedstore::Value) -> String {
+    match v {
+        pillar_keyedstore::Value::Scalar(b) => match std::str::from_utf8(b) {
+            Ok(s) => s.to_owned(),
+            Err(_) => hex_encode(b),
+        },
+        pillar_keyedstore::Value::Nested(_) => format!("{v:?}"),
+    }
+}
+
+/// Render a materialized SQL view's rows for a query-op ack: one line per row,
+/// `<id>\t<field>=<value>,…` with fields in sorted (BTreeMap) order.
+fn render_rows(rows: &[pillar_sqlviews::Row]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&row.id);
+        for (field, value) in &row.fields {
+            out.push('\t');
+            out.push_str(field);
+            out.push('=');
+            out.push_str(&render_value(value));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// `POST /portal/profile/cli-config` — body `<token>`: an authenticated user
