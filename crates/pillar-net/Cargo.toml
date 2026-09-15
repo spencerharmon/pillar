@@ -99,6 +99,12 @@ pillar-keyedstore = { path = "../pillar-keyedstore" }
 # depend on pillar-net, so these edges are acyclic.
 pillar-quota-ledger = { path = "../pillar-quota-ledger" }
 pillar-sqlviews = { path = "../pillar-sqlviews" }
+# routing-dashboards-derived-views-migration folds the derived routing table
+# (derive_routing_table takes a &TrustStore) onto the generic pillar-sqlviews
+# engine, so the WoT trust-artifact types are now a RUNTIME dep of this crate,
+# not merely a dev-dep of the acceptance test. pillar-trust-artifacts does not
+# depend on pillar-net, so this edge stays acyclic.
+pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
 pillar-coordination = { path = "../pillar-coordination" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -122,11 +128,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pillar-streamdb = { path = "../pillar-streamdb" }
 # (pillar-topology is now a runtime dep, above — used to build a
 # TopologyScopedIpam fixture here too, so no separate dev-dep entry.)
-# Dev-only: the distributed-lb-acceptance test composes the ingress/LB
-# manifest model (Route/Frontend/derive_routing_table) and the WoT trust
-# artifacts gating Route attachment. (pillar-manifest is now a runtime dep of
-# this crate for the UDP dataplane, above.)
-pillar-trust-artifacts = { path = "../pillar-trust-artifacts" }
+# (pillar-trust-artifacts is now a RUNTIME dep, above — the
+# routing-dashboards-derived-views-migration fold reads &TrustStore — so no
+# separate dev-dep entry; the distributed-lb-acceptance test uses the runtime dep.)
 # Dev-only: the network-root pnet acceptance test (`tests/network_root_pnet.rs`,
 # gated by the `acceptance` feature) asserts the PUBLIC default derives its pnet
 # key from the published `pillar_swarm::PUBLIC_PILLAR_ROOT` (never a keyless
