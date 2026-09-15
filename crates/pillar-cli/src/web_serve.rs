@@ -6904,6 +6904,11 @@ pub static ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: PathMatch::Exact("/portal/users/bulk-invite"),
+        handler: dispatch_users_bulk_invite,
+    },
+    RouteSpec {
+        method: "POST",
         path: PathMatch::Exact("/portal/users/disable"),
         handler: |ctx, peer, request| {
             dispatch_users_lifecycle(ctx, peer, request, UserLifecycleAction::Disable)
@@ -8390,6 +8395,123 @@ fn dispatch_users_invite(
         }
         Err(resp) => resp,
     }
+}
+
+/// One row of a `POST /portal/users/bulk-invite` CSV batch, and the outcome
+/// of applying it.
+struct BulkInviteRow {
+    handle: String,
+    outcome: Result<String, String>,
+}
+
+/// Parse and apply ONE CSV row of a bulk invite batch: `handle,email
+/// [,password[,force_password_change[,require_passkey]]]`. Mirrors
+/// [`dispatch_users_invite`]'s per-user field defaults (force-change ON
+/// unless the field is literally `false`; require-passkey OFF unless the
+/// field is literally `true`; an empty/absent password field generates a
+/// fresh temporary one) but never returns early on a bad/duplicate row —
+/// the caller is responsible for continuing the batch regardless of this
+/// row's outcome (partial-batch tolerance).
+fn apply_bulk_invite_row(
+    ctx: &mut WebAuthContext,
+    caller: &str,
+    admin_password: &str,
+    row: &str,
+) -> BulkInviteRow {
+    let mut fields = row.split(',').map(str::trim);
+    let handle = fields.next().unwrap_or("").to_owned();
+    if handle.is_empty() {
+        return BulkInviteRow {
+            handle,
+            outcome: Err("MISSING-HANDLE".to_owned()),
+        };
+    }
+    let email = fields.next().unwrap_or("").to_owned();
+    let pw_field = fields.next().unwrap_or("");
+    let force_field = fields.next().unwrap_or("");
+    let passkey_field = fields.next().unwrap_or("");
+    let force_password_change = force_field != "false";
+    let require_passkey = passkey_field == "true";
+    let (password, _generated) = if pw_field.is_empty() {
+        match generate_temp_password() {
+            Ok(p) => (p, true),
+            Err(()) => {
+                return BulkInviteRow {
+                    handle,
+                    outcome: Err("RNG-FAILURE".to_owned()),
+                }
+            }
+        }
+    } else {
+        (pw_field.to_owned(), false)
+    };
+    let op = pillar_ops::UserOp::Invite {
+        handle: handle.clone(),
+        email,
+        force_password_change,
+        require_passkey,
+        password: Some(password.clone()),
+    };
+    let outcome = match dispatch_delegated_user_op(ctx, caller, admin_password, op) {
+        Ok(_detail) => Ok(password),
+        Err(resp) if resp.body.contains("already exists") => Err("already-exists".to_owned()),
+        Err(resp) => Err(format!("{} {}", resp.status, resp.body.trim())),
+    };
+    BulkInviteRow { handle, outcome }
+}
+
+/// Bulk (CSV) admin invite: `POST /portal/users/bulk-invite`, body
+/// `<admin_password>\n<token>\n<csv row>\n<csv row>\n...` where each CSV row
+/// is `handle,email[,password[,force_password_change[,require_passkey]]]`
+/// (the same option defaults as the single-user
+/// [`dispatch_users_invite`]). Batches the SAME proven delegated-signed
+/// `ControlOp::User(Invite)` path ([`dispatch_delegated_user_op`]) one row
+/// at a time — batching convenience only, no new authority and no new RBAC
+/// gate beyond the existing `iam:users:write`-gated `user_op` decision made
+/// per row.
+///
+/// PARTIAL-BATCH TOLERANT: a malformed, duplicate, or otherwise refused row
+/// never aborts the batch — every remaining row is still attempted. Blank
+/// lines and lines starting with `#` are skipped (comments/spacing). The
+/// response carries ONE result line per non-skipped row, in order:
+/// `<handle> OK <password>` on success or `<handle> ERROR <reason>` on
+/// failure, so the caller can reconcile exactly which invites in the batch
+/// landed.
+fn dispatch_users_bulk_invite(
+    ctx: &mut WebAuthContext,
+    peer: &SocketAddr,
+    request: &HttpRequest,
+) -> HttpResponse {
+    let mut lines = request.body.lines();
+    let admin_password = lines.next().unwrap_or("").trim().to_owned();
+    let token = lines.next().unwrap_or("").trim().to_owned();
+    let session = ctx.login_session_for(&token).cloned();
+    if let Err(e) = authorize_nonloopback_signing_action(peer, session.as_ref()) {
+        return text_response(403, "Forbidden", format!("REFUSED {e:?}"));
+    }
+    if session.is_none() {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let Some(caller) = iam_caller_handle(ctx, &token) else {
+        return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
+    };
+    let rows: Vec<String> = lines
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    if rows.is_empty() {
+        return text_response(400, "Bad Request", "MISSING csv-rows".to_owned());
+    }
+    let mut body = String::new();
+    for row in &rows {
+        let result = apply_bulk_invite_row(ctx, &caller, &admin_password, row);
+        match result.outcome {
+            Ok(password) => body.push_str(&format!("{} OK {password}\n", result.handle)),
+            Err(reason) => body.push_str(&format!("{} ERROR {reason}\n", result.handle)),
+        }
+    }
+    text_response(200, "OK", body)
 }
 
 /// Self profile read: `GET /portal/profile?token=...`. Renders
