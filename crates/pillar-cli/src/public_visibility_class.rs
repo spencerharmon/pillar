@@ -122,9 +122,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Extract the inner op-envelope payload from a GENESIS segment's wire bytes.
@@ -183,7 +181,12 @@ fn step_public_write_and_keyless_read() -> Result<(), String> {
     let record = b"public catalog record: sku=42, price=9.99".to_vec();
     collection
         .append(record.clone(), SideEffect::Convergent)
-        .map_err(|e| fail(STEP, format!("append through the real public op path failed: {e:?}")))?;
+        .map_err(|e| {
+            fail(
+                STEP,
+                format!("append through the real public op path failed: {e:?}"),
+            )
+        })?;
 
     let head = collection
         .store()
@@ -202,8 +205,12 @@ fn step_public_write_and_keyless_read() -> Result<(), String> {
         .store()
         .get_local(&target)
         .ok_or_else(|| fail(STEP, "head target segment absent from the store"))?;
-    let envelope = genesis_segment_payload(segment.bytes())
-        .map_err(|e| fail(STEP, format!("could not extract the op envelope from the public segment: {e}")))?;
+    let envelope = genesis_segment_payload(segment.bytes()).map_err(|e| {
+        fail(
+            STEP,
+            format!("could not extract the op envelope from the public segment: {e}"),
+        )
+    })?;
     let recovered_at_rest = pillar_streamdb::decode_stream_op_segment_payload(
         &envelope,
         None, // NO group key — a public op must decode without one
@@ -212,7 +219,9 @@ fn step_public_write_and_keyless_read() -> Result<(), String> {
     .map_err(|e| {
         fail(
             STEP,
-            format!("keyless decode of the public segment at rest FAILED (seal was NOT elided): {e:?}"),
+            format!(
+                "keyless decode of the public segment at rest FAILED (seal was NOT elided): {e:?}"
+            ),
         )
     })?;
     if recovered_at_rest != record {
@@ -266,11 +275,7 @@ fn step_public_write_and_keyless_read() -> Result<(), String> {
 }
 
 /// Build the real decider and decide an `append` request for `subject`.
-fn decide_append(
-    owner: &NodeId,
-    subject: &NodeId,
-    grants: &[ExplicitGrant],
-) -> Decision {
+fn decide_append(owner: &NodeId, subject: &NodeId, grants: &[ExplicitGrant]) -> Decision {
     let authority = WotAuthority::new(owner.clone(), 8);
     let policies: Vec<PolicyEvent> = Vec::new();
     let decider = RbacDecider::new(&authority, &policies, grants);
@@ -348,7 +353,12 @@ fn step_cell_encrypted_contrast() -> Result<(), String> {
     let record = b"secret catalog record: ssn=***-**-****".to_vec();
     collection
         .append(record.clone(), SideEffect::Convergent)
-        .map_err(|e| fail(STEP, format!("append to the cell-encrypted collection failed: {e:?}")))?;
+        .map_err(|e| {
+            fail(
+                STEP,
+                format!("append to the cell-encrypted collection failed: {e:?}"),
+            )
+        })?;
 
     let head = collection
         .store()
@@ -361,12 +371,18 @@ fn step_cell_encrypted_contrast() -> Result<(), String> {
     // either fails outright (missing group key) or, at worst, never yields the
     // cleartext.
     let target = head.target().clone();
-    let segment = collection
-        .store()
-        .get_local(&target)
-        .ok_or_else(|| fail(STEP, "cell-encrypted head target segment absent from the store"))?;
-    let envelope = genesis_segment_payload(segment.bytes())
-        .map_err(|e| fail(STEP, format!("could not extract the op envelope from the cell-encrypted segment: {e}")))?;
+    let segment = collection.store().get_local(&target).ok_or_else(|| {
+        fail(
+            STEP,
+            "cell-encrypted head target segment absent from the store",
+        )
+    })?;
+    let envelope = genesis_segment_payload(segment.bytes()).map_err(|e| {
+        fail(
+            STEP,
+            format!("could not extract the op envelope from the cell-encrypted segment: {e}"),
+        )
+    })?;
     // The raw envelope bytes must not carry the plaintext record verbatim.
     if contains_subslice(&envelope, &record) {
         return Err(fail(
@@ -403,9 +419,9 @@ fn step_cell_encrypted_contrast() -> Result<(), String> {
         IpfsPersistentStream::rehydrate(owner_pk.clone(), &head, &swarm, cell.clone(), None)
             .map_err(|e| {
                 fail(
-                    STEP,
-                    format!("keyless rehydrate failed structurally (expected structural success): {e:?}"),
-                )
+            STEP,
+            format!("keyless rehydrate failed structurally (expected structural success): {e:?}"),
+        )
             })?;
     let keyless_payloads: Vec<_> = keyless
         .stream()
@@ -426,7 +442,12 @@ fn step_cell_encrypted_contrast() -> Result<(), String> {
 
     // The cell MEMBER, holding the group key, reads it back exactly.
     let member = IpfsPersistentStream::rehydrate(owner_pk, &head, &swarm, cell, Some(group))
-        .map_err(|e| fail(STEP, format!("cell member rehydrate with the group key failed: {e:?}")))?;
+        .map_err(|e| {
+            fail(
+                STEP,
+                format!("cell member rehydrate with the group key failed: {e:?}"),
+            )
+        })?;
     let member_payloads: Vec<_> = member
         .stream()
         .log()
@@ -506,18 +527,16 @@ mod tests {
 
         let (opk, osk) = keys("cmp-public");
         let pcell = CellId::from_bytes(b"cmp::public".to_vec());
-        let mut public =
-            IpfsPersistentStream::genesis_public(opk.clone(), osk, pcell, None);
-        public.append(record.clone(), SideEffect::Convergent).unwrap();
+        let mut public = IpfsPersistentStream::genesis_public(opk.clone(), osk, pcell, None);
+        public
+            .append(record.clone(), SideEffect::Convergent)
+            .unwrap();
         let phead = public.store().resolve_head(&opk).cloned().unwrap();
         let pseg = public.store().get_local(phead.target()).unwrap();
         let penv = genesis_segment_payload(pseg.bytes()).unwrap();
-        let precovered = pillar_streamdb::decode_stream_op_segment_payload(
-            &penv,
-            None,
-            Confidentiality::Public,
-        )
-        .expect("public segment decodes keyless");
+        let precovered =
+            pillar_streamdb::decode_stream_op_segment_payload(&penv, None, Confidentiality::Public)
+                .expect("public segment decodes keyless");
         assert_eq!(
             precovered, record,
             "public segment must decode to the plaintext keyless"
@@ -525,8 +544,7 @@ mod tests {
 
         let (cpk, csk) = keys("cmp-cell");
         let ccell = CellId::from_bytes(b"cmp::cell".to_vec());
-        let group =
-            group_key_from_seed(&Seed::from_bytes(b"cmp-cell-group".to_vec())).unwrap();
+        let group = group_key_from_seed(&Seed::from_bytes(b"cmp-cell-group".to_vec())).unwrap();
         let mut cellc = IpfsPersistentStream::genesis(
             cpk.clone(),
             csk,
@@ -534,7 +552,9 @@ mod tests {
             ccell,
             group,
         );
-        cellc.append(record.clone(), SideEffect::Convergent).unwrap();
+        cellc
+            .append(record.clone(), SideEffect::Convergent)
+            .unwrap();
         let chead = cellc.store().resolve_head(&cpk).cloned().unwrap();
         let cseg = cellc.store().get_local(chead.target()).unwrap();
         let cenv = genesis_segment_payload(cseg.bytes()).unwrap();

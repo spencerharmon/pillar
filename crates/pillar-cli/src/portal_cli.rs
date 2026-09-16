@@ -118,12 +118,7 @@ impl NodeEndpoint {
     }
 
     /// Send one real HTTP/1.1 request and read the full response back.
-    fn http(
-        &self,
-        method: &str,
-        path: &str,
-        body: &str,
-    ) -> Result<NodeResponse, PortalError> {
+    fn http(&self, method: &str, path: &str, body: &str) -> Result<NodeResponse, PortalError> {
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .map_err(|e| PortalError::Transport(e.to_string()))?;
         stream
@@ -148,9 +143,8 @@ impl NodeEndpoint {
         stream
             .read_to_end(&mut raw)
             .map_err(|e| PortalError::Transport(e.to_string()))?;
-        parse_http_response(&raw).ok_or_else(|| {
-            PortalError::Transport("could not parse node HTTP response".to_string())
-        })
+        parse_http_response(&raw)
+            .ok_or_else(|| PortalError::Transport("could not parse node HTTP response".to_string()))
     }
 
     /// `GET <path>`.
@@ -292,9 +286,11 @@ impl PortalClient {
     }
 
     fn token(&self) -> Result<&str, PortalError> {
-        self.token.as_deref().ok_or_else(|| PortalError::Transport(
-            "no session token — call `pillar portal login` first".to_string(),
-        ))
+        self.token.as_deref().ok_or_else(|| {
+            PortalError::Transport(
+                "no session token — call `pillar portal login` first".to_string(),
+            )
+        })
     }
 
     /// Add (or upsert) a member — the canonical CLI MUTATION under test. This
@@ -319,9 +315,10 @@ impl PortalClient {
     /// Change a member's role — a second CLI mutation, likewise journaled.
     pub fn set_role(&self, handle: &str, role: &str) -> Result<(), PortalError> {
         let token = self.token()?;
-        let resp = self
-            .endpoint
-            .post("/portal/members/role", &format!("{token}\n{handle}\n{role}"))?;
+        let resp = self.endpoint.post(
+            "/portal/members/role",
+            &format!("{token}\n{handle}\n{role}"),
+        )?;
         if resp.status != 200 {
             return Err(PortalError::Node {
                 step: "portal/members/role",
@@ -564,11 +561,7 @@ mod tests {
             vec!["members", "add", "alice", "operator"]
         );
 
-        let args = vec![
-            "--node=http://x:1".into(),
-            "members".into(),
-            "list".into(),
-        ];
+        let args = vec!["--node=http://x:1".into(), "members".into(), "list".into()];
         assert_eq!(positionals(&args), vec!["members", "list"]);
     }
 

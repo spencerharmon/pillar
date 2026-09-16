@@ -213,8 +213,8 @@ mod tests {
     fn signal_envelope_round_trips_as_pillar_message_signal() {
         let (group, cell, signer, secret) = fixture("cell-a", "author-a");
         let payload = b"metric cpu 0.9".to_vec();
-        let msg = seal_signal(&payload, &group, cell, signer, &secret, Visibility::Cell)
-            .expect("seal");
+        let msg =
+            seal_signal(&payload, &group, cell, signer, &secret, Visibility::Cell).expect("seal");
 
         // It really is a Signal body kind (opening any other body kind errors).
         let encoded = msg.to_canonical_cbor().expect("encode");
@@ -276,8 +276,8 @@ mod tests {
     fn non_member_cannot_open_cell_sealed_signal() {
         let (group, cell, signer, secret) = fixture("cell-a", "author-a");
         let payload = b"secret signal".to_vec();
-        let msg = seal_signal(&payload, &group, cell, signer, &secret, Visibility::Cell)
-            .expect("seal");
+        let msg =
+            seal_signal(&payload, &group, cell, signer, &secret, Visibility::Cell).expect("seal");
 
         let wrong_group =
             group_key_from_seed(&Seed::from_bytes(b"cell-b".to_vec())).expect("wrong cell key");
@@ -340,8 +340,7 @@ mod tests {
         let aad = PillarMessage::header_aad(visibility, &cell);
         let body_sealed =
             cell_seal_convergent(group, &plaintext, STREAM_OP_SEAL_DOMAIN, &aad).expect("seal");
-        let signature =
-            sign(secret, &PillarMessage::signing_material(&body_sealed)).expect("sign");
+        let signature = sign(secret, &PillarMessage::signing_material(&body_sealed)).expect("sign");
         PillarMessage::new(signer, signature, visibility, cell, body_sealed)
             .to_canonical_cbor()
             .expect("encode")

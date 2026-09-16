@@ -253,11 +253,7 @@ impl Scheduler {
         self.hierarchy
             .tiers()
             .iter()
-            .filter(|t| {
-                self.hierarchy
-                    .rank(t)
-                    .is_some_and(|r| r >= req_rank)
-            })
+            .filter(|t| self.hierarchy.rank(t).is_some_and(|r| r >= req_rank))
             .cloned()
             .collect()
     }
@@ -375,11 +371,7 @@ impl Scheduler {
 
     /// Mark the OLDEST running run of `id` with `status`. The oldest is chosen
     /// so termination is deterministic.
-    fn terminate_one_running(
-        &mut self,
-        id: &str,
-        status: RunStatus,
-    ) -> Result<(), TerminateError> {
+    fn terminate_one_running(&mut self, id: &str, status: RunStatus) -> Result<(), TerminateError> {
         let idx = self
             .runs
             .iter()
@@ -474,7 +466,13 @@ mod tests {
         );
         sched.register(
             "recording-rule",
-            Job::new(JobKind::Observability, ConcurrencyPolicy::Allow, "node", 3, 5),
+            Job::new(
+                JobKind::Observability,
+                ConcurrencyPolicy::Allow,
+                "node",
+                3,
+                5,
+            ),
         );
 
         // Both fire via the EXACT SAME method — no observability-specific entry

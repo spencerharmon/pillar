@@ -66,7 +66,11 @@ fn attestation(cose: &[u8], credential_id: &[u8], sign_count: u32) -> Vec<u8> {
 /// payload plus the clientDataJSON both surfaces transmit) that
 /// `verify_assertion` expects: `authData || SHA-256(clientDataJSON)`, signed
 /// by the presented authenticator's real secret key.
-fn assertion(secret: &SigningSecretKey, challenge: &[u8], sign_count: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn assertion(
+    secret: &SigningSecretKey,
+    challenge: &[u8],
+    sign_count: u32,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let cdj = format!(
         r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://pillar.local"}}"#,
         base64url_encode(challenge)
@@ -114,8 +118,10 @@ fn login_on(
 ) -> Result<[u8; 32], RpError> {
     let ch = rp.begin(session, CELL, now, TTL);
     let (ad, cdj, sig) = assertion(secret, &ch, sign_count);
-    rp.authenticate_finish(session, CELL, now, now, &ch, cred, &ad, &cdj, &sig, b"prf-out")
-        .map(|u| u.expect("non-empty prf output yields an unlock secret"))
+    rp.authenticate_finish(
+        session, CELL, now, now, &ch, cred, &ad, &cdj, &sig, b"prf-out",
+    )
+    .map(|u| u.expect("non-empty prf output yields an unlock secret"))
 }
 
 #[test]
@@ -124,12 +130,28 @@ fn register_in_browser_then_login_via_cli_succeeds() {
     let mut rp = RelyingParty::new();
 
     // Register-in-browser (simulated ceremony).
-    register_on(&mut rp, "browser-session", 1_000, &cose, b"cred-browser-then-cli");
+    register_on(
+        &mut rp,
+        "browser-session",
+        1_000,
+        &cose,
+        b"cred-browser-then-cli",
+    );
 
     // Login-via-CLI against the SAME shared record.
-    let unlock = login_on(&mut rp, "cli-session", 2_000, &secret, b"cred-browser-then-cli", 5)
-        .expect("a credential registered in the browser must admit a CLI login");
-    assert_ne!(unlock, [0u8; 32], "unlock secret is real, not a placeholder");
+    let unlock = login_on(
+        &mut rp,
+        "cli-session",
+        2_000,
+        &secret,
+        b"cred-browser-then-cli",
+        5,
+    )
+    .expect("a credential registered in the browser must admit a CLI login");
+    assert_ne!(
+        unlock, [0u8; 32],
+        "unlock secret is real, not a placeholder"
+    );
 }
 
 #[test]
@@ -138,12 +160,28 @@ fn register_at_cli_then_login_in_browser_succeeds() {
     let mut rp = RelyingParty::new();
 
     // Register-at-CLI (simulated ceremony).
-    register_on(&mut rp, "cli-session", 1_000, &cose, b"cred-cli-then-browser");
+    register_on(
+        &mut rp,
+        "cli-session",
+        1_000,
+        &cose,
+        b"cred-cli-then-browser",
+    );
 
     // Login-in-browser (simulated ceremony) against the SAME shared record.
-    let unlock = login_on(&mut rp, "browser-session", 2_000, &secret, b"cred-cli-then-browser", 5)
-        .expect("a credential registered at the CLI must admit a browser login");
-    assert_ne!(unlock, [0u8; 32], "unlock secret is real, not a placeholder");
+    let unlock = login_on(
+        &mut rp,
+        "browser-session",
+        2_000,
+        &secret,
+        b"cred-cli-then-browser",
+        5,
+    )
+    .expect("a credential registered at the CLI must admit a browser login");
+    assert_ne!(
+        unlock, [0u8; 32],
+        "unlock secret is real, not a placeholder"
+    );
 }
 
 #[test]
@@ -155,15 +193,33 @@ fn a_wrong_credential_is_refused_on_both_surfaces() {
 
     // Wrong authenticator via the CLI surface.
     assert_eq!(
-        login_on(&mut rp, "cli-session", 2_000, &wrong_secret, b"cred-wrong", 5),
-        Err(RpError::Crypto(pillar_crypto::CryptoError::VerificationFailed)),
+        login_on(
+            &mut rp,
+            "cli-session",
+            2_000,
+            &wrong_secret,
+            b"cred-wrong",
+            5
+        ),
+        Err(RpError::Crypto(
+            pillar_crypto::CryptoError::VerificationFailed
+        )),
         "a forged assertion from a wrong credential must be refused via the CLI surface"
     );
 
     // Wrong authenticator via the browser surface.
     assert_eq!(
-        login_on(&mut rp, "browser-session", 3_000, &wrong_secret, b"cred-wrong", 5),
-        Err(RpError::Crypto(pillar_crypto::CryptoError::VerificationFailed)),
+        login_on(
+            &mut rp,
+            "browser-session",
+            3_000,
+            &wrong_secret,
+            b"cred-wrong",
+            5
+        ),
+        Err(RpError::Crypto(
+            pillar_crypto::CryptoError::VerificationFailed
+        )),
         "a forged assertion from a wrong credential must be refused via the browser surface"
     );
 
@@ -185,7 +241,14 @@ fn a_revoked_credential_is_refused_on_both_surfaces() {
         "a revoked credential must be refused via the CLI surface"
     );
     assert_eq!(
-        login_on(&mut rp, "browser-session", 3_000, &secret, b"cred-revoked", 5),
+        login_on(
+            &mut rp,
+            "browser-session",
+            3_000,
+            &secret,
+            b"cred-revoked",
+            5
+        ),
         Err(RpError::Revoked),
         "a revoked credential must be refused via the browser surface"
     );

@@ -233,9 +233,7 @@ mod tests {
             Some("This field is required.")
         );
         // Non-blank but short fails MinLen.
-        assert!(validate_field("ab", &rules)
-            .unwrap()
-            .contains("at least 3"));
+        assert!(validate_field("ab", &rules).unwrap().contains("at least 3"));
         // Valid.
         assert!(validate_field("abcd", &rules).is_none());
     }

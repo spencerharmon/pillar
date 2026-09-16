@@ -15,9 +15,9 @@ use pillar_core::SideEffect;
 use pillar_crypto::aead::seal_symmetric_with;
 use pillar_crypto::seal::sealing_keypair_from_seed;
 use pillar_crypto::sign::signing_keypair_from_seed;
-use pillar_crypto::{AeadAlgorithm, Seed, SymmetricKey};
+use pillar_crypto::{AeadAlgorithm, CellId, Seed, SymmetricKey};
 use pillar_identity::login::{ColdRoot, DeviceSubkey, IdentityStore, OpKey};
-use pillar_streamdb::{IpfsPersistentStream, Visibility};
+use pillar_streamdb::IpfsPersistentStream;
 use pillar_trust_artifacts::{Attest, Capacity, Predicate, TrustStore};
 
 use crate::{CapturedCellState, CapturedTrust, CapturedUser, SegmentStore};
@@ -98,10 +98,12 @@ pub fn run_against_scratch_cell() -> CapturedCellState {
     let (node_custody_pub, node_custody_secret) =
         sealing_keypair_from_seed(&seed("node-custody")).expect("custody keygen");
 
-    let mut node = IpfsPersistentStream::genesis(
+    let cell = CellId::from_bytes(b"upgrade-gate/scratch-cell".to_vec());
+    let mut node = IpfsPersistentStream::genesis_public(
         owner_pub.clone(),
         owner_secret.clone(),
-        Visibility::Public,
+        cell.clone(),
+        None,
     );
 
     // Track every segment Cid as the head advances — the exact chain a
@@ -114,17 +116,13 @@ pub fn run_against_scratch_cell() -> CapturedCellState {
     ] {
         node.append(payload.to_vec(), SideEffect::Exclusive)
             .expect("prior binary: append event");
-        segment_cids.push(
-            node.head_cid()
-                .cloned()
-                .expect("head advanced on append"),
-        );
+        segment_cids.push(node.head_cid().cloned().expect("head advanced on append"));
     }
 
     let view_root_before = node.stream().log().root();
 
     let sealed_signing_key_cid = node
-        .seal_signing_key(&[node_custody_pub.clone()])
+        .seal_signing_key(std::slice::from_ref(&node_custody_pub))
         .expect("prior binary: seal + pin segment-signing key");
     segment_cids.push(sealed_signing_key_cid.clone());
 
@@ -134,12 +132,8 @@ pub fn run_against_scratch_cell() -> CapturedCellState {
         .cloned()
         .expect("prior binary published a head");
 
-    let segments = SegmentStore::capture(
-        node.store(),
-        &segment_cids,
-        owner_pub.clone(),
-        owner_secret,
-    );
+    let segments =
+        SegmentStore::capture(node.store(), &segment_cids, owner_pub.clone(), owner_secret);
 
     // ---- 4. Real trust artifact anchored to the cell genesis ----
     let genesis = "cell-genesis";
@@ -178,6 +172,7 @@ pub fn run_against_scratch_cell() -> CapturedCellState {
 
     CapturedCellState {
         owner_pub,
+        cell,
         head,
         segments,
         view_root_before,

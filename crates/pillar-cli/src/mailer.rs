@@ -99,10 +99,16 @@ fn send_via_smtp(cfg: &SmtpConfig, to: &str, message: &str) -> Result<(), String
     let mut reader = BufReader::new(stream);
     read_smtp_reply(&mut reader)?; // banner
     smtp_cmd(&mut writer, &mut reader, "EHLO pillar\r\n")?;
-    smtp_cmd(&mut writer, &mut reader, &format!("MAIL FROM:<{}>\r\n", cfg.from))?;
+    smtp_cmd(
+        &mut writer,
+        &mut reader,
+        &format!("MAIL FROM:<{}>\r\n", cfg.from),
+    )?;
     smtp_cmd(&mut writer, &mut reader, &format!("RCPT TO:<{to}>\r\n"))?;
     smtp_cmd(&mut writer, &mut reader, "DATA\r\n")?;
-    writer.write_all(message.as_bytes()).map_err(|e| e.to_string())?;
+    writer
+        .write_all(message.as_bytes())
+        .map_err(|e| e.to_string())?;
     smtp_cmd(&mut writer, &mut reader, "\r\n.\r\n")?;
     smtp_cmd(&mut writer, &mut reader, "QUIT\r\n")?;
     Ok(())
@@ -113,7 +119,9 @@ fn smtp_cmd(
     reader: &mut BufReader<TcpStream>,
     cmd: &str,
 ) -> Result<(), String> {
-    writer.write_all(cmd.as_bytes()).map_err(|e| e.to_string())?;
+    writer
+        .write_all(cmd.as_bytes())
+        .map_err(|e| e.to_string())?;
     read_smtp_reply(reader)
 }
 

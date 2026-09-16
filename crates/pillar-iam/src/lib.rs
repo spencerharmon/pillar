@@ -37,9 +37,7 @@ use pillar_core::NodeId;
 use pillar_rbac::{Capability, Decision, RbacDecider, Request, ResourceClass};
 
 pub mod document_migration;
-pub use document_migration::{
-    record_projection, DocumentUserStore, IAM_USERS_COLLECTION,
-};
+pub use document_migration::{record_projection, DocumentUserStore, IAM_USERS_COLLECTION};
 
 pub mod rbac_bridge;
 pub use rbac_bridge::{
@@ -203,8 +201,11 @@ pub enum UserOp {
     /// handle already has a record — invite is create-only; use
     /// [`UserOp::ProfileUpdate`] to edit an existing one.
     Invite {
+        /// The new user's login handle (the record key).
         handle: String,
+        /// The user's display name.
         display_name: String,
+        /// The user's contact email.
         email: String,
         /// Whether the invitee must change their password on first login (the
         /// forced-change required action). Journaled with a `true` default so
@@ -217,52 +218,92 @@ pub enum UserOp {
         /// for pre-options journals.
         #[serde(default)]
         require_passkey_enrollment: bool,
+        /// Wall-clock timestamp (seconds) the invite was recorded.
         at: u64,
     },
     /// Clears the required-passkey onboarding action once the user's first
     /// WebAuthn credential registers (`specs/UserLifecycle.tla`'s
     /// `EnrollPasskey`). A no-op (via [`apply_op`]) if the handle is unknown.
-    PasskeyEnrolled { handle: String, at: u64 },
+    PasskeyEnrolled {
+        /// The user's login handle.
+        handle: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
+        at: u64,
+    },
     /// A profile edit (self `PUT /portal/profile`, or an admin edit): updates
     /// `display_name`/`email` on an EXISTING record.
     ProfileUpdate {
+        /// The user's login handle.
         handle: String,
+        /// The new display name.
         display_name: String,
+        /// The new contact email.
         email: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
     /// Records a completed self password change: clears
     /// `force_password_change` and stamps `password_changed_at`
     /// (`CompletePasswordChange`).
-    PasswordChanged { handle: String, at: u64 },
+    PasswordChanged {
+        /// The user's login handle.
+        handle: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
+        at: u64,
+    },
     /// Admin sets the forced-change label (`RequireChange`).
-    RequireChange { handle: String, at: u64 },
+    RequireChange {
+        /// The user's login handle.
+        handle: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
+        at: u64,
+    },
+    /// Assigns a role to the record (`roles-groups-rbac-bridge` derives
+    /// effective capabilities over the record's roles).
     RoleAssign {
+        /// The user's login handle.
         handle: String,
+        /// The role name to assign.
         role: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
+    /// Revokes a directly-assigned role from the record.
     RoleRevoke {
+        /// The user's login handle.
         handle: String,
+        /// The role name to revoke.
         role: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
+    /// Adds the record to a named group.
     GroupAdd {
+        /// The user's login handle.
         handle: String,
+        /// The group name to add the record to.
         group: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
+    /// Removes the record from a named group.
     GroupRemove {
+        /// The user's login handle.
         handle: String,
+        /// The group name to remove the record from.
         group: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
     /// Admin disable/enable (carried here so a replay of a disable/enable op
     /// stream — landed by `user-disable-enable` — folds through the same
     /// [`apply_op`] path as every other IAM mutation).
     StatusChange {
+        /// The user's login handle.
         handle: String,
+        /// The new lifecycle status.
         status: UserStatus,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
     /// Sets (or replaces) the record's sealed operational key —
@@ -272,8 +313,11 @@ pub enum UserOp {
     /// folded only into `Invite`) so an admin re-provision
     /// (`admin-password-reset-reprovision`) can reuse the same op.
     ProvisionOperationalKey {
+        /// The user's login handle.
         handle: String,
+        /// The sealed operational key to install as the record's live key.
         sealed: SealedOperationalKey,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
     /// An admin-driven password reset (`admin-password-reset-reprovision`):
@@ -285,8 +329,12 @@ pub enum UserOp {
     /// `iam:credentials:manage`); it never re-derives or exposes the old key
     /// and never touches the user's WebAuthn credentials.
     AdminReset {
+        /// The user's login handle.
         handle: String,
+        /// The genuinely-new operational key (sealed under the admin-chosen new
+        /// password) to install as the live key.
         sealed: SealedOperationalKey,
+        /// Wall-clock timestamp (seconds) the op was recorded.
         at: u64,
     },
     /// Marks the record's email as verified (`um-email-selfservice-reset`):
@@ -294,7 +342,12 @@ pub enum UserOp {
     /// matches against, so an email that was never proven reachable can
     /// never mint a re-enrollment offer for the account. A no-op (via
     /// [`apply_op`]) if the handle is unknown.
-    EmailVerified { handle: String, at: u64 },
+    EmailVerified {
+        /// The user's login handle.
+        handle: String,
+        /// Wall-clock timestamp (seconds) the op was recorded.
+        at: u64,
+    },
 }
 
 impl UserOp {
@@ -538,8 +591,11 @@ pub enum ProfileError {
 /// narrow; the admin surface exposes the rest).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileView {
+    /// The user's login handle.
     pub handle: String,
+    /// The user's display name.
     pub display_name: String,
+    /// The user's contact email.
     pub email: String,
 }
 

@@ -232,14 +232,8 @@ impl AlertEngine {
         }
 
         // Run body: the identical aggregate scan a RecordingRule performs.
-        let rows: Vec<AggregateRow> = aggregate(
-            &alert.query,
-            source,
-            index,
-            now,
-            alert.aggregate,
-            &alert.by,
-        );
+        let rows: Vec<AggregateRow> =
+            aggregate(&alert.query, source, index, now, alert.aggregate, &alert.by);
 
         let mut notifications = Vec::new();
         for row in rows {
@@ -324,7 +318,14 @@ mod tests {
         eng.register(alert);
         let mut notifier = RecordingNotifier::default();
         let eval = eng
-            .evaluate("high_error_rate", "node", 1000, &source, &index, &mut notifier)
+            .evaluate(
+                "high_error_rate",
+                "node",
+                1000,
+                &source,
+                &index,
+                &mut notifier,
+            )
             .unwrap();
 
         assert!(eval.fired);
@@ -368,7 +369,14 @@ mod tests {
         eng.register(alert);
         let mut notifier = RecordingNotifier::default();
         let eval = eng
-            .evaluate("high_error_rate", "node", 1000, &source, &index, &mut notifier)
+            .evaluate(
+                "high_error_rate",
+                "node",
+                1000,
+                &source,
+                &index,
+                &mut notifier,
+            )
             .unwrap();
 
         assert!(eval.fired);

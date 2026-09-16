@@ -223,8 +223,22 @@ mod tests {
         let (pk, sk) = owner_keys("alice");
         let (pk_mallory, sk_mallory) = owner_keys("mallory");
 
-        let seq1 = IpnsHead::sign(&sk, pk.clone(), 1, cid("root-v1"), 10_000, Visibility::Public);
-        let seq2 = IpnsHead::sign(&sk, pk.clone(), 2, cid("root-v2"), 10_000, Visibility::Public);
+        let seq1 = IpnsHead::sign(
+            &sk,
+            pk.clone(),
+            1,
+            cid("root-v1"),
+            10_000,
+            Visibility::Public,
+        );
+        let seq2 = IpnsHead::sign(
+            &sk,
+            pk.clone(),
+            2,
+            cid("root-v2"),
+            10_000,
+            Visibility::Public,
+        );
         let seq3_expired =
             IpnsHead::sign(&sk, pk.clone(), 3, cid("root-v3"), 100, Visibility::Public);
         // A forged candidate that CLAIMS the higher sequence 4 but is signed
@@ -247,7 +261,11 @@ mod tests {
         // the forged seq4 record never verifies.
         assert_eq!(winner, seq2);
         assert_ne!(winner.sequence, 1, "a stale lower sequence must lose");
-        assert_ne!(winner.cid, cid("root-forged"), "a forged head must never win");
+        assert_ne!(
+            winner.cid,
+            cid("root-forged"),
+            "a forged head must never win"
+        );
 
         // A resolver that has already accepted seq2 must reject a re-offered
         // seq1 (or seq2 itself) as stale relative to what it holds — modeled

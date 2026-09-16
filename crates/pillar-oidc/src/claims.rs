@@ -139,11 +139,7 @@ pub struct ClaimSet {
 /// populated from `auth` (they describe the token, not the profile) and are
 /// NOT gated by any scope.
 #[must_use]
-pub fn map_claims(
-    record: &UserRecord,
-    granted: &BTreeSet<String>,
-    auth: AuthMethod,
-) -> ClaimSet {
+pub fn map_claims(record: &UserRecord, granted: &BTreeSet<String>, auth: AuthMethod) -> ClaimSet {
     let has = |scope: &str| granted.contains(scope);
 
     ClaimSet {
@@ -178,6 +174,8 @@ mod claims_mapping {
                 .collect(),
             groups: ["staff".to_string()].into_iter().collect(),
             force_password_change: false,
+            require_passkey_enrollment: false,
+            verified_email: false,
             password_changed_at: Some(100),
             created_at: 0,
             updated_at: 0,
@@ -273,8 +271,11 @@ mod claims_mapping {
     fn claims_mapping_auth_context_is_not_scope_gated() {
         // acr/amr describe the token, not the profile: present even under
         // bare `openid` with no profile/email/roles scopes.
-        let claims =
-            map_claims(&alice(), &scopes(&["openid"]), AuthMethod::PasswordAndWebAuthn);
+        let claims = map_claims(
+            &alice(),
+            &scopes(&["openid"]),
+            AuthMethod::PasswordAndWebAuthn,
+        );
         assert_eq!(claims.acr, ACR_WEBAUTHN);
         assert!(claims.amr.contains(&"webauthn".to_string()));
         assert_eq!(claims.name, None);

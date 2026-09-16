@@ -210,8 +210,18 @@ fn a_scoped_delegate_can_never_widen_scope_when_re_delegating() {
         &BTreeSet::from(["emea-support".to_owned()]),
     )
     .expect("a same-or-narrower re-delegation must succeed");
-    assert!(is_authorized_for_target(&grant, &records, "iam:users:write", "bob"));
-    assert!(!is_authorized_for_target(&grant, &records, "iam:users:write", "carol"));
+    assert!(is_authorized_for_target(
+        &grant,
+        &records,
+        "iam:users:write",
+        "bob"
+    ));
+    assert!(!is_authorized_for_target(
+        &grant,
+        &records,
+        "iam:users:write",
+        "carol"
+    ));
 }
 
 /// A scope group that does not exist is refused fail-closed, never

@@ -171,11 +171,7 @@ impl CollectionPlacement {
     /// The live count of participating nodes (for CLI/UI surfacing), computed
     /// as the size of [`node_set`](Self::node_set).
     #[must_use]
-    pub fn participant_count(
-        &self,
-        topology: &Topology,
-        cell_members: &BTreeSet<NodeId>,
-    ) -> usize {
+    pub fn participant_count(&self, topology: &Topology, cell_members: &BTreeSet<NodeId>) -> usize {
         self.node_set(topology, cell_members).len()
     }
 }

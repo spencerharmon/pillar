@@ -418,8 +418,8 @@ pub use yew_impl::{AttestationWizard, CustodyWizard};
 mod yew_impl {
     use super::{
         attestation_step_valid, compose_attestation_body, compose_custody_body, custody_step_valid,
-        parse_attestation_result, AttestationFields, AttestationResult, AttestationStep, CustodyOp,
-        CustodyStep, CustodyFields,
+        parse_attestation_result, AttestationFields, AttestationResult, AttestationStep,
+        CustodyFields, CustodyOp, CustodyStep,
     };
     use crate::auth::use_auth;
     use crate::components::form::{FieldRule, FieldSet, FormField};
@@ -735,7 +735,11 @@ mod yew_impl {
         };
 
         let submit_label = if current.is_last() {
-            if *busy { "Signing\u{2026}" } else { "Sign & apply" }
+            if *busy {
+                "Signing\u{2026}"
+            } else {
+                "Sign & apply"
+            }
         } else if matches!(current, CustodyStep::Operation) {
             "Choose an operation above"
         } else {
@@ -850,10 +854,7 @@ mod tests {
         };
         let body = compose_attestation_body("tok", &f);
         // token\nissuer\ncapacity\nauthority\nsubject\naction\nresource\nquota\nscope
-        assert_eq!(
-            body,
-            "tok\nroot\nself\n\nalice\nread\ndb\ncpu=1000m\nprod"
-        );
+        assert_eq!(body, "tok\nroot\nself\n\nalice\nread\ndb\ncpu=1000m\nprod");
         // A supplied capacity is passed through verbatim (trimmed).
         let f2 = AttestationFields {
             capacity: " admin@prod ".into(),
@@ -864,7 +865,8 @@ mod tests {
 
     #[test]
     fn attestation_result_parses_cid_sentence_and_chain() {
-        let body = "CID cid-top\nSENTENCE root grants alice read on db\nCHAIN cid-1\nCHAIN cid-2\nnoise\n";
+        let body =
+            "CID cid-top\nSENTENCE root grants alice read on db\nCHAIN cid-1\nCHAIN cid-2\nnoise\n";
         let r = parse_attestation_result(body);
         assert_eq!(r.cid, "cid-top");
         assert_eq!(r.sentence, "root grants alice read on db");
@@ -889,7 +891,10 @@ mod tests {
         let mut f = CustodyFields::default();
         // Every op needs a handle.
         for op in CustodyOp::all() {
-            assert!(!custody_step_valid(op, &f), "{op:?} accepted a blank handle");
+            assert!(
+                !custody_step_valid(op, &f),
+                "{op:?} accepted a blank handle"
+            );
         }
         f.handle = "h1".into();
         // Seal/revoke are satisfied by handle alone.
@@ -912,13 +917,19 @@ mod tests {
             cid: " cid-9 ".into(),
             holder: " bob ".into(),
         };
-        assert_eq!(compose_custody_body("tok", CustodyOp::Rotate, &f), "tok\nh1\ncid-9");
+        assert_eq!(
+            compose_custody_body("tok", CustodyOp::Rotate, &f),
+            "tok\nh1\ncid-9"
+        );
         assert_eq!(
             compose_custody_body("tok", CustodyOp::Migrate, &f),
             "tok\nh1\nbob\ncid-9"
         );
         assert_eq!(compose_custody_body("tok", CustodyOp::Seal, &f), "tok\nh1");
-        assert_eq!(compose_custody_body("tok", CustodyOp::Revoke, &f), "tok\nh1");
+        assert_eq!(
+            compose_custody_body("tok", CustodyOp::Revoke, &f),
+            "tok\nh1"
+        );
     }
 
     #[test]

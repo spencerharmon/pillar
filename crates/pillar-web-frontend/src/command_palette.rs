@@ -235,8 +235,12 @@ mod yew_impl {
                 spawn_local(async move {
                     match http("GET", "/surface-inventory", None).await {
                         Ok(r) if r.ok() => verbs.set(verb_commands(&r.body)),
-                        Ok(_) => toaster.error("Command palette: could not load the action inventory."),
-                        Err(_) => toaster.error("Command palette: the action inventory request failed."),
+                        Ok(_) => {
+                            toaster.error("Command palette: could not load the action inventory.")
+                        }
+                        Err(_) => {
+                            toaster.error("Command palette: the action inventory request failed.")
+                        }
                     }
                 });
                 || ()
@@ -353,8 +357,12 @@ mod yew_impl {
         // highlighted command, Escape closes. Keeping the keys on the always-
         // focused input means the palette is fully operable without a mouse.
         let on_keydown = {
-            let (selected, open, go, section_at) =
-                (selected.clone(), open.clone(), go.clone(), section_at.clone());
+            let (selected, open, go, section_at) = (
+                selected.clone(),
+                open.clone(),
+                go.clone(),
+                section_at.clone(),
+            );
             let len = visible.len();
             Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
                 "ArrowDown" => {
@@ -538,9 +546,7 @@ mod tests {
         // Present-but-empty array.
         assert!(verb_commands(r#"{"surface_inventory": []}"#).is_empty());
         // An object missing `id`/`kind` is skipped, never guessed.
-        assert!(
-            verb_commands(r#"{"surface_inventory": [{"signature": "x"}]}"#).is_empty()
-        );
+        assert!(verb_commands(r#"{"surface_inventory": [{"signature": "x"}]}"#).is_empty());
     }
 
     /// Source audit (anti-facade DoD): the palette's verb list is DERIVED from

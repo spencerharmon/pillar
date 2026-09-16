@@ -19,4 +19,3 @@
 pub fn start() {
     yew::Renderer::<pillar_web_frontend::router::Shell>::new().render();
 }
-

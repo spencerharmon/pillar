@@ -124,10 +124,13 @@ struct ObjectRecord {
 }
 
 impl ObjectRecord {
-    fn signing_material(visibility: ObjectVisibility, author_subject: &str, body: &[u8]) -> Vec<u8> {
-        let mut m = Vec::with_capacity(
-            OBJECT_SIG_DOMAIN.len() + 1 + author_subject.len() + body.len(),
-        );
+    fn signing_material(
+        visibility: ObjectVisibility,
+        author_subject: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut m =
+            Vec::with_capacity(OBJECT_SIG_DOMAIN.len() + 1 + author_subject.len() + body.len());
         m.extend_from_slice(OBJECT_SIG_DOMAIN);
         m.push(vis_to_u8(visibility));
         m.extend_from_slice(author_subject.as_bytes());
@@ -199,8 +202,7 @@ impl ObjectRecord {
         let signer = SigningPublicKey::from_bytes(take_bytes(bytes, &mut pos)?);
         let signature = Signature::from_bytes(take_bytes(bytes, &mut pos)?);
         let author_subject = String::from_utf8(take_bytes(bytes, &mut pos)?).ok()?;
-        let recipient_count =
-            u32::from_be_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?);
+        let recipient_count = u32::from_be_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?);
         pos += 4;
         let link_count = u32::from_be_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?);
         pos += 4;
@@ -318,9 +320,10 @@ impl ObjectStore {
                 }
                 let mut recipients = Vec::with_capacity(recipients_hex.len());
                 for r in recipients_hex {
-                    recipients.push(SealingPublicKey::from_bytes(hex_decode(r).ok_or_else(
-                        || "recipients_hex entry is not valid hex".to_owned(),
-                    )?));
+                    recipients
+                        .push(SealingPublicKey::from_bytes(hex_decode(r).ok_or_else(
+                            || "recipients_hex entry is not valid hex".to_owned(),
+                        )?));
                 }
                 let sealed = seal_to_recipients(&plaintext, &recipients)
                     .map_err(|e| format!("seal to recipients: {e}"))?;
@@ -344,9 +347,7 @@ impl ObjectStore {
         // Every authored object is pinned durable on write — matches the
         // design doc's `pinned: n1, n3` expectation (a block a node authors
         // it always holds durably).
-        self.node
-            .pin(&cid)
-            .map_err(|e| format!("pin: {e}"))?;
+        self.node.pin(&cid).map_err(|e| format!("pin: {e}"))?;
         Ok(hex_encode(cid.as_bytes()))
     }
 
@@ -540,7 +541,8 @@ mod tests {
     fn a_sealed_object_hides_its_body_from_everyone_but_a_recipient() {
         let store = ObjectStore::new();
         let (recipient_pub, recipient_secret) =
-            sealing_keypair_from_seed(&Seed::from_bytes(b"recipient-a".to_vec())).expect("seal keys");
+            sealing_keypair_from_seed(&Seed::from_bytes(b"recipient-a".to_vec()))
+                .expect("seal keys");
         let (intruder_pub, intruder_secret) =
             sealing_keypair_from_seed(&Seed::from_bytes(b"intruder".to_vec())).expect("seal keys");
         let _ = intruder_pub;
@@ -574,7 +576,10 @@ mod tests {
         let stat = store.stat(&cid_hex, "n1").expect("stat");
         assert!(stat.contains("sealed (1 recipients)"), "{stat}");
         let links = store.links(&cid_hex).expect("links");
-        assert!(links.contains(&hex_encode(b"child-cid-placeholder")), "{links}");
+        assert!(
+            links.contains(&hex_encode(b"child-cid-placeholder")),
+            "{links}"
+        );
 
         // verify never opens the body and still confirms hash+signature.
         let verify = store.verify(&cid_hex).expect("verify");

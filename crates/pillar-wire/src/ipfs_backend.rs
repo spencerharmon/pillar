@@ -40,9 +40,9 @@ use std::sync::Mutex;
 #[cfg(feature = "ipfs")]
 use pillar_ipfs::IpfsNode;
 
-use crate::store::{Cid, HeadRecord, StoreError};
 #[cfg(feature = "ipfs")]
 use crate::store::{hex_encode, io_store_err};
+use crate::store::{Cid, HeadRecord, StoreError};
 
 /// The abstract IPFS content-object substrate a [`crate::ContentStore`]
 /// delegates its durability to. Every method is synchronous (the store surface

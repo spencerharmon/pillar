@@ -244,7 +244,8 @@ mod tests {
 
     /// A workload manifest requesting `amount` quota units.
     fn workload(amount: i64) -> Crd {
-        Crd::new(API, KIND, Metadata::new("wl")).with_spec(QUOTA_REQUEST_FIELD, Value::Integer(amount))
+        Crd::new(API, KIND, Metadata::new("wl"))
+            .with_spec(QUOTA_REQUEST_FIELD, Value::Integer(amount))
     }
 
     // --- Test 1: over-budget is REFUSED AT ADMISSION, not recorded after ----

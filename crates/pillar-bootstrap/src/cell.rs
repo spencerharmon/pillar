@@ -548,7 +548,9 @@ mod tests {
         let mut store = pillar_manifest::apply::ManifestStore::new(schema_registry, "cell-signals");
 
         for crd in &outcome.signal_config_manifests {
-            store.apply_crd(crd.clone()).expect("valid default manifest");
+            store
+                .apply_crd(crd.clone())
+                .expect("valid default manifest");
         }
 
         // Readable via the normal manifest-get path, one per declared source,
@@ -595,7 +597,9 @@ mod tests {
         let mut store =
             pillar_manifest::apply::ManifestStore::new(schema_registry, "cell-signals-live");
         for crd in &outcome.signal_config_manifests {
-            store.apply_crd(crd.clone()).expect("valid default manifest");
+            store
+                .apply_crd(crd.clone())
+                .expect("valid default manifest");
         }
 
         // Live producer matrix mirrors the seeded manifest set.
@@ -624,11 +628,12 @@ mod tests {
                 .to_owned(),
             name: "default-traces".to_owned(),
         };
-        let mut edited = store.get_body(&traces_key).expect("seeded manifest present");
-        edited.spec.insert(
-            "enabled".to_owned(),
-            pillar_manifest::Value::Boolean(true),
-        );
+        let mut edited = store
+            .get_body(&traces_key)
+            .expect("seeded manifest present");
+        edited
+            .spec
+            .insert("enabled".to_owned(), pillar_manifest::Value::Boolean(true));
         store.apply_crd(edited.clone()).expect("edit re-applies");
 
         // Lower the edited manifest into the live producer matrix.

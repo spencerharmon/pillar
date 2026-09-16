@@ -314,6 +314,14 @@
             pkgs.clippy
             pkgs.rustfmt
             pkgs.git
+            # `lld` is the wasm32 linker the nixpkgs rustc needs to build
+            # `pillar-frontend` for `wasm32-unknown-unknown`. The frontend
+            # PACKAGE build already carries it (nativeBuildInputs above); the
+            # devShell needs it too because the `rust` CI lane's `cargo test
+            # --all` includes portal tests that shell out to `cargo build
+            # --target wasm32-unknown-unknown` at test time. Without it those
+            # tests fail with `linker \`lld\` not found`.
+            pkgs.lld
           ];
           buildInputs = [ pkgs.tpm2-tss pkgs.hidapi pkgs.libusb1 ];
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";

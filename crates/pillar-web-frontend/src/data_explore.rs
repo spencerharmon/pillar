@@ -165,10 +165,17 @@ mod yew_impl {
 
     /// `GET <path>?token=<t>&<extra>` and hand the response body to `apply` on
     /// success; a failed/non-2xx fetch leaves the prior state untouched.
-    fn refresh(token: String, path: &'static str, extra: Vec<(String, String)>, apply: Callback<String>) {
+    fn refresh(
+        token: String,
+        path: &'static str,
+        extra: Vec<(String, String)>,
+        apply: Callback<String>,
+    ) {
         spawn_local(async move {
-            let extra_ref: Vec<(&str, &str)> =
-                extra.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let extra_ref: Vec<(&str, &str)> = extra
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
             let url = get_url(path, &token, &extra_ref);
             if let Ok(r) = http("GET", &url, None).await {
                 if r.ok() {
@@ -222,8 +229,12 @@ mod yew_impl {
         };
 
         let on_pick_collection = {
-            let (collection, load_keys, selected_key, value) =
-                (collection.clone(), load_keys.clone(), selected_key.clone(), value.clone());
+            let (collection, load_keys, selected_key, value) = (
+                collection.clone(),
+                load_keys.clone(),
+                selected_key.clone(),
+                value.clone(),
+            );
             Callback::from(move |e: InputEvent| {
                 let v = input_value(&e);
                 collection.set(v.clone());
@@ -234,8 +245,12 @@ mod yew_impl {
         };
 
         let on_pick_key = {
-            let (auth, collection, selected_key, value) =
-                (auth.clone(), collection.clone(), selected_key.clone(), value.clone());
+            let (auth, collection, selected_key, value) = (
+                auth.clone(),
+                collection.clone(),
+                selected_key.clone(),
+                value.clone(),
+            );
             Callback::from(move |key: String| {
                 selected_key.set(key.clone());
                 let Some(token) = auth.token.clone() else {
@@ -317,15 +332,23 @@ mod yew_impl {
         };
 
         let on_pick_id = {
-            let (auth, collection, selected_id, fields) =
-                (auth.clone(), collection.clone(), selected_id.clone(), fields.clone());
+            let (auth, collection, selected_id, fields) = (
+                auth.clone(),
+                collection.clone(),
+                selected_id.clone(),
+                fields.clone(),
+            );
             Callback::from(move |id: String| {
                 selected_id.set(id.clone());
                 let Some(token) = auth.token.clone() else {
                     return;
                 };
-                let (auth2, collection2, id2, fields2) =
-                    (auth.clone(), (*collection).clone(), id.clone(), fields.clone());
+                let (auth2, collection2, id2, fields2) = (
+                    auth.clone(),
+                    (*collection).clone(),
+                    id.clone(),
+                    fields.clone(),
+                );
                 // First list the field NAMES, then fetch each one's live value.
                 spawn_local(async move {
                     let names_url = crate::portal::get_url(
@@ -512,7 +535,21 @@ mod yew_impl {
         // Loading a collection re-fetches op-log info/list/dag and the
         // storage-layout panel, and clears any deeper breadcrumb selection.
         let load_collection = {
-            let (auth, log_info, log_ids, log_dag, layout, selected_event, log_show, log_verify, object_cid, object_stat, object_links, object_cat, object_verify) = (
+            let (
+                auth,
+                log_info,
+                log_ids,
+                log_dag,
+                layout,
+                selected_event,
+                log_show,
+                log_verify,
+                object_cid,
+                object_stat,
+                object_links,
+                object_cat,
+                object_verify,
+            ) = (
                 auth.clone(),
                 log_info.clone(),
                 log_ids.clone(),
@@ -684,7 +721,9 @@ mod yew_impl {
             })
         };
 
-        let payload_cid = parse_field(&log_show, "payload-cid").unwrap_or("").to_owned();
+        let payload_cid = parse_field(&log_show, "payload-cid")
+            .unwrap_or("")
+            .to_owned();
         let log_verified = log_verify.contains("hash-matches-id: true")
             && log_verify.contains("signature-valid: true");
         let object_verified = object_verify.contains("hash-matches-cid: true")

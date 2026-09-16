@@ -94,7 +94,7 @@ impl NodeMetadataSource {
         members.dedup();
         NodeMetadataSource {
             peer_id: peer_id.into(),
-            cell: cell.map(Into::into),
+            cell,
             members,
             version: version.into(),
             build,

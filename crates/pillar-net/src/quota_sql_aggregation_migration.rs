@@ -30,8 +30,8 @@
 
 use std::collections::BTreeMap;
 
-use pillar_core::{Epoch, NodeId};
 use pillar_coordination::LeaseRegister;
+use pillar_core::{Epoch, NodeId};
 use pillar_keyedstore::{Hlc, KeyedStore, Value};
 use pillar_sqlviews::{aggregate_sum, create_view, Filter, ViewDef};
 use pillar_streamdb::cofold::{CoFoldError, CoFoldInvariant, StrictCofold};
@@ -96,14 +96,16 @@ fn decode_delta(payload: &[u8]) -> Option<(u64, bool)> {
 
 impl CoFoldInvariant for AmountQuotaCeiling {
     fn admit(&mut self, key: &[u8], payload: &[u8]) -> Result<(), CoFoldError> {
-        let (amount, is_release) = decode_delta(payload).ok_or_else(|| CoFoldError::QuotaExceeded {
-            key: key.to_vec(),
-            ceiling: self.ceiling,
-            attempted: self.sum(key),
-        })?;
+        let (amount, is_release) =
+            decode_delta(payload).ok_or_else(|| CoFoldError::QuotaExceeded {
+                key: key.to_vec(),
+                ceiling: self.ceiling,
+                attempted: self.sum(key),
+            })?;
         let current = self.sum(key);
         if is_release {
-            self.sums.insert(key.to_vec(), current.saturating_sub(amount));
+            self.sums
+                .insert(key.to_vec(), current.saturating_sub(amount));
             return Ok(());
         }
         let next = current + amount;
@@ -162,7 +164,13 @@ impl SqlQuotaLedger {
     /// Acquire the CP fencing epoch for `budget`'s partition through
     /// `lease`, exactly like [`StrictCofold::acquire`]. Must succeed before
     /// [`Self::admit`]/[`Self::release`] will admit any write for `budget`.
-    pub fn acquire(&mut self, budget: &[u8], lease: &mut LeaseRegister, candidate: &NodeId, epoch: Epoch) -> bool {
+    pub fn acquire(
+        &mut self,
+        budget: &[u8],
+        lease: &mut LeaseRegister,
+        candidate: &NodeId,
+        epoch: Epoch,
+    ) -> bool {
         self.cofold.acquire(budget, lease, candidate, epoch)
     }
 
@@ -266,7 +274,12 @@ impl SqlQuotaLedger {
     /// `SELECT budget, SUM(amount) FROM reservation_events GROUP BY budget`.
     #[must_use]
     pub fn usage_by_budget(&self) -> Vec<(Vec<u8>, i64)> {
-        pillar_sqlviews::aggregate_group_by_sum(&self.store, RESERVATION_EVENTS_COLLECTION, "budget", "amount")
+        pillar_sqlviews::aggregate_group_by_sum(
+            &self.store,
+            RESERVATION_EVENTS_COLLECTION,
+            "budget",
+            "amount",
+        )
     }
 
     /// The catalog-registered view's rows, materialized: proves the
@@ -282,11 +295,17 @@ impl SqlQuotaLedger {
 mod tests {
     use super::*;
 
-    fn fenced_ledger(ceiling: u64, budget: &[u8], candidate: &NodeId) -> (SqlQuotaLedger, LeaseRegister, Epoch) {
+    fn fenced_ledger(
+        ceiling: u64,
+        budget: &[u8],
+        candidate: &NodeId,
+    ) -> (SqlQuotaLedger, LeaseRegister, Epoch) {
         let mut ledger = SqlQuotaLedger::new(ceiling);
         let mut lease = LeaseRegister::new(1);
         let epoch = Epoch(1);
-        lease.grant(NodeId::from("v1"), candidate.clone(), epoch).unwrap();
+        lease
+            .grant(NodeId::from("v1"), candidate.clone(), epoch)
+            .unwrap();
         assert!(ledger.acquire(budget, &mut lease, candidate, epoch));
         (ledger, lease, epoch)
     }
@@ -355,7 +374,10 @@ mod tests {
         let mut ledger = SqlQuotaLedger::new(100);
 
         let refused = ledger.admit(&budget, Epoch(1), &candidate, 10);
-        assert!(matches!(refused, Err(SqlQuotaError::Fence(CoFoldError::NotFenced { .. }))));
+        assert!(matches!(
+            refused,
+            Err(SqlQuotaError::Fence(CoFoldError::NotFenced { .. }))
+        ));
         assert_eq!(ledger.usage(&budget), 0);
     }
 
@@ -370,7 +392,9 @@ mod tests {
         let mut ledger = SqlQuotaLedger::new(10);
         let mut lease = LeaseRegister::new(1);
         let epoch = Epoch(1);
-        lease.grant(NodeId::from("v1"), candidate.clone(), epoch).unwrap();
+        lease
+            .grant(NodeId::from("v1"), candidate.clone(), epoch)
+            .unwrap();
         assert!(ledger.acquire(&budget_a, &mut lease, &candidate, epoch));
         assert!(ledger.acquire(&budget_b, &mut lease, &candidate, epoch));
 

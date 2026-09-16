@@ -96,7 +96,11 @@ impl fmt::Display for SurfaceNotDeclared {
         write!(
             f,
             "{} party never declared a version for required surface {:?}",
-            if self.missing_local { "local" } else { "remote" },
+            if self.missing_local {
+                "local"
+            } else {
+                "remote"
+            },
             self.surface
         )
     }
@@ -213,10 +217,12 @@ pub fn negotiate_all(
     window: CompatWindow,
 ) -> Result<(), NegotiationError> {
     for &surface in required {
-        let l = local.get(surface).ok_or(NegotiationError::NotDeclared(SurfaceNotDeclared {
-            surface,
-            missing_local: true,
-        }))?;
+        let l = local
+            .get(surface)
+            .ok_or(NegotiationError::NotDeclared(SurfaceNotDeclared {
+                surface,
+                missing_local: true,
+            }))?;
         let r = remote
             .get(surface)
             .ok_or(NegotiationError::NotDeclared(SurfaceNotDeclared {
@@ -322,8 +328,7 @@ pub fn require_supported_and_in_window(
             window,
         }));
     }
-    negotiate_surface(surface, found, current_release, window)
-        .map_err(NegotiationError::Refused)
+    negotiate_surface(surface, found, current_release, window).map_err(NegotiationError::Refused)
 }
 
 #[cfg(test)]
@@ -402,9 +407,13 @@ mod tests {
     #[test]
     fn negotiate_all_requires_every_named_surface_to_link() {
         let mut local = DeclaredVersions::new();
-        local.declare("udp", SurfaceVersion(3)).declare("http", SurfaceVersion(1));
+        local
+            .declare("udp", SurfaceVersion(3))
+            .declare("http", SurfaceVersion(1));
         let mut remote = DeclaredVersions::new();
-        remote.declare("udp", SurfaceVersion(3)).declare("http", SurfaceVersion(1));
+        remote
+            .declare("udp", SurfaceVersion(3))
+            .declare("http", SurfaceVersion(1));
 
         assert!(negotiate_all(&local, &remote, &["udp", "http"], CompatWindow(1)).is_ok());
     }
@@ -412,9 +421,13 @@ mod tests {
     #[test]
     fn negotiate_all_refuses_on_the_first_incompatible_surface() {
         let mut local = DeclaredVersions::new();
-        local.declare("udp", SurfaceVersion(5)).declare("http", SurfaceVersion(1));
+        local
+            .declare("udp", SurfaceVersion(5))
+            .declare("http", SurfaceVersion(1));
         let mut remote = DeclaredVersions::new();
-        remote.declare("udp", SurfaceVersion(0)).declare("http", SurfaceVersion(1));
+        remote
+            .declare("udp", SurfaceVersion(0))
+            .declare("http", SurfaceVersion(1));
 
         let err = negotiate_all(&local, &remote, &["udp", "http"], CompatWindow(1)).unwrap_err();
         assert_eq!(
@@ -456,29 +469,20 @@ mod tests {
     #[test]
     fn self_check_passes_when_the_proposed_min_still_covers_the_window() {
         // release=10, window=2 => floor=8. Supporting down to 8 (or older) is fine.
-        assert!(startup_self_check(
-            S,
-            SurfaceVersion(10),
-            SurfaceVersion(8),
-            CompatWindow(2)
-        )
-        .is_ok());
-        assert!(startup_self_check(
-            S,
-            SurfaceVersion(10),
-            SurfaceVersion(5),
-            CompatWindow(2)
-        )
-        .is_ok());
+        assert!(
+            startup_self_check(S, SurfaceVersion(10), SurfaceVersion(8), CompatWindow(2)).is_ok()
+        );
+        assert!(
+            startup_self_check(S, SurfaceVersion(10), SurfaceVersion(5), CompatWindow(2)).is_ok()
+        );
     }
 
     #[test]
     fn self_check_fails_when_the_binary_would_drop_an_in_window_version() {
         // release=10, window=2 => floor=8. Proposing min=9 drops support for
         // version 8, which is still legitimately in-window.
-        let err =
-            startup_self_check(S, SurfaceVersion(10), SurfaceVersion(9), CompatWindow(2))
-                .unwrap_err();
+        let err = startup_self_check(S, SurfaceVersion(10), SurfaceVersion(9), CompatWindow(2))
+            .unwrap_err();
         assert_eq!(
             err,
             StartupSelfCheckFailed {
@@ -494,13 +498,9 @@ mod tests {
     #[test]
     fn self_check_floor_saturates_at_zero_near_genesis() {
         // release=1, window=5 => floor saturates at 0, never underflows.
-        assert!(startup_self_check(
-            S,
-            SurfaceVersion(1),
-            SurfaceVersion(0),
-            CompatWindow(5)
-        )
-        .is_ok());
+        assert!(
+            startup_self_check(S, SurfaceVersion(1), SurfaceVersion(0), CompatWindow(5)).is_ok()
+        );
     }
 
     // --- require_supported_and_in_window: layers the window on top of the

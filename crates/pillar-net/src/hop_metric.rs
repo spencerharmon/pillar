@@ -128,7 +128,13 @@ mod tests {
         msg
     }
 
-    fn attest_tier(topology: &mut Topology, store: &mut TrustStore, node: &str, tier: &str, value: &str) {
+    fn attest_tier(
+        topology: &mut Topology,
+        store: &mut TrustStore,
+        node: &str,
+        tier: &str,
+        value: &str,
+    ) {
         let label = Label::new(tier, value);
         let attest = Attest {
             issuer: store.genesis().clone(),
@@ -141,7 +147,9 @@ mod tests {
             sig: Sig::sign_as(NodeId::from(""), b""),
         }
         .signed_by_issuer();
-        let cid = store.issue_attest(attest.clone()).expect("genesis self-issue succeeds");
+        let cid = store
+            .issue_attest(attest.clone())
+            .expect("genesis self-issue succeeds");
         let assignment = Assignment::Attested {
             attest: Box::new(attest),
             cid,
@@ -159,8 +167,20 @@ mod tests {
         let hierarchy = TierHierarchy::default();
         let mut trust = TrustStore::new(NodeId::from("genesis"));
         let mut topology = Topology::new(hierarchy);
-        attest_tier(&mut topology, &mut trust, "ingest-node", "region", "us-east");
-        attest_tier(&mut topology, &mut trust, "ingest-node", "zone", "us-east-1a");
+        attest_tier(
+            &mut topology,
+            &mut trust,
+            "ingest-node",
+            "region",
+            "us-east",
+        );
+        attest_tier(
+            &mut topology,
+            &mut trust,
+            "ingest-node",
+            "zone",
+            "us-east-1a",
+        );
         attest_tier(&mut topology, &mut trust, "dest-node", "region", "us-west");
         attest_tier(&mut topology, &mut trust, "dest-node", "zone", "us-west-1b");
 
@@ -247,4 +267,3 @@ mod tests {
         );
     }
 }
-

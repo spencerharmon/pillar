@@ -47,9 +47,7 @@
 //! asserting the migrated fold equals the original.
 
 use pillar_keyedstore::{Hlc, KeyedStore, Value};
-use pillar_manifest::ingress::{
-    derive_routing_table, Frontend, Route, RouteStatus, RoutingTable,
-};
+use pillar_manifest::ingress::{derive_routing_table, Frontend, Route, RouteStatus, RoutingTable};
 use pillar_sqlviews::{create_view, materialize_view, Row, ViewDef};
 use pillar_trust_artifacts::TrustStore;
 
@@ -113,9 +111,18 @@ pub fn fold_routing_table_into_store(
     }
     // DDL is data: register the "attached routes" sub-table as an ordinary
     // filtered view in the catalog — no side index, no second engine.
-    let def = ViewDef::over(ROUTES_COLLECTION)
-        .filtered_eq("status", route_status_label(&RouteStatus::Attached).as_bytes().to_vec());
-    create_view(&mut store, ATTACHED_ROUTES_VIEW, def, Hlc::new(u64::MAX, 0, "routing-fold"));
+    let def = ViewDef::over(ROUTES_COLLECTION).filtered_eq(
+        "status",
+        route_status_label(&RouteStatus::Attached)
+            .as_bytes()
+            .to_vec(),
+    );
+    create_view(
+        &mut store,
+        ATTACHED_ROUTES_VIEW,
+        def,
+        Hlc::new(u64::MAX, 0, "routing-fold"),
+    );
     (store, table)
 }
 
@@ -140,8 +147,7 @@ pub fn attached_routes(store: &KeyedStore) -> Vec<String> {
 /// folded by the shared engine rather than a bespoke per-dashboard loop.
 #[must_use]
 pub fn dashboard_panels_view(dashboard_id: &str) -> ViewDef {
-    ViewDef::over("dashboard_panels")
-        .filtered_eq("dashboard", dashboard_id.as_bytes().to_vec())
+    ViewDef::over("dashboard_panels").filtered_eq("dashboard", dashboard_id.as_bytes().to_vec())
 }
 
 /// A recording-rule kind's live rule set, expressed as a `pillar_sqlviews`
@@ -153,10 +159,10 @@ pub fn recording_rules_view(kind: &str) -> ViewDef {
 }
 
 #[cfg(test)]
-mod derived_views_migration {
+mod tests {
     use super::*;
-    use pillar_manifest::ingress::RouteKind;
     use pillar_core::NodeId;
+    use pillar_manifest::ingress::RouteKind;
     use pillar_trust_artifacts::{Attest, Capacity, Predicate, Sig};
 
     const ATTACH_ACTION: &str = "route:attach";
@@ -243,8 +249,15 @@ mod derived_views_migration {
             .collect();
         via_bespoke.sort();
 
-        assert_eq!(via_view, via_bespoke, "generic view == bespoke is_attached filter");
-        assert_eq!(via_view, vec!["r-attached".to_string()], "only the authorized+existing route attaches");
+        assert_eq!(
+            via_view, via_bespoke,
+            "generic view == bespoke is_attached filter"
+        );
+        assert_eq!(
+            via_view,
+            vec!["r-attached".to_string()],
+            "only the authorized+existing route attaches"
+        );
     }
 
     /// The migration is a pure fold: re-materializing the view over the
@@ -268,9 +281,27 @@ mod derived_views_migration {
         let mut store = KeyedStore::new();
         let hlc = |t| Hlc::new(t, 0, "dash");
         // Two dashboards' panels in one shared collection.
-        store.doc_put_field("dashboard_panels", "p1", "dashboard", Value::Scalar(b"ops".to_vec()), hlc(1));
-        store.doc_put_field("dashboard_panels", "p2", "dashboard", Value::Scalar(b"ops".to_vec()), hlc(1));
-        store.doc_put_field("dashboard_panels", "p3", "dashboard", Value::Scalar(b"net".to_vec()), hlc(1));
+        store.doc_put_field(
+            "dashboard_panels",
+            "p1",
+            "dashboard",
+            Value::Scalar(b"ops".to_vec()),
+            hlc(1),
+        );
+        store.doc_put_field(
+            "dashboard_panels",
+            "p2",
+            "dashboard",
+            Value::Scalar(b"ops".to_vec()),
+            hlc(1),
+        );
+        store.doc_put_field(
+            "dashboard_panels",
+            "p3",
+            "dashboard",
+            Value::Scalar(b"net".to_vec()),
+            hlc(1),
+        );
 
         create_view(&mut store, "dash_ops", dashboard_panels_view("ops"), hlc(2));
         let mut ids: Vec<String> = materialize_view(&store, "dash_ops")
@@ -279,7 +310,11 @@ mod derived_views_migration {
             .map(|r| r.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec!["p1".to_string(), "p2".to_string()], "only the ops dashboard's panels");
+        assert_eq!(
+            ids,
+            vec!["p1".to_string(), "p2".to_string()],
+            "only the ops dashboard's panels"
+        );
     }
 
     /// The psl-recording-rules consumer is the SAME generic filtered view: a
@@ -289,17 +324,44 @@ mod derived_views_migration {
     fn recording_rules_are_a_generic_filtered_view() {
         let mut store = KeyedStore::new();
         let hlc = |t| Hlc::new(t, 0, "rec");
-        store.doc_put_field("recording_rules", "r1", "kind", Value::Scalar(b"logs_to_metrics".to_vec()), hlc(1));
-        store.doc_put_field("recording_rules", "r2", "kind", Value::Scalar(b"traces_to_metrics".to_vec()), hlc(1));
-        store.doc_put_field("recording_rules", "r3", "kind", Value::Scalar(b"logs_to_metrics".to_vec()), hlc(1));
+        store.doc_put_field(
+            "recording_rules",
+            "r1",
+            "kind",
+            Value::Scalar(b"logs_to_metrics".to_vec()),
+            hlc(1),
+        );
+        store.doc_put_field(
+            "recording_rules",
+            "r2",
+            "kind",
+            Value::Scalar(b"traces_to_metrics".to_vec()),
+            hlc(1),
+        );
+        store.doc_put_field(
+            "recording_rules",
+            "r3",
+            "kind",
+            Value::Scalar(b"logs_to_metrics".to_vec()),
+            hlc(1),
+        );
 
-        create_view(&mut store, "rec_logs", recording_rules_view("logs_to_metrics"), hlc(2));
+        create_view(
+            &mut store,
+            "rec_logs",
+            recording_rules_view("logs_to_metrics"),
+            hlc(2),
+        );
         let mut ids: Vec<String> = materialize_view(&store, "rec_logs")
             .unwrap()
             .into_iter()
             .map(|r| r.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec!["r1".to_string(), "r3".to_string()], "only logs->metrics rules");
+        assert_eq!(
+            ids,
+            vec!["r1".to_string(), "r3".to_string()],
+            "only logs->metrics rules"
+        );
     }
 }

@@ -148,7 +148,9 @@ pub fn seal_signed_op_bytes(
     let secret = SigningSecretKey::from_bytes(config.signer_secret.clone());
     let visibility = Visibility::Cell;
 
-    let payload = op.encode().map_err(|e| ClientError::Encode(e.to_string()))?;
+    let payload = op
+        .encode()
+        .map_err(|e| ClientError::Encode(e.to_string()))?;
     let body = Body::StreamOp(payload);
     let plaintext = body
         .to_canonical_cbor()
@@ -169,10 +171,7 @@ pub fn seal_signed_op_bytes(
 ///
 /// # Errors
 /// [`ClientError`] if sealing/signing the op fails.
-pub fn apply_request(
-    crd: Crd,
-    config: &BrowserClientConfig,
-) -> Result<OpRequest, ClientError> {
+pub fn apply_request(crd: Crd, config: &BrowserClientConfig) -> Result<OpRequest, ClientError> {
     let body = seal_signed_op_bytes(&ResourceOp::Apply { crd }, config)?;
     Ok(OpRequest {
         url: config.request_url(),

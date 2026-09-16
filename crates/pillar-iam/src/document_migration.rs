@@ -198,7 +198,10 @@ pub fn record_projection(record: &UserRecord) -> BTreeMap<String, String> {
     m.insert("handle".to_string(), record.handle.clone());
     m.insert("display_name".to_string(), record.display_name.clone());
     m.insert("email".to_string(), record.email.clone());
-    m.insert("status".to_string(), status_label(record.status).to_string());
+    m.insert(
+        "status".to_string(),
+        status_label(record.status).to_string(),
+    );
     m.insert("roles".to_string(), join_sorted(&record.roles));
     m.insert("groups".to_string(), join_sorted(&record.groups));
     m.insert(
@@ -225,7 +228,7 @@ fn join_sorted(set: &BTreeSet<String>) -> String {
 }
 
 #[cfg(test)]
-mod document_migration {
+mod tests {
     use super::*;
     use crate::{replay, InviteError, UserOp, UserStatus};
     use std::collections::BTreeMap;
@@ -297,7 +300,9 @@ mod document_migration {
 
         // The collection shows up in the top-level browse enumeration.
         assert!(
-            shared.collections().contains(&IAM_USERS_COLLECTION.to_string()),
+            shared
+                .collections()
+                .contains(&IAM_USERS_COLLECTION.to_string()),
             "user records must be a listable Document collection"
         );
         // `doc_ids` enumerates the handles in deterministic order.
@@ -338,10 +343,18 @@ mod document_migration {
             },
             Hlc::new(100, 0, "iam"),
         );
-        let bob = store.show("bob").expect("disabled != deleted; record retained");
+        let bob = store
+            .show("bob")
+            .expect("disabled != deleted; record retained");
         assert_eq!(bob.status, UserStatus::Disabled);
-        assert!(bob.roles.contains("member"), "history retained through the swap");
-        assert!(store.document_store().doc_ids(IAM_USERS_COLLECTION).contains(&"bob".to_string()));
+        assert!(
+            bob.roles.contains("member"),
+            "history retained through the swap"
+        );
+        assert!(store
+            .document_store()
+            .doc_ids(IAM_USERS_COLLECTION)
+            .contains(&"bob".to_string()));
     }
 
     // The structured browse projection renders a record's columns for a

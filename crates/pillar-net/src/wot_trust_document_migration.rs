@@ -191,8 +191,7 @@ impl WotTrustStore {
     /// skipped. This is the single decode point both the traversal and the
     /// reference-authority cross-check read through.
     fn live_edges(&self) -> Vec<(NodeId, NodeId, TrustKind, u8)> {
-        let rows =
-            materialize_view(&self.store, WOT_TRUST_EDGES_VIEW).unwrap_or_default();
+        let rows = materialize_view(&self.store, WOT_TRUST_EDGES_VIEW).unwrap_or_default();
         rows.into_iter().filter_map(decode_edge_row).collect()
     }
 
@@ -237,12 +236,7 @@ impl WotTrustStore {
     #[must_use]
     pub fn reachable(&self, source: &NodeId) -> Vec<String> {
         let proj = self.projection_store();
-        traverse(
-            &proj,
-            "edges",
-            &source.0,
-            Some(self.max_depth as usize),
-        )
+        traverse(&proj, "edges", &source.0, Some(self.max_depth as usize))
     }
 
     /// Whether `target` is reachable from the store's `owner` over the live
@@ -292,8 +286,16 @@ fn decode_edge_row(row: Row) -> Option<(NodeId, NodeId, TrustKind, u8)> {
     let source = String::from_utf8(scalar("source_key")?).ok()?;
     let target = String::from_utf8(scalar("target_key")?).ok()?;
     let kind = TrustKind::from_bytes(&scalar("trust_kind")?)?;
-    let weight = std::str::from_utf8(&scalar("weight")?).ok()?.parse::<u8>().ok()?;
-    Some((NodeId::from(source.as_str()), NodeId::from(target.as_str()), kind, weight))
+    let weight = std::str::from_utf8(&scalar("weight")?)
+        .ok()?
+        .parse::<u8>()
+        .ok()?;
+    Some((
+        NodeId::from(source.as_str()),
+        NodeId::from(target.as_str()),
+        kind,
+        weight,
+    ))
 }
 
 #[cfg(test)]

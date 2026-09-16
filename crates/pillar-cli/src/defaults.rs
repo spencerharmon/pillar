@@ -140,6 +140,7 @@ pub enum DefaultStatus {
 }
 
 impl DefaultStatus {
+    /// The status as a stable, human-readable display string.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -154,7 +155,9 @@ impl DefaultStatus {
 /// One shipped default's advisory line: its name and classification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefaultAdvisory {
+    /// The shipped default's name.
     pub name: String,
+    /// Its classification relative to the live set.
     pub status: DefaultStatus,
 }
 

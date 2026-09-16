@@ -431,8 +431,12 @@ impl KeyDistributionLedger {
 
     fn insert_offered(&mut self, record: &RecordKey) {
         let hlc = self.next_offered_hlc();
-        self.offered
-            .kv_put(OFFERS_COLLECTION, &record.to_string(), b"offered".to_vec(), hlc);
+        self.offered.kv_put(
+            OFFERS_COLLECTION,
+            &record.to_string(),
+            b"offered".to_vec(),
+            hlc,
+        );
     }
 
     fn remove_offered(&mut self, record: &RecordKey) {
@@ -1544,7 +1548,7 @@ mod tests {
     fn single_recipient_seal_is_confidential() {
         let only = sealing_key("only-node");
         let other = sealing_key("other-node");
-        let sealed = SealedArtifact::seal(b"cell group key", &[only.clone()]).unwrap();
+        let sealed = SealedArtifact::seal(b"cell group key", std::slice::from_ref(&only)).unwrap();
         assert_eq!(sealed.unseal(&only).unwrap(), b"cell group key");
         assert_eq!(
             sealed.unseal(&other),

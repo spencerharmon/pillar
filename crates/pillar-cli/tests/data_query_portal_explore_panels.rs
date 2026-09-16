@@ -276,7 +276,10 @@ fn explore_panels_render_the_live_kv_doc_and_sql_view_data_over_the_portal() {
     );
     std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
     std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(signer_public.as_bytes()),
+    );
     std::env::set_var(
         "PILLAR_SIGNER_SECRET_HEX",
         hex_encode(signer_secret.as_bytes()),
@@ -340,7 +343,9 @@ fn explore_panels_render_the_live_kv_doc_and_sql_view_data_over_the_portal() {
         cols.body
     );
 
-    let keys = node.get(&format!("/portal/data/kv/keys?token={token}&collection=config"));
+    let keys = node.get(&format!(
+        "/portal/data/kv/keys?token={token}&collection=config"
+    ));
     assert_eq!(keys.status, 200, "kv keys: {}", keys.body);
     let key_set: std::collections::BTreeSet<_> = keys.body.lines().collect();
     assert!(key_set.contains("greeting"), "kv keys: {}", keys.body);
@@ -363,7 +368,9 @@ fn explore_panels_render_the_live_kv_doc_and_sql_view_data_over_the_portal() {
     assert_eq!(missing.status, 404, "kv get of a missing key must 404");
 
     // === Document Explore panel ==============================================
-    let ids = node.get(&format!("/portal/data/doc/ids?token={token}&collection=users"));
+    let ids = node.get(&format!(
+        "/portal/data/doc/ids?token={token}&collection=users"
+    ));
     assert_eq!(ids.status, 200, "doc ids: {}", ids.body);
     let id_set: std::collections::BTreeSet<_> = ids.body.lines().collect();
     for want in ["u1", "u2", "u3"] {
@@ -400,15 +407,25 @@ fn explore_panels_render_the_live_kv_doc_and_sql_view_data_over_the_portal() {
         views.body
     );
 
-    let rows = node.get(&format!("/portal/data/sql/view?token={token}&name=active_users"));
+    let rows = node.get(&format!(
+        "/portal/data/sql/view?token={token}&name=active_users"
+    ));
     assert_eq!(rows.status, 200, "sql view: {}", rows.body);
     let row_ids: std::collections::BTreeSet<_> = rows
         .body
         .lines()
         .filter_map(|l| l.split('\t').next())
         .collect();
-    assert!(row_ids.contains("u1"), "active view includes u1 (on): {}", rows.body);
-    assert!(row_ids.contains("u3"), "active view includes u3 (on): {}", rows.body);
+    assert!(
+        row_ids.contains("u1"),
+        "active view includes u1 (on): {}",
+        rows.body
+    );
+    assert!(
+        row_ids.contains("u3"),
+        "active view includes u3 (on): {}",
+        rows.body
+    );
     assert!(
         !row_ids.contains("u2"),
         "active view excludes u2 (off): {}",
@@ -425,8 +442,13 @@ fn explore_panels_render_the_live_kv_doc_and_sql_view_data_over_the_portal() {
         rows.body
     );
 
-    let missing_view = node.get(&format!("/portal/data/sql/view?token={token}&name=no-such-view"));
-    assert_eq!(missing_view.status, 404, "materializing an unknown view must 404");
+    let missing_view = node.get(&format!(
+        "/portal/data/sql/view?token={token}&name=no-such-view"
+    ));
+    assert_eq!(
+        missing_view.status, 404,
+        "materializing an unknown view must 404"
+    );
 }
 
 #[test]

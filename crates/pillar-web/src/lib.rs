@@ -750,9 +750,12 @@ mod tests {
             preimage.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
             preimage.extend_from_slice(bytes);
         }
-        let address =
-            pillar_crypto::content::content_address(&preimage).expect("content address");
-        let hex: String = address.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let address = pillar_crypto::content::content_address(&preimage).expect("content address");
+        let hex: String = address
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(response, hex, "digest must come from content_address");
         assert!(address.len() >= 32, "content address must be >= 256 bits");
     }

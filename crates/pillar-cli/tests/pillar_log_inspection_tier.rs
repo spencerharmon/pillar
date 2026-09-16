@@ -231,8 +231,14 @@ fn cli_log_info_list_show_dag_verify_and_the_reported_blocks_discriminator_on_a_
     );
     std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
     std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
-    std::env::set_var("PILLAR_SIGNER_SECRET_HEX", hex_encode(signer_secret.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(signer_public.as_bytes()),
+    );
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(signer_secret.as_bytes()),
+    );
 
     // === A real document/keyed collection: `pillar kv put` writes into the
     // "widgets" collection, appending a signed event to its op log ==========

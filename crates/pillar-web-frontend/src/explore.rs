@@ -22,7 +22,9 @@
 //! [`ExploreBuilder`] lives behind the `yew` feature, mirroring `panels`' and
 //! `auth`'s "host-testable logic, thin Yew wrapper" split.
 
-use pillar_observability::{MetadataIndex, PslError, PslQuery, PslQueryBuilder, Predicate, SignalKind};
+use pillar_observability::{
+    MetadataIndex, Predicate, PslError, PslQuery, PslQueryBuilder, SignalKind,
+};
 
 #[cfg(feature = "yew")]
 use wasm_bindgen::{JsCast, JsValue};
@@ -538,7 +540,9 @@ pub fn explore_builder(props: &ExploreBuilderProps) -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 let full = format!("{path}?query={}", urlencode(&text));
                 match fetch_text(&full, token.as_deref()).await {
-                    Ok(FetchOutcome::Ok(text)) => results.set(crate::panels::parse_lines(&text, "")),
+                    Ok(FetchOutcome::Ok(text)) => {
+                        results.set(crate::panels::parse_lines(&text, ""))
+                    }
                     Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
                     Err(_) => {}
                 }
@@ -710,7 +714,9 @@ pub fn explore_profiles_builder(props: &ExploreBuilderProps) -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 let full = format!("{path}?query={}", urlencode(&text));
                 match fetch_text(&full, token.as_deref()).await {
-                    Ok(FetchOutcome::Ok(text)) => results.set(crate::panels::parse_lines(&text, "")),
+                    Ok(FetchOutcome::Ok(text)) => {
+                        results.set(crate::panels::parse_lines(&text, ""))
+                    }
                     Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
                     Err(_) => {}
                 }
@@ -917,7 +923,8 @@ pub fn explore_logs_builder(props: &ExploreBuilderProps) -> Html {
                 .collect();
             let filters: Vec<LogFilter> = (*select_rows).clone();
             let correlate = (*correlate_anchor).map(|anchor| (60u64, anchor));
-            let Ok(query) = build_log_query(&filters, &predicates, *range_seconds, correlate) else {
+            let Ok(query) = build_log_query(&filters, &predicates, *range_seconds, correlate)
+            else {
                 return;
             };
             let text = query.to_text();
@@ -928,7 +935,9 @@ pub fn explore_logs_builder(props: &ExploreBuilderProps) -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 let full = format!("{path}?query={}", urlencode(&text));
                 match fetch_text(&full, token.as_deref()).await {
-                    Ok(FetchOutcome::Ok(text)) => results.set(crate::panels::parse_lines(&text, "")),
+                    Ok(FetchOutcome::Ok(text)) => {
+                        results.set(crate::panels::parse_lines(&text, ""))
+                    }
                     Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
                     Err(_) => {}
                 }
@@ -1159,7 +1168,9 @@ pub fn explore_traces_builder(props: &ExploreBuilderProps) -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 let full = format!("{path}?query={}", urlencode(&text));
                 match fetch_text(&full, token.as_deref()).await {
-                    Ok(FetchOutcome::Ok(text)) => results.set(crate::panels::parse_lines(&text, "")),
+                    Ok(FetchOutcome::Ok(text)) => {
+                        results.set(crate::panels::parse_lines(&text, ""))
+                    }
                     Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
                     Err(_) => {}
                 }
@@ -1304,7 +1315,8 @@ pub fn explore_metadata_builder(props: &ExploreBuilderProps) -> Html {
                 .map(|r| (r.key.clone(), r.value.clone()))
                 .collect();
             let correlate = (*correlate_anchor).map(|anchor| (60u64, anchor));
-            let Ok(query) = build_metadata_query(&[], &predicates, *range_seconds, correlate) else {
+            let Ok(query) = build_metadata_query(&[], &predicates, *range_seconds, correlate)
+            else {
                 return;
             };
             let text = query.to_text();
@@ -1315,7 +1327,9 @@ pub fn explore_metadata_builder(props: &ExploreBuilderProps) -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 let full = format!("{path}?query={}", urlencode(&text));
                 match fetch_text(&full, token.as_deref()).await {
-                    Ok(FetchOutcome::Ok(text)) => results.set(crate::panels::parse_lines(&text, "")),
+                    Ok(FetchOutcome::Ok(text)) => {
+                        results.set(crate::panels::parse_lines(&text, ""))
+                    }
                     Ok(FetchOutcome::Unauthorized) => auth.dispatch(AuthAction::Unauthorized),
                     Err(_) => {}
                 }
@@ -1384,7 +1398,10 @@ mod tests {
         )
         .expect("structured build succeeds");
 
-        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(
+            built, parsed,
+            "structured AST must equal the parsed text AST"
+        );
         assert_eq!(built.to_text(), parsed.to_text());
         assert_eq!(built.to_text(), text);
     }
@@ -1421,7 +1438,9 @@ mod tests {
         store.write_labeled(
             SignalKind::Metric,
             b"b".to_vec(),
-            [("cell".to_string(), "us-2".to_string())].into_iter().collect(),
+            [("cell".to_string(), "us-2".to_string())]
+                .into_iter()
+                .collect(),
             0,
         );
 
@@ -1471,7 +1490,10 @@ mod tests {
         )
         .expect("structured build succeeds");
 
-        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(
+            built, parsed,
+            "structured AST must equal the parsed text AST"
+        );
         assert_eq!(built.to_text(), parsed.to_text());
         assert_eq!(built.to_text(), text);
     }
@@ -1509,7 +1531,9 @@ mod tests {
         store.write_labeled(
             SignalKind::MetadataSample,
             b"b".to_vec(),
-            [("source".to_string(), "node-2".to_string())].into_iter().collect(),
+            [("source".to_string(), "node-2".to_string())]
+                .into_iter()
+                .collect(),
             0,
         );
 
@@ -1559,7 +1583,10 @@ mod tests {
         )
         .expect("structured build succeeds");
 
-        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(
+            built, parsed,
+            "structured AST must equal the parsed text AST"
+        );
         assert_eq!(built.to_text(), parsed.to_text());
         assert_eq!(built.to_text(), text);
     }
@@ -1658,7 +1685,10 @@ mod tests {
         )
         .expect("structured build succeeds");
 
-        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(
+            built, parsed,
+            "structured AST must equal the parsed text AST"
+        );
         assert_eq!(built.to_text(), parsed.to_text());
         assert_eq!(built.to_text(), text);
     }
@@ -1695,7 +1725,9 @@ mod tests {
         store.write_labeled(
             SignalKind::ProfileSample,
             b"stack=d;e".to_vec(),
-            [("cell".to_string(), "us-2".to_string())].into_iter().collect(),
+            [("cell".to_string(), "us-2".to_string())]
+                .into_iter()
+                .collect(),
             0,
         );
 
@@ -1751,7 +1783,10 @@ mod tests {
         )
         .expect("structured build succeeds");
 
-        assert_eq!(built, parsed, "structured AST must equal the parsed text AST");
+        assert_eq!(
+            built, parsed,
+            "structured AST must equal the parsed text AST"
+        );
         assert_eq!(built.to_text(), parsed.to_text());
         assert_eq!(built.to_text(), text);
     }
@@ -1777,16 +1812,28 @@ mod tests {
     #[test]
     fn log_message_filter_is_a_substring_match_while_level_is_exact() {
         let message_filter = LogFilter::for_key("message", "timeout");
-        assert!(message_filter.is_match, "message auto-selects the substring operator");
-        assert_eq!(message_filter.to_predicate(), Predicate::matches("message", "timeout"));
+        assert!(
+            message_filter.is_match,
+            "message auto-selects the substring operator"
+        );
+        assert_eq!(
+            message_filter.to_predicate(),
+            Predicate::matches("message", "timeout")
+        );
 
         let level_filter = LogFilter::for_key("level", "error");
         assert!(!level_filter.is_match, "level auto-selects exact equality");
         assert_eq!(level_filter.to_predicate(), Predicate::eq("level", "error"));
 
         let field_filter = LogFilter::for_key("field.x", "alpha");
-        assert!(!field_filter.is_match, "field.x auto-selects exact equality");
-        assert_eq!(field_filter.to_predicate(), Predicate::eq("field.x", "alpha"));
+        assert!(
+            !field_filter.is_match,
+            "field.x auto-selects exact equality"
+        );
+        assert_eq!(
+            field_filter.to_predicate(),
+            Predicate::eq("field.x", "alpha")
+        );
 
         // Round-trip through the parser: a query built with the substring
         // filter must parse back to the SAME AST as the equivalent `=~` text
@@ -1797,8 +1844,8 @@ mod tests {
         assert_eq!(built, parsed);
 
         let built_eq = build_log_query(&[level_filter], &[], 300, None).expect("build succeeds");
-        let parsed_eq =
-            parse_psl("select: logs(level = error) range: now-5m").expect("fixture text query parses");
+        let parsed_eq = parse_psl("select: logs(level = error) range: now-5m")
+            .expect("fixture text query parses");
         assert_eq!(built_eq, parsed_eq);
     }
 
@@ -1824,7 +1871,9 @@ mod tests {
         store.write_labeled(
             SignalKind::Log,
             b"level=info msg=served".to_vec(),
-            [("cell".to_string(), "us-2".to_string())].into_iter().collect(),
+            [("cell".to_string(), "us-2".to_string())]
+                .into_iter()
+                .collect(),
             0,
         );
 

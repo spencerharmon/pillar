@@ -35,12 +35,10 @@ pub fn spawn(
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let cert = rcgen::generate_simple_self_signed(vec!["pillar-psl-quic".to_owned()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key_der =
-        rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("psl-quic key: {e}").into()
-            },
-        )?;
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("psl-quic key: {e}").into()
+        })?;
 
     let server_config = quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)?;
     let endpoint = quinn::Endpoint::server(server_config, bind)?;
@@ -51,23 +49,18 @@ pub fn spawn(
             let ctx = Arc::clone(&ctx);
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
-                loop {
-                    match conn.accept_bi().await {
-                        Ok((mut send, mut recv)) => {
-                            let ctx = Arc::clone(&ctx);
-                            tokio::spawn(async move {
-                                let Ok(bytes) = recv.read_to_end(MAX_MESSAGE).await else {
-                                    return;
-                                };
-                                let resp = handle_request(&bytes, &ctx);
-                                if let Ok(out) = pillar_wire::encode_response(&resp) {
-                                    let _ = send.write_all(&out).await;
-                                    let _ = send.finish();
-                                }
-                            });
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let ctx = Arc::clone(&ctx);
+                    tokio::spawn(async move {
+                        let Ok(bytes) = recv.read_to_end(MAX_MESSAGE).await else {
+                            return;
+                        };
+                        let resp = handle_request(&bytes, &ctx);
+                        if let Ok(out) = pillar_wire::encode_response(&resp) {
+                            let _ = send.write_all(&out).await;
+                            let _ = send.finish();
                         }
-                        Err(_) => break,
-                    }
+                    });
                 }
             });
         }

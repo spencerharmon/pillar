@@ -1,3 +1,5 @@
+//! Acceptance (feature-gated): a late/partitioned `pillar node run` peer
+//! reconverges to the full durable op set via anti-entropy catch-up sync.
 #![cfg(feature = "acceptance")]
 //! Acceptance: a partitioned/late `pillar node run` peer RECONVERGES to the
 //! full durable op set via anti-entropy catch-up sync.
@@ -240,7 +242,10 @@ fn partitioned_late_node_reconverges_via_anti_entropy() {
     let b_port = free_tcp_port();
     let node_b = Node::spawn("b", b_port, Some(&a_dial), None);
     // Confirm B actually connected to A.
-    node_b.wait_for_line("pillar peer connection established", Duration::from_secs(30));
+    node_b.wait_for_line(
+        "pillar peer connection established",
+        Duration::from_secs(30),
+    );
 
     // Sanity: B does not have the op immediately on connect (it missed the
     // gossip; only anti-entropy can fill it).

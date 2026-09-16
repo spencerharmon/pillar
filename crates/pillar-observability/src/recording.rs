@@ -263,14 +263,7 @@ impl RecordingEngine {
         }
 
         // Run body: the expensive scan runs exactly once here, on the schedule.
-        let rows = aggregate(
-            &rule.query,
-            source,
-            index,
-            now,
-            rule.aggregate,
-            &rule.by,
-        );
+        let rows = aggregate(&rule.query, source, index, now, rule.aggregate, &rule.by);
 
         let mut emitted = Vec::new();
         for row in rows {
@@ -407,13 +400,28 @@ mod tests {
     fn logs_to_metrics_counts_lines_on_schedule_and_is_queryable() {
         let (mut source, index) = source_store();
         source
-            .write_labeled(SignalKind::Log, b"level=error a".to_vec(), labels(&[("level", "error")]), 999)
+            .write_labeled(
+                SignalKind::Log,
+                b"level=error a".to_vec(),
+                labels(&[("level", "error")]),
+                999,
+            )
             .unwrap();
         source
-            .write_labeled(SignalKind::Log, b"level=error b".to_vec(), labels(&[("level", "error")]), 999)
+            .write_labeled(
+                SignalKind::Log,
+                b"level=error b".to_vec(),
+                labels(&[("level", "error")]),
+                999,
+            )
             .unwrap();
         source
-            .write_labeled(SignalKind::Log, b"level=info c".to_vec(), labels(&[("level", "info")]), 999)
+            .write_labeled(
+                SignalKind::Log,
+                b"level=info c".to_vec(),
+                labels(&[("level", "info")]),
+                999,
+            )
             .unwrap();
 
         let q = PslQueryBuilder::new()
@@ -523,10 +531,7 @@ mod tests {
         eng.evaluate("hot_frames", "node", 1000, &source, &index, &mut target)
             .unwrap();
         // Groups sort by label: encode=1, parse=3.
-        assert_eq!(
-            eng.query_derived("hot_frames", &target),
-            vec![1.0, 3.0]
-        );
+        assert_eq!(eng.query_derived("hot_frames", &target), vec![1.0, 3.0]);
     }
 
     /// metadata -> metrics: entity-count over a label dimension.
@@ -568,10 +573,7 @@ mod tests {
         eng.evaluate("entity_count", "node", 1000, &source, &index, &mut target)
             .unwrap();
         // t1=2, t2=1, in ascending group order.
-        assert_eq!(
-            eng.query_derived("entity_count", &target),
-            vec![2.0, 1.0]
-        );
+        assert_eq!(eng.query_derived("entity_count", &target), vec![2.0, 1.0]);
     }
 
     /// metrics -> metrics: sum-rollup of an existing series into a coarser one.

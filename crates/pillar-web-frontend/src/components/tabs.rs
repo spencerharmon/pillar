@@ -74,7 +74,11 @@ mod yew_impl {
                 }
             })
             .collect::<Html>();
-        let panel = props.tabs.get(cur).map(|t| t.panel.clone()).unwrap_or_default();
+        let panel = props
+            .tabs
+            .get(cur)
+            .map(|t| t.panel.clone())
+            .unwrap_or_default();
         html! {
             <div class="pillar-tabs">
                 <div class="pillar-tabs__bar" role="tablist">{ bar }</div>

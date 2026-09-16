@@ -768,7 +768,9 @@ mod tests {
         cli.mint("bob", "s1", 0, 1000);
 
         let epoch_before = cli.registry().rev_epoch();
-        let event = cli.revoke_all_but_current("alice", "alice", "laptop").unwrap();
+        let event = cli
+            .revoke_all_but_current("alice", "alice", "laptop")
+            .unwrap();
 
         assert_eq!(cli.log().len(), 1, "exactly one signed event");
         assert!(cli.log().get(&event).unwrap().is_authentic());

@@ -24,7 +24,7 @@
 //! kinds, so the Explore builder for any signal kind autofills from the actual
 //! dimensions present.
 
-use std::collections::{BTreeSet, BTreeMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::block::{SignalId, SignalKind, TimeseriesStore};
 use crate::correlation::{CorrelationId, CorrelationIndex};
@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     use crate::block::SignalKind;
     use crate::correlation::{CorrelationId, CorrelationIndex, Label, SignalRef};
-    use crate::ingest::{MetricKind, MetricsProducer, MetricSource};
+    use crate::ingest::{MetricKind, MetricSource, MetricsProducer};
     use crate::metadata::LabelSet;
     use std::collections::BTreeMap;
 

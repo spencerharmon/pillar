@@ -262,7 +262,7 @@ pub fn admin_issue_enrollment_invite(
 }
 
 #[cfg(test)]
-mod admin_credentials {
+mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 

@@ -582,7 +582,10 @@ mod tests {
         let sa = store.write_seq_of(&a).expect("seq");
         let sb = store.write_seq_of(&b).expect("seq");
         let sc = store.write_seq_of(&c).expect("seq");
-        assert!(sa < sb && sb < sc, "append seq must follow arrival: {sa} {sb} {sc}");
+        assert!(
+            sa < sb && sb < sc,
+            "append seq must follow arrival: {sa} {sb} {sc}"
+        );
     }
 
     /// A re-write of the SAME signal id does not burn a new append sequence
@@ -597,7 +600,10 @@ mod tests {
         let a2 = store.write(SignalKind::Metric, b"x 1 @0".to_vec(), 0);
         assert_eq!(a, a2);
         assert_eq!(store.write_seq_of(&a), Some(first));
-        assert!(store.write_seq_of(&b).expect("seq") > first, "distinct id advances seq");
+        assert!(
+            store.write_seq_of(&b).expect("seq") > first,
+            "distinct id advances seq"
+        );
     }
 
     /// A block seals exactly at its configured capacity and thereafter refuses

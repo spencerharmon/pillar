@@ -524,8 +524,8 @@ fn key_verb(args: &[String]) -> ExitCode {
     identity_trust("key", args)
 }
 
-/// `pillar wot {graph|list-trust|list-signatures|list-attestations} …`: the
-/// live web-of-trust views (public keys, signatures, attestations, trust edges).
+// `pillar wot {graph|list-trust|list-signatures|list-attestations} …`: the
+// live web-of-trust views (public keys, signatures, attestations, trust edges).
 
 /// `pillar {identity|user|key|offer|trust|attest|grant|caps|revoke|audit} …`.
 fn identity_trust(verb: &str, _args: &[String]) -> ExitCode {

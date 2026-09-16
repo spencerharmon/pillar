@@ -199,10 +199,19 @@ impl Dashboard {
     /// shared [`ViewCache`] so an unchanged panel over an unchanged store is a
     /// cache HIT (no re-scan). Returns one `(panel-title, signal ids)` per
     /// panel, in layout order.
-    pub fn render(&self, store: &TimeseriesStore, cache: &mut ViewCache) -> Vec<(String, Vec<SignalId>)> {
+    pub fn render(
+        &self,
+        store: &TimeseriesStore,
+        cache: &mut ViewCache,
+    ) -> Vec<(String, Vec<SignalId>)> {
         self.panels
             .iter()
-            .map(|panel| (panel.title.clone(), cache.materialize(store, panel.view_query())))
+            .map(|panel| {
+                (
+                    panel.title.clone(),
+                    cache.materialize(store, panel.view_query()),
+                )
+            })
             .collect()
     }
 }

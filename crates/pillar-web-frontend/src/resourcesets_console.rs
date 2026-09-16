@@ -15,11 +15,17 @@
 /// One row of the ResourceSet list: its name and rolled-up status.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceSetRow {
+    /// The ResourceSet's name.
     pub name: String,
+    /// Rolled-up health of the set's members (e.g. `Healthy`, `Degraded`).
     pub health: String,
+    /// Rolled-up sync/reconcile state (e.g. `Synced`, `Pending`).
     pub sync: String,
+    /// Number of members in the set.
     pub members: usize,
+    /// Count of members pending adoption into the set.
     pub adopt: usize,
+    /// Count of members pending pruning from the set.
     pub prune: usize,
     /// Net-new shipped defaults available to adopt (additive advisory, NOT
     /// drift). Only meaningful for the Default set.
@@ -67,8 +73,11 @@ pub fn parse_set_list(body: &str) -> Vec<ResourceSetRow> {
 /// degradation (rendered as health-badge subtext/tooltip).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemberRow {
+    /// The member's `Kind/name` reference.
     pub reference: String,
+    /// The member's observed health.
     pub health: String,
+    /// Provenance of the member (`defaults@<v>` or `operator`).
     pub origin: String,
     /// Free-form degradation reason (empty when healthy / not reported).
     pub reason: String,
@@ -77,12 +86,19 @@ pub struct MemberRow {
 /// A ResourceSet's full detail, parsed from `GET /portal/resource/set`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceSetDetail {
+    /// The ResourceSet's name.
     pub name: String,
+    /// Human-readable description of the set.
     pub description: String,
+    /// Rolled-up health across the set's members.
     pub health: String,
+    /// Rolled-up sync/reconcile state across the set.
     pub sync: String,
+    /// The set's member rows.
     pub members: Vec<MemberRow>,
+    /// References of members pending adoption into the set.
     pub adopt: Vec<String>,
+    /// References of members pending pruning from the set.
     pub prune: Vec<String>,
     /// Graph node labels, in emission order (node 0 is the set root).
     pub nodes: Vec<String>,
@@ -122,8 +138,17 @@ pub fn is_reconciling(adopt: usize, prune: usize) -> bool {
 /// `ADOPT `/`PRUNE ` line (never omitted), so the backend never has to guess
 /// whether the field was intentionally cleared or missing.
 #[must_use]
-pub fn reconcile_request_body(token: &str, name: &str, adopt: &[String], prune: &[String]) -> String {
-    format!("{token}\n{name}\nADOPT {}\nPRUNE {}", adopt.join(","), prune.join(","))
+pub fn reconcile_request_body(
+    token: &str,
+    name: &str,
+    adopt: &[String],
+    prune: &[String],
+) -> String {
+    format!(
+        "{token}\n{name}\nADOPT {}\nPRUNE {}",
+        adopt.join(","),
+        prune.join(",")
+    )
 }
 
 /// Narrow a plan's full adopt/prune member lists down to the subset the
@@ -131,8 +156,14 @@ pub fn reconcile_request_body(token: &str, name: &str, adopt: &[String], prune: 
 /// Host-testable — no `yew` — so the selective-sync narrowing itself is
 /// provably correct independent of the checkbox wiring.
 #[must_use]
-pub fn selected_subset(plan: &[String], selected: &std::collections::HashSet<String>) -> Vec<String> {
-    plan.iter().filter(|m| selected.contains(*m)).cloned().collect()
+pub fn selected_subset(
+    plan: &[String],
+    selected: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    plan.iter()
+        .filter(|m| selected.contains(*m))
+        .cloned()
+        .collect()
 }
 
 /// Framework-agnostic driver for the "Refresh" button + optional interval
@@ -401,7 +432,9 @@ mod yew_impl {
     use crate::components::tree::Tree;
     use crate::portal::{get_url, http};
     use crate::primitives::{Badge, DiffView, Drawer, Tone};
-    use crate::resources_console::{parse_act_result, parse_predicted, ChangeState, ResourceDetail};
+    use crate::resources_console::{
+        parse_act_result, parse_predicted, ChangeState, ResourceDetail,
+    };
     use std::collections::HashSet;
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
@@ -424,7 +457,6 @@ mod yew_impl {
             None => "—".to_owned(),
         }
     }
-
 
     /// The "Reconcile" action: turns the adopt/prune plan from a DISPLAY-only
     /// list into a signed act, gated by the SAME [`ChangeState`] dry-run
@@ -499,12 +531,8 @@ mod yew_impl {
         // apply can issue without a preceding ALLOW dry-run of this exact
         // (possibly narrowed) selection.
         let apply = {
-            let (auth, name, gate, result) = (
-                auth.clone(),
-                name.clone(),
-                gate.clone(),
-                result.clone(),
-            );
+            let (auth, name, gate, result) =
+                (auth.clone(), name.clone(), gate.clone(), result.clone());
             let (selected_adopt, selected_prune) = (selected_adopt.clone(), selected_prune.clone());
             Callback::from(move |_: MouseEvent| {
                 if !gate.can_confirm() {
@@ -615,8 +643,7 @@ mod yew_impl {
         // consumes. `Some` opens the shipped Drawer over that resource; `None`
         // closes it. Node selection is wired straight into the real, mounted
         // detail drawer — no new backend, no new drawer.
-        let selected_node =
-            use_state(|| None::<crate::resources_console::ResourceRow>);
+        let selected_node = use_state(|| None::<crate::resources_console::ResourceRow>);
 
         // Load the set list on mount / token change / manual refresh /
         // interval tick.
@@ -790,10 +817,7 @@ mod yew_impl {
 
         // The filter-chip row: one chip per health and sync tone; clicking a
         // chip toggles it (a second click clears back to "all").
-        let chip = |label: &str,
-                    active: bool,
-                    on_click: Callback<MouseEvent>|
-         -> Html {
+        let chip = |label: &str, active: bool, on_click: Callback<MouseEvent>| -> Html {
             let mut class = Classes::from("ds-chip");
             if active {
                 class.push("is-active");
@@ -1161,20 +1185,30 @@ mod tests {
                 "Replica/web-192.0.2.11".to_string(),
             ]
         );
-        assert_eq!(d.node_health, vec!["Healthy", "Healthy", "Healthy", "Missing"]);
+        assert_eq!(
+            d.node_health,
+            vec!["Healthy", "Healthy", "Healthy", "Missing"]
+        );
         assert_eq!(d.node_sync, vec!["Synced", "Synced", "Synced", "Synced"]);
 
         // The collapsible depth tree: set root -> workload -> its two replicas.
         let root = depth_tree(&d).expect("non-empty graph yields a root");
         assert_eq!(root.id, "rsnode-0");
         assert_eq!(root.label, "ResourceSet/prod — Healthy/Synced");
-        assert_eq!(root.children.len(), 1, "set root has the one Workload child");
+        assert_eq!(
+            root.children.len(),
+            1,
+            "set root has the one Workload child"
+        );
         let wl = &root.children[0];
         assert_eq!(wl.label, "Workload/web — Healthy/Synced");
-        assert_eq!(wl.children.len(), 2, "workload descends into its 2 replicas");
         assert_eq!(
-            wl.children[1].label,
-            "Replica/web-192.0.2.11 — Missing/Synced",
+            wl.children.len(),
+            2,
+            "workload descends into its 2 replicas"
+        );
+        assert_eq!(
+            wl.children[1].label, "Replica/web-192.0.2.11 — Missing/Synced",
             "the exited replica carries a Missing per-node token"
         );
     }
@@ -1240,7 +1274,6 @@ mod tests {
         assert_eq!(d.health, "Healthy");
     }
 
-    #[test]
     #[test]
     fn reconciling_indicator_is_derived_from_a_non_empty_plan() {
         assert!(!is_reconciling(0, 0), "synced set is not reconciling");
@@ -1372,7 +1405,9 @@ mod tests {
             "the reconcile plan no longer mounts the ReconcilePanel action"
         );
         assert!(
-            src.contains("use crate::resources_console::{parse_act_result, parse_predicted, ChangeState}"),
+            src.contains(
+                "use crate::resources_console::{parse_act_result, parse_predicted, ChangeState}"
+            ),
             "ReconcilePanel no longer reuses the shared ChangeState dry-run gate"
         );
         assert!(
@@ -1402,9 +1437,13 @@ mod tests {
             &["Job/nightly".to_string()],
             &["RetentionPolicy/old".to_string()],
         );
-        assert_eq!(body, "tok\nweb\nADOPT Job/nightly\nPRUNE RetentionPolicy/old");
+        assert_eq!(
+            body,
+            "tok\nweb\nADOPT Job/nightly\nPRUNE RetentionPolicy/old"
+        );
         // Deselecting an axis narrows to an empty (never omitted) field.
-        let narrowed = reconcile_request_body("tok", "web", &[], &["RetentionPolicy/old".to_string()]);
+        let narrowed =
+            reconcile_request_body("tok", "web", &[], &["RetentionPolicy/old".to_string()]);
         assert_eq!(narrowed, "tok\nweb\nADOPT \nPRUNE RetentionPolicy/old");
     }
 
@@ -1438,13 +1477,22 @@ mod tests {
         use crate::resources_console::ChangeState;
 
         let mut gate = ChangeState::default();
-        assert!(!gate.can_confirm(), "a reconcile apply must not confirm from Idle");
+        assert!(
+            !gate.can_confirm(),
+            "a reconcile apply must not confirm from Idle"
+        );
         // A DENY dry-run still refuses.
         gate = gate.previewed(false);
-        assert!(!gate.can_confirm(), "a DENY dry-run must not authorize a reconcile apply");
+        assert!(
+            !gate.can_confirm(),
+            "a DENY dry-run must not authorize a reconcile apply"
+        );
         // Only a preceding ALLOW dry-run authorizes the apply.
         gate = gate.previewed(true);
-        assert!(gate.can_confirm(), "an ALLOW dry-run must authorize the reconcile apply");
+        assert!(
+            gate.can_confirm(),
+            "an ALLOW dry-run must authorize the reconcile apply"
+        );
         // Toggling a member's selective-sync checkbox (invalidation) strips
         // the authorization: a stale ALLOW previewed a DIFFERENT selection.
         gate = gate.invalidated();

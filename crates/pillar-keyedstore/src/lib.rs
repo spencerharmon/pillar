@@ -67,8 +67,7 @@ impl Hlc {
     /// in the spec.
     #[must_use]
     pub fn happens_after(&self, other: &Hlc) -> bool {
-        (self.physical, self.logical, &self.author)
-            > (other.physical, other.logical, &other.author)
+        (self.physical, self.logical, &self.author) > (other.physical, other.logical, &other.author)
     }
 }
 
@@ -230,12 +229,7 @@ impl KeyedStore {
     }
 
     /// K/V tombstone: delete `key` in `collection` at `hlc`.
-    pub fn kv_delete(
-        &mut self,
-        collection: &str,
-        key: &str,
-        hlc: Hlc,
-    ) -> pillar_streamdb::OpId {
+    pub fn kv_delete(&mut self, collection: &str, key: &str, hlc: Hlc) -> pillar_streamdb::OpId {
         self.append_op(KeyedOp {
             collection: collection.to_string(),
             id: key.to_string(),
@@ -450,11 +444,7 @@ impl pillar_streamdb::ReclaimPolicy for KeyedFieldReclaimPolicy {
         // A simple length-prefixed concatenation avoids any ambiguity from a
         // field/id/collection name containing the separator byte.
         let mut key = Vec::new();
-        for part in [
-            k.collection.as_bytes(),
-            k.id.as_bytes(),
-            k.field.as_bytes(),
-        ] {
+        for part in [k.collection.as_bytes(), k.id.as_bytes(), k.field.as_bytes()] {
             key.extend_from_slice(&(part.len() as u64).to_be_bytes());
             key.extend_from_slice(part);
         }
@@ -612,7 +602,11 @@ mod keyed_store {
         let mut s = KeyedStore::new();
         s.kv_put("c", "k", b"v".to_vec(), hlc(1, 0, "n1"));
         s.kv_delete("c", "k", hlc(2, 0, "n1"));
-        assert_eq!(s.kv_get("c", "k"), None, "tombstone with higher HLC deletes");
+        assert_eq!(
+            s.kv_get("c", "k"),
+            None,
+            "tombstone with higher HLC deletes"
+        );
     }
 
     #[test]
@@ -665,10 +659,28 @@ mod keyed_store {
     fn document_fields_are_independent_lww() {
         // Per-field LWW: concurrent writes to different fields never conflict.
         let mut s = KeyedStore::new();
-        s.doc_put_field("docs", "d1", "name", Value::Scalar(b"alice".to_vec()), hlc(1, 0, "n1"));
-        s.doc_put_field("docs", "d1", "age", Value::Scalar(b"30".to_vec()), hlc(1, 0, "n1"));
+        s.doc_put_field(
+            "docs",
+            "d1",
+            "name",
+            Value::Scalar(b"alice".to_vec()),
+            hlc(1, 0, "n1"),
+        );
+        s.doc_put_field(
+            "docs",
+            "d1",
+            "age",
+            Value::Scalar(b"30".to_vec()),
+            hlc(1, 0, "n1"),
+        );
         // Overwrite only `age`.
-        s.doc_put_field("docs", "d1", "age", Value::Scalar(b"31".to_vec()), hlc(2, 0, "n1"));
+        s.doc_put_field(
+            "docs",
+            "d1",
+            "age",
+            Value::Scalar(b"31".to_vec()),
+            hlc(2, 0, "n1"),
+        );
 
         assert_eq!(
             s.doc_get_field("docs", "d1", "name"),
@@ -679,14 +691,29 @@ mod keyed_store {
             s.doc_get_field("docs", "d1", "age"),
             Some(Value::Scalar(b"31".to_vec())),
         );
-        assert_eq!(s.doc_fields("docs", "d1"), vec!["age".to_string(), "name".to_string()]);
+        assert_eq!(
+            s.doc_fields("docs", "d1"),
+            vec!["age".to_string(), "name".to_string()]
+        );
     }
 
     #[test]
     fn document_tombstone_removes_field_from_live_set() {
         let mut s = KeyedStore::new();
-        s.doc_put_field("docs", "d1", "a", Value::Scalar(b"1".to_vec()), hlc(1, 0, "n1"));
-        s.doc_put_field("docs", "d1", "b", Value::Scalar(b"2".to_vec()), hlc(1, 0, "n1"));
+        s.doc_put_field(
+            "docs",
+            "d1",
+            "a",
+            Value::Scalar(b"1".to_vec()),
+            hlc(1, 0, "n1"),
+        );
+        s.doc_put_field(
+            "docs",
+            "d1",
+            "b",
+            Value::Scalar(b"2".to_vec()),
+            hlc(1, 0, "n1"),
+        );
         s.doc_delete_field("docs", "d1", "a", hlc(2, 0, "n1"));
         assert_eq!(s.doc_get_field("docs", "d1", "a"), None);
         assert_eq!(s.doc_fields("docs", "d1"), vec!["b".to_string()]);
@@ -744,10 +771,22 @@ mod keyed_store {
 
     #[test]
     fn hlc_comparator_total_order() {
-        assert!(hlc(2, 0, "n1").happens_after(&hlc(1, 9, "n9")), "physical dominates");
-        assert!(hlc(1, 5, "n1").happens_after(&hlc(1, 4, "n9")), "logical dominates within physical");
-        assert!(hlc(1, 1, "n2").happens_after(&hlc(1, 1, "n1")), "author breaks a full tie");
-        assert!(!hlc(1, 1, "n1").happens_after(&hlc(1, 1, "n1")), "irreflexive");
+        assert!(
+            hlc(2, 0, "n1").happens_after(&hlc(1, 9, "n9")),
+            "physical dominates"
+        );
+        assert!(
+            hlc(1, 5, "n1").happens_after(&hlc(1, 4, "n9")),
+            "logical dominates within physical"
+        );
+        assert!(
+            hlc(1, 1, "n2").happens_after(&hlc(1, 1, "n1")),
+            "author breaks a full tie"
+        );
+        assert!(
+            !hlc(1, 1, "n1").happens_after(&hlc(1, 1, "n1")),
+            "irreflexive"
+        );
     }
 
     #[test]
@@ -775,8 +814,20 @@ mod keyed_store {
         let mut s = KeyedStore::new();
         s.kv_put("c", "k", b"old".to_vec(), hlc(1, 0, "n1"));
         s.kv_put("c", "k", b"newer".to_vec(), hlc(2, 0, "n1"));
-        s.doc_put_field("docs", "d1", "a", Value::Scalar(b"1".to_vec()), hlc(1, 0, "n1"));
-        s.doc_put_field("docs", "d1", "a", Value::Scalar(b"2".to_vec()), hlc(2, 0, "n1"));
+        s.doc_put_field(
+            "docs",
+            "d1",
+            "a",
+            Value::Scalar(b"1".to_vec()),
+            hlc(1, 0, "n1"),
+        );
+        s.doc_put_field(
+            "docs",
+            "d1",
+            "a",
+            Value::Scalar(b"2".to_vec()),
+            hlc(2, 0, "n1"),
+        );
         s.doc_delete_field("docs", "d1", "b", hlc(1, 0, "n1"));
 
         let snapshot = s.compact_reclaiming();
@@ -812,14 +863,22 @@ mod keyed_store {
 
     #[test]
     fn persistent_store_reloads_folded_state() {
-        let dir = std::env::temp_dir().join(format!("pillar-keyedstore-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pillar-keyedstore-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         {
             let mut ps = PersistentStore::open(&dir).unwrap();
-            ps.kv_put("c", "k", b"durable".to_vec(), hlc(1, 0, "n1")).unwrap();
-            ps.doc_put_field("docs", "d1", "f", Value::Scalar(b"fv".to_vec()), hlc(1, 0, "n1"))
+            ps.kv_put("c", "k", b"durable".to_vec(), hlc(1, 0, "n1"))
                 .unwrap();
+            ps.doc_put_field(
+                "docs",
+                "d1",
+                "f",
+                Value::Scalar(b"fv".to_vec()),
+                hlc(1, 0, "n1"),
+            )
+            .unwrap();
         }
 
         // Reopen: the same op set reloads and re-derives the same fold.

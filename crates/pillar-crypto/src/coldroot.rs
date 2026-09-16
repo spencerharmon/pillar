@@ -226,7 +226,9 @@ mod tests {
         )
         .unwrap();
         assert!(asc.starts_with("-----BEGIN PGP PRIVATE KEY BLOCK-----"));
-        assert!(asc.trim_end().ends_with("-----END PGP PRIVATE KEY BLOCK-----"));
+        assert!(asc
+            .trim_end()
+            .ends_with("-----END PGP PRIVATE KEY BLOCK-----"));
 
         // The exported key's fingerprint is exactly the one the reconstructed
         // public key produces — the secret cannot masquerade under another key.
@@ -304,13 +306,24 @@ mod tests {
         let s = Command::new("gpg")
             .envs(env)
             .args([
-                "--batch", "--yes", "--pinentry-mode", "loopback", "--local-user",
-                "cold-root@pillar", "--output", sig.to_str().unwrap(), "--detach-sign",
+                "--batch",
+                "--yes",
+                "--pinentry-mode",
+                "loopback",
+                "--local-user",
+                "cold-root@pillar",
+                "--output",
+                sig.to_str().unwrap(),
+                "--detach-sign",
                 msg.to_str().unwrap(),
             ])
             .output()
             .expect("gpg sign");
-        assert!(s.status.success(), "gpg sign failed: {}", String::from_utf8_lossy(&s.stderr));
+        assert!(
+            s.status.success(),
+            "gpg sign failed: {}",
+            String::from_utf8_lossy(&s.stderr)
+        );
         let v = Command::new("gpg")
             .envs(env)
             .args(["--verify", sig.to_str().unwrap(), msg.to_str().unwrap()])

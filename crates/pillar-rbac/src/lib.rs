@@ -65,18 +65,18 @@ use std::fmt;
 use pillar_core::NodeId;
 use pillar_wot_authority::WotAuthority;
 
-pub mod sealed_secret_store;
-pub mod key_export;
 pub mod document_sql_migration;
+pub mod key_export;
+pub mod sealed_secret_store;
+pub use document_sql_migration::{
+    acquire_revoke_epoch, effective_grants, ensure_effective_grants_view, grant_key, put_grant,
+    revoke_grant, EFFECTIVE_GRANTS_VIEW, GRANTS_COLLECTION,
+};
 pub use key_export::{
     authorize_key_export, cell_key_export_capability, key_export_step_up_policy,
     CELL_KEY_EXPORT_CAPABILITY, KEY_EXPORT_STEP_UP_MAX_AGE_SECS,
 };
 pub use sealed_secret_store::{SecretId, SecretRequestError, SecretStore};
-pub use document_sql_migration::{
-    acquire_revoke_epoch, effective_grants, ensure_effective_grants_view, grant_key, put_grant, revoke_grant,
-    EFFECTIVE_GRANTS_VIEW, GRANTS_COLLECTION,
-};
 
 /// One specific, named action the decider may allow or deny.
 ///
@@ -516,10 +516,7 @@ impl StepUpPolicy {
     /// Build a step-up policy requiring a fresh assertion for `capabilities`,
     /// with the given freshness window in seconds.
     #[must_use]
-    pub fn new(
-        capabilities: impl IntoIterator<Item = Capability>,
-        max_age_secs: u64,
-    ) -> Self {
+    pub fn new(capabilities: impl IntoIterator<Item = Capability>, max_age_secs: u64) -> Self {
         StepUpPolicy {
             required: capabilities.into_iter().collect(),
             max_age_secs,
@@ -1446,7 +1443,12 @@ mod tests {
     /// alice on base auth alone, with `rotate:key` marked step-up-required.
     fn stepup_fixture(
         max_age: u64,
-    ) -> (WotAuthority, Vec<PolicyEvent>, Vec<ExplicitGrant>, StepUpPolicy) {
+    ) -> (
+        WotAuthority,
+        Vec<PolicyEvent>,
+        Vec<ExplicitGrant>,
+        StepUpPolicy,
+    ) {
         let a = owner_authority_with_alice(3, 2);
         let policies = vec![PolicyEvent {
             target: PolicyTarget::ResourceClass(ResourceClass::All),
@@ -1599,10 +1601,10 @@ mod tests {
         // assertion drives the step-up rung of the RBAC decider — not a
         // bespoke MFA credential.
         use pillar_crypto::sign::signing_keypair_from_seed;
-        use pillar_crypto::Seed;
         use pillar_crypto::webauthn::{
             base64url_encode, ed25519_public_key_to_cose, verify_assertion,
         };
+        use pillar_crypto::Seed;
         use sha2::{Digest, Sha256};
 
         // Register the credential (as webauthn-rp-endpoints would).

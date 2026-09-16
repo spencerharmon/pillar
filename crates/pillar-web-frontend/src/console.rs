@@ -265,7 +265,9 @@ mod yew_impl {
     use crate::auth::{use_auth, AuthAction};
     use crate::command_palette::CommandPalette;
     use crate::data_explore::ExploreDataConsole;
-    use crate::iam_console::{AccountHub, OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile};
+    use crate::iam_console::{
+        AccountHub, OAuthClientsTile, ProfileTile, RolesGroupsTile, UsersTile,
+    };
     use crate::obs_console::ObservabilityConsole;
     use crate::overview::OverviewConsole;
     use crate::portal::{
@@ -493,8 +495,15 @@ mod tests {
             Section::Sessions,
             Section::Credentials,
         ] {
-            assert_eq!(s.group(), NavGroup::Account, "{s:?} must be in the Account group");
-            assert!(!s.in_sidebar(), "{s:?} must be hidden (folded into the Account hub)");
+            assert_eq!(
+                s.group(),
+                NavGroup::Account,
+                "{s:?} must be in the Account group"
+            );
+            assert!(
+                !s.in_sidebar(),
+                "{s:?} must be hidden (folded into the Account hub)"
+            );
         }
         // The hub is the single visible Account entry.
         assert_eq!(Section::Account.group(), NavGroup::Account);
@@ -503,7 +512,10 @@ mod tests {
             .into_iter()
             .filter(|s| s.group() == NavGroup::Account && s.in_sidebar())
             .count();
-        assert_eq!(visible, 1, "the Account group must show exactly one sidebar link (the hub)");
+        assert_eq!(
+            visible, 1,
+            "the Account group must show exactly one sidebar link (the hub)"
+        );
     }
 
     #[test]
@@ -515,7 +527,11 @@ mod tests {
             Section::Members,
             Section::Trust,
         ] {
-            assert_eq!(s.group(), NavGroup::Administration, "{s:?} must be an Administration section");
+            assert_eq!(
+                s.group(),
+                NavGroup::Administration,
+                "{s:?} must be an Administration section"
+            );
             assert!(s.in_sidebar(), "{s:?} must be a first-class sidebar link");
         }
     }

@@ -266,6 +266,8 @@ fn user_audit_collection(handle: &str) -> String {
     format!("{USER_AUDIT_COLLECTION_PREFIX}{handle}")
 }
 
+/// Shared per-connection web-plane auth context: the node-custody verifier, the
+/// WoT authority used for fail-closed admission, and the fenced actor identity.
 pub struct WebAuthContext {
     verifier: NodeCustodyVerifier,
     authority: WotAuthority,
@@ -1577,7 +1579,10 @@ impl WebAuthContext {
             PortalOp::WebauthnRevoke { credential_id } => {
                 self.webauthn_rp.revoke(&credential_id);
             }
-            PortalOp::WebauthnRename { credential_id, label } => {
+            PortalOp::WebauthnRename {
+                credential_id,
+                label,
+            } => {
                 // Replay is best-effort: an unknown/revoked credential (e.g. a
                 // rename racing a since-replayed revoke) is a harmless no-op.
                 let owners: Vec<String> = self
@@ -1672,7 +1677,7 @@ impl WebAuthContext {
                 let _ = self.build_attestation(
                     NodeId::from(issuer.as_str()),
                     capacity,
-                    authority.map(|a| TrustCid(a)),
+                    authority.map(TrustCid),
                     NodeId::from(subject.as_str()),
                     &action,
                     &resource,
@@ -2283,7 +2288,7 @@ impl WebAuthContext {
     /// The ONE `psl-message-api` `PillarMessage` contract (`psl-message-api`,
     /// 2026-09-09 ROI HEAD): runs `query_text` against the SAME live query
     /// engine [`Self::live_obs_psl`] rides (`pillar_observability::parse_psl`
-    /// + `psl_query`/`psl_correlate`), but returns the typed
+    /// plus `psl_query`/`psl_correlate`), but returns the typed
     /// [`pillar_wire::PslQueryResponse`] every transport tier (pillar-UDP,
     /// QUIC, HTTPS) serves verbatim as canonical CBOR — never the ad hoc text
     /// line-protocol `live_obs_psl` renders. `None` when no live substrate is
@@ -4101,8 +4106,8 @@ impl WebAuthContext {
                 // recovery credential (force=true => the subject holds NO usable
                 // operational key until it completes onboarding by changing the
                 // temp password), never regranting more than prior authority.
-                let temp =
-                    generate_temp_password().map_err(|()| "temp-password RNG failure".to_owned())?;
+                let temp = generate_temp_password()
+                    .map_err(|()| "temp-password RNG failure".to_owned())?;
                 let at = self.iam_now();
                 let offer_material =
                     fresh_offer_material(subject).map_err(|()| "offer RNG failure".to_owned())?;
@@ -4700,15 +4705,21 @@ impl WebAuthContext {
             } => {
                 let value = decode_hex_bytes(value_hex)
                     .ok_or_else(|| "value_hex is not valid lowercase hex".to_owned())?;
-                let cid =
-                    self.authorize_data_write(actor, collection, &format!("KV-PUT {collection} {key}"))?;
+                let cid = self.authorize_data_write(
+                    actor,
+                    collection,
+                    &format!("KV-PUT {collection} {key}"),
+                )?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.kv_put(collection, key, value, hlc);
                 Ok(format!("KV-PUT {collection} {key} EVENT-CID {cid}"))
             }
             pillar_ops::KvOp::Delete { collection, key } => {
-                let cid =
-                    self.authorize_data_write(actor, collection, &format!("KV-DELETE {collection} {key}"))?;
+                let cid = self.authorize_data_write(
+                    actor,
+                    collection,
+                    &format!("KV-DELETE {collection} {key}"),
+                )?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.kv_delete(collection, key, hlc);
                 Ok(format!("KV-DELETE {collection} {key} EVENT-CID {cid}"))
@@ -4734,8 +4745,11 @@ impl WebAuthContext {
                 field,
                 value,
             } => {
-                let cid = self
-                    .authorize_data_write(actor, collection, &format!("DOC-PUT {collection} {id} {field}"))?;
+                let cid = self.authorize_data_write(
+                    actor,
+                    collection,
+                    &format!("DOC-PUT {collection} {id} {field}"),
+                )?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store.doc_put_field(
                     collection,
@@ -4798,14 +4812,18 @@ impl WebAuthContext {
                 if let Some(p) = project {
                     def = def.projecting(p.clone());
                 }
-                let cid =
-                    self.authorize_data_write(actor, name, &format!("SQL-CREATE-VIEW {name} {source}"))?;
+                let cid = self.authorize_data_write(
+                    actor,
+                    name,
+                    &format!("SQL-CREATE-VIEW {name} {source}"),
+                )?;
                 let hlc = self.next_keyed_hlc(actor);
                 pillar_sqlviews::create_view(&mut self.keyed_store, name, def, hlc);
                 Ok(format!("VIEW {name} OVER {source} EVENT-CID {cid}"))
             }
             pillar_ops::SqlOp::DropView { name } => {
-                let cid = self.authorize_data_write(actor, name, &format!("SQL-DROP-VIEW {name}"))?;
+                let cid =
+                    self.authorize_data_write(actor, name, &format!("SQL-DROP-VIEW {name}"))?;
                 let hlc = self.next_keyed_hlc(actor);
                 pillar_sqlviews::drop_view(&mut self.keyed_store, name, hlc);
                 Ok(format!("DROP-VIEW {name} EVENT-CID {cid}"))
@@ -5055,7 +5073,8 @@ impl WebAuthContext {
         collection: impl Into<String>,
         selector: pillar_net::NodeSelector,
     ) {
-        self.collection_placement.insert(collection.into(), selector);
+        self.collection_placement
+            .insert(collection.into(), selector);
     }
 
     /// The retention window (in ops) `pillar log blocks` reports for the
@@ -5612,8 +5631,7 @@ impl WebAuthContext {
         let (rlat1, rlat2) = (lat1.to_radians(), lat2.to_radians());
         let dlat = (lat2 - lat1).to_radians();
         let dlon = (lon2 - lon1).to_radians();
-        let a = (dlat / 2.0).sin().powi(2)
-            + rlat1.cos() * rlat2.cos() * (dlon / 2.0).sin().powi(2);
+        let a = (dlat / 2.0).sin().powi(2) + rlat1.cos() * rlat2.cos() * (dlon / 2.0).sin().powi(2);
         let c = 2.0 * a.sqrt().asin();
         EARTH_RADIUS_KM * c
     }
@@ -6078,13 +6096,12 @@ impl WebAuthContext {
                 CrdValue::String(new_image.to_owned()),
             )
             .map(|applied| format!("{}", applied.event.0))
-            .map(|applied| {
+            .inspect(|_applied| {
                 self.record(&PortalOp::ResourceEdit {
                     actor: actor.to_string(),
                     name: name.to_owned(),
                     new_image: new_image.to_owned(),
                 });
-                applied
             })
     }
 
@@ -6142,12 +6159,11 @@ impl WebAuthContext {
                 CrdValue::Integer(generation),
             )
             .map(|applied| format!("{}", applied.event.0))
-            .map(|applied| {
+            .inspect(|_applied| {
                 self.record(&PortalOp::ResourceRollout {
                     actor: actor.to_string(),
                     name: name.to_owned(),
                 });
-                applied
             })
     }
 
@@ -6622,14 +6638,14 @@ pub fn serve_shared(listener: TcpListener, ctx: std::sync::Arc<std::sync::Mutex<
     }
 }
 
-/// The graphical portal UI served at `GET /` — a real login page (two fields:
-/// user identifier + unlock factor, NO CID), whose embedded script drives the
-/// `GET /nonce` → `POST /login` handshake as hidden plumbing and, on success,
-/// transitions into an authenticated portal view greeting the user by handle
-/// with node management. On a FRESH node the same page guides the operator
-/// through the create-cell → create-first-user bootstrap flow. The origin is
-/// derived from the browser (`location`) at runtime, so no infrastructure
-/// identifier is embedded in this public source.
+// The graphical portal UI served at `GET /` — a real login page (two fields:
+// user identifier + unlock factor, NO CID), whose embedded script drives the
+// `GET /nonce` → `POST /login` handshake as hidden plumbing and, on success,
+// transitions into an authenticated portal view greeting the user by handle
+// with node management. On a FRESH node the same page guides the operator
+// through the create-cell → create-first-user bootstrap flow. The origin is
+// derived from the browser (`location`) at runtime, so no infrastructure
+// identifier is embedded in this public source.
 
 /// The Yew + WebAssembly portal's static asset bundle, EMBEDDED into this one
 /// `pillar` binary at compile time (`include_bytes!`) — the SECOND stage of the
@@ -7173,7 +7189,6 @@ fn view_def_summary(def: &pillar_sqlviews::ViewDef) -> String {
 fn render_view_def(name: &str, def: &pillar_sqlviews::ViewDef) -> String {
     format!("TABLE {name}\n{}\n", view_def_summary(def))
 }
-
 
 /// `POST /portal/profile/cli-config` — body `<token>`: an authenticated user
 /// downloads a ready-to-use `config.yaml` for the `pillar` CLI. Mints a FRESH,
@@ -8072,7 +8087,11 @@ fn dispatch_data_doc_fields(ctx: &WebAuthContext, request: &HttpRequest) -> Http
     let Some(id) = query_value(&request.path, "id") else {
         return text_response(400, "Bad Request", "MISSING id".to_owned());
     };
-    text_response(200, "OK", join_lines(ctx.keyed_store.doc_fields(collection, id)))
+    text_response(
+        200,
+        "OK",
+        join_lines(ctx.keyed_store.doc_fields(collection, id)),
+    )
 }
 
 /// `GET /portal/data/doc/get?token=<s>&collection=<c>&id=<i>&field=<f>` — the
@@ -8153,7 +8172,11 @@ fn require_data_session_actor(
 /// reason (a malformed CID/event id, an unknown collection, or a fail-closed
 /// membership check) — the Collection Explorer never gets a silent empty
 /// panel for a real backend refusal.
-fn query_op_response(ctx: &mut WebAuthContext, actor: &NodeId, op: pillar_ops::QueryOp) -> HttpResponse {
+fn query_op_response(
+    ctx: &mut WebAuthContext,
+    actor: &NodeId,
+    op: pillar_ops::QueryOp,
+) -> HttpResponse {
     match ctx.query_op(actor, &op) {
         Ok(body) => text_response(200, "OK", body),
         Err(reason) => text_response(404, "Not Found", format!("DENIED {reason}")),
@@ -9161,7 +9184,12 @@ fn dispatch_delegated_user_op(
             resp.body.trim()
         );
     }
-    dispatch_delegated_control_op(ctx, caller, caller_password, pillar_ops::ControlOp::User(op))
+    dispatch_delegated_control_op(
+        ctx,
+        caller,
+        caller_password,
+        pillar_ops::ControlOp::User(op),
+    )
 }
 
 /// Dispatch ANY [`pillar_ops::ControlOp`] on `caller`'s behalf through the
@@ -9192,21 +9220,20 @@ fn dispatch_delegated_control_op(
         }
     };
     let mut step_up = pillar_key_distribution::StepUpToken::fresh();
-    let (signature, signer) = match ctx.verifier.sign_op_for(
-        caller,
-        caller_password,
-        &signing_material,
-        &mut step_up,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(text_response(
-                403,
-                "Forbidden",
-                format!("REFUSED delegated-sign {e:?}"),
-            ));
-        }
-    };
+    let (signature, signer) =
+        match ctx
+            .verifier
+            .sign_op_for(caller, caller_password, &signing_material, &mut step_up)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(text_response(
+                    403,
+                    "Forbidden",
+                    format!("REFUSED delegated-sign {e:?}"),
+                ));
+            }
+        };
     let crypto_signature = pillar_crypto::Signature::from_bytes(signature.to_wire().to_vec());
     if pillar_crypto::sign::verify(&signer, &signing_material, &crypto_signature).is_err() {
         return Err(text_response(
@@ -9351,7 +9378,10 @@ fn parse_bulk_invite_row(line: &str) -> Result<BulkInviteRow, String> {
     if handle.is_empty() {
         return Err("MALFORMED-ROW empty handle".to_owned());
     }
-    let password = fields.get(2).filter(|p| !p.is_empty()).map(|p| p.to_string());
+    let password = fields
+        .get(2)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string());
     let force_password_change = fields.get(3).map(|f| *f != "false").unwrap_or(true);
     let require_passkey = fields.get(4).map(|f| *f == "true").unwrap_or(false);
     let verified_email = fields.get(5).map(|f| *f == "true").unwrap_or(false);
@@ -9381,9 +9411,11 @@ fn parse_bulk_invite_row(line: &str) -> Result<BulkInviteRow, String> {
 /// `already exists`) does NOT abort the batch — every remaining row is still
 /// attempted. The response is one line per row, in the SAME order as the
 /// input:
+///
 /// - `<handle> OK <password>` — invited; `<password>` is the temp password
 ///   (either the row's explicit one or the freshly generated one).
 /// - `<handle> FAILED <reason>` — this row failed; every other row still ran.
+///
 /// A wrong admin password fails EVERY row identically (`FAILED REFUSED
 /// delegated-sign ...`), since the delegated signature is verified once per
 /// row using the same caller/password pair — the response still enumerates
@@ -9451,11 +9483,7 @@ fn dispatch_users_bulk_invite(
                 report.push_str(&format!("{} FAILED already-exists\n", row.handle));
             }
             Err(resp) => {
-                report.push_str(&format!(
-                    "{} FAILED {}\n",
-                    row.handle,
-                    resp.body.trim()
-                ));
+                report.push_str(&format!("{} FAILED {}\n", row.handle, resp.body.trim()));
             }
         }
     }
@@ -12277,7 +12305,9 @@ mod tests {
         let invite = post(
             &mut ctx,
             "/portal/users/invite",
-            &format!("{PASSWORD}\n{admin}\ncarol\ncarol@example.com\ncarol-initial-pw\nfalse\nfalse"),
+            &format!(
+                "{PASSWORD}\n{admin}\ncarol\ncarol@example.com\ncarol-initial-pw\nfalse\nfalse"
+            ),
         );
         assert_eq!(invite.status, 200, "invite: {}", invite.body);
 
@@ -12391,7 +12421,11 @@ mod tests {
         assert_eq!(dry.body.trim(), "PREDICTED ALLOW", "dry-run: {}", dry.body);
 
         // Disable fay → login now refused.
-        let dis = post(&mut ctx, "/portal/users/disable", &format!("{PASSWORD}\n{admin}\nfay"));
+        let dis = post(
+            &mut ctx,
+            "/portal/users/disable",
+            &format!("{PASSWORD}\n{admin}\nfay"),
+        );
         assert_eq!(dis.status, 200, "disable: {}", dis.body);
         let list = get(&mut ctx, &format!("/portal/users?token={admin}"));
         assert!(
@@ -12420,7 +12454,11 @@ mod tests {
         );
 
         // Enable → login works again.
-        let en = post(&mut ctx, "/portal/users/enable", &format!("{PASSWORD}\n{admin}\nfay"));
+        let en = post(
+            &mut ctx,
+            "/portal/users/enable",
+            &format!("{PASSWORD}\n{admin}\nfay"),
+        );
         assert_eq!(en.status, 200, "enable: {}", en.body);
         let _fay2 = login_token(&mut ctx, "fay", "fay-pw");
 
@@ -15795,6 +15833,7 @@ mod tests {
     // observable in the runtime's real run history — proving the production
     // apply -> admit -> schedule -> run path end to end.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_cronjob_manifest_applied_via_the_real_admission_route_actually_runs() {
         let (mut ctx, _subkey) = provisioned_ctx();
         let token = login_alice(&mut ctx);
@@ -16408,9 +16447,16 @@ mod tests {
         // Unauthenticated is refused.
         assert_eq!(get(&mut ctx, "/portal/data/kv/collections").status, 401);
 
-        let cols = get(&mut ctx, &format!("/portal/data/kv/collections?token={token}"));
+        let cols = get(
+            &mut ctx,
+            &format!("/portal/data/kv/collections?token={token}"),
+        );
         assert_eq!(cols.status, 200, "got: {}", cols.body);
-        assert!(cols.body.lines().any(|c| c == "config"), "got: {}", cols.body);
+        assert!(
+            cols.body.lines().any(|c| c == "config"),
+            "got: {}",
+            cols.body
+        );
 
         let keys = get(
             &mut ctx,
@@ -16425,7 +16471,12 @@ mod tests {
             &format!("/portal/data/kv/get?token={token}&collection=config&key=greeting"),
         );
         assert_eq!(value.status, 200, "got: {}", value.body);
-        assert_eq!(value.body.trim(), hex_encode(b"hello"), "got: {}", value.body);
+        assert_eq!(
+            value.body.trim(),
+            hex_encode(b"hello"),
+            "got: {}",
+            value.body
+        );
 
         let missing = get(
             &mut ctx,
@@ -16433,10 +16484,7 @@ mod tests {
         );
         assert_eq!(missing.status, 404, "got: {}", missing.body);
 
-        let missing_collection = get(
-            &mut ctx,
-            &format!("/portal/data/kv/keys?token={token}"),
-        );
+        let missing_collection = get(&mut ctx, &format!("/portal/data/kv/keys?token={token}"));
         assert_eq!(
             missing_collection.status, 400,
             "collection is required: {}",
@@ -16465,7 +16513,10 @@ mod tests {
             401
         );
 
-        let ids = get(&mut ctx, &format!("/portal/data/doc/ids?token={token}&collection=users"));
+        let ids = get(
+            &mut ctx,
+            &format!("/portal/data/doc/ids?token={token}&collection=users"),
+        );
         assert_eq!(ids.status, 200, "got: {}", ids.body);
         assert!(ids.body.contains("u1"), "got: {}", ids.body);
         assert!(ids.body.contains("u2"), "got: {}", ids.body);
@@ -16520,7 +16571,10 @@ mod tests {
         let hlc = ctx.next_keyed_hlc(&actor);
         pillar_sqlviews::create_view(&mut ctx.keyed_store, "active_users", def, hlc);
 
-        assert_eq!(get(&mut ctx, "/portal/data/sql/views?token=nope").status, 401);
+        assert_eq!(
+            get(&mut ctx, "/portal/data/sql/views?token=nope").status,
+            401
+        );
 
         let views = get(&mut ctx, &format!("/portal/data/sql/views?token={token}"));
         assert_eq!(views.status, 200, "got: {}", views.body);

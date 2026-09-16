@@ -38,16 +38,20 @@ pub fn content_address(bytes: &[u8]) -> pillar_crypto::ContentId {
 }
 
 pub mod store;
-pub use store::{Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, StoreError, Visibility};
+pub use store::{
+    Cid, ContentStore, HeadRecord, SegmentSource, SignedSegment, StoreError, Visibility,
+};
 
 pub mod ipfs_backend;
 pub use ipfs_backend::IpfsBackend;
 #[cfg(feature = "ipfs")]
 pub use ipfs_backend::{cid_to_cidv1_raw, cidv1_raw_to_cid, NativeIpfsBackend};
 
-pub mod seal;
 pub mod envelope;
-pub use envelope::{Body, PillarMessage, PILLAR_MESSAGE_MAX_SUPPORTED, PILLAR_MESSAGE_MIN_SUPPORTED};
+pub mod seal;
+pub use envelope::{
+    Body, PillarMessage, PILLAR_MESSAGE_MAX_SUPPORTED, PILLAR_MESSAGE_MIN_SUPPORTED,
+};
 
 pub mod psl_message;
 pub use psl_message::{

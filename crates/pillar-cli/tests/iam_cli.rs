@@ -71,23 +71,26 @@ fn role_group_oauth_cli_parity_gated_signed_and_describable() {
     assert!(roles
         .add(&decider_deny, &op, "support-role", ["iam:users:write"])
         .is_err());
-    assert!(roles.show("support-role").is_none(), "refused act must mutate nothing");
+    assert!(
+        roles.show("support-role").is_none(),
+        "refused act must mutate nothing"
+    );
 
     assert_eq!(roles.dry_run(&decider_allow, &op), Decision::Allow);
     let role_cid = roles
         .add(&decider_allow, &op, "support-role", ["iam:users:write"])
         .expect("granted operator may create a role");
-    let role_event = roles.describe("support-role").expect("describe renders the event");
+    let role_event = roles
+        .describe("support-role")
+        .expect("describe renders the event");
     assert_eq!(role_event.signer, op);
     assert_eq!(role_event.authority, Capability::from("iam:roles:write"));
     assert_eq!(role_event.cid, role_cid);
-    assert!(
-        roles
-            .show("support-role")
-            .unwrap()
-            .capabilities
-            .contains("iam:users:write")
-    );
+    assert!(roles
+        .show("support-role")
+        .unwrap()
+        .capabilities
+        .contains("iam:users:write"));
 
     // -- group ------------------------------------------------------------
     let mut groups = GroupCli::new();
@@ -106,8 +109,13 @@ fn role_group_oauth_cli_parity_gated_signed_and_describable() {
     let group = groups.show("support-team").expect("group exists");
     assert_eq!(group.roles, BTreeSet::from(["support-role".to_owned()]));
     assert_eq!(group.members, BTreeSet::from(["bob".to_owned()]));
-    let group_event = groups.describe("support-team").expect("describe renders the event");
-    assert_eq!(group_event.cid, member_cid, "describe shows the MOST RECENT mutation");
+    let group_event = groups
+        .describe("support-team")
+        .expect("describe renders the event");
+    assert_eq!(
+        group_event.cid, member_cid,
+        "describe shows the MOST RECENT mutation"
+    );
     assert_eq!(group_event.authority, Capability::from("iam:groups:write"));
 
     // -- oauth --------------------------------------------------------------
@@ -145,7 +153,9 @@ fn role_group_oauth_cli_parity_gated_signed_and_describable() {
         .expect("granted operator may register an oauth client");
     let client = oauth.show("console-app").expect("client registered");
     assert_eq!(client.client_type, ClientType::Public);
-    let oauth_event = oauth.describe("console-app").expect("describe renders the event");
+    let oauth_event = oauth
+        .describe("console-app")
+        .expect("describe renders the event");
     assert_eq!(oauth_event.cid, oauth_cid);
     assert_eq!(oauth_event.authority, Capability::from("iam:oauth:write"));
 

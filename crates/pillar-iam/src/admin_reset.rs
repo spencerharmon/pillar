@@ -161,7 +161,7 @@ impl AdminAuthContext<'_> {
 }
 
 #[cfg(test)]
-mod admin_reset {
+mod tests {
     use super::*;
     use std::collections::BTreeMap;
 

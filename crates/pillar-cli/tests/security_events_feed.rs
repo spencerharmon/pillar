@@ -262,7 +262,10 @@ fn security_events_feed_is_a_filterable_verifiable_cell_wide_view_over_the_contr
         password: Some("bob-initial-pw".to_owned()),
     })
     .expect("invite bob over control-op tier");
-    assert!(invite_bob.contains("INVITED handle=bob"), "invite: {invite_bob}");
+    assert!(
+        invite_bob.contains("INVITED handle=bob"),
+        "invite: {invite_bob}"
+    );
 
     let invite_carol = user_op(&UserOp::Invite {
         handle: carol.to_owned(),
@@ -303,8 +306,8 @@ fn security_events_feed_is_a_filterable_verifiable_cell_wide_view_over_the_contr
     .expect("revoke-all bob sessions");
 
     // === The cell-wide, unfiltered feed =======================================
-    let feed = user_op(&UserOp::SecurityEventsFeed { kind: None })
-        .expect("security events feed (all)");
+    let feed =
+        user_op(&UserOp::SecurityEventsFeed { kind: None }).expect("security events feed (all)");
     assert!(
         feed.contains("security-events-feed kind=all"),
         "header: {feed}"
@@ -384,8 +387,8 @@ fn security_events_feed_is_a_filterable_verifiable_cell_wide_view_over_the_contr
     );
 
     // Read-only: a second unfiltered read returns the identical count.
-    let feed_again = user_op(&UserOp::SecurityEventsFeed { kind: None })
-        .expect("re-read security events feed");
+    let feed_again =
+        user_op(&UserOp::SecurityEventsFeed { kind: None }).expect("re-read security events feed");
     assert_eq!(
         events_count(&feed_again),
         4,

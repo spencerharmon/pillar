@@ -28,18 +28,13 @@ const ALLOW_STUB_MARKER: &str = "allow-stub:";
 
 /// A forbidden unfinished-code macro, matched as a whole-word token in stripped
 /// (comment-free) source. Each marks code that is not actually implemented.
-const FORBIDDEN_TOKENS: &[&str] = &[
-    "todo!",
-    "unimplemented!",
-];
+const FORBIDDEN_TOKENS: &[&str] = &["todo!", "unimplemented!"];
 
 /// The `panic!("not implemented"...)` shape is matched separately: `panic!` on
 /// its own is a legitimate assertion, so it is only forbidden when its message
 /// begins with "not implemented".
-const PANIC_NOT_IMPLEMENTED_PREFIXES: &[&str] = &[
-    "panic!(\"not implemented",
-    "panic!(\"not yet implemented",
-];
+const PANIC_NOT_IMPLEMENTED_PREFIXES: &[&str] =
+    &["panic!(\"not implemented", "panic!(\"not yet implemented"];
 
 /// Resolve the workspace root (two levels up from this crate's manifest dir:
 /// `crates/pillar-crypto` -> workspace root).
@@ -58,8 +53,8 @@ fn workspace_root() -> PathBuf {
 fn shipping_rs_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let crates = root.join("crates");
-    let entries = fs::read_dir(&crates)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", crates.display()));
+    let entries =
+        fs::read_dir(&crates).unwrap_or_else(|e| panic!("cannot read {}: {e}", crates.display()));
     for crate_dir in entries.flatten() {
         let src = crate_dir.path().join("src");
         if src.is_dir() {
@@ -129,9 +124,8 @@ fn scan_source(label: &str, text: &str) -> Vec<Offense> {
             continue;
         }
 
-        let starts_test_mod = (is_cfg_test_attr || pending_cfg_test)
-            && code.contains("mod ")
-            && code.contains('{');
+        let starts_test_mod =
+            (is_cfg_test_attr || pending_cfg_test) && code.contains("mod ") && code.contains('{');
         if starts_test_mod {
             let before = depth;
             depth += opens - closes;

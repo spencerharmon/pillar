@@ -49,7 +49,13 @@ fn seed_message(cell: &str) -> PillarMessage {
 /// Attest (never merely declare) that `node` sits at `tier = value`,
 /// self-issued by `store`'s genesis authority — the REAL, chain-verified
 /// artifact `Topology::attested_placement` requires, not a placeholder.
-fn attest_tier(topology: &mut Topology, store: &mut TrustStore, node: &str, tier: &str, value: &str) {
+fn attest_tier(
+    topology: &mut Topology,
+    store: &mut TrustStore,
+    node: &str,
+    tier: &str,
+    value: &str,
+) {
     let label = Label::new(tier, value);
     let attest = Attest {
         issuer: store.genesis().clone(),
@@ -79,16 +85,34 @@ fn routing_across_a_known_multi_hop_topology_yields_the_real_hop_count_and_tier_
     // --- topology: ingest in us-east, destination in us-west, both ATTESTED ---
     let mut trust = TrustStore::new(n("genesis"));
     let mut topology = Topology::new(TierHierarchy::default());
-    attest_tier(&mut topology, &mut trust, "ingest-node", "region", "us-east");
-    attest_tier(&mut topology, &mut trust, "ingest-node", "zone", "us-east-1a");
+    attest_tier(
+        &mut topology,
+        &mut trust,
+        "ingest-node",
+        "region",
+        "us-east",
+    );
+    attest_tier(
+        &mut topology,
+        &mut trust,
+        "ingest-node",
+        "zone",
+        "us-east-1a",
+    );
     attest_tier(&mut topology, &mut trust, "dest-node", "region", "us-west");
     attest_tier(&mut topology, &mut trust, "dest-node", "zone", "us-west-1b");
 
     // A node that lies about its own placement must never win: self-declared
     // labels are display-only and must not leak into a placement-facing
     // rollup label.
-    topology.declare(n("dest-node"), &[Label::new("region", "not-actually-us-west")]);
-    topology.declare(n("ingest-node"), &[Label::new("region", "not-actually-us-east")]);
+    topology.declare(
+        n("dest-node"),
+        &[Label::new("region", "not-actually-us-west")],
+    );
+    topology.declare(
+        n("ingest-node"),
+        &[Label::new("region", "not-actually-us-east")],
+    );
 
     // --- routing context (RouteKind + cell, the other required labels) ---
     let route = Route::new(
@@ -151,8 +175,14 @@ fn routing_across_a_known_multi_hop_topology_yields_the_real_hop_count_and_tier_
     );
 
     let labels = signal.labels();
-    assert_eq!(labels.get("ingest_region").map(String::as_str), Some("us-east"));
-    assert_eq!(labels.get("ingest_zone").map(String::as_str), Some("us-east-1a"));
+    assert_eq!(
+        labels.get("ingest_region").map(String::as_str),
+        Some("us-east")
+    );
+    assert_eq!(
+        labels.get("ingest_zone").map(String::as_str),
+        Some("us-east-1a")
+    );
     assert_eq!(
         labels.get("destination_region").map(String::as_str),
         Some("us-west"),
@@ -162,8 +192,14 @@ fn routing_across_a_known_multi_hop_topology_yields_the_real_hop_count_and_tier_
         labels.get("destination_zone").map(String::as_str),
         Some("us-west-1b")
     );
-    assert_eq!(labels.get("cell").map(String::as_str), Some("cell-checkout"));
-    assert_eq!(labels.get("route").map(String::as_str), Some("checkout-route"));
+    assert_eq!(
+        labels.get("cell").map(String::as_str),
+        Some("cell-checkout")
+    );
+    assert_eq!(
+        labels.get("route").map(String::as_str),
+        Some("checkout-route")
+    );
     assert_eq!(
         labels.get("route_kind").map(String::as_str),
         Some("pillar_native")

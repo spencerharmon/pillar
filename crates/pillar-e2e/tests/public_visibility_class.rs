@@ -1,3 +1,5 @@
+//! Acceptance (feature-gated): the first-class `public` (unencrypted)
+//! collection visibility class alongside the `cell-encrypted` default.
 #![cfg(feature = "acceptance")]
 //! Acceptance: `public-visibility-class` — a first-class `public`
 //! (unencrypted) collection visibility class, alongside the `cell-encrypted`
@@ -38,7 +40,7 @@ use pillar_core::{NodeId, SideEffect};
 use pillar_crypto::cell::group_key_from_seed;
 use pillar_crypto::sign::signing_keypair_from_seed;
 use pillar_crypto::{CellId, Seed};
-use pillar_rbac::{Capability, Decision, ExplicitGrant, PolicyEvent, Request, RbacDecider};
+use pillar_rbac::{Capability, Decision, ExplicitGrant, PolicyEvent, RbacDecider, Request};
 use pillar_streamdb::{CollectionPolicy, Confidentiality, IpfsPersistentStream};
 use pillar_wot_authority::WotAuthority;
 
@@ -52,12 +54,20 @@ struct InMemorySwarm<'a> {
 }
 
 impl<'a> pillar_streamdb::store::SegmentSource for InMemorySwarm<'a> {
-    fn fetch(&self, cid: &pillar_streamdb::store::Cid) -> Option<pillar_streamdb::store::SignedSegment> {
+    fn fetch(
+        &self,
+        cid: &pillar_streamdb::store::Cid,
+    ) -> Option<pillar_streamdb::store::SignedSegment> {
         self.store.get_local(cid)
     }
 }
 
-fn keys(seed: &str) -> (pillar_crypto::SigningPublicKey, pillar_crypto::SigningSecretKey) {
+fn keys(
+    seed: &str,
+) -> (
+    pillar_crypto::SigningPublicKey,
+    pillar_crypto::SigningSecretKey,
+) {
     signing_keypair_from_seed(&Seed::from_bytes(seed.as_bytes().to_vec())).expect("keygen")
 }
 
@@ -67,7 +77,10 @@ fn public_collection_writes_through_real_op_path_and_reads_back_keyless() {
     let (owner_pk, owner_sk) = keys("public-collection-owner");
     let cell = CellId::from_bytes(b"cell::public-catalog".to_vec());
     let policy = CollectionPolicy::public();
-    assert!(policy.is_public(), "public() policy must be Confidentiality::Public");
+    assert!(
+        policy.is_public(),
+        "public() policy must be Confidentiality::Public"
+    );
 
     let mut collection =
         IpfsPersistentStream::genesis_public(owner_pk.clone(), owner_sk, cell.clone(), None);

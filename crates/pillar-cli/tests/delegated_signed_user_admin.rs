@@ -221,7 +221,8 @@ fn admin_user_mutations_require_a_real_delegated_signature_not_just_a_session_to
     let list = node.get(&format!("/portal/users?token={admin}"));
     assert_eq!(list.status, 200);
     assert!(
-        list.body.contains("bob status=Invited force_password_change=false"),
+        list.body
+            .contains("bob status=Invited force_password_change=false"),
         "bob invited: {}",
         list.body
     );

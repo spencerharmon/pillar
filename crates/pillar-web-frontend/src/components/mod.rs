@@ -63,9 +63,9 @@ pub use data_table::{DataTable, DataTableProps};
 #[cfg(feature = "yew")]
 pub use drawer::{Drawer, DrawerProps};
 #[cfg(feature = "yew")]
-pub use form::{FormField, FormFieldProps};
-#[cfg(feature = "yew")]
 pub use form::{FieldSet, FieldSetProps};
+#[cfg(feature = "yew")]
+pub use form::{FormField, FormFieldProps};
 #[cfg(feature = "yew")]
 pub use secret_reveal::{SecretReveal, SecretRevealProps};
 #[cfg(feature = "yew")]

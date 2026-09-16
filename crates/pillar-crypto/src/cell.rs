@@ -286,8 +286,8 @@ mod tests {
         let aad = b"envelope-header-v1";
 
         let ct_op = cell_seal_convergent(&group, plaintext, b"streamdb-op", aad).expect("seal op");
-        let ct_signal =
-            cell_seal_convergent(&group, plaintext, b"observability-signal", aad).expect("seal signal");
+        let ct_signal = cell_seal_convergent(&group, plaintext, b"observability-signal", aad)
+            .expect("seal signal");
         assert_ne!(
             ct_op, ct_signal,
             "the same plaintext under different domains must not converge across classes"
@@ -315,8 +315,8 @@ mod tests {
         let group = group_key_from_seed(&seed("cell-convergent")).expect("group key");
         let plaintext = b"header-bound body";
 
-        let ct = cell_seal_convergent(&group, plaintext, b"streamdb-op", b"header-v1")
-            .expect("seal");
+        let ct =
+            cell_seal_convergent(&group, plaintext, b"streamdb-op", b"header-v1").expect("seal");
         assert!(
             cell_open_convergent(&group, &ct, b"different-header").is_err(),
             "wrong aad must fail to open even with the right group key"

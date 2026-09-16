@@ -85,12 +85,7 @@ impl TrafficView {
 
     /// Record that `backend` exchanges `weight` traffic with ingest `domain`.
     /// Additive: repeated calls for the same pair accumulate.
-    pub fn observe(
-        &mut self,
-        backend: impl Into<Backend>,
-        domain: impl Into<Domain>,
-        weight: u64,
-    ) {
+    pub fn observe(&mut self, backend: impl Into<Backend>, domain: impl Into<Domain>, weight: u64) {
         *self
             .per_backend
             .entry(backend.into())
@@ -285,13 +280,12 @@ fn aggregate_hops(
     for (backend, domain) in assignment {
         if let Some(per_ingest) = traffic.backend_traffic(backend) {
             for (ingest_domain, weight) in per_ingest {
-                total = total
-                    .saturating_add(weight.saturating_mul(hierarchy_hops(
-                        hierarchy,
-                        tier,
-                        domain,
-                        ingest_domain,
-                    )));
+                total = total.saturating_add(weight.saturating_mul(hierarchy_hops(
+                    hierarchy,
+                    tier,
+                    domain,
+                    ingest_domain,
+                )));
             }
         }
     }
@@ -356,8 +350,11 @@ impl Optimizer {
             // by SOME backend (the failure domains the application already
             // spans) — we relocate toward ingest locality among those, never
             // inventing a brand-new domain the operator never declared.
-            let target_domains: Vec<Domain> =
-                placement.occupied_domains().iter().map(|d| (*d).to_owned()).collect();
+            let target_domains: Vec<Domain> = placement
+                .occupied_domains()
+                .iter()
+                .map(|d| (*d).to_owned())
+                .collect();
 
             let mut best: Option<Move> = None;
 
@@ -485,6 +482,9 @@ mod tests {
 
         assert!(!moves.is_empty(), "expected the backend to be relocated");
         assert_eq!(placement.domain_of("b1"), Some("r1"));
-        assert!(after < before, "aggregate hops must fall: {before} -> {after}");
+        assert!(
+            after < before,
+            "aggregate hops must fall: {before} -> {after}"
+        );
     }
 }

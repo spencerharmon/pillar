@@ -58,7 +58,7 @@ pub fn browse_sessions(registry: &SessionRegistry) -> KvBrowseView {
 }
 
 #[cfg(test)]
-mod kv_plane_migration {
+mod tests {
     use super::*;
 
     /// `session-registry-impl`'s session records are real K/V surface
@@ -95,7 +95,11 @@ mod kv_plane_migration {
         reg.revoke_one("alice", "s1").unwrap();
 
         let view = browse_sessions(&reg);
-        assert_eq!(view.keys.len(), 1, "revoked session's record is still a live K/V entry");
+        assert_eq!(
+            view.keys.len(),
+            1,
+            "revoked session's record is still a live K/V entry"
+        );
         assert!(reg.show("alice", "s1").unwrap().is_revoked());
         // The revocation is real: ls (which filters on `is_active`) excludes it.
         assert!(reg.ls("alice", 10).is_empty());

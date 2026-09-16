@@ -327,7 +327,10 @@ fn boot_seeded_node(data_dir: &std::path::Path) -> (Node, String) {
     );
     std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
     std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(signer_public.as_bytes()),
+    );
     std::env::set_var(
         "PILLAR_SIGNER_SECRET_HEX",
         hex_encode(signer_secret.as_bytes()),
@@ -409,8 +412,16 @@ fn collection_explorer_drilldown_exercises_all_four_layers_end_to_end() {
     ));
     assert_eq!(show.status, 200, "log show: {}", show.body);
     assert!(show.body.contains("kind: KV-PUT"), "show: {}", show.body);
-    assert!(field(&show.body, "key").contains("gamma"), "show: {}", show.body);
-    assert!(!field(&show.body, "payload-cid").is_empty(), "show: {}", show.body);
+    assert!(
+        field(&show.body, "key").contains("gamma"),
+        "show: {}",
+        show.body
+    );
+    assert!(
+        !field(&show.body, "payload-cid").is_empty(),
+        "show: {}",
+        show.body
+    );
     assert_eq!(field(&show.body, "seal"), "none", "show: {}", show.body);
 
     // DAG toggle: the causal graph renders at least the tip's own edge/
@@ -455,18 +466,42 @@ fn collection_explorer_drilldown_exercises_all_four_layers_end_to_end() {
     let doc_blocks = node.get(&format!(
         "/portal/data/log/blocks?token={token}&collection=widgets"
     ));
-    assert_eq!(doc_blocks.status, 200, "log blocks (doc): {}", doc_blocks.body);
-    assert!(doc_blocks.body.contains("kind: document"), "{}", doc_blocks.body);
-    assert!(doc_blocks.body.contains("snapshot: none"), "{}", doc_blocks.body);
-    assert!(doc_blocks.body.contains("tail: 3 ops"), "{}", doc_blocks.body);
+    assert_eq!(
+        doc_blocks.status, 200,
+        "log blocks (doc): {}",
+        doc_blocks.body
+    );
+    assert!(
+        doc_blocks.body.contains("kind: document"),
+        "{}",
+        doc_blocks.body
+    );
+    assert!(
+        doc_blocks.body.contains("snapshot: none"),
+        "{}",
+        doc_blocks.body
+    );
+    assert!(
+        doc_blocks.body.contains("tail: 3 ops"),
+        "{}",
+        doc_blocks.body
+    );
 
     // TSDB collection: NO snapshot line at all, a retention-block ribbon with
     // a horizon and a pruned region — a visibly, structurally distinct shape.
     let tsdb_blocks = node.get(&format!(
         "/portal/data/log/blocks?token={token}&collection=__objects"
     ));
-    assert_eq!(tsdb_blocks.status, 200, "log blocks (tsdb): {}", tsdb_blocks.body);
-    assert!(tsdb_blocks.body.contains("kind: tsdb"), "{}", tsdb_blocks.body);
+    assert_eq!(
+        tsdb_blocks.status, 200,
+        "log blocks (tsdb): {}",
+        tsdb_blocks.body
+    );
+    assert!(
+        tsdb_blocks.body.contains("kind: tsdb"),
+        "{}",
+        tsdb_blocks.body
+    );
     assert!(
         !tsdb_blocks.body.contains("snapshot:"),
         "a tsdb collection reports no snapshot: {}",
@@ -477,7 +512,11 @@ fn collection_explorer_drilldown_exercises_all_four_layers_end_to_end() {
         "{}",
         tsdb_blocks.body
     );
-    assert!(tsdb_blocks.body.contains("pruned: 2"), "{}", tsdb_blocks.body);
+    assert!(
+        tsdb_blocks.body.contains("pruned: 2"),
+        "{}",
+        tsdb_blocks.body
+    );
 
     // === Layer 4: Object inspector + CID breadcrumb ==========================
 
@@ -516,21 +555,29 @@ fn collection_explorer_drilldown_exercises_all_four_layers_end_to_end() {
         .to_owned();
 
     // Object inspector: codec/size/pin/visibility.
-    let stat = node.get(&format!("/portal/data/object/stat?token={token}&cid={cid_hex}"));
+    let stat = node.get(&format!(
+        "/portal/data/object/stat?token={token}&cid={cid_hex}"
+    ));
     assert_eq!(stat.status, 200, "object stat: {}", stat.body);
     assert!(stat.body.contains("codec:"), "{}", stat.body);
     assert!(stat.body.contains("visibility: public"), "{}", stat.body);
 
     // Links graph (empty here — no children given), decoded body, and the
     // REAL verify badge.
-    let links = node.get(&format!("/portal/data/object/links?token={token}&cid={cid_hex}"));
+    let links = node.get(&format!(
+        "/portal/data/object/links?token={token}&cid={cid_hex}"
+    ));
     assert_eq!(links.status, 200, "object links: {}", links.body);
 
-    let cat = node.get(&format!("/portal/data/object/cat?token={token}&cid={cid_hex}"));
+    let cat = node.get(&format!(
+        "/portal/data/object/cat?token={token}&cid={cid_hex}"
+    ));
     assert_eq!(cat.status, 200, "object cat: {}", cat.body);
     assert_eq!(cat.body.trim(), "breadcrumb-object", "cat: {}", cat.body);
 
-    let verify = node.get(&format!("/portal/data/object/verify?token={token}&cid={cid_hex}"));
+    let verify = node.get(&format!(
+        "/portal/data/object/verify?token={token}&cid={cid_hex}"
+    ));
     assert_eq!(verify.status, 200, "object verify: {}", verify.body);
     assert!(
         verify.body.contains("hash-matches-cid: true"),

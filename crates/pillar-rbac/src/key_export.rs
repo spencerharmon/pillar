@@ -102,7 +102,8 @@ mod tests {
             capability: cell_key_export_capability(),
             effect: GrantEffect::Allow,
         }];
-        let decider = RbacDecider::new(&authority, &policies, &grants).with_step_up_policy(&step_up);
+        let decider =
+            RbacDecider::new(&authority, &policies, &grants).with_step_up_policy(&step_up);
 
         // With a fresh step-up: allowed.
         let fresh = StepUpAssertion::new(1_000, b"cred");
@@ -134,7 +135,8 @@ mod tests {
             capability: Capability::from("user:admin"),
             effect: GrantEffect::Allow,
         }];
-        let decider = RbacDecider::new(&authority, &policies, &grants).with_step_up_policy(&step_up);
+        let decider =
+            RbacDecider::new(&authority, &policies, &grants).with_step_up_policy(&step_up);
         let fresh = StepUpAssertion::new(1_000, b"cred");
         assert_eq!(
             authorize_key_export(&decider, node("bob"), 1_010, Some(fresh)),
@@ -159,7 +161,8 @@ mod tests {
                 effect: GrantEffect::Deny,
             },
         ];
-        let decider = RbacDecider::new(&authority, &policies, &grants).with_step_up_policy(&step_up);
+        let decider =
+            RbacDecider::new(&authority, &policies, &grants).with_step_up_policy(&step_up);
         let fresh = StepUpAssertion::new(1_000, b"cred");
         assert_eq!(
             authorize_key_export(&decider, node("carol"), 1_010, Some(fresh)),

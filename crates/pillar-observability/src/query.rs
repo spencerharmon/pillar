@@ -218,7 +218,10 @@ impl PersistedMaterializedView {
     /// # Errors
     ///
     /// Returns [`ViewPersistError`] if `root_dir` cannot be created.
-    pub fn open(name: impl Into<String>, root_dir: impl Into<PathBuf>) -> Result<Self, ViewPersistError> {
+    pub fn open(
+        name: impl Into<String>,
+        root_dir: impl Into<PathBuf>,
+    ) -> Result<Self, ViewPersistError> {
         let root_dir = root_dir.into();
         fs::create_dir_all(&root_dir).map_err(|source| ViewPersistError::Io {
             path: root_dir.clone(),
@@ -615,7 +618,11 @@ mod tests {
         // The root changes — the persisted record now names a stale root.
         store.write(SignalKind::Metric, b"m2".to_vec(), 0);
         let after = view.materialize(&store, Query::all()).unwrap();
-        assert_eq!(after.len(), 2, "stale root must be recomputed, not served stale");
+        assert_eq!(
+            after.len(),
+            2,
+            "stale root must be recomputed, not served stale"
+        );
 
         // A live ViewCache over the same evolved store agrees exactly — no
         // divergent invalidation logic between the live cache and the

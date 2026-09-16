@@ -113,10 +113,11 @@ fn assert_identity_and_login(state: &CapturedCellState) {
 /// reconverges to EXACTLY the captured view root, then recovers write
 /// capability via the custody key + sealed segment.
 fn assert_stream_rehydrates_to_same_root(state: &CapturedCellState) {
-    let node = IpfsPersistentStream::rehydrate(
+    let node = IpfsPersistentStream::rehydrate_public(
         state.owner_pub.clone(),
         &state.head,
         state.segment_source(),
+        state.cell.clone(),
     )
     .expect("NEW binary: rehydrate from prior-version pinned segments");
 
@@ -159,7 +160,10 @@ fn assert_trust_artifact_verifies(state: &CapturedCellState) {
         predicate: Predicate::new(state.trust.action.clone(), state.trust.resource.clone()),
         scope: state.trust.scope.clone(),
         epoch: store.epoch(),
-        sig: Sig::sign_as(pillar_core::NodeId(state.trust.issuer.clone()), b"placeholder"),
+        sig: Sig::sign_as(
+            pillar_core::NodeId(state.trust.issuer.clone()),
+            b"placeholder",
+        ),
     }
     .signed_by_issuer();
     let cid = store
@@ -254,10 +258,11 @@ fn corrupted_fixture_fails_the_gate() {
     // silently reconverging to a wrong (or any) view root.
     let corrupted = captured.corrupt_stream_segments();
 
-    let result = IpfsPersistentStream::rehydrate(
+    let result = IpfsPersistentStream::rehydrate_public(
         corrupted.owner_pub.clone(),
         &corrupted.head,
         corrupted.segment_source(),
+        corrupted.cell.clone(),
     );
     assert!(
         result.is_err(),

@@ -1465,8 +1465,16 @@ mod tests {
         let backend = TpmBackend::new("h");
         let sig = backend.sign_challenge("c").expect("backend signs");
         let truncated = &sig[..sig.len() - 4];
-        assert!(!verify_backend_signature(&backend.public_key(), "c", truncated));
-        assert!(!verify_backend_signature(&backend.public_key(), "c", "garbage"));
+        assert!(!verify_backend_signature(
+            &backend.public_key(),
+            "c",
+            truncated
+        ));
+        assert!(!verify_backend_signature(
+            &backend.public_key(),
+            "c",
+            "garbage"
+        ));
         assert!(!verify_backend_signature(&backend.public_key(), "c", ""));
     }
 

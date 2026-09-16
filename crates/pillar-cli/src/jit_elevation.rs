@@ -214,7 +214,14 @@ impl AuthorityLedger {
                 granter_level,
             });
         }
-        Ok(self.push(granter, subject, level, expiry, GrantKind::Grant, granter_level))
+        Ok(self.push(
+            granter,
+            subject,
+            level,
+            expiry,
+            GrantKind::Grant,
+            granter_level,
+        ))
     }
 
     /// Request a JIT elevation: `granter` raises `subject` to `level` for a
@@ -254,7 +261,14 @@ impl AuthorityLedger {
                 subject_level,
             });
         }
-        Ok(self.push(granter, subject, level, expiry, GrantKind::Jit, granter_level))
+        Ok(self.push(
+            granter,
+            subject,
+            level,
+            expiry,
+            GrantKind::Jit,
+            granter_level,
+        ))
     }
 
     fn push(
@@ -306,18 +320,19 @@ impl AuthorityLedger {
     /// would be a permanent privilege escalation; this predicate is what
     /// guarantees it is not.
     pub fn jit_elevation_is_bounded(&self) -> bool {
-        self.grants.iter().filter(|g| g.kind == GrantKind::Jit).all(|g| {
-            let capped = g.level <= g.granter_level;
-            let bounded = if self.now > g.expiry {
-                // Past its window it must contribute nothing to its subject.
-                !self
-                    .live_grants_for(&g.subject)
-                    .any(|live| live.id == g.id)
-            } else {
-                true
-            };
-            capped && bounded
-        })
+        self.grants
+            .iter()
+            .filter(|g| g.kind == GrantKind::Jit)
+            .all(|g| {
+                let capped = g.level <= g.granter_level;
+                let bounded = if self.now > g.expiry {
+                    // Past its window it must contribute nothing to its subject.
+                    !self.live_grants_for(&g.subject).any(|live| live.id == g.id)
+                } else {
+                    true
+                };
+                capped && bounded
+            })
     }
 }
 
@@ -393,7 +408,10 @@ mod tests {
         l.tick_to(20);
         assert!(matches!(
             l.jit_elevate("owner", "erin", 5, 19),
-            Err(ElevationError::ExpiryInPast { expiry: 19, now: 20 })
+            Err(ElevationError::ExpiryInPast {
+                expiry: 19,
+                now: 20
+            })
         ));
     }
 

@@ -112,8 +112,7 @@ impl ServiceRequest {
             Some(Value::Integer(i)) => *i,
             _ => return Err(RequestError::MalformedSpec("port".to_owned())),
         };
-        let port =
-            u16::try_from(port_raw).map_err(|_| RequestError::PortOutOfRange(port_raw))?;
+        let port = u16::try_from(port_raw).map_err(|_| RequestError::PortOutOfRange(port_raw))?;
         let endpoints: Vec<String> = string("endpoints")?
             .split(',')
             .map(str::trim)

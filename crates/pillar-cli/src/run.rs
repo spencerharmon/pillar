@@ -742,6 +742,11 @@ pub fn load_or_create_identity(path: &Path) -> Result<Keypair, BootError> {
 /// This is the imperative shell over the pure, unit-tested helpers above; it
 /// performs real network and filesystem side effects and so is driven by the
 /// integration/deploy path rather than unit tests.
+/// Boot and run a pillar node to completion.
+// The node run loop intentionally holds the scheduler-runtime std guard across
+// the reap/dispatch awaits inside its tick arm to serialize a tick against a
+// concurrent web-plane registration (the awaits never re-acquire the lock).
+#[allow(clippy::await_holding_lock)]
 pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     use futures::StreamExt;
     use libp2p::swarm::SwarmEvent;
@@ -1363,8 +1368,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // separate follow-up and does not gate default-on.
                 {
                     let override_value = std::env::var(pillar_net::RESOURCE_OP_UDP_BIND_ENV).ok();
-                    let resolved =
-                        pillar_net::resolve_resource_op_bind(override_value.as_deref());
+                    let resolved = pillar_net::resolve_resource_op_bind(override_value.as_deref());
                     if let Some(invalid) = &resolved.invalid_override {
                         tracing::warn!(bind = %invalid, "invalid PILLAR_RESOURCE_OP_UDP_BIND; falling back to the default 0.0.0.0 bind");
                     }
@@ -1580,6 +1584,10 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // runtime a `CronJob`/`Job` manifest apply registers into over
                 // the web plane (`with_scheduler_runtime`), so a registration
                 // that lands mid-tick is picked up on the very next tick.
+                // The std guard is intentionally held across the reap/dispatch
+                // awaits to serialize the whole tick against a concurrent
+                // registration; the tick's awaits never re-acquire this lock,
+                // so the hold cannot self-deadlock.
                 let mut scheduler_runtime = scheduler_runtime.lock().unwrap_or_else(|e| e.into_inner());
                 match scheduler_runtime.reap().await {
                     Ok(reaped) => {

@@ -276,7 +276,9 @@ impl Provider {
     /// [`ClientRegistry`] for tests/hosts that do not need the full signed-op
     /// journal for this call.
     pub fn put_client(&mut self, client: OAuthClient) {
-        self.registry.clients.insert(client.client_id.clone(), client);
+        self.registry
+            .clients
+            .insert(client.client_id.clone(), client);
     }
 
     /// Set (or change) a user's lifecycle status
@@ -291,7 +293,13 @@ impl Provider {
     }
 
     /// Grant (or extend) consent — `GrantConsent`.
-    pub fn grant_consent(&mut self, user: &str, client_id: &str, scopes: BTreeSet<String>, at: u64) {
+    pub fn grant_consent(
+        &mut self,
+        user: &str,
+        client_id: &str,
+        scopes: BTreeSet<String>,
+        at: u64,
+    ) {
         apply_op(
             &mut self.registry,
             ClientOp::GrantConsent {
@@ -365,7 +373,10 @@ impl Provider {
         if !client.redirect_uris.contains(&req.redirect_uri) {
             return Err(AuthorizeError::InvalidRedirectUri);
         }
-        if !client.allowed_grants.contains(&GrantType::AuthorizationCode) {
+        if !client
+            .allowed_grants
+            .contains(&GrantType::AuthorizationCode)
+        {
             return Err(AuthorizeError::UnauthorizedClient);
         }
         let code_challenge = req.code_challenge.ok_or(AuthorizeError::PkceRequired)?;
@@ -508,7 +519,9 @@ impl Provider {
             .get(client_id)
             .ok_or(TokenError::UnauthorizedClient)?;
         if client.client_type != crate::client_registry::ClientType::Confidential
-            || !client.allowed_grants.contains(&GrantType::ClientCredentials)
+            || !client
+                .allowed_grants
+                .contains(&GrantType::ClientCredentials)
         {
             return Err(TokenError::UnauthorizedClient);
         }
@@ -563,7 +576,8 @@ impl Provider {
             self.refresh_index.remove(&prev);
         }
         self.access_index.insert(access_token.clone(), key.clone());
-        self.refresh_index.insert(refresh_token.clone(), key.clone());
+        self.refresh_index
+            .insert(refresh_token.clone(), key.clone());
 
         let id_token = Some(self.keys.sign_id_token(&IdTokenClaims {
             iss: self.issuer.clone(),
@@ -658,7 +672,9 @@ mod tests {
         OAuthClient {
             client_id: id.to_string(),
             client_type: ClientType::Confidential,
-            redirect_uris: [format!("https://{id}.example.com/cb")].into_iter().collect(),
+            redirect_uris: [format!("https://{id}.example.com/cb")]
+                .into_iter()
+                .collect(),
             allowed_scopes: scopes(&["openid", "profile"]),
             allowed_grants: [
                 GrantType::AuthorizationCode,
@@ -927,7 +943,11 @@ mod tests {
     #[test]
     fn endpoints_token_refuses_password_and_implicit_grants() {
         let p = provider();
-        for bad in ["password", "implicit", "urn:ietf:params:oauth:grant-type:jwt-bearer"] {
+        for bad in [
+            "password",
+            "implicit",
+            "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        ] {
             assert_eq!(
                 p.refuse_unsupported_grant(bad).unwrap_err(),
                 TokenError::UnsupportedGrantType

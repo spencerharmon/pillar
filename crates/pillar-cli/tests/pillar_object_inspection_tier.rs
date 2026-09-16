@@ -210,7 +210,8 @@ fn cli_object_stat_links_get_cat_verify_round_trip_real_sealed_and_public_blocks
     let create_user = node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
     assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
 
-    let signer_seed = pillar_crypto::Seed::from_bytes(b"object-inspection-e2e-test-signer".to_vec());
+    let signer_seed =
+        pillar_crypto::Seed::from_bytes(b"object-inspection-e2e-test-signer".to_vec());
     let (signer_public, signer_secret) =
         pillar_crypto::sign::signing_keypair_from_seed(&signer_seed).expect("signing keypair");
     let subject_hex = hex_encode(signer_public.as_bytes());
@@ -225,8 +226,14 @@ fn cli_object_stat_links_get_cat_verify_round_trip_real_sealed_and_public_blocks
     );
     std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
     std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
-    std::env::set_var("PILLAR_SIGNER_SECRET_HEX", hex_encode(signer_secret.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(signer_public.as_bytes()),
+    );
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(signer_secret.as_bytes()),
+    );
 
     // === A real PUBLIC object: no access barrier ============================
     let public_payload = b"a public, unsealed pillar object";
@@ -237,8 +244,14 @@ fn cli_object_stat_links_get_cat_verify_round_trip_real_sealed_and_public_blocks
         recipients_hex: vec![],
     }))
     .expect("object put (public) over pillar-UDP succeeds");
-    assert!(put_ack.starts_with("OBJECT-PUT"), "object put ack: {put_ack}");
-    assert!(put_ack.contains("EVENT-CID"), "object put emits a signed event: {put_ack}");
+    assert!(
+        put_ack.starts_with("OBJECT-PUT"),
+        "object put ack: {put_ack}"
+    );
+    assert!(
+        put_ack.contains("EVENT-CID"),
+        "object put emits a signed event: {put_ack}"
+    );
     let public_cid = put_ack
         .split_whitespace()
         .nth(1)
@@ -253,7 +266,10 @@ fn cli_object_stat_links_get_cat_verify_round_trip_real_sealed_and_public_blocks
     assert!(stat.contains("codec:"), "stat: {stat}");
     assert!(stat.contains("visibility: public"), "stat: {stat}");
     assert!(stat.contains("pinned:"), "stat: {stat}");
-    assert!(!stat.contains("(none)"), "a freshly-put object is pinned: {stat}");
+    assert!(
+        !stat.contains("(none)"),
+        "a freshly-put object is pinned: {stat}"
+    );
 
     // cat/get return the real plaintext with NO barrier.
     let cat = query_op(&QueryOp::Object(ObjectOp::Cat {
@@ -268,19 +284,27 @@ fn cli_object_stat_links_get_cat_verify_round_trip_real_sealed_and_public_blocks
         sealing_secret_hex: None,
     }))
     .expect("object get (public)");
-    assert_eq!(hex_decode(&get), public_payload, "get returns raw hex bytes");
+    assert_eq!(
+        hex_decode(&get),
+        public_payload,
+        "get returns raw hex bytes"
+    );
 
     // verify confirms hash==CID and a valid signature.
     let verify = query_op(&QueryOp::Object(ObjectOp::Verify {
         cid_hex: public_cid.clone(),
     }))
     .expect("object verify (public)");
-    assert!(verify.contains("hash-matches-cid: true"), "verify: {verify}");
+    assert!(
+        verify.contains("hash-matches-cid: true"),
+        "verify: {verify}"
+    );
     assert!(verify.contains("signature-valid: true"), "verify: {verify}");
 
     // === A real SEALED object: access follows the seal, verifiable without
     // decrypting =============================================================
-    let recipient_seed = pillar_crypto::Seed::from_bytes(b"object-inspection-e2e-recipient".to_vec());
+    let recipient_seed =
+        pillar_crypto::Seed::from_bytes(b"object-inspection-e2e-recipient".to_vec());
     let (recipient_pub, recipient_secret) =
         pillar_crypto::seal::sealing_keypair_from_seed(&recipient_seed).expect("seal keypair");
     let intruder_seed = pillar_crypto::Seed::from_bytes(b"object-inspection-e2e-intruder".to_vec());
@@ -327,7 +351,10 @@ fn cli_object_stat_links_get_cat_verify_round_trip_real_sealed_and_public_blocks
         sealing_secret_hex: Some(hex_encode(intruder_secret.as_bytes())),
     }))
     .expect("object cat with wrong secret still returns the envelope");
-    assert!(wrong_secret.starts_with("SEALED"), "wrong_secret: {wrong_secret}");
+    assert!(
+        wrong_secret.starts_with("SEALED"),
+        "wrong_secret: {wrong_secret}"
+    );
 
     // The REAL recipient's secret -> the real plaintext, in place.
     let opened = query_op(&QueryOp::Object(ObjectOp::Cat {
@@ -351,7 +378,10 @@ fn cli_object_stat_links_get_cat_verify_round_trip_real_sealed_and_public_blocks
         cid_hex: sealed_cid,
     }))
     .expect("object verify (sealed) never needs to decrypt");
-    assert!(verify.contains("hash-matches-cid: true"), "verify: {verify}");
+    assert!(
+        verify.contains("hash-matches-cid: true"),
+        "verify: {verify}"
+    );
     assert!(verify.contains("signature-valid: true"), "verify: {verify}");
 
     // === Fail-closed: an UNADMITTED signer is refused, exactly like the

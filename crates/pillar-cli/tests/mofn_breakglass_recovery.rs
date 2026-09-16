@@ -55,7 +55,9 @@ struct HttpResponse {
 
 fn http(port: u16, method: &str, path: &str, body: &str) -> Option<HttpResponse> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -211,8 +213,20 @@ fn a_locked_out_user_is_recovered_only_by_an_m_of_n_admin_quorum_never_a_single_
     // WoT-admitted the moment they log in, so both hold `iam:users:write`
     // authority — carol as a distinct quorum member, bob as the locked-out
     // subject whose ORIGINAL operational password we then exercise.
-    invite_user(&node, &admin1, ADMIN1_PASSWORD, ADMIN2_HANDLE, ADMIN2_PASSWORD);
-    invite_user(&node, &admin1, ADMIN1_PASSWORD, SUBJECT_HANDLE, SUBJECT_PASSWORD);
+    invite_user(
+        &node,
+        &admin1,
+        ADMIN1_PASSWORD,
+        ADMIN2_HANDLE,
+        ADMIN2_PASSWORD,
+    );
+    invite_user(
+        &node,
+        &admin1,
+        ADMIN1_PASSWORD,
+        SUBJECT_HANDLE,
+        SUBJECT_PASSWORD,
+    );
 
     // The second admin logs in (proves its own password works, and admits it
     // as an authoritative signer for its own delegated approvals). Each admin

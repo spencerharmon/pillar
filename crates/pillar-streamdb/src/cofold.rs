@@ -27,8 +27,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pillar_core::{Epoch, NodeId, SideEffect, ViewPolicy};
 use pillar_coordination::LeaseRegister;
+use pillar_core::{Epoch, NodeId, SideEffect, ViewPolicy};
 
 use crate::{OpId, PolicyViolation, Stream, View};
 
@@ -199,7 +199,13 @@ impl<I: CoFoldInvariant> StrictCofold<I> {
     /// is refused as [`CoFoldError::NotFenced`].
     ///
     /// Returns `true` iff `candidate` now holds `epoch` for `key`.
-    pub fn acquire(&mut self, key: &[u8], lease: &mut LeaseRegister, candidate: &NodeId, epoch: Epoch) -> bool {
+    pub fn acquire(
+        &mut self,
+        key: &[u8],
+        lease: &mut LeaseRegister,
+        candidate: &NodeId,
+        epoch: Epoch,
+    ) -> bool {
         if lease.try_acquire(candidate, epoch) {
             self.held.insert(key.to_vec(), epoch);
             true
@@ -216,7 +222,12 @@ impl<I: CoFoldInvariant> StrictCofold<I> {
     /// the stream's `Strict` policy admits the write (always true here, kept
     /// only as defense-in-depth). On success the op is appended to the
     /// co-partitioned total order and `I`'s running state for `key` advances.
-    pub fn try_admit(&mut self, key: &[u8], epoch: Epoch, payload: Vec<u8>) -> Result<OpId, CoFoldError> {
+    pub fn try_admit(
+        &mut self,
+        key: &[u8],
+        epoch: Epoch,
+        payload: Vec<u8>,
+    ) -> Result<OpId, CoFoldError> {
         let held = self.held.get(key).copied();
         if held != Some(epoch) {
             return Err(CoFoldError::NotFenced {
@@ -261,7 +272,9 @@ mod tests {
         let stale = NodeId::from("node-b");
 
         // Fewer than a quorum of voters -> no epoch held -> writes refused.
-        lease.grant(NodeId::from("v1"), candidate.clone(), Epoch(1)).unwrap();
+        lease
+            .grant(NodeId::from("v1"), candidate.clone(), Epoch(1))
+            .unwrap();
         assert!(!cofold.acquire(b"account-42", &mut lease, &candidate, Epoch(1)));
         let refused = cofold.try_admit(b"account-42", Epoch(1), b"claim".to_vec());
         assert_eq!(
@@ -275,7 +288,9 @@ mod tests {
 
         // A quorum grants the epoch -> the fenced candidate can now admit,
         // exactly once (uniqueness / exactly-once admission).
-        lease.grant(NodeId::from("v2"), candidate.clone(), Epoch(1)).unwrap();
+        lease
+            .grant(NodeId::from("v2"), candidate.clone(), Epoch(1))
+            .unwrap();
         assert!(cofold.acquire(b"account-42", &mut lease, &candidate, Epoch(1)));
         cofold
             .try_admit(b"account-42", Epoch(1), b"claim".to_vec())
@@ -334,11 +349,17 @@ mod tests {
         let mut cofold = StrictCofold::new(QuotaCeiling::new(2));
         let mut lease = LeaseRegister::new(1);
         let candidate = NodeId::from("solo");
-        lease.grant(NodeId::from("v1"), candidate.clone(), Epoch(1)).unwrap();
+        lease
+            .grant(NodeId::from("v1"), candidate.clone(), Epoch(1))
+            .unwrap();
         assert!(cofold.acquire(b"tenant-1", &mut lease, &candidate, Epoch(1)));
 
-        cofold.try_admit(b"tenant-1", Epoch(1), b"a".to_vec()).unwrap();
-        cofold.try_admit(b"tenant-1", Epoch(1), b"b".to_vec()).unwrap();
+        cofold
+            .try_admit(b"tenant-1", Epoch(1), b"a".to_vec())
+            .unwrap();
+        cofold
+            .try_admit(b"tenant-1", Epoch(1), b"b".to_vec())
+            .unwrap();
         let over = cofold.try_admit(b"tenant-1", Epoch(1), b"c".to_vec());
         assert_eq!(
             over,

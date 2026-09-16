@@ -34,8 +34,8 @@ use libp2p::{
     tcp, upnp, yamux, PeerId, Swarm, Transport,
 };
 
-pub mod pillar_udp;
 pub mod hop_metric;
+pub mod pillar_udp;
 
 pub mod pillarmsg_udp;
 pub use pillarmsg_udp::{
@@ -95,8 +95,7 @@ pub use client_ingest::{
 
 pub mod resource_op_bind;
 pub use resource_op_bind::{
-    resolve_resource_op_bind, ResolvedBind, DEFAULT_RESOURCE_OP_UDP_PORT,
-    RESOURCE_OP_UDP_BIND_ENV,
+    resolve_resource_op_bind, ResolvedBind, DEFAULT_RESOURCE_OP_UDP_PORT, RESOURCE_OP_UDP_BIND_ENV,
 };
 
 pub mod kv_plane_migration;
@@ -107,14 +106,12 @@ pub mod wot_trust_document_migration;
 
 pub mod derived_views_migration;
 pub use derived_views_migration::{
-    attached_routes, dashboard_panels_view, fold_routing_table_into_store,
-    recording_rules_view, route_status_label, ATTACHED_ROUTES_VIEW, ROUTES_COLLECTION,
+    attached_routes, dashboard_panels_view, fold_routing_table_into_store, recording_rules_view,
+    route_status_label, ATTACHED_ROUTES_VIEW, ROUTES_COLLECTION,
 };
 
 pub mod collection_placement;
-pub use collection_placement::{
-    view_placement, CollectionPlacement, NodeSelector,
-};
+pub use collection_placement::{view_placement, CollectionPlacement, NodeSelector};
 
 /// Gossipsub topic carrying Pillar's append-only event log.
 pub const EVENT_LOG_TOPIC: &str = "/pillar/event-log/1.0.0";

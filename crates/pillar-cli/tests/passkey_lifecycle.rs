@@ -310,9 +310,7 @@ fn passkey_list_name_revoke_enforce_no_lockout() {
         revoke_last_unconfirmed.body
     );
     assert!(
-        revoke_last_unconfirmed
-            .body
-            .contains("CONFIRM-REQUIRED"),
+        revoke_last_unconfirmed.body.contains("CONFIRM-REQUIRED"),
         "refusal names the confirm gate: {}",
         revoke_last_unconfirmed.body
     );
@@ -356,12 +354,20 @@ fn passkey_list_name_revoke_enforce_no_lockout() {
         "/webauthn/credentials/revoke",
         &format!("{token}\n{unknown}"),
     );
-    assert_eq!(bad_revoke.status, 404, "unknown credential: {}", bad_revoke.body);
+    assert_eq!(
+        bad_revoke.status, 404,
+        "unknown credential: {}",
+        bad_revoke.body
+    );
     let bad_name = node.post(
         "/webauthn/credentials/name",
         &format!("{token}\n{unknown}\nnope"),
     );
-    assert_eq!(bad_name.status, 404, "unknown credential: {}", bad_name.body);
+    assert_eq!(
+        bad_name.status, 404,
+        "unknown credential: {}",
+        bad_name.body
+    );
 
     // Sanity: base64url_decode round-trips what register_passkey encoded
     // (guards against a helper bug silently making every assertion above a

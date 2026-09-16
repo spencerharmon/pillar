@@ -43,11 +43,14 @@ pub type ResourceView = BTreeMap<ResourceKey, Envelope>;
 /// plane.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemberRef {
+    /// The resource kind (e.g. `Deployment`, `CronJob`).
     pub kind: String,
+    /// The resource name.
     pub name: String,
 }
 
 impl MemberRef {
+    /// Construct a [`MemberRef`] from a resource `kind` and `name`.
     #[must_use]
     pub fn new(kind: impl Into<String>, name: impl Into<String>) -> Self {
         MemberRef {
@@ -84,8 +87,11 @@ impl fmt::Display for MemberRef {
 /// The typed spec of a ResourceSet, lowered from a validated manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceSetSpec {
+    /// The ResourceSet's name.
     pub name: String,
+    /// Optional human-readable description.
     pub description: Option<String>,
+    /// The declared member references.
     pub members: Vec<MemberRef>,
 }
 
@@ -147,6 +153,7 @@ pub enum MemberHealth {
 }
 
 impl MemberHealth {
+    /// The health as a stable, human-readable display string.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -169,6 +176,7 @@ pub enum SetHealth {
 }
 
 impl SetHealth {
+    /// The rolled-up health as a stable, human-readable display string.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -203,6 +211,7 @@ pub enum SyncStatus {
 }
 
 impl SyncStatus {
+    /// The sync status as a stable, human-readable display string.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -218,12 +227,16 @@ impl SyncStatus {
 /// declared set).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconcilePlan {
+    /// Declared members not yet owned/live (to be adopted).
     pub to_adopt: Vec<MemberRef>,
+    /// Owned/live members no longer declared (to be pruned).
     pub to_prune: Vec<MemberRef>,
+    /// True iff the live owned set already equals the declared set.
     pub synced: bool,
 }
 
 impl ReconcilePlan {
+    /// The plan's rolled-up [`SyncStatus`] (`Synced` iff [`Self::synced`]).
     #[must_use]
     pub fn sync_status(&self) -> SyncStatus {
         if self.synced {
@@ -268,7 +281,9 @@ pub fn plan_reconcile(declared: &[MemberRef], owned_live: &[MemberRef]) -> Recon
 /// gives the console a badge subtext/tooltip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberStatus {
+    /// The member this status is for.
     pub reference: MemberRef,
+    /// The member's observed health.
     pub health: MemberHealth,
     /// Human-readable degradation reason (empty when `Healthy`).
     pub reason: String,
@@ -288,6 +303,7 @@ pub fn missing_reason(reference: &MemberRef) -> String {
 /// consumes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceGraph {
+    /// Node labels: node 0 is the set, nodes `1..=n` are its members.
     pub nodes: Vec<String>,
     /// `(from_index, to_index, edge_label)`.
     pub edges: Vec<(usize, usize, String)>,
@@ -800,7 +816,11 @@ mod tests {
         }];
         // No replicas observed for `idle`.
         let g = build_depth_graph("prod", &members, &[], SyncStatus::OutOfSync);
-        assert_eq!(g.nodes.len(), 2, "set + workload, no synthetic replica leaf");
+        assert_eq!(
+            g.nodes.len(),
+            2,
+            "set + workload, no synthetic replica leaf"
+        );
         assert_eq!(g.edges, vec![(0, 1, "Healthy".to_string())]);
         assert!(g.nodes.iter().all(|n| n.sync == SyncStatus::OutOfSync));
     }

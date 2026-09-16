@@ -104,7 +104,10 @@ impl std::fmt::Display for ScopeGrantError {
             }
             ScopeGrantError::UnknownGroup(g) => write!(f, "unknown managed group '{g}'"),
             ScopeGrantError::EmptyRequest => {
-                write!(f, "a scoped grant must name at least one capability and one scope group")
+                write!(
+                    f,
+                    "a scoped grant must name at least one capability and one scope group"
+                )
             }
         }
     }
@@ -146,7 +149,9 @@ pub fn delegate_scoped_admin(
     }
     for capability in requested_capabilities {
         if !granter_caps.contains(capability) {
-            return Err(ScopeGrantError::CapabilityExceedsGranter(capability.clone()));
+            return Err(ScopeGrantError::CapabilityExceedsGranter(
+                capability.clone(),
+            ));
         }
     }
 
@@ -193,10 +198,7 @@ pub fn is_authorized_for_target(
     let Some(target) = records.get(target_handle) else {
         return false;
     };
-    target
-        .groups
-        .iter()
-        .any(|g| grant.scope_groups.contains(g))
+    target.groups.iter().any(|g| grant.scope_groups.contains(g))
 }
 
 #[cfg(test)]
@@ -296,7 +298,12 @@ mod tests {
         )
         .expect("alice may delegate a subset of her own authority");
 
-        assert!(is_authorized_for_target(&grant, &records, "iam:users:write", "carol"));
+        assert!(is_authorized_for_target(
+            &grant,
+            &records,
+            "iam:users:write",
+            "carol"
+        ));
         assert!(
             !is_authorized_for_target(&grant, &records, "iam:users:write", "dave"),
             "dave is outside the delegated scope (billing-team, not support-team)"
@@ -370,7 +377,12 @@ mod tests {
             &BTreeSet::from(["support-team".to_owned()]),
         )
         .expect("a same-or-narrower re-delegation must succeed");
-        assert!(is_authorized_for_target(&grant, &records, "iam:users:write", "carol"));
+        assert!(is_authorized_for_target(
+            &grant,
+            &records,
+            "iam:users:write",
+            "carol"
+        ));
     }
 
     #[test]
@@ -392,7 +404,10 @@ mod tests {
             &BTreeSet::from(["nonexistent-team".to_owned()]),
         )
         .expect_err("a nonexistent group must be refused, not silently accepted");
-        assert_eq!(err, ScopeGrantError::UnknownGroup("nonexistent-team".to_owned()));
+        assert_eq!(
+            err,
+            ScopeGrantError::UnknownGroup("nonexistent-team".to_owned())
+        );
     }
 
     #[test]
@@ -438,9 +453,19 @@ mod tests {
         .expect("delegation succeeds");
 
         // A handle with no record at all is refused, fail-closed.
-        assert!(!is_authorized_for_target(&grant, &records, "iam:users:write", "ghost"));
+        assert!(!is_authorized_for_target(
+            &grant,
+            &records,
+            "iam:users:write",
+            "ghost"
+        ));
         // A capability outside the grant's set is refused even for an
         // in-scope target.
-        assert!(!is_authorized_for_target(&grant, &records, "iam:credentials:manage", "carol"));
+        assert!(!is_authorized_for_target(
+            &grant,
+            &records,
+            "iam:credentials:manage",
+            "carol"
+        ));
     }
 }

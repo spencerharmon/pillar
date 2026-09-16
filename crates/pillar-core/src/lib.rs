@@ -252,6 +252,10 @@ mod tests {
     // link to pillar-observability. This is exactly the shape a real crate
     // (ipam, streamdb, controller) uses.
     #[derive(Default)]
+    // Test spy: its accumulator fields are intentionally tuple-shaped mirrors of
+    // the observer callback signatures; a type alias per field would obscure that
+    // 1:1 correspondence for no real gain in test scaffolding.
+    #[allow(clippy::type_complexity)]
     struct SpyObserver {
         registered: std::sync::Mutex<Vec<(String, ObsMetricType, String, String)>>,
         metrics: std::sync::Mutex<Vec<(String, f64)>>,

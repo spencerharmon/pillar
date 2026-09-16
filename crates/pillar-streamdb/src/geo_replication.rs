@@ -202,10 +202,7 @@ impl ReplicationTrust {
     /// # Errors
     ///
     /// Propagates any signing failure from `pillar_crypto::sign`.
-    pub fn grant(
-        &mut self,
-        remote: &SigningPublicKey,
-    ) -> pillar_crypto::Result<ReplicationGrant> {
+    pub fn grant(&mut self, remote: &SigningPublicKey) -> pillar_crypto::Result<ReplicationGrant> {
         let key = remote.as_bytes().to_vec();
         // On a re-grant after revoke, advance past the revoked epoch so the old
         // grant can never be replayed as valid.
@@ -460,8 +457,12 @@ mod tests {
         assert!(trust.trusts(&remote_pk));
 
         // Owner's encrypted DB segment.
-        let (seg, _ct, _aad) =
-            encrypted_db_segment(b"secret database record", &owner_group, &owner_pk, &owner_sk);
+        let (seg, _ct, _aad) = encrypted_db_segment(
+            b"secret database record",
+            &owner_group,
+            &owner_pk,
+            &owner_sk,
+        );
         let expected_cid = seg.cid();
 
         // Remote B pins it under the authorization.
@@ -491,18 +492,14 @@ mod tests {
         let _real = trust.grant(&remote_pk).expect("grant");
 
         // Forge a grant claiming the owner but signed with the forger's key.
-        let forged =
-            ReplicationGrant::author(owner_pk.clone(), remote_pk.clone(), 0, &forger_sk)
-                .expect("author forged");
+        let forged = ReplicationGrant::author(owner_pk.clone(), remote_pk.clone(), 0, &forger_sk)
+            .expect("author forged");
         assert!(!trust.authorizes(&forged));
 
-        let (seg, _ct, _aad) =
-            encrypted_db_segment(b"record", &owner_group, &owner_pk, &owner_sk);
+        let (seg, _ct, _aad) = encrypted_db_segment(b"record", &owner_group, &owner_pk, &owner_sk);
         let mut replica = RemoteReplica::new();
         assert_eq!(
-            replica
-                .authorize_and_pin(&trust, &forged, seg)
-                .unwrap_err(),
+            replica.authorize_and_pin(&trust, &forged, seg).unwrap_err(),
             ReplicationError::NotAuthorized
         );
     }
@@ -517,8 +514,7 @@ mod tests {
         let owner_group = group_key("owner-A");
 
         let plaintext = b"the plaintext the remote must never read";
-        let (seg, ct, aad) =
-            encrypted_db_segment(plaintext, &owner_group, &owner_pk, &owner_sk);
+        let (seg, ct, aad) = encrypted_db_segment(plaintext, &owner_group, &owner_pk, &owner_sk);
 
         // The replica stores/serves only the ciphertext bytes.
         assert_ne!(
@@ -567,7 +563,9 @@ mod tests {
         .expect("author");
         let mut replica = RemoteReplica::new();
         assert_eq!(
-            replica.authorize_and_pin(&trust, &grant, plain).unwrap_err(),
+            replica
+                .authorize_and_pin(&trust, &grant, plain)
+                .unwrap_err(),
             ReplicationError::NotEncrypted
         );
         assert_eq!(replica.replicated_count(), 0);
@@ -604,9 +602,7 @@ mod tests {
         let (seg2, _ct2, _aad2) =
             encrypted_db_segment(b"record two", &owner_group, &owner_pk, &owner_sk);
         assert_eq!(
-            replica
-                .authorize_and_pin(&trust, &grant, seg2)
-                .unwrap_err(),
+            replica.authorize_and_pin(&trust, &grant, seg2).unwrap_err(),
             ReplicationError::NotAuthorized,
             "no new pin is authorized after revocation"
         );
@@ -666,13 +662,8 @@ mod tests {
         let _ = trust.grant(&remote_pk).expect("grant");
 
         // A validly-signed grant, but from a different owner cell.
-        let foreign = ReplicationGrant::author(
-            other_owner_pk,
-            remote_pk,
-            0,
-            &other_owner_sk,
-        )
-        .expect("author foreign");
+        let foreign = ReplicationGrant::author(other_owner_pk, remote_pk, 0, &other_owner_sk)
+            .expect("author foreign");
         assert!(foreign.verify().is_ok(), "foreign grant is self-consistent");
         assert!(
             !trust.authorizes(&foreign),

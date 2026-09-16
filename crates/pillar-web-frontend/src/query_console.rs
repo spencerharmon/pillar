@@ -1319,7 +1319,7 @@ mod yew_impl {
 
         // The builder always renders from the persistent draft (never blanks).
         let builder = render_builder(
-            &*query,
+            &query,
             &apply,
             &label_keys,
             &metric_names,

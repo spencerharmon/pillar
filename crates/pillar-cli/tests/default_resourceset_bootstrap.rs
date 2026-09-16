@@ -211,7 +211,8 @@ fn cell_bootstrap_seeds_the_default_resourceset_floor_and_refuses_its_deletion()
     let create_user = node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
     assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
 
-    let signer_seed = pillar_crypto::Seed::from_bytes(b"resourceset-bootstrap-test-signer".to_vec());
+    let signer_seed =
+        pillar_crypto::Seed::from_bytes(b"resourceset-bootstrap-test-signer".to_vec());
     let (signer_public, signer_secret) =
         pillar_crypto::sign::signing_keypair_from_seed(&signer_seed).expect("signing keypair");
     let subject_hex = signer_subject_hex(&signer_public);

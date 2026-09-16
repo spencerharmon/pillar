@@ -46,9 +46,7 @@
 use std::collections::BTreeSet;
 
 use pillar_manifest::apply::{ApplyError, ManifestKey, ManifestStore};
-use pillar_manifest::builtin::{
-    register_builtin_schemas, ControllerRegistry, ReconcileOutcome,
-};
+use pillar_manifest::builtin::{register_builtin_schemas, ControllerRegistry, ReconcileOutcome};
 use pillar_manifest::{Crd, FieldType, Metadata, Schema, SchemaRegistry, Value};
 
 /// The third-party CRD the plugin-interface hook must travel the identical
@@ -342,10 +340,22 @@ fn a_third_party_crd_and_a_builtin_travel_the_same_controller_path() {
     assert_eq!(
         *seen.borrow(),
         vec![
-            ("pillar.dev/v1".to_owned(), "Dashboard".to_owned(), "reconcile"),
-            (THIRD_PARTY_API.to_owned(), THIRD_PARTY_KIND.to_owned(), "reconcile"),
+            (
+                "pillar.dev/v1".to_owned(),
+                "Dashboard".to_owned(),
+                "reconcile"
+            ),
+            (
+                THIRD_PARTY_API.to_owned(),
+                THIRD_PARTY_KIND.to_owned(),
+                "reconcile"
+            ),
             ("pillar.dev/v1".to_owned(), "Dashboard".to_owned(), "delete"),
-            (THIRD_PARTY_API.to_owned(), THIRD_PARTY_KIND.to_owned(), "delete"),
+            (
+                THIRD_PARTY_API.to_owned(),
+                THIRD_PARTY_KIND.to_owned(),
+                "delete"
+            ),
         ],
         "built-in and third-party CRD travel the identical reconcile+prune path"
     );

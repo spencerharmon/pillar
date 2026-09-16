@@ -1070,6 +1070,16 @@ impl NodeCustodyVerifier {
         Ok(())
     }
 
+    /// Admit a principal into node custody: resolve their offer through the REAL
+    /// key-distribution ledger, strip the node seal, unlock the operational key
+    /// with `password` (a wrong password fails AEAD), verify the signed
+    /// challenge `nonce`, and enforce the fail-closed WoT authority guard,
+    /// returning a live [`NodeCustodySession`] on success.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeCustodyError`] if the offer cannot be resolved/unlocked, the nonce
+    /// or its signature is invalid, or the authority guard denies the actor.
     pub fn admit(
         &mut self,
         identifier: &str,

@@ -11,8 +11,8 @@
 //! * a **parse error** (`VersionError::Malformed`): the bytes are not a
 //!   well-formed stamped value at all (truncated, wrong tag, garbage), and
 //!   * a **stamped-but-unknown-future version** (`VersionError::Unsupported`):
-//!   the value parsed cleanly and carries a legible version number, but that
-//!   number is newer than this build knows how to interpret.
+//!     the value parsed cleanly and carries a legible version number, but that
+//!     number is newer than this build knows how to interpret.
 //!
 //! Keeping these distinct is what lets the later compatibility-negotiation and
 //! migration work (`compat-negotiation-impl`, the cell/swarm migration tasks)

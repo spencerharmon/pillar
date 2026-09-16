@@ -141,7 +141,11 @@ fn metric_aggregation_reads_real_values_not_the_tick_marker() {
         sum[0].values
     );
     let topk = sub.aggregate(&query, now, Aggregate::TopK(2), &[]);
-    assert_eq!(topk[0].values, vec![30.0, 20.0], "top-2 real values descending");
+    assert_eq!(
+        topk[0].values,
+        vec![30.0, 20.0],
+        "top-2 real values descending"
+    );
 }
 
 /// Bugs 5 & 6: a query whose quoted match value contains BOTH a comma and the

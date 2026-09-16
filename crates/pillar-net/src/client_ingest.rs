@@ -174,6 +174,10 @@ pub fn authorize_client_op(
 /// # Errors
 /// The [`ClientOpReject`] from [`authorize_client_op`] on any authentication /
 /// decode / authorization failure; the store is never mutated on error.
+// Threads the distinct authorization inputs (authority, policies, grants,
+// resource class, clock) explicitly rather than behind a context struct; the
+// call sites pass each from a different owner, so bundling would not simplify them.
+#[allow(clippy::too_many_arguments)]
 pub fn ingest_client_op<S: pillar_streamdb::OpSyncTarget>(
     stream: &mut S,
     msg: &PillarMessage,

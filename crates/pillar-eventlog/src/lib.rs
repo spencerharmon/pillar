@@ -239,7 +239,10 @@ impl EventContent {
 /// dependency-free stand-in.
 fn author_signing_keypair(
     author: &Author,
-) -> (pillar_crypto::SigningPublicKey, pillar_crypto::SigningSecretKey) {
+) -> (
+    pillar_crypto::SigningPublicKey,
+    pillar_crypto::SigningSecretKey,
+) {
     let seed = pillar_crypto::Seed::from_bytes(
         format!("pillar-eventlog/author-signing-seed::{}", author.0).into_bytes(),
     );
@@ -532,7 +535,7 @@ impl EventLog {
             .filter(|(_, n)| **n == 0)
             .map(|(id, _)| id.clone())
             .collect();
-        ready.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        ready.sort_by_key(|id| sort_key(id));
         let mut order: Vec<&Event> = Vec::with_capacity(self.events.len());
         while let Some(next) = ready.first().cloned() {
             ready.remove(0);

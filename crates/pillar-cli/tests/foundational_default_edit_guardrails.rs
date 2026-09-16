@@ -29,8 +29,8 @@
 
 use std::collections::BTreeSet;
 
-use pillar_core::{Epoch, NodeId};
 use pillar_coordination::LeaseRegister;
+use pillar_core::{Epoch, NodeId};
 use pillar_rbac::{Capability, PolicyEvent, PolicyTarget, ResourceClass};
 use pillar_streamdb::cofold::CoFoldError;
 use pillar_wot_authority::WotAuthority;
@@ -65,7 +65,10 @@ fn guardrail_1_dry_run_confirmation_gates_access_reducing_edits() {
             becomes_unreachable,
         } => {
             assert_eq!(losing_access, vec![stripped_operator]);
-            assert_eq!(becomes_unreachable, vec!["RoleBinding/seed-admin".to_owned()]);
+            assert_eq!(
+                becomes_unreachable,
+                vec!["RoleBinding/seed-admin".to_owned()]
+            );
         }
         other => panic!("expected ConfirmationRequired, got {other:?}"),
     }
@@ -111,19 +114,25 @@ fn guardrail_3_strict_cp_revocation_is_fenced_and_exactly_once() {
     let key = b"RoleBinding/seed-admin";
 
     // Sub-quorum: not fenced yet, revoke refused outright (never half-applied).
-    lease.grant(nid("voter-1"), candidate.clone(), Epoch(1)).unwrap();
+    lease
+        .grant(nid("voter-1"), candidate.clone(), Epoch(1))
+        .unwrap();
     let unfenced = revocation.revoke(&mut lease, &candidate, key, Epoch(1), b"revoke".to_vec());
     assert!(
         matches!(
             unfenced,
-            Err(GuardrailError::RevocationNotStrict(CoFoldError::NotFenced { .. }))
+            Err(GuardrailError::RevocationNotStrict(
+                CoFoldError::NotFenced { .. }
+            ))
         ),
         "an unfenced revoke must be refused outright, got {unfenced:?}"
     );
     assert!(!revocation.already_revoked(key));
 
     // Quorum reached: the fenced candidate's revoke is admitted.
-    lease.grant(nid("voter-2"), candidate.clone(), Epoch(1)).unwrap();
+    lease
+        .grant(nid("voter-2"), candidate.clone(), Epoch(1))
+        .unwrap();
     revocation
         .revoke(&mut lease, &candidate, key, Epoch(1), b"revoke".to_vec())
         .expect("a fenced, quorum-backed revoke is admitted");
@@ -131,11 +140,19 @@ fn guardrail_3_strict_cp_revocation_is_fenced_and_exactly_once() {
 
     // A second revoke of the SAME key is refused — never lost, never
     // silently re-admitted.
-    let dup = revocation.revoke(&mut lease, &candidate, key, Epoch(1), b"revoke-again".to_vec());
+    let dup = revocation.revoke(
+        &mut lease,
+        &candidate,
+        key,
+        Epoch(1),
+        b"revoke-again".to_vec(),
+    );
     assert!(
         matches!(
             dup,
-            Err(GuardrailError::RevocationNotStrict(CoFoldError::DuplicateKey { .. }))
+            Err(GuardrailError::RevocationNotStrict(
+                CoFoldError::DuplicateKey { .. }
+            ))
         ),
         "a duplicate revoke must be refused, got {dup:?}"
     );
@@ -165,7 +182,11 @@ fn guardrail_4_foundational_edit_requires_higher_authority() {
     );
 
     // The ordinary operator clears the ORDINARY threshold...
-    assert!(ordinary_operator_meets_ordinary(&authority, &ordinary_operator, ordinary.depth_threshold));
+    assert!(ordinary_operator_meets_ordinary(
+        &authority,
+        &ordinary_operator,
+        ordinary.depth_threshold
+    ));
     // ...but NOT the foundational one.
     assert!(!meets_higher_authority(
         &authority,
@@ -182,8 +203,14 @@ fn guardrail_4_foundational_edit_requires_higher_authority() {
         .expect("a subject with enough remaining WoT budget clears the foundational threshold");
 }
 
-fn ordinary_operator_meets_ordinary(authority: &WotAuthority, subject: &NodeId, threshold: u8) -> bool {
-    authority.reachable_depth(subject).is_some_and(|d| d >= threshold)
+fn ordinary_operator_meets_ordinary(
+    authority: &WotAuthority,
+    subject: &NodeId,
+    threshold: u8,
+) -> bool {
+    authority
+        .reachable_depth(subject)
+        .is_some_and(|d| d >= threshold)
 }
 
 /// Guardrail 5: a system collection's kind/identity fields and the cell
@@ -216,10 +243,18 @@ fn break_glass_restores_seed_admin_for_genesis_key_holder_only() {
         seed_admin.clone(),
     );
     assert_eq!(refused, Err(GuardrailError::BreakGlassUnauthorized));
-    assert!(admins.is_empty(), "an unauthorized restore must not mutate anything");
+    assert!(
+        admins.is_empty(),
+        "an unauthorized restore must not mutate anything"
+    );
 
-    break_glass_restore_seed_admin(&genesis_identity, &genesis_identity, &mut admins, seed_admin.clone())
-        .expect("the genesis-key holder can always restore the seed administrator binding");
+    break_glass_restore_seed_admin(
+        &genesis_identity,
+        &genesis_identity,
+        &mut admins,
+        seed_admin.clone(),
+    )
+    .expect("the genesis-key holder can always restore the seed administrator binding");
     assert!(admins.contains(&seed_admin));
 }
 
@@ -229,7 +264,9 @@ fn break_glass_restores_seed_admin_for_genesis_key_holder_only() {
 fn retention_window_shortening_requires_strong_confirmation_and_removes_data() {
     let old_window = 30 * 86_400;
     let new_window = 7 * 86_400;
-    assert!(retention_shortening_requires_confirmation(old_window, new_window));
+    assert!(retention_shortening_requires_confirmation(
+        old_window, new_window
+    ));
 
     let refused = apply_retention_shortening(old_window, new_window, 12_345, false);
     assert!(matches!(
@@ -239,10 +276,15 @@ fn retention_window_shortening_requires_strong_confirmation_and_removes_data() {
 
     let removed = apply_retention_shortening(old_window, new_window, 12_345, true)
         .expect("a confirmed shortening applies");
-    assert_eq!(removed, 12_345, "the confirmed shortening reports the removed count");
+    assert_eq!(
+        removed, 12_345,
+        "the confirmed shortening reports the removed count"
+    );
 
     // Widening never requires confirmation and never removes anything.
-    assert!(!retention_shortening_requires_confirmation(new_window, old_window));
+    assert!(!retention_shortening_requires_confirmation(
+        new_window, old_window
+    ));
     assert_eq!(
         apply_retention_shortening(new_window, old_window, 999, false).unwrap(),
         0

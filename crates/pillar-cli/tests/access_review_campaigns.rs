@@ -183,7 +183,10 @@ fn close_is_guarded_until_every_grant_is_adjudicated() {
     // campaign active.
     let refused = campaign.close(&grants, 60).unwrap_err();
     assert_eq!(refused.len(), 2, "both un-attested grants block the close");
-    assert!(campaign.is_active(), "a refused close leaves the campaign running");
+    assert!(
+        campaign.is_active(),
+        "a refused close leaves the campaign running"
+    );
 
     // Adjudicate both: re-attest one, revoke the other.
     campaign.reattest(GrantKey::role("alice", "billing-admin"), 60);
@@ -230,6 +233,9 @@ fn already_expired_grants_are_not_swept_by_the_campaign() {
     );
 
     let revoked = campaign.close_fail_closed(&mut grants, 200);
-    assert_eq!(revoked, BTreeSet::from([GrantKey::role("bob", "support-role")]));
+    assert_eq!(
+        revoked,
+        BTreeSet::from([GrantKey::role("bob", "support-role")])
+    );
     assert!(campaign.stale_live_grants(&grants, 200).is_empty());
 }

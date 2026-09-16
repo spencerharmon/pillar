@@ -230,8 +230,14 @@ fn cli_kv_doc_sql_round_trip_a_real_query_against_the_live_node_over_pillar_udp(
     );
     std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
     std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
-    std::env::set_var("PILLAR_SIGNER_SECRET_HEX", hex_encode(signer_secret.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(signer_public.as_bytes()),
+    );
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(signer_secret.as_bytes()),
+    );
 
     // === K/V surface ========================================================
     // A signed PUT lands a value on the LIVE node over pillar-UDP.
@@ -242,7 +248,10 @@ fn cli_kv_doc_sql_round_trip_a_real_query_against_the_live_node_over_pillar_udp(
     }))
     .expect("kv put over pillar-UDP succeeds");
     assert!(ack.starts_with("KV-PUT"), "kv put ack: {ack}");
-    assert!(ack.contains("EVENT-CID"), "kv put emits a signed event: {ack}");
+    assert!(
+        ack.contains("EVENT-CID"),
+        "kv put emits a signed event: {ack}"
+    );
 
     // A member-gated GET reads the REAL value back (hex, round-trips to bytes).
     let got = query_op(&QueryOp::Kv(KvOp::Get {
@@ -325,7 +334,10 @@ fn cli_kv_doc_sql_round_trip_a_real_query_against_the_live_node_over_pillar_udp(
     .expect("doc ids");
     let id_set: std::collections::BTreeSet<_> = ids.lines().collect();
     for want in ["u1", "u2", "u3"] {
-        assert!(id_set.contains(want), "doc ids must include {want}; got {ids:?}");
+        assert!(
+            id_set.contains(want),
+            "doc ids must include {want}; got {ids:?}"
+        );
     }
     let fields = query_op(&QueryOp::Doc(DocOp::Fields {
         collection: "users".into(),
@@ -333,7 +345,10 @@ fn cli_kv_doc_sql_round_trip_a_real_query_against_the_live_node_over_pillar_udp(
     }))
     .expect("doc fields");
     let field_set: std::collections::BTreeSet<_> = fields.lines().collect();
-    assert!(field_set.contains("name") && field_set.contains("status"), "fields: {fields:?}");
+    assert!(
+        field_set.contains("name") && field_set.contains("status"),
+        "fields: {fields:?}"
+    );
 
     // === SQL views over the Document store ==================================
     // CREATE a materialized view of active users (status == "on"), projecting
@@ -346,11 +361,17 @@ fn cli_kv_doc_sql_round_trip_a_real_query_against_the_live_node_over_pillar_udp(
         project: Some(vec!["name".into()]),
     }))
     .expect("sql create-view over pillar-UDP");
-    assert!(ddl.contains("EVENT-CID"), "create-view emits a signed event: {ddl}");
+    assert!(
+        ddl.contains("EVENT-CID"),
+        "create-view emits a signed event: {ddl}"
+    );
 
     // VIEWS lists it.
     let views = query_op(&QueryOp::Sql(SqlOp::Views)).expect("sql views");
-    assert!(views.lines().any(|v| v == "active_users"), "views: {views:?}");
+    assert!(
+        views.lines().any(|v| v == "active_users"),
+        "views: {views:?}"
+    );
 
     // Materializing the VIEW folds the LIVE source collection and returns only
     // the active rows (u1, u3) — the folded, root-cached view the ROI mandates,
@@ -361,12 +382,27 @@ fn cli_kv_doc_sql_round_trip_a_real_query_against_the_live_node_over_pillar_udp(
     .expect("sql view materializes over pillar-UDP");
     let row_ids: std::collections::BTreeSet<_> =
         rows.lines().filter_map(|l| l.split('\t').next()).collect();
-    assert!(row_ids.contains("u1"), "active view includes u1 (on): {rows:?}");
-    assert!(row_ids.contains("u3"), "active view includes u3 (on): {rows:?}");
-    assert!(!row_ids.contains("u2"), "active view excludes u2 (off): {rows:?}");
+    assert!(
+        row_ids.contains("u1"),
+        "active view includes u1 (on): {rows:?}"
+    );
+    assert!(
+        row_ids.contains("u3"),
+        "active view includes u3 (on): {rows:?}"
+    );
+    assert!(
+        !row_ids.contains("u2"),
+        "active view excludes u2 (off): {rows:?}"
+    );
     // The projection kept only `name`; each active row carries `name=<val>`.
-    assert!(rows.contains("name=alice"), "projected name for u1: {rows:?}");
-    assert!(rows.contains("name=carol"), "projected name for u3: {rows:?}");
+    assert!(
+        rows.contains("name=alice"),
+        "projected name for u1: {rows:?}"
+    );
+    assert!(
+        rows.contains("name=carol"),
+        "projected name for u3: {rows:?}"
+    );
 
     // === Fail-closed: an UNADMITTED signer is refused on a read ==============
     let intruder = pillar_crypto::Seed::from_bytes(b"data-query-e2e-unadmitted".to_vec());
@@ -374,8 +410,14 @@ fn cli_kv_doc_sql_round_trip_a_real_query_against_the_live_node_over_pillar_udp(
         pillar_crypto::sign::signing_keypair_from_seed(&intruder).expect("intruder keypair");
     let saved_pub = std::env::var("PILLAR_SIGNER_PUBLIC_HEX").expect("pub set");
     let saved_secret = std::env::var("PILLAR_SIGNER_SECRET_HEX").expect("secret set");
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(intruder_pub.as_bytes()));
-    std::env::set_var("PILLAR_SIGNER_SECRET_HEX", hex_encode(intruder_secret.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(intruder_pub.as_bytes()),
+    );
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(intruder_secret.as_bytes()),
+    );
     assert!(
         query_op(&QueryOp::Kv(KvOp::Get {
             collection: "config".into(),

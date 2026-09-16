@@ -237,7 +237,11 @@ fn bootstrap_and_cli_login(node: &Node) -> String {
         login.stdout, login.stderr
     );
     let token = login.stdout.trim().to_string();
-    assert!(!token.is_empty(), "cli login printed no token: {login:?}", login = login.stderr);
+    assert!(
+        !token.is_empty(),
+        "cli login printed no token: {login:?}",
+        login = login.stderr
+    );
     token
 }
 
@@ -312,10 +316,17 @@ fn a_cli_mutation_against_a_running_node_is_journaled_and_survives_a_fresh_conte
         .stdout
         .trim()
         .to_string();
-    assert!(!token_b.is_empty(), "cli re-login on restarted node minted no token");
+    assert!(
+        !token_b.is_empty(),
+        "cli re-login on restarted node minted no token"
+    );
 
     let list_b = pillar_cli(&node_b.url(), Some(&token_b), &["members", "list"]);
-    assert!(list_b.status_ok, "cli members list on restart: {}", list_b.stderr);
+    assert!(
+        list_b.status_ok,
+        "cli members list on restart: {}",
+        list_b.stderr
+    );
     assert!(
         list_b.stdout.contains("MEMBER charlie ROLE operator"),
         "the CLI-authored add-member act MUST survive a fresh-context restart \
@@ -345,7 +356,11 @@ fn a_cli_mutation_against_a_running_node_is_journaled_and_survives_a_fresh_conte
         .trim()
         .to_string();
     let list_c = pillar_cli(&node_c.url(), Some(&token_c), &["members", "list"]);
-    assert!(list_c.status_ok, "cli members list after 2nd restart: {}", list_c.stderr);
+    assert!(
+        list_c.status_ok,
+        "cli members list after 2nd restart: {}",
+        list_c.stderr
+    );
     assert!(
         list_c.stdout.contains("MEMBER charlie ROLE viewer"),
         "the SECOND CLI mutation (role change) must ALSO survive a restart, got: {}",

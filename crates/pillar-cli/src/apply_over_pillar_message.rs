@@ -54,8 +54,11 @@ use crate::resource::Address;
 /// an address string that will not parse.
 #[derive(Debug)]
 pub enum ConnectError {
+    /// A required environment variable is missing (names the variable).
     MissingEnv(&'static str),
+    /// An address string that will not parse (names the offending value).
     BadAddr(&'static str),
+    /// A hex-encoded value that will not decode (names the offending value).
     BadHex(&'static str),
     /// No `PILLAR_RESOURCE_OP_ADDR` env and no `identity:` block in any loaded
     /// `config.yaml` — nothing tells the CLI where/how to connect. Run the
@@ -215,9 +218,13 @@ fn tiers(addr: SocketAddr) -> Vec<TierAddr> {
 /// than an opaque process exit code.
 #[derive(Debug)]
 pub enum SendError {
+    /// Failed to establish the connection to the resource-op endpoint.
     Connect(ConnectError),
+    /// A transport-level failure while sending/receiving (with a description).
     Transport(String),
+    /// The response acknowledgement could not be unsealed.
     UnsealAck,
+    /// The acknowledgement body was malformed.
     BadAckBody,
 }
 

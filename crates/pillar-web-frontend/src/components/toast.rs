@@ -128,7 +128,8 @@ mod yew_impl {
         fn emit(&self, level: Level, text: &str) {
             let id = *self.next;
             self.next.set(id + 1);
-            self.queue.set(push(&self.queue, id, level, text, Self::MAX));
+            self.queue
+                .set(push(&self.queue, id, level, text, Self::MAX));
         }
 
         /// Surface an error toast (the failure arm of a console fetch).
@@ -215,8 +216,16 @@ mod tests {
     #[test]
     fn dismiss_removes_only_the_matching_id() {
         let q = vec![
-            Toast { id: 1, level: Level::Info, text: "a".into() },
-            Toast { id: 2, level: Level::Error, text: "b".into() },
+            Toast {
+                id: 1,
+                level: Level::Info,
+                text: "a".into(),
+            },
+            Toast {
+                id: 2,
+                level: Level::Error,
+                text: "b".into(),
+            },
         ];
         let after = dismiss(&q, 1);
         assert_eq!(after.len(), 1);

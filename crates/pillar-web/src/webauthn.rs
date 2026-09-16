@@ -391,7 +391,12 @@ impl RelyingParty {
     /// uses ([`user_owns_credential`](Self::user_owns_credential)), so a user
     /// can never relabel another user's credential. Purely cosmetic: does not
     /// touch `sign_count`, `last_used_at`, or the no-lockout guard.
-    pub fn rename_credential(&mut self, user_handle: &str, credential_id: &[u8], label: &str) -> bool {
+    pub fn rename_credential(
+        &mut self,
+        user_handle: &str,
+        credential_id: &[u8],
+        label: &str,
+    ) -> bool {
         if !self.user_owns_credential(user_handle, credential_id) {
             return false;
         }
@@ -545,7 +550,16 @@ mod tests {
         let (ad, cdj, sig) = assertion(&sk, &ch, 5);
         let unlock = rp
             .authenticate_finish(
-                "sess-1", "cell-A", 2000, 0, &ch, b"cred-noprf", &ad, &cdj, &sig, b"",
+                "sess-1",
+                "cell-A",
+                2000,
+                0,
+                &ch,
+                b"cred-noprf",
+                &ad,
+                &cdj,
+                &sig,
+                b"",
             )
             .expect("assertion verifies with no prf output");
         assert_eq!(

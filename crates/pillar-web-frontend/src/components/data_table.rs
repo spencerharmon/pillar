@@ -88,10 +88,7 @@ pub fn filter_rows(rows: &[Row], needle: &str) -> Vec<Row> {
         return rows.to_vec();
     }
     rows.iter()
-        .filter(|row| {
-            row.iter()
-                .any(|cell| cell.to_lowercase().contains(&needle))
-        })
+        .filter(|row| row.iter().any(|cell| cell.to_lowercase().contains(&needle)))
         .cloned()
         .collect()
 }
@@ -113,7 +110,10 @@ pub fn sort_rows(rows: &[Row], col: usize, dir: SortDir, numeric: bool) -> Vec<R
         }
     }
     out.sort_by(|a, b| {
-        let (ca, cb) = (a.get(col).map_or("", String::as_str), b.get(col).map_or("", String::as_str));
+        let (ca, cb) = (
+            a.get(col).map_or("", String::as_str),
+            b.get(col).map_or("", String::as_str),
+        );
         let ord = if numeric {
             let pa = ca.trim().parse::<f64>().unwrap_or(f64::NEG_INFINITY);
             let pb = cb.trim().parse::<f64>().unwrap_or(f64::NEG_INFINITY);
@@ -436,11 +436,7 @@ mod tests {
 
     #[test]
     fn numeric_sort_treats_non_numbers_as_lowest() {
-        let rows = vec![
-            vec!["5".into()],
-            vec!["notanum".into()],
-            vec!["1".into()],
-        ];
+        let rows = vec![vec!["5".into()], vec!["notanum".into()], vec!["1".into()]];
         let asc = sort_rows(&rows, 0, SortDir::Asc, true);
         assert_eq!(
             asc.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),

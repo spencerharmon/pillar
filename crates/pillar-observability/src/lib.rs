@@ -44,7 +44,9 @@
 #![forbid(unsafe_code)]
 
 pub mod alerting;
-pub use alerting::{Alert, AlertEngine, AlertError, AlertPredicate, Notification, Notifier, RecordingNotifier};
+pub use alerting::{
+    Alert, AlertEngine, AlertError, AlertPredicate, Notification, Notifier, RecordingNotifier,
+};
 pub mod block;
 pub mod correlation;
 pub mod hop_metric;
@@ -74,8 +76,8 @@ pub use instrument::{
     Cx, MetricDescriptor, MetricRegistry, MetricType, ProbeObserver, TickClock, COMPONENT_LABEL,
     METRIC_TYPE_LABEL, METRIC_UNIT_LABEL,
 };
-pub use logs::{LogEvent, LogLevel, LogProducer};
 pub use live::{ComponentProbe, LiveObservabilitySubstrate, LiveRecord, DEFAULT_EVAL_TIER};
+pub use logs::{LogEvent, LogLevel, LogProducer};
 pub use metadata::{
     EntityId, LabelDiff, LabelObservation, LabelSet, LabelTransition, MetadataStore,
 };
@@ -88,7 +90,7 @@ pub use profiling::{
     NodeProfileSource, ProfileKind, ProfileReading, ProfileSource, ProfilingProducer,
 };
 pub use psl::{
-    parse as parse_psl, execute as execute_psl, CorrelateSpec, CorrelationGroup, Predicate,
+    execute as execute_psl, parse as parse_psl, CorrelateSpec, CorrelationGroup, Predicate,
     PslError, PslQuery, PslQueryBuilder, PslResult, RelativeRange, SelectClause, TimeBound,
     TimeRange,
 };

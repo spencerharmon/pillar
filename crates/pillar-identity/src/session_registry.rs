@@ -168,7 +168,9 @@ impl SessionRegistry {
     }
 
     fn get(&self, principal: &str, id: &str) -> Option<Session> {
-        let bytes = self.store.kv_get(SESSIONS_COLLECTION, &Self::kv_key(principal, id))?;
+        let bytes = self
+            .store
+            .kv_get(SESSIONS_COLLECTION, &Self::kv_key(principal, id))?;
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -676,9 +678,15 @@ mod tests {
         assert_eq!(keys.len(), 3, "one live K/V key per minted session");
         // Keys are `principal\0id` — every minted (principal, id) pair
         // appears exactly once.
-        assert!(keys.iter().any(|k| k.starts_with("alice") && k.ends_with("s1")));
-        assert!(keys.iter().any(|k| k.starts_with("alice") && k.ends_with("s2")));
-        assert!(keys.iter().any(|k| k.starts_with("bob") && k.ends_with("s1")));
+        assert!(keys
+            .iter()
+            .any(|k| k.starts_with("alice") && k.ends_with("s1")));
+        assert!(keys
+            .iter()
+            .any(|k| k.starts_with("alice") && k.ends_with("s2")));
+        assert!(keys
+            .iter()
+            .any(|k| k.starts_with("bob") && k.ends_with("s1")));
 
         // Revoking does not remove the key from the browse surface — the
         // record is still live in the K/V surface, only its `revoked_epoch`
@@ -755,7 +763,11 @@ mod tests {
         assert!(view.admit(&reg, "bob", "s1", 10).is_ok());
 
         let active: Vec<String> = reg.ls("alice", 10).into_iter().map(|s| s.id).collect();
-        assert_eq!(active, vec!["s2".to_string()], "only the kept session remains active");
+        assert_eq!(
+            active,
+            vec!["s2".to_string()],
+            "only the kept session remains active"
+        );
 
         // A fresh mint into a swept slot is a strictly newer generation.
         let fresh = reg.mint("alice", "s1", 20, 1000);

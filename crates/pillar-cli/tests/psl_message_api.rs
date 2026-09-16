@@ -246,10 +246,7 @@ fn cli_over_every_tier_and_the_ui_over_https_see_identical_psl_query_results() {
 
     let create_cell = node.post("/bootstrap/create-cell", "cell-genesis");
     assert_eq!(create_cell.status, 200, "create-cell: {}", create_cell.body);
-    let create_user = node.post(
-        "/bootstrap/create-user",
-        &format!("{HANDLE}\n{PASSWORD}"),
-    );
+    let create_user = node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
     assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
 
     let login = node.login(HANDLE, PASSWORD);
@@ -284,8 +281,8 @@ fn cli_over_every_tier_and_the_ui_over_https_see_identical_psl_query_results() {
 
     // The CLI dialing its FULL preferred tier list must reach the pillar-UDP
     // tier FIRST and see the IDENTICAL rows the UI saw over HTTPS.
-    let cli_outcome = query_with_fallback(&node.all_tiers(), &token, QUERY)
-        .expect("at least one tier reachable");
+    let cli_outcome =
+        query_with_fallback(&node.all_tiers(), &token, QUERY).expect("at least one tier reachable");
     assert_eq!(
         cli_outcome.tier,
         Tier::PillarUdp,
@@ -334,10 +331,7 @@ fn cli_falls_back_past_a_down_pillar_udp_tier_to_quic_then_https() {
     let node = Node::boot(data_dir.path());
 
     node.post("/bootstrap/create-cell", "cell-genesis");
-    node.post(
-        "/bootstrap/create-user",
-        &format!("{HANDLE}\n{PASSWORD}"),
-    );
+    node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
     let login = node.login(HANDLE, PASSWORD);
     let token = login.session_token.expect("session token");
 
@@ -375,8 +369,7 @@ fn cli_falls_back_past_a_down_pillar_udp_tier_to_quic_then_https() {
             addr: node.https_addr(),
         },
     ];
-    let outcome =
-        query_with_fallback(&tiers_udp_down, &token, QUERY).expect("falls back to quic");
+    let outcome = query_with_fallback(&tiers_udp_down, &token, QUERY).expect("falls back to quic");
     assert_eq!(
         outcome.tier,
         Tier::Quic,

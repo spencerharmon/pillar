@@ -153,7 +153,12 @@ fn login(addr: &str) -> String {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("nonce id");
-    let resp = http(addr, "POST", "/login", &format!("alice@node\n{PASSWORD}\n{id}"));
+    let resp = http(
+        addr,
+        "POST",
+        "/login",
+        &format!("alice@node\n{PASSWORD}\n{id}"),
+    );
     assert_eq!(resp.status, 200, "login: {}", resp.body);
     resp.session_token.expect("session token")
 }
@@ -216,7 +221,8 @@ fn generate_mints_a_fresh_distinct_key_with_no_persisted_side_effect() {
         g1.body
     );
     assert!(
-        g1.body.contains(&format!("FINGERPRINT {}", key1.fingerprint())),
+        g1.body
+            .contains(&format!("FINGERPRINT {}", key1.fingerprint())),
         "generate must return the key fingerprint, got: {}",
         g1.body
     );
@@ -275,7 +281,12 @@ fn unauthenticated_requests_are_refused() {
     // POST generate from a non-loopback peer with a bad session is refused by
     // the shared non-loopback signing guard. (The TCP connection here is
     // loopback, but a bad session still cannot mint — no key is returned.)
-    let bad_generate = http(&addr, "POST", "/portal/swarm/generate", "not-a-real-session");
+    let bad_generate = http(
+        &addr,
+        "POST",
+        "/portal/swarm/generate",
+        "not-a-real-session",
+    );
     assert!(
         bad_generate.status == 401 || bad_generate.status == 403,
         "unauthenticated generate must be refused (401/403), got {}: {}",

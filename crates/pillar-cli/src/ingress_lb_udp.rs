@@ -45,9 +45,7 @@
 use std::net::SocketAddr;
 
 use pillar_core::SideEffect;
-use pillar_manifest::ingress::{
-    Affinity, Algorithm, HealthCheck, LoadBalancerPolicy,
-};
+use pillar_manifest::ingress::{Affinity, Algorithm, HealthCheck, LoadBalancerPolicy};
 use pillar_net::UdpDataplane;
 
 /// A parsed ingress-lb-udp manifest: the VIP the dataplane binds, the concrete
@@ -183,8 +181,9 @@ impl IngressLbUdpManifest {
             }
         }
 
-        let ip = frontend_ip
-            .ok_or_else(|| IngressLbUdpError("manifest missing a `frontend <name> <vip-ip>`".into()))?;
+        let ip = frontend_ip.ok_or_else(|| {
+            IngressLbUdpError("manifest missing a `frontend <name> <vip-ip>`".into())
+        })?;
         let port = listen_port
             .ok_or_else(|| IngressLbUdpError("manifest missing a `listen <port>`".into()))?;
         if backends.is_empty() {
@@ -319,8 +318,8 @@ mod tests {
 
     #[test]
     fn rejects_missing_listen() {
-        let e =
-            IngressLbUdpManifest::parse("frontend f 127.0.0.1\nbackend b 127.0.0.1:2\n").unwrap_err();
+        let e = IngressLbUdpManifest::parse("frontend f 127.0.0.1\nbackend b 127.0.0.1:2\n")
+            .unwrap_err();
         assert!(e.0.contains("listen"), "{}", e.0);
     }
 
@@ -332,10 +331,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_backend_addr() {
-        let e = IngressLbUdpManifest::parse(
-            "frontend f 127.0.0.1\nlisten 0\nbackend b not-an-addr\n",
-        )
-        .unwrap_err();
+        let e =
+            IngressLbUdpManifest::parse("frontend f 127.0.0.1\nlisten 0\nbackend b not-an-addr\n")
+                .unwrap_err();
         assert!(e.0.contains("bad backend address"), "{}", e.0);
     }
 

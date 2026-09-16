@@ -233,11 +233,7 @@ pub fn parse_authenticate_begin(body: &str) -> Result<AuthChallenge, CeremonyErr
 /// `POST /webauthn/authenticate/finish` request body:
 /// `<token>\n<challenge_b64>\n<cred_b64>\n<authenticator_data_b64>\n
 /// <client_data_json_b64>\n<signature_b64>\n<prf_output_b64>`.
-pub fn authenticate_finish_body(
-    token: &str,
-    challenge_b64: &str,
-    assertion: &Assertion,
-) -> String {
+pub fn authenticate_finish_body(token: &str, challenge_b64: &str, assertion: &Assertion) -> String {
     format!(
         "{token}\n{challenge_b64}\n{}\n{}\n{}\n{}\n{}",
         assertion.credential_id_b64,
@@ -270,7 +266,11 @@ pub fn parse_authenticate_finish(body: &str) -> Result<AuthFinish, CeremonyError
             // `-` sentinel = the authenticator produced no PRF output, so there
             // is no operational-key-unlock secret (the second factor still
             // succeeded). Login promotion uses `session_token`, not this.
-            unlock_secret: if unlock == "-" { String::new() } else { unlock.to_owned() },
+            unlock_secret: if unlock == "-" {
+                String::new()
+            } else {
+                unlock.to_owned()
+            },
             session_token: token.filter(|t| !t.is_empty()).map(str::to_owned),
         }),
         _ => Err(CeremonyError::Protocol(format!(
@@ -349,12 +349,22 @@ pub fn register(
     label: &str,
     rp_id: &str,
 ) -> Result<String, CeremonyError> {
-    let begin_resp = transport.post(Endpoint::RegisterBegin, &register_begin_body(token, user_handle))?;
+    let begin_resp = transport.post(
+        Endpoint::RegisterBegin,
+        &register_begin_body(token, user_handle),
+    )?;
     let challenge = parse_register_begin(&begin_resp)?;
     let attestation = ceremony.create(&challenge)?;
     let finish_resp = transport.post(
         Endpoint::RegisterFinish,
-        &register_finish_body(token, user_handle, &challenge.challenge_b64, &attestation, label, rp_id),
+        &register_finish_body(
+            token,
+            user_handle,
+            &challenge.challenge_b64,
+            &attestation,
+            label,
+            rp_id,
+        ),
     )?;
     parse_register_finish(&finish_resp)
 }
@@ -367,7 +377,8 @@ pub fn authenticate(
     ceremony: &impl CredentialCeremony,
     token: &str,
 ) -> Result<AuthFinish, CeremonyError> {
-    let begin_resp = transport.post(Endpoint::AuthenticateBegin, &authenticate_begin_body(token))?;
+    let begin_resp =
+        transport.post(Endpoint::AuthenticateBegin, &authenticate_begin_body(token))?;
     let challenge = parse_authenticate_begin(&begin_resp)?;
     let assertion = ceremony.get(&challenge)?;
     let finish_resp = transport.post(
@@ -395,9 +406,8 @@ mod browser {
         AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, AuthenticatorResponse,
         CredentialCreationOptions, CredentialRequestOptions, CredentialsContainer,
         PublicKeyCredential, PublicKeyCredentialCreationOptions, PublicKeyCredentialDescriptor,
-        PublicKeyCredentialParameters,
-        PublicKeyCredentialRequestOptions, PublicKeyCredentialRpEntity,
-        PublicKeyCredentialType, PublicKeyCredentialUserEntity,
+        PublicKeyCredentialParameters, PublicKeyCredentialRequestOptions,
+        PublicKeyCredentialRpEntity, PublicKeyCredentialType, PublicKeyCredentialUserEntity,
     };
 
     /// Base64url (no padding) decode, per the WebAuthn wire convention every
@@ -454,10 +464,16 @@ mod browser {
     impl BrowserTransport {
         /// A transport posting to same-origin relative `/webauthn/*` paths.
         pub fn new() -> Self {
-            BrowserTransport { base_url: String::new() }
+            BrowserTransport {
+                base_url: String::new(),
+            }
         }
 
-        async fn post_async(&self, endpoint: Endpoint, body: String) -> Result<String, CeremonyError> {
+        async fn post_async(
+            &self,
+            endpoint: Endpoint,
+            body: String,
+        ) -> Result<String, CeremonyError> {
             let url = format!("{}{}", self.base_url, endpoint.path());
             let resp = Request::post(&url)
                 .header("Content-Type", "text/plain")
@@ -526,12 +542,11 @@ mod browser {
             );
             let options = CredentialCreationOptions::new();
             options.set_public_key(&pkc_options);
-            let promise = creds
-                .create_with_options(&options)
-                .map_err(js_err)?;
+            let promise = creds.create_with_options(&options).map_err(js_err)?;
             let cred = JsFuture::from(promise).await.map_err(js_err)?;
-            let cred: PublicKeyCredential = cred.dyn_into().map_err(|_| CeremonyError::Unsupported)?;
-            let credential_id_b64 = Object::from(cred.clone().unchecked_into::<Object>());
+            let cred: PublicKeyCredential =
+                cred.dyn_into().map_err(|_| CeremonyError::Unsupported)?;
+            let credential_id_b64 = cred.clone().unchecked_into::<Object>();
             // `Credential.id` is already the base64url credential id per spec.
             let credential_id_b64 = Reflect::get(&credential_id_b64, &JsValue::from_str("id"))
                 .ok()
@@ -558,8 +573,7 @@ mod browser {
             // are immune. (This path allocates per allow-credential, unlike the
             // register path, so it is the one that trips the footgun.)
             let challenge_buf = Uint8Array::from(b64_decode(&challenge.challenge_b64)?.as_slice());
-            let pkc_options =
-                PublicKeyCredentialRequestOptions::new(challenge_buf.unchecked_ref());
+            let pkc_options = PublicKeyCredentialRequestOptions::new(challenge_buf.unchecked_ref());
             // NOTE: rpId is deliberately NOT set. The browser defaults it to the
             // serving origin's effective domain — exactly what registration used
             // (create() only set rp.name, never rp.id, so the credential is
@@ -587,7 +601,8 @@ mod browser {
             options.set_public_key(&pkc_options);
             let promise = creds.get_with_options(&options).map_err(js_err)?;
             let cred = JsFuture::from(promise).await.map_err(js_err)?;
-            let cred: PublicKeyCredential = cred.dyn_into().map_err(|_| CeremonyError::Unsupported)?;
+            let cred: PublicKeyCredential =
+                cred.dyn_into().map_err(|_| CeremonyError::Unsupported)?;
             let credential_id_b64 = Reflect::get(&cred, &JsValue::from_str("id"))
                 .ok()
                 .and_then(|v| v.as_string())
@@ -645,14 +660,24 @@ mod browser {
             .and_then(|w| w.location().hostname().ok())
             .unwrap_or_default();
         let begin_resp = transport
-            .post_async(Endpoint::RegisterBegin, register_begin_body(token, user_handle))
+            .post_async(
+                Endpoint::RegisterBegin,
+                register_begin_body(token, user_handle),
+            )
             .await?;
         let challenge = parse_register_begin(&begin_resp)?;
         let attestation = ceremony.create_async(&challenge).await?;
         let finish_resp = transport
             .post_async(
                 Endpoint::RegisterFinish,
-                register_finish_body(token, user_handle, &challenge.challenge_b64, &attestation, label, &rp_id),
+                register_finish_body(
+                    token,
+                    user_handle,
+                    &challenge.challenge_b64,
+                    &attestation,
+                    label,
+                    &rp_id,
+                ),
             )
             .await?;
         parse_register_finish(&finish_resp)
@@ -698,7 +723,10 @@ mod tests {
 
     impl MockTransport {
         fn new(responses: Vec<(Endpoint, Result<&'static str, CeremonyError>)>) -> Self {
-            MockTransport { steps: RefCell::new(Vec::new()), responses }
+            MockTransport {
+                steps: RefCell::new(Vec::new()),
+                responses,
+            }
         }
     }
 
@@ -710,7 +738,9 @@ mod tests {
                 .find(|(e, _)| *e == endpoint)
                 .map(|(_, r)| r.clone().map(str::to_owned))
                 .unwrap_or_else(|| {
-                    Err(CeremonyError::Protocol(format!("unexpected endpoint {endpoint:?}")))
+                    Err(CeremonyError::Protocol(format!(
+                        "unexpected endpoint {endpoint:?}"
+                    )))
                 })
         }
     }
@@ -766,12 +796,22 @@ mod tests {
     #[test]
     fn registration_drives_begin_create_finish_in_order() {
         let transport = MockTransport::new(vec![
-            (Endpoint::RegisterBegin, Ok("CHALLENGE Y2hhbGxlbmdl pillar.example alice")),
+            (
+                Endpoint::RegisterBegin,
+                Ok("CHALLENGE Y2hhbGxlbmdl pillar.example alice"),
+            ),
             (Endpoint::RegisterFinish, Ok("REGISTERED Y3JlZC0x")),
         ]);
         let ceremony = MockCeremony::ok();
 
-        let result = register(&transport, &ceremony, "tok-1", "alice", "test-key", "example.com");
+        let result = register(
+            &transport,
+            &ceremony,
+            "tok-1",
+            "alice",
+            "test-key",
+            "example.com",
+        );
 
         assert_eq!(result, Ok("Y3JlZC0x".to_owned()));
         assert_eq!(
@@ -780,7 +820,11 @@ mod tests {
             "registration must post begin THEN finish, in that order"
         );
         assert_eq!(*ceremony.create_calls.borrow(), 1);
-        assert_eq!(*ceremony.get_calls.borrow(), 0, "registration never calls get()");
+        assert_eq!(
+            *ceremony.get_calls.borrow(),
+            0,
+            "registration never calls get()"
+        );
     }
 
     #[test]
@@ -806,7 +850,11 @@ mod tests {
             "authentication must post begin THEN finish, in that order"
         );
         assert_eq!(*ceremony.get_calls.borrow(), 1);
-        assert_eq!(*ceremony.create_calls.borrow(), 0, "authentication never calls create()");
+        assert_eq!(
+            *ceremony.create_calls.borrow(),
+            0,
+            "authentication never calls create()"
+        );
     }
 
     #[test]
@@ -817,11 +865,22 @@ mod tests {
         )]);
         let ceremony = MockCeremony::failing(CeremonyError::UserCancelled);
 
-        let err = register(&transport, &ceremony, "tok-1", "alice", "test-key", "example.com").unwrap_err();
+        let err = register(
+            &transport,
+            &ceremony,
+            "tok-1",
+            "alice",
+            "test-key",
+            "example.com",
+        )
+        .unwrap_err();
 
         assert_eq!(err, CeremonyError::UserCancelled);
         assert!(err.message().contains("cancelled"));
-        assert!(err.message().contains("password"), "must point at the fallback");
+        assert!(
+            err.message().contains("password"),
+            "must point at the fallback"
+        );
         assert_eq!(
             *transport.steps.borrow(),
             vec![Endpoint::RegisterBegin],
@@ -852,7 +911,15 @@ mod tests {
         )]);
         let ceremony = MockCeremony::failing(CeremonyError::Unsupported);
 
-        let err = register(&transport, &ceremony, "tok-1", "alice", "test-key", "example.com").unwrap_err();
+        let err = register(
+            &transport,
+            &ceremony,
+            "tok-1",
+            "alice",
+            "test-key",
+            "example.com",
+        )
+        .unwrap_err();
 
         assert_eq!(err, CeremonyError::Unsupported);
         assert!(err.message().to_lowercase().contains("does not support"));
@@ -897,7 +964,11 @@ mod tests {
         let mut unique = messages.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(unique.len(), messages.len(), "every error must have a distinct message");
+        assert_eq!(
+            unique.len(),
+            messages.len(),
+            "every error must have a distinct message"
+        );
     }
 
     #[test]
@@ -944,7 +1015,14 @@ mod tests {
             attestation_object_b64: "att".into(),
         };
         assert_eq!(
-            register_finish_body("tok", "alice", "chal", &attestation, "my-key", "example.com"),
+            register_finish_body(
+                "tok",
+                "alice",
+                "chal",
+                &attestation,
+                "my-key",
+                "example.com"
+            ),
             "tok\nalice\nchal\natt\nmy-key\nexample.com"
         );
         // authenticate/begin: "<token>"

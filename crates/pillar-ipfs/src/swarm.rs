@@ -113,13 +113,27 @@ mod content_id_wire {
 
 /// The behaviour a networked IPFS node runs: the bitswap-style want/answer
 /// protocol plus Kademlia for provider-record routing of public anchors.
-#[derive(libp2p::swarm::NetworkBehaviour)]
-pub struct IpfsSwarmBehaviour {
-    /// Direct block want/answer exchange.
-    pub bitswap: request_response::cbor::Behaviour<BlockRequest, BlockResponse>,
-    /// Provider-record routing for public anchor CIDs, on pillar's own
-    /// private DHT instance (never the public IPFS DHT).
-    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+pub use behaviour::{IpfsSwarmBehaviour, IpfsSwarmBehaviourEvent};
+
+// The `NetworkBehaviour` derive generates a companion `IpfsSwarmBehaviourEvent`
+// enum whose variants cannot carry doc comments, so a struct-level
+// `#[allow(missing_docs)]` does not reach them. Wrap the derive in a private
+// module carrying an inner `#![allow(missing_docs)]` that covers the generated
+// item too; the struct and its fields remain fully documented.
+mod behaviour {
+    #![allow(missing_docs)]
+    use super::*;
+
+    /// The behaviour a networked IPFS node runs: the bitswap-style want/answer
+    /// protocol plus Kademlia for provider-record routing of public anchors.
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    pub struct IpfsSwarmBehaviour {
+        /// Direct block want/answer exchange.
+        pub bitswap: request_response::cbor::Behaviour<BlockRequest, BlockResponse>,
+        /// Provider-record routing for public anchor CIDs, on pillar's own
+        /// private DHT instance (never the public IPFS DHT).
+        pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    }
 }
 
 fn bitswap_behaviour() -> request_response::cbor::Behaviour<BlockRequest, BlockResponse> {

@@ -25,7 +25,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use pillar_controller::deployment::{Deployment, DeploymentReplica, DeploymentSpec, RestartPolicy};
-use pillar_controller::{Controller, RUN_WORKLOAD_CAPABILITY, WorkloadSpec};
+use pillar_controller::{Controller, WorkloadSpec, RUN_WORKLOAD_CAPABILITY};
 use pillar_coordination::LeaseRegister;
 use pillar_core::{Epoch, NodeId, SideEffect};
 use pillar_identity::capability::{Capability, CapabilityRegistry};
@@ -200,7 +200,11 @@ async fn deployment_places_and_runs_replicas_and_restarts_a_killed_one() {
     }
     // Distinct real pids across replicas.
     let distinct_pids: std::collections::BTreeSet<_> = pids.iter().copied().collect();
-    assert_eq!(distinct_pids.len(), 3, "each replica is a distinct real process");
+    assert_eq!(
+        distinct_pids.len(),
+        3,
+        "each replica is a distinct real process"
+    );
 
     // --- restart policy: kill one replica's REAL process out from under the
     // supervisor (simulating an external crash) and confirm reconciliation

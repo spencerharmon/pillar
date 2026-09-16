@@ -37,7 +37,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use pillar_core::NodeId;
-use pillar_rbac::{Capability, Decision as RbacDecision, RbacDecider, Request as RbacRequest, ResourceClass};
+use pillar_rbac::{
+    Capability, Decision as RbacDecision, RbacDecider, Request as RbacRequest, ResourceClass,
+};
 
 use crate::builtin::{ControllerHook, ReconcileOutcome};
 use crate::{Crd, FieldType, Schema, Value};

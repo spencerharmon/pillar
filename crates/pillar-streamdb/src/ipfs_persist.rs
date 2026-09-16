@@ -85,7 +85,9 @@ impl std::fmt::Display for IpfsPersistError {
                     "no segment-signing secret held — cannot author new segments"
                 )
             }
-            IpfsPersistError::StreamOpMessage(e) => write!(f, "stream-op pillar-message error: {e}"),
+            IpfsPersistError::StreamOpMessage(e) => {
+                write!(f, "stream-op pillar-message error: {e}")
+            }
         }
     }
 }
@@ -293,7 +295,14 @@ impl IpfsPersistentStream {
         cell: CellId,
         group: CellGroupKey,
     ) -> Result<Self, IpfsPersistError> {
-        Self::open_with_store(ContentStore::open(root)?, owner, secret, visibility, cell, group)
+        Self::open_with_store(
+            ContentStore::open(root)?,
+            owner,
+            secret,
+            visibility,
+            cell,
+            group,
+        )
     }
 
     /// Like [`Self::open`] but over an already-constructed durable
@@ -409,7 +418,7 @@ impl IpfsPersistentStream {
 
     /// Append `payload` as a fresh op: seal it as a `PillarMessage::StreamOp`
     /// body (method #1 step (d) — [`encode_stream_op_segment_payload`]), build
-    /// + sign the new segment carrying that sealed envelope (linking to the
+    /// and sign the new segment carrying that sealed envelope (linking to the
     /// previous head), store + pin it (advertise to the DHT only if
     /// `visibility` is public), publish the advanced [`HeadRecord`], and only
     /// then record the PLAINTEXT op in the in-memory view — durable-first,
@@ -610,12 +619,10 @@ impl IpfsPersistentStream {
                         .map_err(IpfsPersistError::StreamOpMessage)?
                 }
                 Confidentiality::CellEncrypted => match &group {
-                    Some(g) => decode_stream_op_segment_payload(
-                        &segment_payload,
-                        Some(g),
-                        confidentiality,
-                    )
-                    .map_err(IpfsPersistError::StreamOpMessage)?,
+                    Some(g) => {
+                        decode_stream_op_segment_payload(&segment_payload, Some(g), confidentiality)
+                            .map_err(IpfsPersistError::StreamOpMessage)?
+                    }
                     None => segment_payload,
                 },
             };

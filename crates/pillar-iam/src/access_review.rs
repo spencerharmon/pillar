@@ -87,7 +87,9 @@ impl GrantKey {
 }
 
 /// Whether a [`GrantKey`] names a role or a group binding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum GrantKind {
     /// A role binding (`GrantSet::role_grants`).
     Role,
@@ -367,7 +369,10 @@ mod tests {
         // Re-attest alice's grant AT the deadline.
         assert!(campaign.reattest(GrantKey::role("alice", "billing-admin"), 60));
         let stale = campaign.stale_live_grants(&grants, 10);
-        assert_eq!(stale, BTreeSet::from([GrantKey::role("bob", "support-role")]));
+        assert_eq!(
+            stale,
+            BTreeSet::from([GrantKey::role("bob", "support-role")])
+        );
     }
 
     #[test]
@@ -416,7 +421,10 @@ mod tests {
         campaign.open(50);
         let err = campaign.close(&grants, 10).unwrap_err();
         assert_eq!(err.len(), 2, "both unattested grants block the close");
-        assert!(campaign.is_active(), "a refused close leaves the campaign active");
+        assert!(
+            campaign.is_active(),
+            "a refused close leaves the campaign active"
+        );
     }
 
     #[test]
@@ -440,7 +448,10 @@ mod tests {
         // Only alice re-attests; bob is left un-attested.
         campaign.reattest(GrantKey::role("alice", "billing-admin"), 60);
         let revoked = campaign.close_fail_closed(&mut grants, 10);
-        assert_eq!(revoked, BTreeSet::from([GrantKey::role("bob", "support-role")]));
+        assert_eq!(
+            revoked,
+            BTreeSet::from([GrantKey::role("bob", "support-role")])
+        );
         assert!(!campaign.is_active());
         // bob's grant is dead; alice's survives.
         assert!(grants.live_role_names("bob", 10).is_empty());

@@ -350,7 +350,10 @@ mod tests {
 
     #[test]
     fn scale_maps_endpoints_and_midpoint() {
-        let r = Range { min: 0.0, max: 10.0 };
+        let r = Range {
+            min: 0.0,
+            max: 10.0,
+        };
         assert!((scale(0.0, r, 0.0, 100.0) - 0.0).abs() < 1e-9);
         assert!((scale(10.0, r, 0.0, 100.0) - 100.0).abs() < 1e-9);
         assert!((scale(5.0, r, 0.0, 100.0) - 50.0).abs() < 1e-9);
@@ -358,7 +361,13 @@ mod tests {
 
     #[test]
     fn nice_ticks_snaps_to_readable_steps_and_covers_range() {
-        let ticks = nice_ticks(Range { min: 0.0, max: 100.0 }, 5);
+        let ticks = nice_ticks(
+            Range {
+                min: 0.0,
+                max: 100.0,
+            },
+            5,
+        );
         assert!(ticks.len() >= 2);
         // Steps are uniform and a 1/2/5×10ⁿ value (here 25 -> actually snaps to
         // 20 or 25; assert uniformity + coverage rather than an exact set).
@@ -372,14 +381,23 @@ mod tests {
 
     #[test]
     fn nice_ticks_always_has_two_endpoints() {
-        let ticks = nice_ticks(Range { min: 0.0, max: 0.0000001 }, 5);
+        let ticks = nice_ticks(
+            Range {
+                min: 0.0,
+                max: 0.0000001,
+            },
+            5,
+        );
         assert!(ticks.len() >= 2);
     }
 
     #[test]
     fn line_points_projects_series_and_inverts_y() {
         let vp = Viewport::new(100.0, 100.0, 0.0);
-        let r = Range { min: 0.0, max: 10.0 };
+        let r = Range {
+            min: 0.0,
+            max: 10.0,
+        };
         let s = line_points(&[0.0, 10.0], vp, r);
         // Two points: first at left/bottom (x=0,y=100), second at right/top
         // (x=100,y=0) because y is inverted.
@@ -397,7 +415,10 @@ mod tests {
     #[test]
     fn bar_rects_are_evenly_spaced_and_height_tracks_value() {
         let vp = Viewport::new(100.0, 100.0, 0.0);
-        let r = Range { min: 0.0, max: 10.0 };
+        let r = Range {
+            min: 0.0,
+            max: 10.0,
+        };
         let bars = bar_rects(&[0.0, 10.0], vp, r, 0.0);
         assert_eq!(bars.len(), 2);
         // First bar (value 0) has ~zero height; second (value 10) is full.

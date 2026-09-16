@@ -271,7 +271,11 @@ fn node_restart_rehydrates_routing_and_trust_state_purely_from_ipfs_not_local_di
     )
     .with_backend(Backend::new("backend-1"));
 
-    let table_before = derive_routing_table(&[frontend.clone()], &[route.clone()], &trust_store);
+    let table_before = derive_routing_table(
+        std::slice::from_ref(&frontend),
+        std::slice::from_ref(&route),
+        &trust_store,
+    );
     assert!(
         table_before.is_attached("lb-route"),
         "authorized Route attaches before restart"
@@ -394,7 +398,7 @@ fn distributed_lb_acceptance_end_to_end() {
         RouteKind::PillarNative,
     );
     let table = derive_routing_table(
-        &[frontend.clone()],
+        std::slice::from_ref(&frontend),
         &[authorized_route.clone(), unauthorized_route],
         &trust_store,
     );

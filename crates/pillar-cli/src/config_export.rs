@@ -66,8 +66,8 @@ fn strip_comment_banner(body: &str) -> String {
 /// expired/invalid session — re-run `pillar login`), or a malformed
 /// `config.yaml` body.
 pub fn fetch_config(authority: &str, token: &str) -> Result<ClientConfig, ExportError> {
-    let reply = http(authority, "POST", "/portal/profile/cli-config", token)
-        .map_err(ExportError)?;
+    let reply =
+        http(authority, "POST", "/portal/profile/cli-config", token).map_err(ExportError)?;
     if reply.status != 200 {
         return Err(ExportError(format!(
             "cli-config export refused: {} {} — run `pillar login` again if your session expired",
@@ -90,7 +90,8 @@ pub fn default_export_path() -> Option<PathBuf> {
     if let Some(xdg) = dirs.xdg_config {
         return Some(xdg.join("pillar").join("config.yaml"));
     }
-    dirs.home.map(|home| home.join(".config").join("pillar").join("config.yaml"))
+    dirs.home
+        .map(|home| home.join(".config").join("pillar").join("config.yaml"))
 }
 
 /// Save `cfg` to `path`, creating parent directories as needed, and — on a
@@ -179,7 +180,9 @@ pub fn export(args: &[String]) -> Result<PathBuf, ExportError> {
         .map(PathBuf::from)
         .or_else(default_export_path)
         .ok_or_else(|| {
-            ExportError("no --out and no $HOME/$XDG_CONFIG_HOME to derive a default path".to_owned())
+            ExportError(
+                "no --out and no $HOME/$XDG_CONFIG_HOME to derive a default path".to_owned(),
+            )
         })?;
 
     let cfg = fetch_config(&authority, &token)?;
@@ -232,11 +235,7 @@ mod tests {
     #[test]
     fn export_requires_token() {
         std::env::remove_var(PILLAR_TOKEN_ENV);
-        let err = export(&[
-            "--domain".to_owned(),
-            "example.invalid:8642".to_owned(),
-        ])
-        .unwrap_err();
+        let err = export(&["--domain".to_owned(), "example.invalid:8642".to_owned()]).unwrap_err();
         assert!(err.0.contains("--token"), "{}", err.0);
     }
 

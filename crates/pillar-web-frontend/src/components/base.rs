@@ -48,12 +48,8 @@ pub fn card(props: &CardProps) -> Html {
                 let rect = el.get_bounding_client_rect();
                 let x = f64::from(e.client_x()) - rect.left();
                 let y = f64::from(e.client_y()) - rect.top();
-                let _ = el
-                    .style()
-                    .set_property("--spot-x", &format!("{x}px"));
-                let _ = el
-                    .style()
-                    .set_property("--spot-y", &format!("{y}px"));
+                let _ = el.style().set_property("--spot-x", &format!("{x}px"));
+                let _ = el.style().set_property("--spot-y", &format!("{y}px"));
             }
         }
     });

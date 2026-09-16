@@ -405,7 +405,7 @@ impl ObservabilityBuilders {
     pub fn metadata_query(&self, prefix: Option<&str>) -> Vec<(EntityId, MetadataView)> {
         self.metadata
             .entities()
-            .filter(|e| prefix.map_or(true, |p| e.0.starts_with(p)))
+            .filter(|e| prefix.is_none_or(|p| e.0.starts_with(p)))
             .map(|e| (e.clone(), self.metadata_view(e)))
             .collect()
     }
@@ -594,7 +594,7 @@ impl ObservabilityBuilders {
             let signer = lines.next().unwrap_or("").to_owned();
             let name = lines.next().unwrap_or("").to_owned();
             let content = lines.next().unwrap_or("").to_owned();
-            if latest.as_ref().map_or(true, |(cur_seq, ..)| seq > *cur_seq) {
+            if latest.as_ref().is_none_or(|(cur_seq, ..)| seq > *cur_seq) {
                 latest = Some((seq, op_kind, signer, name, content));
             }
         }

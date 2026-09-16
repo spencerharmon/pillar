@@ -56,7 +56,11 @@ fn signed_segment_round_trips_by_cid_multihash_verified() {
     wire.extend_from_slice(signature.as_bytes());
 
     let cid = node.put_block(&wire).expect("put segment");
-    assert_eq!(cid, content_id(&wire), "CID must be the real multihash of the bytes");
+    assert_eq!(
+        cid,
+        content_id(&wire),
+        "CID must be the real multihash of the bytes"
+    );
 
     let fetched = node
         .get_block(&cid)
@@ -179,7 +183,9 @@ async fn backfills_missing_segment_from_a_second_node_over_the_private_swarm() {
 
     assert_eq!(backfilled, block);
     assert!(
-        node_b.has_block(&cid).expect("has_block on B after backfill"),
+        node_b
+            .has_block(&cid)
+            .expect("has_block on B after backfill"),
         "node B must hold the block locally after backfill"
     );
     assert_eq!(
@@ -235,8 +241,14 @@ fn ipns_head_resolves_to_latest_sequence_rejecting_stale_or_forged() {
     let winner = resolve_latest(&[stale.clone(), latest.clone(), forged], now)
         .expect("a genuine candidate must win");
 
-    assert_eq!(winner, latest, "the highest genuinely-signed sequence must win");
-    assert_ne!(winner.sequence, stale.sequence, "the stale sequence must not win");
+    assert_eq!(
+        winner, latest,
+        "the highest genuinely-signed sequence must win"
+    );
+    assert_ne!(
+        winner.sequence, stale.sequence,
+        "the stale sequence must not win"
+    );
     assert_ne!(
         winner.cid,
         content_id(b"root-forged"),

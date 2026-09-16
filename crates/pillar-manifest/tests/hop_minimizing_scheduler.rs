@@ -18,9 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pillar_manifest::hop_min::{
-    aggregate_placement_hops, Optimizer, Placement, Plan, TrafficView,
-};
+use pillar_manifest::hop_min::{aggregate_placement_hops, Optimizer, Placement, Plan, TrafficView};
 use pillar_topology::TierHierarchy;
 
 fn assignment(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -77,12 +75,21 @@ fn concentrated_traffic_reduces_aggregate_hops_within_spread_bound() {
         after < before,
         "optimizer must reduce aggregate hops: {before} -> {after}"
     );
-    assert!(!moves.is_empty(), "at least one backend should be pulled toward r1");
+    assert!(
+        !moves.is_empty(),
+        "at least one backend should be pulled toward r1"
+    );
 
     // 2. Every move actually moved a backend toward the concentrated ingest r1.
     for m in &moves {
-        assert_eq!(m.to, "r1", "backends should be pulled toward ingest locality r1");
-        assert!(m.improvement > 0, "every applied move improves aggregate hops");
+        assert_eq!(
+            m.to, "r1",
+            "backends should be pulled toward ingest locality r1"
+        );
+        assert!(
+            m.improvement > 0,
+            "every applied move improves aggregate hops"
+        );
     }
 
     // 3. The declared spread / anti-affinity floor is NEVER violated: the app

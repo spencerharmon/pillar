@@ -126,10 +126,7 @@ async fn probe_echo(port: u16, msg: &[u8]) -> std::io::Result<Vec<u8>> {
 /// port-unreachable ICMP) — both count as "no listener".
 async fn assert_no_listener(port: u16) {
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
-    client
-        .connect(("127.0.0.1", port))
-        .await
-        .expect("connect");
+    client.connect(("127.0.0.1", port)).await.expect("connect");
     client.send(b"ping").await.expect("send");
     let mut buf = [0u8; 1024];
     match timeout(Duration::from_millis(500), client.recv(&mut buf)).await {
@@ -139,9 +136,7 @@ async fn assert_no_listener(port: u16) {
                 e.kind(),
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
             ) => {} // kernel confirmed nobody is bound to the port.
-        Ok(Ok(n)) => panic!(
-            "expected no reply after stop, but the port answered with {n} bytes"
-        ),
+        Ok(Ok(n)) => panic!("expected no reply after stop, but the port answered with {n} bytes"),
         Ok(Err(e)) => panic!("unexpected error probing stopped port: {e}"),
     }
 }
@@ -181,8 +176,7 @@ async fn spawns_stops_and_restarts_a_real_supervised_process() {
     assert!(process.is_alive().expect("liveness check after restart"));
     let new_pid = process.pid().expect("restarted process has a real pid");
     assert_ne!(
-        new_pid,
-        0,
+        new_pid, 0,
         "restarted process must have been assigned a real pid"
     );
 

@@ -64,8 +64,8 @@ fn workspace_root() -> PathBuf {
 fn shipping_rs_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let crates = root.join("crates");
-    let entries = fs::read_dir(&crates)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", crates.display()));
+    let entries =
+        fs::read_dir(&crates).unwrap_or_else(|e| panic!("cannot read {}: {e}", crates.display()));
     for crate_dir in entries.flatten() {
         let src = crate_dir.path().join("src");
         if src.is_dir() {
@@ -145,9 +145,8 @@ fn scan_source(label: &str, text: &str) -> Vec<Offense> {
 
         // A `#[cfg(test)] mod foo {` (attribute + mod on one line) opens a
         // skipped module. Record the depth BEFORE this line's braces.
-        let starts_test_mod = (is_cfg_test_attr || pending_cfg_test)
-            && code.contains("mod ")
-            && code.contains('{');
+        let starts_test_mod =
+            (is_cfg_test_attr || pending_cfg_test) && code.contains("mod ") && code.contains('{');
         if starts_test_mod {
             let before = depth;
             depth += opens - closes;

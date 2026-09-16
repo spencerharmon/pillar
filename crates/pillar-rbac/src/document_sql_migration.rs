@@ -24,8 +24,8 @@
 
 use std::collections::BTreeMap;
 
-use pillar_core::{Epoch, NodeId};
 use pillar_coordination::LeaseRegister;
+use pillar_core::{Epoch, NodeId};
 use pillar_sqlviews::{create_view, materialize_view, Hlc, KeyedStore, Value, ViewDef};
 use pillar_streamdb::cofold::{CoFoldError, StrictCofold, UniqueOnce};
 
@@ -74,7 +74,13 @@ fn effect_from_bytes(b: &[u8]) -> Option<GrantEffect> {
 /// resolves any concurrent write to the same key by highest HLC, exactly
 /// like any other collection write — no CP coordination is needed to GRANT
 /// a capability, only to REVOKE one (see [`revoke_grant`]).
-pub fn put_grant(store: &mut KeyedStore, subject: &NodeId, capability: &Capability, effect: GrantEffect, hlc: Hlc) {
+pub fn put_grant(
+    store: &mut KeyedStore,
+    subject: &NodeId,
+    capability: &Capability,
+    effect: GrantEffect,
+    hlc: Hlc,
+) {
     let id = grant_key(subject, capability);
     store.doc_put_field(
         GRANTS_COLLECTION,
@@ -148,7 +154,12 @@ pub fn acquire_revoke_epoch(
 /// (`materialize_view`), so a revoke's tombstone is reflected the instant
 /// it lands — there is no separately-materialized copy to go stale.
 pub fn ensure_effective_grants_view(store: &mut KeyedStore, hlc: Hlc) {
-    create_view(store, EFFECTIVE_GRANTS_VIEW, ViewDef::over(GRANTS_COLLECTION), hlc);
+    create_view(
+        store,
+        EFFECTIVE_GRANTS_VIEW,
+        ViewDef::over(GRANTS_COLLECTION),
+        hlc,
+    );
 }
 
 fn field_str(fields: &BTreeMap<String, Value>, field: &str) -> Option<String> {
@@ -189,7 +200,7 @@ pub fn effective_grants(store: &KeyedStore) -> Vec<ExplicitGrant> {
 }
 
 #[cfg(test)]
-mod document_sql_migration {
+mod tests {
     use super::*;
 
     fn hlc(p: u64) -> Hlc {
@@ -212,7 +223,13 @@ mod document_sql_migration {
         let mut store = KeyedStore::new();
         ensure_effective_grants_view(&mut store, hlc(1));
 
-        put_grant(&mut store, &n("alice"), &cap("read"), GrantEffect::Allow, hlc(2));
+        put_grant(
+            &mut store,
+            &n("alice"),
+            &cap("read"),
+            GrantEffect::Allow,
+            hlc(2),
+        );
 
         let grants = effective_grants(&store);
         assert_eq!(
@@ -240,13 +257,21 @@ mod document_sql_migration {
     fn revoke_is_a_fenced_exactly_once_cp_tombstone() {
         let mut store = KeyedStore::new();
         ensure_effective_grants_view(&mut store, hlc(1));
-        put_grant(&mut store, &n("alice"), &cap("delete-account"), GrantEffect::Allow, hlc(2));
+        put_grant(
+            &mut store,
+            &n("alice"),
+            &cap("delete-account"),
+            GrantEffect::Allow,
+            hlc(2),
+        );
         assert_eq!(effective_grants(&store).len(), 1);
 
         let mut cofold = StrictCofold::new(UniqueOnce::new());
         let mut lease = LeaseRegister::new(1);
         let candidate = n("controller-1");
-        lease.grant(n("voter-1"), candidate.clone(), Epoch(1)).unwrap();
+        lease
+            .grant(n("voter-1"), candidate.clone(), Epoch(1))
+            .unwrap();
 
         assert!(acquire_revoke_epoch(
             &mut cofold,
@@ -257,8 +282,15 @@ mod document_sql_migration {
             Epoch(1)
         ));
 
-        revoke_grant(&mut cofold, &mut store, &n("alice"), &cap("delete-account"), Epoch(1), hlc(3))
-            .expect("first revoke admits");
+        revoke_grant(
+            &mut cofold,
+            &mut store,
+            &n("alice"),
+            &cap("delete-account"),
+            Epoch(1),
+            hlc(3),
+        )
+        .expect("first revoke admits");
 
         // The row is gone from the effective view immediately.
         assert!(effective_grants(&store).is_empty());
@@ -268,7 +300,14 @@ mod document_sql_migration {
         // keyed-store fold) -- and a second revoke attempt for the same key
         // is refused outright by the cofold's uniqueness invariant,
         // regardless of the store's own fold semantics.
-        let again = revoke_grant(&mut cofold, &mut store, &n("alice"), &cap("delete-account"), Epoch(1), hlc(4));
+        let again = revoke_grant(
+            &mut cofold,
+            &mut store,
+            &n("alice"),
+            &cap("delete-account"),
+            Epoch(1),
+            hlc(4),
+        );
         assert_eq!(
             again,
             Err(CoFoldError::DuplicateKey {
@@ -284,10 +323,23 @@ mod document_sql_migration {
     fn revoke_without_fenced_epoch_is_refused() {
         let mut store = KeyedStore::new();
         ensure_effective_grants_view(&mut store, hlc(1));
-        put_grant(&mut store, &n("bob"), &cap("write"), GrantEffect::Allow, hlc(1));
+        put_grant(
+            &mut store,
+            &n("bob"),
+            &cap("write"),
+            GrantEffect::Allow,
+            hlc(1),
+        );
 
         let mut cofold = StrictCofold::new(UniqueOnce::new());
-        let result = revoke_grant(&mut cofold, &mut store, &n("bob"), &cap("write"), Epoch(1), hlc(2));
+        let result = revoke_grant(
+            &mut cofold,
+            &mut store,
+            &n("bob"),
+            &cap("write"),
+            Epoch(1),
+            hlc(2),
+        );
         assert!(matches!(result, Err(CoFoldError::NotFenced { .. })));
 
         // Refused revoke never touches the row.
@@ -301,22 +353,54 @@ mod document_sql_migration {
     fn independent_grant_keys_revoke_independently() {
         let mut store = KeyedStore::new();
         ensure_effective_grants_view(&mut store, hlc(1));
-        put_grant(&mut store, &n("alice"), &cap("read"), GrantEffect::Allow, hlc(2));
-        put_grant(&mut store, &n("bob"), &cap("read"), GrantEffect::Allow, hlc(2));
+        put_grant(
+            &mut store,
+            &n("alice"),
+            &cap("read"),
+            GrantEffect::Allow,
+            hlc(2),
+        );
+        put_grant(
+            &mut store,
+            &n("bob"),
+            &cap("read"),
+            GrantEffect::Allow,
+            hlc(2),
+        );
 
         let mut cofold = StrictCofold::new(UniqueOnce::new());
         let mut lease = LeaseRegister::new(1);
         let candidate = n("controller-1");
-        lease.grant(n("voter-1"), candidate.clone(), Epoch(1)).unwrap();
+        lease
+            .grant(n("voter-1"), candidate.clone(), Epoch(1))
+            .unwrap();
 
-        assert!(acquire_revoke_epoch(&mut cofold, &n("alice"), &cap("read"), &mut lease, &candidate, Epoch(1)));
-        revoke_grant(&mut cofold, &mut store, &n("alice"), &cap("read"), Epoch(1), hlc(3)).unwrap();
+        assert!(acquire_revoke_epoch(
+            &mut cofold,
+            &n("alice"),
+            &cap("read"),
+            &mut lease,
+            &candidate,
+            Epoch(1)
+        ));
+        revoke_grant(
+            &mut cofold,
+            &mut store,
+            &n("alice"),
+            &cap("read"),
+            Epoch(1),
+            hlc(3),
+        )
+        .unwrap();
 
         let remaining = effective_grants(&store);
-        assert_eq!(remaining, vec![ExplicitGrant {
-            subject: n("bob"),
-            capability: cap("read"),
-            effect: GrantEffect::Allow,
-        }]);
+        assert_eq!(
+            remaining,
+            vec![ExplicitGrant {
+                subject: n("bob"),
+                capability: cap("read"),
+                effect: GrantEffect::Allow,
+            }]
+        );
     }
 }

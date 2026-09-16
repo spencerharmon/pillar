@@ -190,7 +190,8 @@ fn read_listening_vip(stdout: std::process::ChildStdout, proc: &mut ServeProcess
         for line in reader.lines() {
             let Ok(line) = line else { break };
             if let Some(rest) = line.strip_prefix("ingress-lb-udp listening ") {
-                if let Some(vip_tok) = rest.split_whitespace().find_map(|t| t.strip_prefix("vip=")) {
+                if let Some(vip_tok) = rest.split_whitespace().find_map(|t| t.strip_prefix("vip="))
+                {
                     let _ = tx.send(vip_tok.to_owned());
                     return;
                 }

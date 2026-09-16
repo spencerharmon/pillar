@@ -45,19 +45,14 @@ use pillar_wire::{Body, PillarMessage, Visibility};
 /// (`pillar-rbac`) is unaffected: it still authorizes WRITES the same way
 /// for either class; `Public` only drops the READ confidentiality barrier
 /// that AEAD sealing otherwise provides.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Confidentiality {
     /// AEAD-sealed to the cell group key (existing/default behavior).
+    #[default]
     CellEncrypted,
     /// No confidentiality seal: the record is world-readable cleartext, but
     /// still signed, content-addressed, and Merkle-DAG verifiable.
     Public,
-}
-
-impl Default for Confidentiality {
-    fn default() -> Self {
-        Confidentiality::CellEncrypted
-    }
 }
 
 /// Domain separator for the convergent seal — keeps a streamdb op's
@@ -66,7 +61,7 @@ impl Default for Confidentiality {
 /// signal sealed under the same cell key (`obs-signal-pillarmsg-ipfs`).
 const STREAM_OP_SEAL_DOMAIN: &[u8] = b"pillar-streamdb/stream-op-v1";
 
-    /// A fault building or opening a `PillarMessage::StreamOp` envelope.
+/// A fault building or opening a `PillarMessage::StreamOp` envelope.
 #[derive(Debug)]
 pub enum StreamOpMessageError {
     /// The sealed body did not decode to a [`Body::StreamOp`] variant (a
@@ -368,15 +363,10 @@ mod tests {
         )
         .expect("seal");
 
-        let wrong_group = group_key_from_seed(&Seed::from_bytes(b"cell-b".to_vec()))
-            .expect("wrong cell key");
+        let wrong_group =
+            group_key_from_seed(&Seed::from_bytes(b"cell-b".to_vec())).expect("wrong cell key");
         assert!(
-            open_stream_op(
-                &msg,
-                Some(&wrong_group),
-                Confidentiality::CellEncrypted
-            )
-            .is_err(),
+            open_stream_op(&msg, Some(&wrong_group), Confidentiality::CellEncrypted).is_err(),
             "wrong cell key must not open the sealed body"
         );
     }

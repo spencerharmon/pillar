@@ -17,7 +17,6 @@ use crate::components::LoginPanel;
 #[cfg(feature = "yew")]
 use crate::components::ToastProvider;
 #[cfg(feature = "yew")]
-#[cfg(feature = "yew")]
 use crate::portal_entry::PortalEntry;
 #[cfg(feature = "yew")]
 use crate::theme::{Motion, Theme};

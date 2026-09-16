@@ -212,21 +212,21 @@ fn ecdh_seckey_body(
     }
     let mut b = ecdh_pubkey_body(created, sealing_pub);
     b.push(0x00); // S2K usage: unencrypted, plain checksum follows the secret.
-    // Clamp per RFC 7748 (clear the low 3 bits of the low-order byte; clear the
-    // top bit and set bit 6 of the high-order byte) BEFORE reversing. Every
-    // X25519 implementation (`x25519_dalek` included) re-clamps on every
-    // scalar-mult, so clamping here changes nothing about which key this
-    // *is* — it is exactly the scalar already in effect. But `gpg`/libgcrypt's
-    // ECDH decrypt path uses the imported secret scalar AS GIVEN, with no
-    // reclamping (it only WARNS "lower 3 bits of the secret key are not
-    // cleared" and proceeds anyway) — so an unclamped export silently
-    // produces the WRONG shared secret on decrypt ("Bad secret key") even
-    // though the exported public key (independently, always computed via a
-    // clamped multiply) still matches. Skipping this clamp is exactly the
-    // footgun that only shows up at decrypt time, never at import or encrypt
-    // time — verified against a real `gpg`-generated key and a real
-    // encrypt/decrypt round trip in
-    // `cv25519_secret_round_trips_through_real_gpg_and_decrypts`.
+                  // Clamp per RFC 7748 (clear the low 3 bits of the low-order byte; clear the
+                  // top bit and set bit 6 of the high-order byte) BEFORE reversing. Every
+                  // X25519 implementation (`x25519_dalek` included) re-clamps on every
+                  // scalar-mult, so clamping here changes nothing about which key this
+                  // *is* — it is exactly the scalar already in effect. But `gpg`/libgcrypt's
+                  // ECDH decrypt path uses the imported secret scalar AS GIVEN, with no
+                  // reclamping (it only WARNS "lower 3 bits of the secret key are not
+                  // cleared" and proceeds anyway) — so an unclamped export silently
+                  // produces the WRONG shared secret on decrypt ("Bad secret key") even
+                  // though the exported public key (independently, always computed via a
+                  // clamped multiply) still matches. Skipping this clamp is exactly the
+                  // footgun that only shows up at decrypt time, never at import or encrypt
+                  // time — verified against a real `gpg`-generated key and a real
+                  // encrypt/decrypt round trip in
+                  // `cv25519_secret_round_trips_through_real_gpg_and_decrypts`.
     let mut native = sealing_sec.as_bytes().to_vec();
     native[0] &= 0b1111_1000;
     native[31] &= 0b0111_1111;
@@ -268,12 +268,9 @@ fn signature_body(
     hashed_subs: &[u8],
     signed_data: &[u8],
 ) -> Result<Vec<u8>> {
-    // Fixed sig header fields that participate in the hash.
-    let mut sig_prefix = Vec::new();
-    sig_prefix.push(0x04); // version
-    sig_prefix.push(sig_type);
-    sig_prefix.push(PUBKEY_ALGO_EDDSA);
-    sig_prefix.push(HASH_ALGO_SHA256);
+    // Fixed sig header fields that participate in the hash:
+    // version, sig type, pubkey algo (EdDSA), hash algo (SHA-256).
+    let mut sig_prefix = vec![0x04, sig_type, PUBKEY_ALGO_EDDSA, HASH_ALGO_SHA256];
     sig_prefix.extend_from_slice(&(hashed_subs.len() as u16).to_be_bytes());
     sig_prefix.extend_from_slice(hashed_subs);
 
@@ -461,10 +458,7 @@ impl TransferableKey {
 
         // Primary key packet.
         if secret {
-            let sec = self
-                .signing_sec
-                .as_ref()
-                .ok_or(CryptoError::InvalidKey)?;
+            let sec = self.signing_sec.as_ref().ok_or(CryptoError::InvalidKey)?;
             let body = eddsa_seckey_body(self.created_secs, &self.signing_pub, sec)?;
             out.extend_from_slice(&packet(PT_SECRET_KEY, &body));
         } else {
@@ -495,8 +489,10 @@ impl TransferableKey {
 
         // Third-party trust signatures (WoT edges into this key's user id).
         for cert in &self.certifications {
-            let issuer_fpr =
-                fingerprint_of(&eddsa_pubkey_body(cert.created_secs, &cert.issuer_signing_pub));
+            let issuer_fpr = fingerprint_of(&eddsa_pubkey_body(
+                cert.created_secs,
+                &cert.issuer_signing_pub,
+            ));
             let hashed = cert_hashed_subs(
                 cert.created_secs,
                 &issuer_fpr,
@@ -524,8 +520,7 @@ impl TransferableKey {
         let subkey_body = ecdh_pubkey_body(self.created_secs, &self.sealing_pub);
         if secret {
             if let Some(sealing_sec) = &self.sealing_sec {
-                let sec_body =
-                    ecdh_seckey_body(self.created_secs, &self.sealing_pub, sealing_sec)?;
+                let sec_body = ecdh_seckey_body(self.created_secs, &self.sealing_pub, sealing_sec)?;
                 out.extend_from_slice(&packet(PT_SECRET_SUBKEY, &sec_body));
             } else {
                 out.extend_from_slice(&packet(PT_PUBLIC_SUBKEY, &subkey_body));
@@ -596,8 +591,7 @@ fn crc24(data: &[u8]) -> u32 {
 }
 
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -637,7 +631,13 @@ struct Sha1 {
 impl Sha1 {
     fn new() -> Self {
         Self {
-            state: [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0],
+            state: [
+                0x6745_2301,
+                0xEFCD_AB89,
+                0x98BA_DCFE,
+                0x1032_5476,
+                0xC3D2_E1F0,
+            ],
             len: 0,
             buf: [0u8; 64],
             buf_len: 0,
@@ -746,8 +746,7 @@ mod tests {
     /// Like [`user_key`] but also carries the X25519 sealing secret, exercising
     /// the cv25519 secret-subkey export path.
     fn user_key_with_sealing_secret(label: &str) -> TransferableKey {
-        let (p, s) =
-            principal_from_seed(&Seed::from_bytes(label.as_bytes().to_vec())).unwrap();
+        let (p, s) = principal_from_seed(&Seed::from_bytes(label.as_bytes().to_vec())).unwrap();
         TransferableKey {
             uid: format!("user:{label} <{label}@example.com>"),
             created_secs: 1_724_800_000,
@@ -822,8 +821,7 @@ mod tests {
         // The raw (unreversed) native secret must NOT appear verbatim as the
         // MPI body; the reversed (and clamped) form is what gets encoded.
         // This directly guards the footgun this module's docs describe.
-        let (p, s) =
-            principal_from_seed(&Seed::from_bytes(b"gina".to_vec())).unwrap();
+        let (p, s) = principal_from_seed(&Seed::from_bytes(b"gina".to_vec())).unwrap();
         let native = s.sealing.as_bytes().to_vec();
         let body = ecdh_seckey_body(1_724_800_000, &p.sealing, &s.sealing).unwrap();
         let mut clamped = native.clone();
@@ -852,8 +850,7 @@ mod tests {
         // the imported secret AS GIVEN (no reclamping) on its ECDH decrypt
         // path, so an unclamped export silently decrypts to garbage — the
         // second half of the footgun, independent of byte order.
-        let (p, s) =
-            principal_from_seed(&Seed::from_bytes(b"harriet".to_vec())).unwrap();
+        let (p, s) = principal_from_seed(&Seed::from_bytes(b"harriet".to_vec())).unwrap();
         let native = s.sealing.as_bytes().to_vec();
         let mut clamped = native.clone();
         clamped[0] &= 0b1111_1000;
@@ -873,7 +870,9 @@ mod tests {
         if unclamped_reversed != clamped {
             let unclamped_mpi = mpi(&unclamped_reversed);
             assert!(
-                !body.windows(unclamped_mpi.len()).any(|w| w == unclamped_mpi),
+                !body
+                    .windows(unclamped_mpi.len())
+                    .any(|w| w == unclamped_mpi),
                 "the un-clamped scalar must not appear when clamping changed it"
             );
         }
@@ -907,7 +906,9 @@ mod tests {
         let k = user_key("dave", vec![]);
         let asc = k.export_public_armored().unwrap();
         assert!(asc.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
-        assert!(asc.trim_end().ends_with("-----END PGP PUBLIC KEY BLOCK-----"));
+        assert!(asc
+            .trim_end()
+            .ends_with("-----END PGP PUBLIC KEY BLOCK-----"));
         // A CRC line ('=' + 4 base64 chars) precedes the END armor.
         let crc_line = asc
             .lines()
@@ -943,7 +944,9 @@ mod tests {
             trust_level: 1,
             trust_amount: 120,
         };
-        let asc = user_key("erin", vec![cert]).export_public_armored().unwrap();
+        let asc = user_key("erin", vec![cert])
+            .export_public_armored()
+            .unwrap();
         // Two signature packets (self-sig + tsig) plus subkey binding -> non-trivial.
         assert!(asc.lines().count() > 6);
     }
@@ -983,20 +986,34 @@ mod tests {
         let s = Command::new("gpg")
             .envs(env)
             .args([
-                "--batch", "--yes", "--pinentry-mode", "loopback", "--local-user",
-                "frank@example.com", "--output", sig.to_str().unwrap(),
-                "--detach-sign", msg.to_str().unwrap(),
+                "--batch",
+                "--yes",
+                "--pinentry-mode",
+                "loopback",
+                "--local-user",
+                "frank@example.com",
+                "--output",
+                sig.to_str().unwrap(),
+                "--detach-sign",
+                msg.to_str().unwrap(),
             ])
             .output()
             .expect("gpg sign");
-        assert!(s.status.success(), "gpg sign failed: {}", String::from_utf8_lossy(&s.stderr));
+        assert!(
+            s.status.success(),
+            "gpg sign failed: {}",
+            String::from_utf8_lossy(&s.stderr)
+        );
         let v = Command::new("gpg")
             .envs(env)
             .args(["--verify", sig.to_str().unwrap(), msg.to_str().unwrap()])
             .output()
             .expect("gpg verify");
         let verr = String::from_utf8_lossy(&v.stderr);
-        assert!(v.status.success() && verr.contains("Good signature"), "verify: {verr}");
+        assert!(
+            v.status.success() && verr.contains("Good signature"),
+            "verify: {verr}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

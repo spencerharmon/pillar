@@ -401,14 +401,8 @@ pub fn es256_public_key_to_cose(public: &p256::ecdsa::VerifyingKey) -> Result<Ve
             Value::Integer(Integer::from(-1)),
             Value::Integer(Integer::from(COSE_CRV_P256)),
         ),
-        (
-            Value::Integer(Integer::from(-2)),
-            Value::Bytes(x.to_vec()),
-        ),
-        (
-            Value::Integer(Integer::from(-3)),
-            Value::Bytes(y.to_vec()),
-        ),
+        (Value::Integer(Integer::from(-2)), Value::Bytes(x.to_vec())),
+        (Value::Integer(Integer::from(-3)), Value::Bytes(y.to_vec())),
     ]);
     let mut out = Vec::new();
     ciborium::into_writer(&map, &mut out).map_err(|_| CryptoError::InvalidKey)?;
@@ -564,7 +558,10 @@ pub fn build_attestation_object(fmt: &str, auth_data: &[u8]) -> Vec<u8> {
     let map = Value::Map(vec![
         (Value::Text("fmt".into()), Value::Text(fmt.to_owned())),
         (Value::Text("attStmt".into()), Value::Map(vec![])),
-        (Value::Text("authData".into()), Value::Bytes(auth_data.to_vec())),
+        (
+            Value::Text("authData".into()),
+            Value::Bytes(auth_data.to_vec()),
+        ),
     ]);
     let mut out = Vec::new();
     ciborium::into_writer(&map, &mut out).expect("attestation object CBOR encode is infallible");
@@ -722,10 +719,8 @@ pub fn derive_unlock_secret(prf_output: &[u8], credential_id: &[u8]) -> Result<[
 /// is scoped to (e.g. `"https://pillar.local"`).
 #[must_use]
 pub fn client_data_json(ceremony_type: &str, challenge_b64url: &str, origin: &str) -> Vec<u8> {
-    format!(
-        r#"{{"type":"{ceremony_type}","challenge":"{challenge_b64url}","origin":"{origin}"}}"#
-    )
-    .into_bytes()
+    format!(r#"{{"type":"{ceremony_type}","challenge":"{challenge_b64url}","origin":"{origin}"}}"#)
+        .into_bytes()
 }
 
 /// CLI-driven CTAP2 WebAuthn ceremonies over ctap-hid against a locally
@@ -779,11 +774,8 @@ pub mod ctap_client {
         let device = open_device()?;
         let cdj = client_data_json("webauthn.create", challenge_b64url, origin);
         let client_data_hash = Sha256::digest(&cdj);
-        let user_entity = PublicKeyCredentialUserEntity::new(
-            Some(user_id),
-            Some(user_name),
-            Some(user_name),
-        );
+        let user_entity =
+            PublicKeyCredentialUserEntity::new(Some(user_id), Some(user_name), Some(user_name));
         let args = MakeCredentialArgsBuilder::new(rp_id, &client_data_hash)
             .key_type(CredentialSupportedKeyType::Ed25519)
             .user_entity(&user_entity)
@@ -829,6 +821,10 @@ pub mod ctap_client {
         Ok((assertion.auth_data, cdj, assertion.signature))
     }
 
+    /// Output of an assertion-with-PRF ceremony:
+    /// `(authenticator_data, client_data_json, signature, prf_output)`.
+    type AssertionWithPrf = (Vec<u8>, Vec<u8>, Vec<u8>, [u8; 32]);
+
     /// Drive an assertion ceremony as [`authenticate`], additionally
     /// requesting the `hmac-secret` extension output for a given `prf_salt` —
     /// the PRF material `/webauthn/authenticate/finish` folds into the
@@ -844,7 +840,7 @@ pub mod ctap_client {
         challenge_b64url: &str,
         credential_id: &[u8],
         prf_salt: [u8; 32],
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, [u8; 32])> {
+    ) -> Result<AssertionWithPrf> {
         let device = open_device()?;
         let cdj = client_data_json("webauthn.get", challenge_b64url, origin);
         let client_data_hash = Sha256::digest(&cdj);
@@ -984,7 +980,11 @@ mod tests {
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&Sha256::digest(&client_data_json));
         let sig: p256::ecdsa::Signature = sk.sign(&signed);
-        (auth_data, client_data_json, sig.to_der().as_bytes().to_vec())
+        (
+            auth_data,
+            client_data_json,
+            sig.to_der().as_bytes().to_vec(),
+        )
     }
 
     #[test]
@@ -1056,11 +1056,26 @@ mod tests {
         let cose = {
             use ciborium::value::{Integer, Value};
             let map = Value::Map(vec![
-                (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(COSE_KTY_EC2))),
-                (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(COSE_ALG_ES384))),
-                (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(COSE_CRV_P384))),
-                (Value::Integer(Integer::from(-2)), Value::Bytes(point.x().unwrap().to_vec())),
-                (Value::Integer(Integer::from(-3)), Value::Bytes(point.y().unwrap().to_vec())),
+                (
+                    Value::Integer(Integer::from(1)),
+                    Value::Integer(Integer::from(COSE_KTY_EC2)),
+                ),
+                (
+                    Value::Integer(Integer::from(3)),
+                    Value::Integer(Integer::from(COSE_ALG_ES384)),
+                ),
+                (
+                    Value::Integer(Integer::from(-1)),
+                    Value::Integer(Integer::from(COSE_CRV_P384)),
+                ),
+                (
+                    Value::Integer(Integer::from(-2)),
+                    Value::Bytes(point.x().unwrap().to_vec()),
+                ),
+                (
+                    Value::Integer(Integer::from(-3)),
+                    Value::Bytes(point.y().unwrap().to_vec()),
+                ),
             ]);
             let mut out = Vec::new();
             ciborium::into_writer(&map, &mut out).unwrap();
@@ -1069,7 +1084,7 @@ mod tests {
         let rec = parse_attestation(&wrap_registration(&cose, b"cred-es384", 0)).expect("parse");
         let (ad, cdj, signed) = assertion_material("ch-es384", 4);
         let sig: p384::ecdsa::Signature = sk.sign(&signed);
-        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, &sig.to_der().as_bytes())
+        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, sig.to_der().as_bytes())
             .expect("ES384 assertion verifies");
         assert_eq!(v.sign_count, 4);
     }
@@ -1087,11 +1102,26 @@ mod tests {
         let cose = {
             use ciborium::value::{Integer, Value};
             let map = Value::Map(vec![
-                (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(COSE_KTY_EC2))),
-                (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(COSE_ALG_ES512))),
-                (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(COSE_CRV_P521))),
-                (Value::Integer(Integer::from(-2)), Value::Bytes(point.x().unwrap().to_vec())),
-                (Value::Integer(Integer::from(-3)), Value::Bytes(point.y().unwrap().to_vec())),
+                (
+                    Value::Integer(Integer::from(1)),
+                    Value::Integer(Integer::from(COSE_KTY_EC2)),
+                ),
+                (
+                    Value::Integer(Integer::from(3)),
+                    Value::Integer(Integer::from(COSE_ALG_ES512)),
+                ),
+                (
+                    Value::Integer(Integer::from(-1)),
+                    Value::Integer(Integer::from(COSE_CRV_P521)),
+                ),
+                (
+                    Value::Integer(Integer::from(-2)),
+                    Value::Bytes(point.x().unwrap().to_vec()),
+                ),
+                (
+                    Value::Integer(Integer::from(-3)),
+                    Value::Bytes(point.y().unwrap().to_vec()),
+                ),
             ]);
             let mut out = Vec::new();
             ciborium::into_writer(&map, &mut out).unwrap();
@@ -1100,7 +1130,7 @@ mod tests {
         let rec = parse_attestation(&wrap_registration(&cose, b"cred-es512", 0)).expect("parse");
         let (ad, cdj, signed) = assertion_material("ch-es512", 6);
         let sig: p521::ecdsa::Signature = sk.sign(&signed);
-        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, &sig.to_der().as_bytes())
+        let v = verify_assertion(&rec.cose_public_key, &ad, &cdj, sig.to_der().as_bytes())
             .expect("ES512 assertion verifies");
         assert_eq!(v.sign_count, 6);
     }
@@ -1110,10 +1140,22 @@ mod tests {
         use ciborium::value::{Integer, Value};
         use rsa::traits::PublicKeyParts;
         let map = Value::Map(vec![
-            (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(COSE_KTY_RSA))),
-            (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(alg))),
-            (Value::Integer(Integer::from(-1)), Value::Bytes(public.n().to_bytes_be())),
-            (Value::Integer(Integer::from(-2)), Value::Bytes(public.e().to_bytes_be())),
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(COSE_KTY_RSA)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(alg)),
+            ),
+            (
+                Value::Integer(Integer::from(-1)),
+                Value::Bytes(public.n().to_bytes_be()),
+            ),
+            (
+                Value::Integer(Integer::from(-2)),
+                Value::Bytes(public.e().to_bytes_be()),
+            ),
         ]);
         let mut out = Vec::new();
         ciborium::into_writer(&map, &mut out).unwrap();
@@ -1151,7 +1193,7 @@ mod tests {
 
     #[test]
     fn a_forged_rsa_signature_is_rejected() {
-        use rsa::signature::{Signer, SignatureEncoding};
+        use rsa::signature::{SignatureEncoding, Signer};
         let real = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
         let cose = rsa_cose(&real.to_public_key(), COSE_ALG_RS256);
         let rec = parse_attestation(&wrap_registration(&cose, b"cred-rs256", 0)).expect("parse");

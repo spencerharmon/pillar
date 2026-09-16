@@ -59,9 +59,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use pillar_controller::deployment::{DeploymentSpec, RestartPolicy};
-use pillar_controller::{
-    Controller, SupervisedWorkload, WorkloadSpec, RUN_WORKLOAD_CAPABILITY,
-};
+use pillar_controller::{Controller, SupervisedWorkload, WorkloadSpec, RUN_WORKLOAD_CAPABILITY};
 use pillar_coordination::LeaseRegister;
 use pillar_core::{Epoch, NodeId, SideEffect};
 use pillar_crypto::seal::sealing_keypair_from_seed;
@@ -71,11 +69,11 @@ use pillar_identity::capability::{Capability, CapabilityRegistry};
 use pillar_identity::{NodeSubkey, PrimaryKeypair, Registry};
 use pillar_ipam::operator::IpamOperator;
 use pillar_ipam::{Pool, TopologyScopedIpam};
+use pillar_manifest::apply::{ManifestKey, ManifestStore};
 use pillar_manifest::ingress::{
     Affinity, Algorithm, Backend, Frontend, HealthCheck, Listener, LoadBalancerPolicy, Route,
     RouteKind,
 };
-use pillar_manifest::apply::{ManifestKey, ManifestStore};
 use pillar_manifest::{Crd, FieldType, Schema, SchemaRegistry, Value};
 use pillar_net::{
     build_blob_swarm, BlobBehaviour, BlobBehaviourEvent, BlobDigest, BlobRequest, BlobStore,
@@ -323,7 +321,10 @@ async fn probe_replica(port: u16, msg: &[u8]) -> std::io::Result<String> {
         match timeout(Duration::from_millis(300), client.recv(&mut buf)).await {
             Ok(Ok(n)) => {
                 let reply = &buf[..n];
-                let colon = reply.iter().position(|&b| b == b':').expect("id-framed reply");
+                let colon = reply
+                    .iter()
+                    .position(|&b| b == b':')
+                    .expect("id-framed reply");
                 return Ok(String::from_utf8_lossy(&reply[..colon]).into_owned());
             }
             _ if tokio::time::Instant::now() < deadline => {
@@ -394,8 +395,7 @@ async fn workload_reckoning_end_to_end_over_real_everything() {
     // === Step 3a: publish the echo image to the cell's content-addressed
     // store and derive its CID. The image is the real udp_echo binary bytes. ===
     let image_bytes = std::fs::read(env!("CARGO_BIN_EXE_udp_echo")).expect("read udp_echo image");
-    let (provider_addr, provider_peer_id, digest) =
-        spawn_image_provider(image_bytes.clone()).await;
+    let (provider_addr, provider_peer_id, digest) = spawn_image_provider(image_bytes.clone()).await;
 
     // === Step 2: the REAL topology-spread engine places `replicas` across
     // `replicas` DISTINCT racks. ===
@@ -423,7 +423,11 @@ async fn workload_reckoning_end_to_end_over_real_everything() {
         .iter()
         .map(|n| topology.placement(n).at("rack").unwrap().to_owned())
         .collect();
-    assert_eq!(racks.len(), 3, "topology spread placed replicas on 3 DISTINCT racks");
+    assert_eq!(
+        racks.len(),
+        3,
+        "topology spread placed replicas on 3 DISTINCT racks"
+    );
 
     // === Step 3b + execute: each placed node fetches the image BY CID over
     // real libp2p, verifies the digest, and runs it as a REAL process on a
@@ -433,24 +437,17 @@ async fn workload_reckoning_end_to_end_over_real_everything() {
     let mut backend_table: Vec<(String, SocketAddr)> = Vec::new();
     let mut processes: Vec<SupervisedWorkload> = Vec::new();
     for node in &placed {
-        let fetched = fetch_image_by_cid(
-            provider_addr.clone(),
-            provider_peer_id,
-            digest.clone(),
-        )
-        .await;
-        assert_eq!(fetched, image_bytes, "fetched-by-CID bytes equal the published image");
+        let fetched =
+            fetch_image_by_cid(provider_addr.clone(), provider_peer_id, digest.clone()).await;
+        assert_eq!(
+            fetched, image_bytes,
+            "fetched-by-CID bytes equal the published image"
+        );
 
         let port = free_udp_port();
         let id = node.0.clone();
-        let process = admit_verify_and_spawn(
-            &node.0,
-            "echo-app",
-            digest.clone(),
-            fetched,
-            port,
-            &id,
-        );
+        let process =
+            admit_verify_and_spawn(&node.0, "echo-app", digest.clone(), fetched, port, &id);
         ports.push(port);
         backend_table.push((id, SocketAddr::new(v4("127.0.0.1"), port)));
         processes.push(process);
@@ -603,10 +600,7 @@ async fn workload_reckoning_end_to_end_over_real_everything() {
     let mut cell = IpfsPersistentStream::genesis(owner_pk.clone(), owner_sk, Visibility::Public);
     // Durable cell state: the sealed manifest content-hash, the VIP binding,
     // and the route declaration — the real declared state a node must recover.
-    let manifest_hash = manifests
-        .get(&key)
-        .expect("stored envelope")
-        .content_hash();
+    let manifest_hash = manifests.get(&key).expect("stored envelope").content_hash();
     cell.append(
         format!("workload:echo-app:{manifest_hash:?}").into_bytes(),
         SideEffect::Exclusive,

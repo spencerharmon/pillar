@@ -101,13 +101,18 @@ impl FederationCoordinator {
         surface: &'static str,
         version: SurfaceVersion,
     ) {
-        self.declared.entry(cell).or_default().insert(surface, version);
+        self.declared
+            .entry(cell)
+            .or_default()
+            .insert(surface, version);
     }
 
     /// `cell`'s currently declared version of `surface`, if any.
     #[must_use]
     pub fn declared_version(&self, cell: &CellId, surface: &str) -> Option<SurfaceVersion> {
-        self.declared.get(cell).and_then(|m| m.get(surface).copied())
+        self.declared
+            .get(cell)
+            .and_then(|m| m.get(surface).copied())
     }
 
     /// Whether `a` and `b` can currently exchange messages on `surface`: both
@@ -215,7 +220,10 @@ impl std::fmt::Display for FederationError {
                 write!(f, "surface {surface:?} has no registered compat window")
             }
             FederationError::NotDeclared(surface, cell) => {
-                write!(f, "cell {cell:?} never declared a version for surface {surface:?}")
+                write!(
+                    f,
+                    "cell {cell:?} never declared a version for surface {surface:?}"
+                )
             }
             FederationError::Refused(e) => e.fmt(f),
         }
@@ -250,9 +258,16 @@ mod tests {
         fc.declare_cell_version(cell("cell-a"), BROADCAST, SurfaceVersion(5));
         fc.declare_cell_version(cell("cell-b"), BROADCAST, SurfaceVersion(4));
 
-        assert!(fc.can_exchange(&cell("cell-a"), &cell("cell-b"), BROADCAST).is_ok());
-        fc.record_exchange(&cell("cell-a"), &cell("cell-b"), BROADCAST, b"hello".to_vec())
-            .unwrap();
+        assert!(fc
+            .can_exchange(&cell("cell-a"), &cell("cell-b"), BROADCAST)
+            .is_ok());
+        fc.record_exchange(
+            &cell("cell-a"),
+            &cell("cell-b"),
+            BROADCAST,
+            b"hello".to_vec(),
+        )
+        .unwrap();
         assert_eq!(fc.exchange_count(), 1);
     }
 
@@ -276,7 +291,9 @@ mod tests {
         assert!(matches!(err, FederationError::Refused(_)));
 
         // But the shared, still-in-window surface keeps working.
-        assert!(fc.can_exchange(&cell("cell-a"), &cell("cell-b"), BROADCAST).is_ok());
+        assert!(fc
+            .can_exchange(&cell("cell-a"), &cell("cell-b"), BROADCAST)
+            .is_ok());
 
         let candidates: [&'static str; 2] = [BROADCAST, NEW_SURFACE];
         let reachable = fc.reachable_surfaces(&cell("cell-a"), &cell("cell-b"), &candidates);
@@ -284,7 +301,12 @@ mod tests {
 
         // The refused surface never reaches the shared log.
         let err = fc
-            .record_exchange(&cell("cell-a"), &cell("cell-b"), NEW_SURFACE, b"nope".to_vec())
+            .record_exchange(
+                &cell("cell-a"),
+                &cell("cell-b"),
+                NEW_SURFACE,
+                b"nope".to_vec(),
+            )
             .unwrap_err();
         assert!(matches!(err, FederationError::Refused(_)));
         assert_eq!(fc.exchange_count(), 0);
@@ -303,8 +325,13 @@ mod tests {
         fc.declare_cell_version(cell("cell-c"), BROADCAST, SurfaceVersion(3));
 
         // In-flight exchange between a and b before cell-a's cutover.
-        fc.record_exchange(&cell("cell-a"), &cell("cell-b"), BROADCAST, b"pre-cutover".to_vec())
-            .unwrap();
+        fc.record_exchange(
+            &cell("cell-a"),
+            &cell("cell-b"),
+            BROADCAST,
+            b"pre-cutover".to_vec(),
+        )
+        .unwrap();
         let root_before = fc.exchange_log_root();
         assert_eq!(fc.exchange_count(), 1);
 
@@ -319,15 +346,24 @@ mod tests {
 
         // cell-a <-> cell-c (still on version 3, diff=2) now falls outside
         // window=1 and is refused on this surface...
-        assert!(fc.can_exchange(&cell("cell-a"), &cell("cell-c"), BROADCAST).is_err());
+        assert!(fc
+            .can_exchange(&cell("cell-a"), &cell("cell-c"), BROADCAST)
+            .is_err());
         // ...but cell-a can still record a FRESH exchange with cell-b, still
         // within window (diff=1) after the bump.
-        fc.record_exchange(&cell("cell-a"), &cell("cell-b"), BROADCAST, b"post-cutover".to_vec())
-            .unwrap();
+        fc.record_exchange(
+            &cell("cell-a"),
+            &cell("cell-b"),
+            BROADCAST,
+            b"post-cutover".to_vec(),
+        )
+        .unwrap();
         assert_eq!(fc.exchange_count(), 2);
 
         // cell-b <-> cell-c remain reachable throughout (diff=1, in window),
         // proving cell-a's cutover never cut off the still-lagging pair.
-        assert!(fc.can_exchange(&cell("cell-b"), &cell("cell-c"), BROADCAST).is_ok());
+        assert!(fc
+            .can_exchange(&cell("cell-b"), &cell("cell-c"), BROADCAST)
+            .is_ok());
     }
 }

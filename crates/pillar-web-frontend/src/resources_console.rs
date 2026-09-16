@@ -92,7 +92,15 @@ pub fn parse_revisions(body: &str) -> Vec<RevisionRow> {
         };
         // `<n> EVENT <cid> SIGNER <signer> MANIFEST <content-hash>`
         let mut it = rest.split_whitespace();
-        let (Some(ord), Some("EVENT"), Some(event), Some("SIGNER"), Some(signer), Some("MANIFEST"), Some(manifest)) = (
+        let (
+            Some(ord),
+            Some("EVENT"),
+            Some(event),
+            Some("SIGNER"),
+            Some(signer),
+            Some("MANIFEST"),
+            Some(manifest),
+        ) = (
             it.next(),
             it.next(),
             it.next(),
@@ -100,7 +108,8 @@ pub fn parse_revisions(body: &str) -> Vec<RevisionRow> {
             it.next(),
             it.next(),
             it.next(),
-        ) else {
+        )
+        else {
             continue;
         };
         let Ok(ordinal) = ord.parse::<u64>() else {
@@ -189,7 +198,6 @@ pub fn parse_predicted(body: &str) -> Option<bool> {
 
 /// Interpret a `POST /portal/resource/{apply,edit,scale,rollout}` response:
 /// `EVENT <cid>` (first line) → `Ok(cid)`; a `DENIED …` body → `Err(reason)`.
-#[must_use]
 pub fn parse_act_result(body: &str) -> Result<String, String> {
     let first = body.lines().next().unwrap_or("").trim();
     if let Some(cid) = first.strip_prefix("EVENT ") {
@@ -538,9 +546,9 @@ pub use yew_impl::{CronJobsPanel, ResourceDetail, ResourceDetailPage, ResourcesC
 mod yew_impl {
     use super::{
         act_request_body, change_preview, cronjob_apply_body, cronjob_delete_body,
-        parse_act_result, parse_event_trail, parse_predicted, parse_replicas,
-        parse_resource_rows, parse_revisions, rollback_request_body, ChangeState, ReplicaRow,
-        ResourceAction, ResourceRow, RevisionRow, RolloutHealth, CRONJOB_KIND,
+        parse_act_result, parse_event_trail, parse_predicted, parse_replicas, parse_resource_rows,
+        parse_revisions, rollback_request_body, ChangeState, ReplicaRow, ResourceAction,
+        ResourceRow, RevisionRow, RolloutHealth, CRONJOB_KIND,
     };
     use crate::auth::use_auth;
     use crate::portal::{get_url, http, input_value};
@@ -873,6 +881,8 @@ mod yew_impl {
         pub row: ResourceRow,
     }
 
+    /// The per-resource detail drawer component: renders the Overview /
+    /// Manifest / Logs / Exec / Events tabs for the selected [`ResourceRow`].
     #[function_component(ResourceDetail)]
     pub fn resource_detail(props: &ResourceDetailProps) -> Html {
         let auth = use_auth();
@@ -1010,17 +1020,11 @@ mod yew_impl {
                 );
                 Callback::from(move |_: MouseEvent| {
                     let token = auth.token.clone().unwrap_or_default();
-                    let body = rollback_request_body(
-                        &token,
-                        &row.name,
-                        &manifest_ref,
-                        &row.kind,
-                    );
+                    let body = rollback_request_body(&token, &row.name, &manifest_ref, &row.kind);
                     let (history, history_msg, load_history) =
                         (history.clone(), history_msg.clone(), load_history.clone());
                     spawn_local(async move {
-                        if let Ok(r) =
-                            http("POST", "/portal/resource/rollback", Some(&body)).await
+                        if let Ok(r) = http("POST", "/portal/resource/rollback", Some(&body)).await
                         {
                             match parse_act_result(&r.body) {
                                 Ok(cid) => {
@@ -1028,9 +1032,7 @@ mod yew_impl {
                                     let _ = &history;
                                     load_history.emit(());
                                 }
-                                Err(e) => {
-                                    history_msg.set(Some((format!("Refused: {e}"), false)))
-                                }
+                                Err(e) => history_msg.set(Some((format!("Refused: {e}"), false))),
                             }
                         }
                     });
@@ -1038,8 +1040,12 @@ mod yew_impl {
             }
         };
         let onselect = {
-            let (tab, output, fetch, load_history) =
-                (tab.clone(), output.clone(), fetch.clone(), load_history.clone());
+            let (tab, output, fetch, load_history) = (
+                tab.clone(),
+                output.clone(),
+                fetch.clone(),
+                load_history.clone(),
+            );
             Callback::from(move |i: usize| {
                 output.set(String::new());
                 tab.set(i);
@@ -1338,7 +1344,10 @@ mod tests {
         );
         assert!(
             src.contains("RolloutHealth::compute(row.replicas, live)")
-                && src.matches("RolloutHealth::compute(row.replicas, live)").count() >= 1,
+                && src
+                    .matches("RolloutHealth::compute(row.replicas, live)")
+                    .count()
+                    >= 1,
             "ResourceDetail no longer derives RolloutHealth from the live oracle"
         );
         assert!(
@@ -1425,10 +1434,16 @@ mod tests {
         assert!(!gate.can_confirm(), "a rollback must not confirm from Idle");
         // A DENY dry-run still refuses.
         gate = gate.previewed(false);
-        assert!(!gate.can_confirm(), "a DENY dry-run must not authorize a rollback");
+        assert!(
+            !gate.can_confirm(),
+            "a DENY dry-run must not authorize a rollback"
+        );
         // Only a preceding ALLOW dry-run authorizes the rollback act.
         gate = gate.previewed(true);
-        assert!(gate.can_confirm(), "an ALLOW dry-run must authorize the rollback");
+        assert!(
+            gate.can_confirm(),
+            "an ALLOW dry-run must authorize the rollback"
+        );
         // Editing the target (invalidation) strips the authorization: a stale
         // ALLOW can never be carried over to a DIFFERENT rollback.
         gate = gate.invalidated();
@@ -1694,7 +1709,9 @@ mod tests {
             signer_public: public.into_bytes(),
             signer_secret: secret.into_bytes(),
         };
-        let op = ResourceAction::Scale.as_resource_op("web", "3").expect("op");
+        let op = ResourceAction::Scale
+            .as_resource_op("web", "3")
+            .expect("op");
         let bytes = seal_signed_op_bytes(&op, &cfg).expect("seal+sign");
         assert!(!bytes.is_empty());
     }

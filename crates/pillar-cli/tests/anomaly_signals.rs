@@ -263,7 +263,7 @@ fn login_observe_detects_impossible_travel_and_new_origin_and_never_denies_the_l
     let first = user_op(&UserOp::LoginObserve {
         handle: bob.to_owned(),
         origin: "chrome/macos/198.51.100.9".to_owned(),
-        lat: "37.7749".to_owned(),  // San Francisco
+        lat: "37.7749".to_owned(), // San Francisco
         lon: "-122.4194".to_owned(),
         at: 1_000,
     })
@@ -382,8 +382,7 @@ fn login_observe_detects_impossible_travel_and_new_origin_and_never_denies_the_l
 
     // === Fail-closed: an UNADMITTED signer is refused, exactly like every
     // other member-gated remote op. ==========================================
-    let intruder_seed =
-        pillar_crypto::Seed::from_bytes(b"anomaly-signals-e2e-unadmitted".to_vec());
+    let intruder_seed = pillar_crypto::Seed::from_bytes(b"anomaly-signals-e2e-unadmitted".to_vec());
     let (intruder_pub, intruder_secret) =
         pillar_crypto::sign::signing_keypair_from_seed(&intruder_seed).expect("intruder keypair");
     std::env::set_var(

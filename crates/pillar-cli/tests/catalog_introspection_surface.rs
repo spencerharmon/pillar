@@ -225,8 +225,14 @@ fn catalog_introspection_surface_folds_the_live_catalog_over_pillar_udp() {
     );
     std::env::set_var("PILLAR_CELL_ID_HEX", hex_encode(&cell_id_bytes));
     std::env::set_var("PILLAR_CELL_SEED_HEX", hex_encode(&seed_bytes));
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(signer_public.as_bytes()));
-    std::env::set_var("PILLAR_SIGNER_SECRET_HEX", hex_encode(signer_secret.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(signer_public.as_bytes()),
+    );
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(signer_secret.as_bytes()),
+    );
 
     // === Seed live data so the catalog has something to fold ================
     // A K/V collection with a namespace prefix ("app.config" → database "app").
@@ -288,7 +294,10 @@ fn catalog_introspection_surface_folds_the_live_catalog_over_pillar_udp() {
 
     // === pillar catalog views ==============================================
     let views = query_op(&QueryOp::Catalog(CatalogOp::Views)).expect("catalog views");
-    assert!(views.lines().any(|v| v == "active_users"), "views: {views:?}");
+    assert!(
+        views.lines().any(|v| v == "active_users"),
+        "views: {views:?}"
+    );
 
     // === pillar catalog describe <collection> ==============================
     // A keyed Document collection: reports SURFACE keyed doc, its live SCHEMA
@@ -302,10 +311,22 @@ fn catalog_introspection_surface_folds_the_live_catalog_over_pillar_udp() {
         describe.contains("COLLECTION app.users"),
         "describe: {describe:?}"
     );
-    assert!(describe.contains("SURFACE keyed doc"), "surface: {describe:?}");
-    assert!(describe.contains("SCHEMA name,status"), "schema: {describe:?}");
-    assert!(describe.contains("CONSISTENCY AP"), "consistency: {describe:?}");
-    assert!(describe.contains("VISIBILITY cell"), "visibility: {describe:?}");
+    assert!(
+        describe.contains("SURFACE keyed doc"),
+        "surface: {describe:?}"
+    );
+    assert!(
+        describe.contains("SCHEMA name,status"),
+        "schema: {describe:?}"
+    );
+    assert!(
+        describe.contains("CONSISTENCY AP"),
+        "consistency: {describe:?}"
+    );
+    assert!(
+        describe.contains("VISIBILITY cell"),
+        "visibility: {describe:?}"
+    );
     assert!(
         describe.contains("PLACEMENT whole-cell"),
         "placement tags: {describe:?}"
@@ -379,8 +400,14 @@ fn catalog_introspection_surface_folds_the_live_catalog_over_pillar_udp() {
         pillar_crypto::sign::signing_keypair_from_seed(&intruder).expect("intruder keypair");
     let saved_pub = std::env::var("PILLAR_SIGNER_PUBLIC_HEX").expect("pub set");
     let saved_secret = std::env::var("PILLAR_SIGNER_SECRET_HEX").expect("secret set");
-    std::env::set_var("PILLAR_SIGNER_PUBLIC_HEX", hex_encode(intruder_pub.as_bytes()));
-    std::env::set_var("PILLAR_SIGNER_SECRET_HEX", hex_encode(intruder_secret.as_bytes()));
+    std::env::set_var(
+        "PILLAR_SIGNER_PUBLIC_HEX",
+        hex_encode(intruder_pub.as_bytes()),
+    );
+    std::env::set_var(
+        "PILLAR_SIGNER_SECRET_HEX",
+        hex_encode(intruder_secret.as_bytes()),
+    );
     assert!(
         query_op(&QueryOp::Catalog(CatalogOp::Collections)).is_err(),
         "an unadmitted signer must be refused (fail-closed) on a catalog read"

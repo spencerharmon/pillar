@@ -70,8 +70,8 @@ mod tests {
         labels.insert("route".to_string(), "checkout".to_string());
         labels.insert("route_kind".to_string(), "PillarNative".to_string());
 
-        let id = record_message_hops(&mut store, 3, labels.clone(), 10)
-            .expect("not downsampled away");
+        let id =
+            record_message_hops(&mut store, 3, labels.clone(), 10).expect("not downsampled away");
 
         let signal = store
             .held_signals()

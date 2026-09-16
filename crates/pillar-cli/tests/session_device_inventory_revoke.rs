@@ -59,7 +59,9 @@ fn ls_and_show_render_the_device_inventory() {
     assert!(!tablet.is_current);
 
     // `show` on one named slot renders the identical projection.
-    let shown = cli.show("alice", "alice", "tablet", 60, Some("phone")).unwrap();
+    let shown = cli
+        .show("alice", "alice", "tablet", 60, Some("phone"))
+        .unwrap();
     assert_eq!(shown, *tablet);
 
     // All three currently admit.
@@ -124,7 +126,11 @@ fn revoke_all_but_current_sweeps_every_other_device_atomically() {
         .unwrap();
 
     // Exactly one signed event, one atomic epoch bump.
-    assert_eq!(cli.log().len(), 1, "revoke-all-but-current signs exactly one event");
+    assert_eq!(
+        cli.log().len(),
+        1,
+        "revoke-all-but-current signs exactly one event"
+    );
     let signed = cli.log().get(&event).unwrap();
     assert!(signed.is_authentic());
     assert_eq!(
@@ -204,7 +210,10 @@ fn cross_principal_device_revoke_requires_admin_grant() {
     );
     assert_eq!(cli.log().len(), 0, "every unauthorized act emits nothing");
     assert!(
-        matches!(cli.ls("mallory", "bob", 10, None), Err(SessionCliError::Unauthorized { .. })),
+        matches!(
+            cli.ls("mallory", "bob", 10, None),
+            Err(SessionCliError::Unauthorized { .. })
+        ),
         "an un-granted caller may not even VIEW another principal's inventory"
     );
 

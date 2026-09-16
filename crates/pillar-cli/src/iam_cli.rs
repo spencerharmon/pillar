@@ -581,7 +581,11 @@ mod tests {
         NodeId::from(s)
     }
 
-    fn allow_decider(authority: &WotAuthority, subject: NodeId, cap: &str) -> Vec<pillar_rbac::ExplicitGrant> {
+    fn allow_decider(
+        _authority: &WotAuthority,
+        subject: NodeId,
+        cap: &str,
+    ) -> Vec<pillar_rbac::ExplicitGrant> {
         vec![pillar_rbac::ExplicitGrant {
             subject,
             capability: Capability::from(cap),

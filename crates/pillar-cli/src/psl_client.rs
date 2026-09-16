@@ -153,7 +153,9 @@ async fn dial_quic_async(
         quinn::Endpoint::client(([0, 0, 0, 0], 0).into()).map_err(|_| Unreachable)?;
     endpoint.set_default_client_config(client_config);
 
-    let connecting = endpoint.connect(addr, "pillar-psl-quic").map_err(|_| Unreachable)?;
+    let connecting = endpoint
+        .connect(addr, "pillar-psl-quic")
+        .map_err(|_| Unreachable)?;
     let conn = tokio::time::timeout(TIER_TIMEOUT, connecting)
         .await
         .map_err(|_| Unreachable)?

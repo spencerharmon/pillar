@@ -230,9 +230,7 @@ mod tests {
         topo.declare(n("node-a"), &[Label::new("rack", "r1")]);
         topo.declare(n("node-b"), &[Label::new("rack", "r1")]);
         let spec = DeploymentSpec::new("web", 2, "rack", RestartPolicy::Never);
-        let err = spec
-            .place(&topo, &[n("node-a"), n("node-b")])
-            .unwrap_err();
+        let err = spec.place(&topo, &[n("node-a"), n("node-b")]).unwrap_err();
         assert_eq!(
             err,
             PlacementError::InsufficientDomains {

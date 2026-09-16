@@ -163,7 +163,7 @@ impl AuditEntry {
 
     /// Whether this entry authenticated.
     #[must_use]
-        pub fn is_verified(&self) -> bool {
+    pub fn is_verified(&self) -> bool {
         matches!(self, AuditEntry::Verified { .. })
     }
 
@@ -375,9 +375,9 @@ mod tests {
 
         // Neither forgery is ever surfaced as a legitimate (Verified) record.
         assert!(
-            view.iter().filter_map(AuditEntry::verified).all(|r| {
-                r.action != "escalate-privilege" && r.target != "secret-doc"
-            }),
+            view.iter()
+                .filter_map(AuditEntry::verified)
+                .all(|r| { r.action != "escalate-privilege" && r.target != "secret-doc" }),
             "a forged/tampered entry must NOT be rendered as a legitimate audit line"
         );
 

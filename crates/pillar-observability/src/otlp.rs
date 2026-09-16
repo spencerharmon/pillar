@@ -269,9 +269,10 @@ fn decode_record(
             .ok_or(OtlpError::MalformedRecord { record })?;
         match k {
             "occ" => {
-                let n = v
-                    .parse::<u64>()
-                    .map_err(|_| OtlpError::NotNumeric { record, field: "occ" })?;
+                let n = v.parse::<u64>().map_err(|_| OtlpError::NotNumeric {
+                    record,
+                    field: "occ",
+                })?;
                 occ = Some(Occurrence(n));
             }
             "corr" => {
@@ -292,8 +293,14 @@ fn decode_record(
         record,
         got: ty.to_string(),
     })?;
-    let occurrence = occ.ok_or(OtlpError::MissingField { record, field: "occ" })?;
-    let body = body.ok_or(OtlpError::MissingField { record, field: "body" })?;
+    let occurrence = occ.ok_or(OtlpError::MissingField {
+        record,
+        field: "occ",
+    })?;
+    let body = body.ok_or(OtlpError::MissingField {
+        record,
+        field: "body",
+    })?;
 
     Ok(Envelope {
         kind,
@@ -340,15 +347,21 @@ trace occ=3 corr=trace-abc body=span=root dur=12ms\n";
         // native-producer signal (same TimeseriesStore + ViewCache path).
         let mut cache = ViewCache::new();
         assert_eq!(
-            cache.materialize(ingest.store(), Query::of_kind(SignalKind::Metric)).len(),
+            cache
+                .materialize(ingest.store(), Query::of_kind(SignalKind::Metric))
+                .len(),
             1
         );
         assert_eq!(
-            cache.materialize(ingest.store(), Query::of_kind(SignalKind::Log)).len(),
+            cache
+                .materialize(ingest.store(), Query::of_kind(SignalKind::Log))
+                .len(),
             1
         );
         assert_eq!(
-            cache.materialize(ingest.store(), Query::of_kind(SignalKind::TraceSpan)).len(),
+            cache
+                .materialize(ingest.store(), Query::of_kind(SignalKind::TraceSpan))
+                .len(),
             1
         );
         // The all-kinds query gathers exactly the three — one substrate.
@@ -379,8 +392,15 @@ trace occ=3 corr=trace-abc body=span=root dur=12ms\n";
         let err = ingest
             .ingest(b"resource service=x\nquux occ=1 body=hi\n")
             .expect_err("unknown signal type must be rejected");
-        assert!(matches!(err, OtlpError::UnknownSignalType { record: 0, .. }));
-        assert_eq!(ingest.store().held_len(), 0, "nothing coerced onto the store");
+        assert!(matches!(
+            err,
+            OtlpError::UnknownSignalType { record: 0, .. }
+        ));
+        assert_eq!(
+            ingest.store().held_len(),
+            0,
+            "nothing coerced onto the store"
+        );
 
         // Missing required occurrence — the field that makes a signal real.
         let err = ingest
@@ -388,7 +408,10 @@ trace occ=3 corr=trace-abc body=span=root dur=12ms\n";
             .expect_err("missing occurrence must be rejected");
         assert!(matches!(
             err,
-            OtlpError::MissingField { record: 0, field: "occ" }
+            OtlpError::MissingField {
+                record: 0,
+                field: "occ"
+            }
         ));
         assert_eq!(ingest.store().held_len(), 0);
 
@@ -398,7 +421,10 @@ trace occ=3 corr=trace-abc body=span=root dur=12ms\n";
             .expect_err("non-numeric occ must be rejected");
         assert!(matches!(
             err,
-            OtlpError::NotNumeric { record: 0, field: "occ" }
+            OtlpError::NotNumeric {
+                record: 0,
+                field: "occ"
+            }
         ));
 
         // Missing body.
@@ -407,7 +433,10 @@ trace occ=3 corr=trace-abc body=span=root dur=12ms\n";
             .expect_err("missing body must be rejected");
         assert!(matches!(
             err,
-            OtlpError::MissingField { record: 0, field: "body" }
+            OtlpError::MissingField {
+                record: 0,
+                field: "body"
+            }
         ));
 
         // No resource header at all.
@@ -428,7 +457,10 @@ trace occ=3 corr=trace-abc body=span=root dur=12ms\n";
             .expect_err("a bad second record rejects the whole payload");
         assert!(matches!(
             err,
-            OtlpError::MissingField { record: 1, field: "body" }
+            OtlpError::MissingField {
+                record: 1,
+                field: "body"
+            }
         ));
         assert_eq!(
             ingest.store().held_len(),
@@ -462,10 +494,9 @@ trace occ=3 corr=trace-abc body=span=root dur=12ms\n";
     /// the `{kind, correlation_id?, labels}` shape.
     #[test]
     fn decode_yields_uniform_envelopes() {
-        let envs = OtlpIngest::decode(
-            b"resource host=n-1\ntrace occ=9 corr=t-1 attrs=op=GET body=span\n",
-        )
-        .expect("well-formed");
+        let envs =
+            OtlpIngest::decode(b"resource host=n-1\ntrace occ=9 corr=t-1 attrs=op=GET body=span\n")
+                .expect("well-formed");
         assert_eq!(envs.len(), 1);
         let e = &envs[0];
         assert_eq!(e.kind, SignalKind::TraceSpan);

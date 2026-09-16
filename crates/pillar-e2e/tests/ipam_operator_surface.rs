@@ -208,7 +208,11 @@ fn topology_scoped_selection_picks_the_correct_site_pool_in_a_multi_site_topolog
         .expect("east node allocates from the east pool");
     assert_eq!(east_binding.node, n("lb-east"));
     assert_eq!(op.recorded_addr("east-frontend-vip"), Some(east_vip));
-    assert_eq!(op.len(), 2, "both site allocations are recorded independently");
+    assert_eq!(
+        op.len(),
+        2,
+        "both site allocations are recorded independently"
+    );
 
     // Topology-scoped selection is ENFORCED, not merely observed: a `west`
     // node cannot be handed a DIFFERENT, not-yet-recorded `east`-pool address

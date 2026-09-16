@@ -267,7 +267,7 @@ mod tests {
                 SecretId::from("db-password"),
                 b"hunter2",
                 &[n("alice")],
-                &[alice_key.clone()],
+                std::slice::from_ref(&alice_key),
             )
             .unwrap();
 
@@ -285,7 +285,12 @@ mod tests {
         let request = Request::new(n("alice"), cap).with_resource_class(ResourceClass::Storage);
 
         let plaintext = store
-            .request_secret(&decider, &request, &SecretId::from("db-password"), &alice_key)
+            .request_secret(
+                &decider,
+                &request,
+                &SecretId::from("db-password"),
+                &alice_key,
+            )
             .expect("authorized recipient must unseal");
         assert_eq!(plaintext, b"hunter2");
     }
@@ -317,8 +322,7 @@ mod tests {
         }];
         let grants = vec![];
         let decider = RbacDecider::new(&authority, &policies, &grants);
-        let request =
-            Request::new(n("mallory"), cap).with_resource_class(ResourceClass::Storage);
+        let request = Request::new(n("mallory"), cap).with_resource_class(ResourceClass::Storage);
 
         let err = store
             .request_secret(
@@ -343,7 +347,7 @@ mod tests {
                 SecretId::from("db-password"),
                 b"hunter2",
                 &[n("alice")],
-                &[alice_key.clone()],
+                std::slice::from_ref(&alice_key),
             )
             .unwrap();
 
@@ -364,7 +368,12 @@ mod tests {
         let request = Request::new(n("alice"), cap).with_resource_class(ResourceClass::Storage);
 
         let err = store
-            .request_secret(&decider, &request, &SecretId::from("db-password"), &alice_key)
+            .request_secret(
+                &decider,
+                &request,
+                &SecretId::from("db-password"),
+                &alice_key,
+            )
             .unwrap_err();
         assert_eq!(err, SecretRequestError::Unauthorized);
     }
@@ -386,9 +395,7 @@ mod tests {
             .expect("stored secret must be present");
         // The plaintext must never appear verbatim in the stored ciphertext.
         assert!(
-            !ciphertext
-                .windows(plaintext.len())
-                .any(|w| w == plaintext),
+            !ciphertext.windows(plaintext.len()).any(|w| w == plaintext),
             "plaintext must never be directly observable in the sealed envelope bytes"
         );
     }
@@ -447,8 +454,7 @@ mod tests {
         let decider = RbacDecider::new(&authority, &policies, &grants);
         // outsider is RBAC-authorized (has a policy) but was never sealed to
         // (not a member) -> unseal itself fails independently.
-        let request =
-            Request::new(n("outsider"), cap).with_resource_class(ResourceClass::Storage);
+        let request = Request::new(n("outsider"), cap).with_resource_class(ResourceClass::Storage);
         let err = store
             .request_secret(&decider, &request, &SecretId::from("s"), &outsider_key)
             .unwrap_err();

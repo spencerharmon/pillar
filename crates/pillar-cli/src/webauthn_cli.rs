@@ -186,7 +186,9 @@ fn register(args: &[String]) -> Result<String, String> {
             &authority,
             "POST",
             "/webauthn/register/finish",
-            &format!("{token}\n{user_handle}\n{challenge_b64}\n{attestation_b64}\n{label}\n{rp_id}"),
+            &format!(
+                "{token}\n{user_handle}\n{challenge_b64}\n{attestation_b64}\n{label}\n{rp_id}"
+            ),
         )?;
         if finish.status != 200 {
             return Err(format!(
@@ -217,7 +219,10 @@ fn list(args: &[String]) -> Result<String, String> {
     let token = token_from(&parsed)?;
     let resp = http(&authority, "POST", "/webauthn/credentials/list", &token)?;
     if resp.status != 200 {
-        return Err(format!("credentials/list refused: {} {}", resp.status, resp.body));
+        return Err(format!(
+            "credentials/list refused: {} {}",
+            resp.status, resp.body
+        ));
     }
     if resp.body.trim().is_empty() {
         return Ok("no credentials enrolled".to_owned());
@@ -256,7 +261,10 @@ fn name(args: &[String]) -> Result<String, String> {
     let body = format!("{token}\n{credential_id_b64}\n{label}");
     let resp = http(&authority, "POST", "/webauthn/credentials/name", &body)?;
     if resp.status != 200 {
-        return Err(format!("credentials/name refused: {} {}", resp.status, resp.body));
+        return Err(format!(
+            "credentials/name refused: {} {}",
+            resp.status, resp.body
+        ));
     }
     Ok(resp.body)
 }
@@ -289,7 +297,10 @@ fn revoke(args: &[String]) -> Result<String, String> {
         );
     }
     if resp.status != 200 {
-        return Err(format!("credentials/revoke refused: {} {}", resp.status, resp.body));
+        return Err(format!(
+            "credentials/revoke refused: {} {}",
+            resp.status, resp.body
+        ));
     }
     Ok(resp.body)
 }

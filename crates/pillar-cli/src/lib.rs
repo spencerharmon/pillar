@@ -49,9 +49,9 @@ pub mod onboard;
 pub mod polish;
 pub mod portal_cli;
 pub mod psl_client;
-pub mod public_visibility_class;
 pub mod psl_quic_server;
 pub mod psl_udp_server;
+pub mod public_visibility_class;
 pub mod resource;
 pub mod resource_op_udp_server;
 pub mod resourceset;
@@ -75,8 +75,8 @@ use std::fmt;
 use pillar_core::NodeId;
 use pillar_eventlog::{Author, EventId, EventLog};
 use pillar_manifest::{
-    Capability as ManifestCapability, ContentHash, Crd, Envelope, SchemaError,
-    SchemaRegistry, Value,
+    Capability as ManifestCapability, ContentHash, Crd, Envelope, SchemaError, SchemaRegistry,
+    Value,
 };
 use pillar_rbac::{
     Capability as RbacCapability, Decision, ExplicitGrant, PolicyEvent, RbacDecider, Request,

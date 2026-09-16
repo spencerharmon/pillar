@@ -42,8 +42,8 @@
 
 use std::collections::BTreeSet;
 
-use pillar_core::{Epoch, NodeId};
 use pillar_coordination::LeaseRegister;
+use pillar_core::{Epoch, NodeId};
 use pillar_rbac::PolicyEvent;
 use pillar_streamdb::cofold::{CoFoldError, StrictCofold, UniqueOnce};
 use pillar_streamdb::OpId;
@@ -245,11 +245,13 @@ impl StrictRevocation {
         payload: Vec<u8>,
     ) -> Result<OpId, GuardrailError> {
         if !self.cofold.acquire(key, lease, candidate, epoch) {
-            return Err(GuardrailError::RevocationNotStrict(CoFoldError::NotFenced {
-                key: key.to_vec(),
-                claimed: epoch,
-                held: self.cofold.held_epoch(key),
-            }));
+            return Err(GuardrailError::RevocationNotStrict(
+                CoFoldError::NotFenced {
+                    key: key.to_vec(),
+                    claimed: epoch,
+                    held: self.cofold.held_epoch(key),
+                },
+            ));
         }
         self.cofold
             .try_admit(key, epoch, payload)
@@ -275,7 +277,9 @@ pub fn foundational_policy(ordinary: &PolicyEvent) -> PolicyEvent {
     PolicyEvent {
         target: ordinary.target.clone(),
         capability: ordinary.capability.clone(),
-        depth_threshold: ordinary.depth_threshold.saturating_add(FOUNDATIONAL_THRESHOLD_MARGIN),
+        depth_threshold: ordinary
+            .depth_threshold
+            .saturating_add(FOUNDATIONAL_THRESHOLD_MARGIN),
     }
 }
 
@@ -374,7 +378,10 @@ pub fn break_glass_restore_seed_admin(
 /// `new_window_secs` is a SHORTENING at all (and therefore requires the
 /// strong confirmation [`apply_retention_shortening`] enforces).
 #[must_use]
-pub fn retention_shortening_requires_confirmation(old_window_secs: u64, new_window_secs: u64) -> bool {
+pub fn retention_shortening_requires_confirmation(
+    old_window_secs: u64,
+    new_window_secs: u64,
+) -> bool {
     new_window_secs < old_window_secs
 }
 
@@ -472,7 +479,9 @@ mod tests {
         let refused = revoke.revoke(&mut lease, &candidate, key, Epoch(1), b"revoke".to_vec());
         assert!(matches!(
             refused,
-            Err(GuardrailError::RevocationNotStrict(CoFoldError::NotFenced { .. }))
+            Err(GuardrailError::RevocationNotStrict(
+                CoFoldError::NotFenced { .. }
+            ))
         ));
 
         // Quorum reached -> the fenced candidate's revoke is admitted, exactly once.
@@ -484,10 +493,18 @@ mod tests {
 
         // A second revoke for the SAME key is refused: never half-applied,
         // never silently re-admitted / lost.
-        let dup = revoke.revoke(&mut lease, &candidate, key, Epoch(1), b"revoke-again".to_vec());
+        let dup = revoke.revoke(
+            &mut lease,
+            &candidate,
+            key,
+            Epoch(1),
+            b"revoke-again".to_vec(),
+        );
         assert!(matches!(
             dup,
-            Err(GuardrailError::RevocationNotStrict(CoFoldError::DuplicateKey { .. }))
+            Err(GuardrailError::RevocationNotStrict(
+                CoFoldError::DuplicateKey { .. }
+            ))
         ));
     }
 
@@ -502,13 +519,21 @@ mod tests {
 
         let ordinary_threshold = 2;
         // `close` has enough remaining budget to clear ordinary + margin.
-        assert!(meets_higher_authority(&authority, &close, ordinary_threshold));
+        assert!(meets_higher_authority(
+            &authority,
+            &close,
+            ordinary_threshold
+        ));
         guard_higher_authority(&authority, &close, ordinary_threshold)
             .expect("close operator clears the foundational threshold");
 
         // `far` clears the ORDINARY threshold but not the foundational one.
         assert!(authority.reachable_depth(&far).unwrap() >= ordinary_threshold);
-        assert!(!meets_higher_authority(&authority, &far, ordinary_threshold));
+        assert!(!meets_higher_authority(
+            &authority,
+            &far,
+            ordinary_threshold
+        ));
         assert!(matches!(
             guard_higher_authority(&authority, &far, ordinary_threshold),
             Err(GuardrailError::InsufficientAuthority { .. })
@@ -550,7 +575,12 @@ mod tests {
         let mut admins: BTreeSet<NodeId> = BTreeSet::new();
         let seed_admin = nid("seed-admin");
 
-        let refused = break_glass_restore_seed_admin(&nid("impostor"), &genesis, &mut admins, seed_admin.clone());
+        let refused = break_glass_restore_seed_admin(
+            &nid("impostor"),
+            &genesis,
+            &mut admins,
+            seed_admin.clone(),
+        );
         assert_eq!(refused.unwrap_err(), GuardrailError::BreakGlassUnauthorized);
         assert!(admins.is_empty());
 
@@ -562,14 +592,20 @@ mod tests {
     #[test]
     fn retention_shortening_requires_strong_confirmation_and_removes_data() {
         // Widening never requires confirmation and never removes anything.
-        assert!(!retention_shortening_requires_confirmation(7 * 86_400, 30 * 86_400));
+        assert!(!retention_shortening_requires_confirmation(
+            7 * 86_400,
+            30 * 86_400
+        ));
         assert_eq!(
             apply_retention_shortening(7 * 86_400, 30 * 86_400, 999, false).unwrap(),
             0
         );
 
         // Shortening requires confirmation.
-        assert!(retention_shortening_requires_confirmation(30 * 86_400, 7 * 86_400));
+        assert!(retention_shortening_requires_confirmation(
+            30 * 86_400,
+            7 * 86_400
+        ));
         let refused = apply_retention_shortening(30 * 86_400, 7 * 86_400, 4_200, false);
         assert_eq!(
             refused.unwrap_err(),

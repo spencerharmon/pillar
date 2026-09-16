@@ -137,7 +137,11 @@ impl RecipientSeal {
     /// [`pillar_crypto::CryptoError::NotARecipient`] if `secret` does not
     /// match the seal's recipient; otherwise propagates a malformed-envelope
     /// or decryption fault.
-    pub fn open(&self, secret: &SealingSecretKey, ciphertext: &Ciphertext) -> CryptoResult<Vec<u8>> {
+    pub fn open(
+        &self,
+        secret: &SealingSecretKey,
+        ciphertext: &Ciphertext,
+    ) -> CryptoResult<Vec<u8>> {
         let envelope = pillar_crypto::SealedEnvelope::from_bytes(ciphertext.as_bytes().to_vec());
         unseal(&envelope, secret)
     }
@@ -170,7 +174,12 @@ mod tests {
         let group = group_key_from_seed(&Seed::from_bytes(b"cell-a".to_vec())).expect("key");
         let seal = CellSeal;
         let ct = seal
-            .seal(&group, b"a sealed pillar-message body", DOMAIN, b"header-aad-v1")
+            .seal(
+                &group,
+                b"a sealed pillar-message body",
+                DOMAIN,
+                b"header-aad-v1",
+            )
             .expect("seal");
         let pt = seal.open(&group, &ct, b"header-aad-v1").expect("open");
         assert_eq!(pt, b"a sealed pillar-message body");
@@ -192,7 +201,11 @@ mod tests {
         let ct2 = seal
             .seal(&group, b"identical body", DOMAIN, b"aad")
             .expect("seal 2");
-        assert_eq!(ct1.as_bytes(), ct2.as_bytes(), "convergent seal must be deterministic");
+        assert_eq!(
+            ct1.as_bytes(),
+            ct2.as_bytes(),
+            "convergent seal must be deterministic"
+        );
         assert_eq!(Cid::of(ct1.as_bytes()), Cid::of(ct2.as_bytes()));
     }
 

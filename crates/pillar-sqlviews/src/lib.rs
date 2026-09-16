@@ -122,7 +122,13 @@ pub struct Row {
 /// disturbs any other view already defined over the same source (spec
 /// `NoMigrationOnNewView`).
 pub fn create_view(store: &mut KeyedStore, name: &str, def: ViewDef, hlc: Hlc) {
-    store.doc_put_field(CATALOG_COLLECTION, name, CATALOG_DEF_FIELD, def.encode(), hlc);
+    store.doc_put_field(
+        CATALOG_COLLECTION,
+        name,
+        CATALOG_DEF_FIELD,
+        def.encode(),
+        hlc,
+    );
 }
 
 /// `DROP VIEW <name>` — tombstones the catalog document. The source
@@ -159,7 +165,12 @@ pub fn list_views(store: &KeyedStore) -> Vec<String> {
 /// stale.
 #[must_use]
 pub fn materialize(store: &KeyedStore, def: &ViewDef) -> Vec<Row> {
-    project_collection(store, &def.source, def.filter.as_ref(), def.project.as_deref())
+    project_collection(
+        store,
+        &def.source,
+        def.filter.as_ref(),
+        def.project.as_deref(),
+    )
 }
 
 /// Materialize the view named `name` by looking it up in the catalog first.
@@ -218,11 +229,21 @@ fn field_as_i64(row: &Row, field: &str) -> i64 {
 /// as a QUERY over the same fold every other view uses (spec section: SUM is
 /// a query pattern, not a separate store).
 #[must_use]
-pub fn aggregate_sum(store: &KeyedStore, collection: &str, field: &str, filter: Option<&Filter>) -> i64 {
-    project_collection(store, collection, filter, Some(std::slice::from_ref(&field.to_string())))
-        .iter()
-        .map(|r| field_as_i64(r, field))
-        .sum()
+pub fn aggregate_sum(
+    store: &KeyedStore,
+    collection: &str,
+    field: &str,
+    filter: Option<&Filter>,
+) -> i64 {
+    project_collection(
+        store,
+        collection,
+        filter,
+        Some(std::slice::from_ref(&field.to_string())),
+    )
+    .iter()
+    .map(|r| field_as_i64(r, field))
+    .sum()
 }
 
 /// `SELECT group_field, SUM(sum_field) FROM collection GROUP BY group_field`
@@ -290,7 +311,12 @@ fn read_edges(store: &KeyedStore, edge_collection: &str) -> Vec<Edge> {
 /// second graph engine, no side index. `max_depth = None` traverses to a
 /// fixpoint (bounded automatically by the finite reachable set).
 #[must_use]
-pub fn traverse(store: &KeyedStore, edge_collection: &str, start: &str, max_depth: Option<usize>) -> Vec<String> {
+pub fn traverse(
+    store: &KeyedStore,
+    edge_collection: &str,
+    start: &str,
+    max_depth: Option<usize>,
+) -> Vec<String> {
     let edges = read_edges(store, edge_collection);
     let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut frontier = vec![start.to_string()];
@@ -340,7 +366,9 @@ mod sql_views {
         create_view(&mut store, "active_users", def.clone(), hlc(1));
 
         assert_eq!(view_def(&store, "active_users"), Some(def));
-        assert!(store.collections().contains(&CATALOG_COLLECTION.to_string()));
+        assert!(store
+            .collections()
+            .contains(&CATALOG_COLLECTION.to_string()));
         assert_eq!(list_views(&store), vec!["active_users".to_string()]);
     }
 
@@ -360,7 +388,10 @@ mod sql_views {
         let rows = materialize_view(&store, "active_users").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "u1");
-        assert_eq!(rows[0].fields.get("name"), Some(&Value::Scalar(b"alice".to_vec())));
+        assert_eq!(
+            rows[0].fields.get("name"),
+            Some(&Value::Scalar(b"alice".to_vec()))
+        );
 
         // Writing MORE data to the same source is picked up on the next fold
         // -- no migration, no stale cache.
@@ -387,7 +418,10 @@ mod sql_views {
         create_view(&mut store, "active_users", active_view, hlc(3));
 
         let after = materialize_view(&store, "all_users").unwrap();
-        assert_eq!(before, after, "existing view unaffected by a new sibling view's creation");
+        assert_eq!(
+            before, after,
+            "existing view unaffected by a new sibling view's creation"
+        );
         assert_eq!(materialize_view(&store, "active_users").unwrap().len(), 1);
     }
 
@@ -490,7 +524,10 @@ mod sql_views {
         put(&mut store, "edges", "e3", "to", b"d", 1);
 
         let reachable = traverse(&store, "edges", "a", None);
-        assert_eq!(reachable, vec!["b".to_string(), "c".to_string(), "d".to_string()]);
+        assert_eq!(
+            reachable,
+            vec!["b".to_string(), "c".to_string(), "d".to_string()]
+        );
     }
 
     #[test]
@@ -526,6 +563,9 @@ mod sql_views {
         let mut store = KeyedStore::new();
         put(&mut store, "users", "u2", "name", b"bob", 1);
         put(&mut store, "users", "u1", "name", b"alice", 1);
-        assert_eq!(store.doc_ids("users"), vec!["u1".to_string(), "u2".to_string()]);
+        assert_eq!(
+            store.doc_ids("users"),
+            vec!["u1".to_string(), "u2".to_string()]
+        );
     }
 }

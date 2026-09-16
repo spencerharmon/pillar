@@ -17,9 +17,10 @@
 //!   closed with [`ExportError::NotAuthorized`]; a secret export with no secret
 //!   held fails with [`ExportError::NoSecret`]. There is no unauthorized path.
 
-use pillar_crypto::openpgp::{TransferableKey, TrustCertification};
-use pillar_crypto::{SealingPublicKey, SealingSecretKey, SigningPublicKey, SigningSecretKey};use pillar_rbac::Decision;
 use pillar_core::NodeId;
+use pillar_crypto::openpgp::{TransferableKey, TrustCertification};
+use pillar_crypto::{SealingPublicKey, SealingSecretKey, SigningPublicKey, SigningSecretKey};
+use pillar_rbac::Decision;
 use pillar_trust_artifacts::{identity_principal, public_key_for, TrustStore};
 
 /// Lowercase hex of a byte slice (public-key/fingerprint rendering).
@@ -348,7 +349,10 @@ mod tests {
             certifications: vec![],
             include_secret: true,
         };
-        assert_eq!(export_openpgp(Decision::Allow, req), Err(ExportError::NoSecret));
+        assert_eq!(
+            export_openpgp(Decision::Allow, req),
+            Err(ExportError::NoSecret)
+        );
     }
 
     #[test]
@@ -450,7 +454,10 @@ pub fn run_wot(args: &[String]) -> Result<String, String> {
     let path = format!("/portal/trust-graph?token={token}&view={view}");
     let reply = crate::bootstrap::http(&authority, "GET", &path, "")?;
     if reply.status != 200 {
-        return Err(format!("trust-graph view refused: {} {}", reply.status, reply.body));
+        return Err(format!(
+            "trust-graph view refused: {} {}",
+            reply.status, reply.body
+        ));
     }
     Ok(reply.body)
 }
@@ -470,7 +477,10 @@ pub fn run_key_export(args: &[String]) -> Result<String, String> {
     );
     let reply = crate::bootstrap::http(&authority, "GET", &path, "")?;
     if reply.status != 200 {
-        return Err(format!("key export refused: {} {}", reply.status, reply.body));
+        return Err(format!(
+            "key export refused: {} {}",
+            reply.status, reply.body
+        ));
     }
     Ok(reply.body)
 }

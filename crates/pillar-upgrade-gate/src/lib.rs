@@ -36,7 +36,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use pillar_crypto::{
-    Ciphertext, SealingPublicKey, SealingSecretKey, SigningPublicKey, SigningSecretKey,
+    CellId, Ciphertext, SealingPublicKey, SealingSecretKey, SigningPublicKey, SigningSecretKey,
     SymmetricKey,
 };
 use pillar_streamdb::{Cid, HeadRecord, MerkleRoot, SegmentSource, SignedSegment, Visibility};
@@ -52,6 +52,9 @@ use pillar_streamdb::{Cid, HeadRecord, MerkleRoot, SegmentSource, SignedSegment,
 pub struct CapturedCellState {
     /// The cell / stream owner's signing public key (a real ed25519 key).
     pub owner_pub: SigningPublicKey,
+    /// The scratch cell the prior binary scoped its stream to; the new binary
+    /// rehydrates the public stream against this same cell id.
+    pub cell: CellId,
     /// The head record the prior binary published for the owner's stream —
     /// resolved out of band exactly as a rehydrating node would.
     pub head: HeadRecord,

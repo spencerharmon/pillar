@@ -898,7 +898,13 @@ mod tests {
             "NODE cell:genesis KEY ABC123\nEDGE cell:genesis -> alice LABEL x SIG c\nNODE alice KEY DEF456\n",
         );
         assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0], TrustNode { id: "cell:genesis".into(), key: "ABC123".into() });
+        assert_eq!(
+            nodes[0],
+            TrustNode {
+                id: "cell:genesis".into(),
+                key: "ABC123".into()
+            }
+        );
         assert_eq!(nodes[1].key, "DEF456");
     }
 

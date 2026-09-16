@@ -149,9 +149,9 @@ impl ReconcileReport {
     /// (no [`ReconcileOutcome::Failed`]).
     #[must_use]
     pub fn all_ok(&self) -> bool {
-        self.outcomes.iter().all(|o| {
-            !matches!(o.outcome, Some(ReconcileOutcome::Failed(_)))
-        })
+        self.outcomes
+            .iter()
+            .all(|o| !matches!(o.outcome, Some(ReconcileOutcome::Failed(_))))
     }
 }
 
@@ -184,7 +184,10 @@ impl std::fmt::Display for ReconcileError {
                 write!(f, "manifest `{path}` is invalid: {error}")
             }
             ReconcileError::NoController { path, kind } => {
-                write!(f, "manifest `{path}` declares kind {kind} with no registered controller")
+                write!(
+                    f,
+                    "manifest `{path}` declares kind {kind} with no registered controller"
+                )
             }
         }
     }
@@ -381,7 +384,8 @@ mod tests {
     fn a_manifest_in_the_repo_is_reconciled_into_the_cell_via_the_apply_path() {
         let mut r = Reconciler::new(schemas());
         let ctl = controllers();
-        let source = ManifestSource::new("rev-1").with("apps/dash.yaml", dashboard("d", "Overview"));
+        let source =
+            ManifestSource::new("rev-1").with("apps/dash.yaml", dashboard("d", "Overview"));
 
         let report = r.reconcile(&source, &ctl).expect("reconcile");
 

@@ -776,7 +776,10 @@ fn payload_fields(payload: &[u8]) -> std::collections::BTreeMap<String, String> 
         let key = rest[..eq].trim();
         let after = &rest[eq + 1..];
         if key == "msg" {
-            fields.insert("msg".to_string(), strip_tick_suffix(after.trim()).to_string());
+            fields.insert(
+                "msg".to_string(),
+                strip_tick_suffix(after.trim()).to_string(),
+            );
             break;
         }
         // Value runs up to the next whitespace.
@@ -1801,7 +1804,11 @@ mod tests {
 
         let eq = parse("select: logs(message = served) range: now-1d").expect("parses");
         let eq_res = execute(&eq, &store, &index, 200_000);
-        assert_eq!(eq_res.matched, vec![served.clone()], "exact message Eq matches");
+        assert_eq!(
+            eq_res.matched,
+            vec![served.clone()],
+            "exact message Eq matches"
+        );
 
         let m = parse("select: logs(message =~ served) range: now-1d").expect("parses");
         let m_res = execute(&m, &store, &index, 200_000);
@@ -1886,7 +1893,11 @@ mod tests {
         let query = parse("select: metrics(cell = c) range: now-100s").expect("parses");
 
         let sum = aggregate(&query, &store, &index, now, Aggregate::Sum, &[]);
-        assert!((sum[0].values[0] - 60.0).abs() < 1e-9, "got {:?}", sum[0].values);
+        assert!(
+            (sum[0].values[0] - 60.0).abs() < 1e-9,
+            "got {:?}",
+            sum[0].values
+        );
         let topk = aggregate(&query, &store, &index, now, Aggregate::TopK(2), &[]);
         assert_eq!(topk[0].values, vec![30.0, 20.0]);
     }

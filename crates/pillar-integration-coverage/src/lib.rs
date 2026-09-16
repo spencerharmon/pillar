@@ -98,7 +98,9 @@ pub fn orphan_surface_offenses(
     let mut out = Vec::new();
 
     for entry in inventory {
-        let claimed = scenarios.iter().any(|s| s.claims.iter().any(|c| c == &entry.id));
+        let claimed = scenarios
+            .iter()
+            .any(|s| s.claims.iter().any(|c| c == &entry.id));
         if !claimed {
             out.push(CoverageOffense {
                 kind: "orphan-surface".to_string(),
@@ -206,7 +208,11 @@ mod tests {
     #[test]
     fn orphaned_surface_is_flagged() {
         let inventory = vec![entry("http:GET /a"), entry("http:GET /b-orphan")];
-        let scenarios = vec![claim("scenario-a", &["http:GET /a"], Some("listening-port"))];
+        let scenarios = vec![claim(
+            "scenario-a",
+            &["http:GET /a"],
+            Some("listening-port"),
+        )];
         let offenses = orphan_surface_offenses(&inventory, &scenarios);
         assert!(
             offenses
@@ -219,7 +225,11 @@ mod tests {
     #[test]
     fn claimed_surface_with_oracle_is_clean() {
         let inventory = vec![entry("http:GET /a")];
-        let scenarios = vec![claim("scenario-a", &["http:GET /a"], Some("listening-port"))];
+        let scenarios = vec![claim(
+            "scenario-a",
+            &["http:GET /a"],
+            Some("listening-port"),
+        )];
         assert!(gate1_holds(&inventory, &scenarios));
     }
 
