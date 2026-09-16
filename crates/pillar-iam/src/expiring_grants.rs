@@ -201,6 +201,19 @@ impl GrantSet {
         set
     }
 
+    /// Every handle that has AT LEAST ONE recorded role or group grant (live or
+    /// lapsed) — the subjects an access-review campaign must sweep. Deduped and
+    /// deterministically ordered (the union of the role- and group-grant maps'
+    /// keys, both `BTreeMap`-ordered).
+    #[must_use]
+    pub fn granted_handles(&self) -> BTreeSet<String> {
+        self.role_grants
+            .keys()
+            .chain(self.group_grants.keys())
+            .cloned()
+            .collect()
+    }
+
     /// Every role grant recorded for `handle`, live or lapsed (inspection).
     #[must_use]
     pub fn role_grants(&self, handle: &str) -> Vec<&ExpiringGrant> {
