@@ -37,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pillar_keyedstore::{Hlc, KeyedStore};
+use pillar_keyedstore::{Hlc, SharedStore};
 use serde::{Deserialize, Serialize};
 
 /// The K/V collection every session record is stored under — the
@@ -132,8 +132,15 @@ pub struct SessionRegistry {
     /// The single global revocation epoch (`revEpoch`), bumped by every
     /// revocation (individual or sweep).
     rev_epoch: u64,
-    /// The K/V-backed store of session records.
-    store: KeyedStore,
+    /// The K/V-backed store of session records — a CLONE of the ONE cell-wide
+    /// [`SharedStore`] substrate (the data-layer-single-substrate-dogfood
+    /// consolidation). The registry NO LONGER owns a private store: sessions
+    /// minted here land in the SAME keyed op-log the portal's kv/doc browse
+    /// reads, so a real login is immediately visible on the live cell. A
+    /// registry built via [`SessionRegistry::new`] wraps a fresh private
+    /// substrate (unit-test use); the running portal builds it via
+    /// [`SessionRegistry::with_shared_store`] onto its shared substrate.
+    store: SharedStore,
     /// A monotonically increasing logical clock feeding each store write's
     /// HLC — this registry is the sole author of its own sessions
     /// collection, so a simple increasing counter (author id fixed to
@@ -152,6 +159,19 @@ impl SessionRegistry {
         SessionRegistry::default()
     }
 
+    /// A registry whose session records land in the supplied CELL-WIDE
+    /// [`SharedStore`] substrate instead of a private one — the
+    /// data-layer-single-substrate-dogfood wiring. Every session minted here
+    /// is written to the SAME keyed op-log the portal's kv/doc browse reads,
+    /// so a login on a live cell surfaces in the portal with no second store.
+    #[must_use]
+    pub fn with_shared_store(store: SharedStore) -> Self {
+        SessionRegistry {
+            store,
+            ..SessionRegistry::default()
+        }
+    }
+
     /// The registry's current true global revocation epoch.
     #[must_use]
     pub fn rev_epoch(&self) -> u64 {
@@ -168,7 +188,9 @@ impl SessionRegistry {
     }
 
     fn get(&self, principal: &str, id: &str) -> Option<Session> {
-        let bytes = self.store.kv_get(SESSIONS_COLLECTION, &Self::kv_key(principal, id))?;
+        let bytes = self
+            .store
+            .with(|s| s.kv_get(SESSIONS_COLLECTION, &Self::kv_key(principal, id)))?;
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -176,7 +198,8 @@ impl SessionRegistry {
         let key = Self::kv_key(&session.principal, &session.id);
         let bytes = serde_json::to_vec(session).expect("Session serializes");
         let hlc = self.next_hlc();
-        self.store.kv_put(SESSIONS_COLLECTION, &key, bytes, hlc);
+        self.store
+            .with_mut(|s| s.kv_put(SESSIONS_COLLECTION, &key, bytes, hlc));
         self.by_principal
             .entry(session.principal.clone())
             .or_default()
@@ -198,7 +221,7 @@ impl SessionRegistry {
     /// registry's backing store, via [`KeyedStore::kv_keys`].
     #[must_use]
     pub fn kv_keys(&self) -> Vec<String> {
-        self.store.kv_keys(SESSIONS_COLLECTION)
+        self.store.with(|s| s.kv_keys(SESSIONS_COLLECTION))
     }
 
     /// Mint a session for `principal` at slot `id`, valid from `issued_at`
@@ -676,9 +699,15 @@ mod tests {
         assert_eq!(keys.len(), 3, "one live K/V key per minted session");
         // Keys are `principal\0id` — every minted (principal, id) pair
         // appears exactly once.
-        assert!(keys.iter().any(|k| k.starts_with("alice") && k.ends_with("s1")));
-        assert!(keys.iter().any(|k| k.starts_with("alice") && k.ends_with("s2")));
-        assert!(keys.iter().any(|k| k.starts_with("bob") && k.ends_with("s1")));
+        assert!(keys
+            .iter()
+            .any(|k| k.starts_with("alice") && k.ends_with("s1")));
+        assert!(keys
+            .iter()
+            .any(|k| k.starts_with("alice") && k.ends_with("s2")));
+        assert!(keys
+            .iter()
+            .any(|k| k.starts_with("bob") && k.ends_with("s1")));
 
         // Revoking does not remove the key from the browse surface — the
         // record is still live in the K/V surface, only its `revoked_epoch`
@@ -755,7 +784,11 @@ mod tests {
         assert!(view.admit(&reg, "bob", "s1", 10).is_ok());
 
         let active: Vec<String> = reg.ls("alice", 10).into_iter().map(|s| s.id).collect();
-        assert_eq!(active, vec!["s2".to_string()], "only the kept session remains active");
+        assert_eq!(
+            active,
+            vec!["s2".to_string()],
+            "only the kept session remains active"
+        );
 
         // A fresh mint into a swept slot is a strictly newer generation.
         let fresh = reg.mint("alice", "s1", 20, 1000);
