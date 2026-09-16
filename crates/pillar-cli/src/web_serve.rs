@@ -530,7 +530,7 @@ pub struct WebAuthContext {
     /// second store. `pillar kv`/`pillar doc`/`pillar sql` over the sealed query
     /// tier act on THIS store (writes are signed acts, reads member-gated views),
     /// and the portal's per-primitive browse/query panels render it.
-    keyed_store: pillar_keyedstore::KeyedStore,
+    keyed_store: pillar_keyedstore::SharedStore,
     /// A monotonic logical counter feeding the HLC stamp of each keyed-store
     /// write, so successive writes to the same field order deterministically
     /// (last-writer-wins) without a wall clock.
@@ -1232,6 +1232,12 @@ impl WebAuthContext {
             lease_epoch,
         );
         let _ = lease.try_acquire(&owner_for_lease, lease_epoch);
+        // The ONE cell-wide keyed-store substrate: the portal's kv/doc/sql
+        // browse surface AND the session registry hold clones of this SAME
+        // handle, so a session minted on a live login lands in the exact keyed
+        // op-log the Explore panels read — no second store per plane
+        // (data-layer-single-substrate-dogfood).
+        let shared_substrate = pillar_keyedstore::SharedStore::new();
         WebAuthContext {
             verifier: NodeCustodyVerifier::new(node_key, Origin::from(origin.as_str())),
             authority,
@@ -1264,7 +1270,7 @@ impl WebAuthContext {
             domain_cells: BTreeMap::new(),
             members: BTreeMap::new(),
             users: BTreeMap::new(),
-            session_registry: SessionRegistry::new(),
+            session_registry: SessionRegistry::with_shared_store(shared_substrate.clone()),
             session_clock: 0,
             trust: TrustStore::new(owner_for_trust),
             grants: Vec::new(),
@@ -1289,7 +1295,7 @@ impl WebAuthContext {
             replaying: false,
             next_op_seq: 0,
             cli_export: None,
-            keyed_store: pillar_keyedstore::KeyedStore::new(),
+            keyed_store: shared_substrate,
             keyed_clock: 0,
             objects: crate::object_inspection::ObjectStore::new(),
             collection_placement: BTreeMap::new(),
@@ -4411,6 +4417,17 @@ impl WebAuthContext {
                     .map_err(|a| format!("unauthorized actor {a} for wot:edges:write"))?;
                 self.authority
                     .issue_edge(actor.clone(), NodeId::from(subject.as_str()), *depth);
+                self.project_plane_event(
+                    actor,
+                    "wot_edges",
+                    &format!("{actor}->{subject}"),
+                    &cid.0.to_string(),
+                    &[
+                        ("signer", actor.0.as_str()),
+                        ("subject", subject.as_str()),
+                        ("depth", &depth.to_string()),
+                    ],
+                );
                 Ok(format!("EDGE {subject} depth {depth} EVENT-CID {}", cid.0))
             }
             pillar_ops::TrustOp::AttestBuild {
@@ -4462,6 +4479,23 @@ impl WebAuthContext {
                             body.push_str(&format!("CHAIN {}\n", c.0));
                         }
                         body.push_str(&format!("EVENT-CID {}", cid.0));
+                        // A quota mutation (an attest carrying a quota budget)
+                        // surfaces in the ONE substrate the portal inspects.
+                        if let Some(q) = quota {
+                            self.project_plane_event(
+                                actor,
+                                "quota_ledger",
+                                &attest_cid.0.to_string(),
+                                &cid.0.to_string(),
+                                &[
+                                    ("subject", subject.as_str()),
+                                    ("action", action.as_str()),
+                                    ("resource", resource.as_str()),
+                                    ("quota", &q.to_string()),
+                                    ("scope", scope.as_str()),
+                                ],
+                            );
+                        }
                         Ok(body)
                     }
                     Err(e) => Err(format!("DENIED {}", trust_error_reason(&e))),
@@ -4493,6 +4527,17 @@ impl WebAuthContext {
                     },
                 });
                 let eff = if *allow { "allow" } else { "deny" };
+                self.project_plane_event(
+                    actor,
+                    "rbac_grants",
+                    &format!("{subject}:{capability}"),
+                    &cid.0.to_string(),
+                    &[
+                        ("subject", subject.as_str()),
+                        ("capability", capability.as_str()),
+                        ("effect", eff),
+                    ],
+                );
                 Ok(format!(
                     "GRANTED {subject} {capability} {eff} EVENT-CID {}",
                     cid.0
@@ -4653,6 +4698,48 @@ impl WebAuthContext {
         pillar_keyedstore::Hlc::new(self.keyed_clock, 0, actor.to_string())
     }
 
+    /// Project a plane's live write into the ONE shared keyed-store substrate
+    /// (`self.keyed_store`) as a Document row the portal Explore panels browse —
+    /// the SAME substrate the session registry and the `pillar kv`/`doc` query
+    /// tier already read. This is the dogfood-invariant wiring: the RBAC-grant,
+    /// quota, and web-of-trust planes each record their live web write here
+    /// (keyed by `id`, one `event` field carrying the already-signed act's CID
+    /// plus the event fields), so a grant / quota mutation / trust edge issued
+    /// through the real front-end SURFACES in the portal browse of a live cell,
+    /// with no second store and no private per-plane copy. `event_cid` is the
+    /// signed act's content address (from `perform_signed_act`), so the surfaced
+    /// row is verifiably tied to the signed resource-event.
+    fn project_plane_event(
+        &mut self,
+        actor: &NodeId,
+        collection: &str,
+        id: &str,
+        event_cid: &str,
+        fields: &[(&str, &str)],
+    ) {
+        let hlc = self.next_keyed_hlc(actor);
+        let mut record = std::collections::BTreeMap::new();
+        record.insert(
+            "event_cid".to_string(),
+            pillar_keyedstore::Value::Scalar(event_cid.as_bytes().to_vec()),
+        );
+        for (k, v) in fields {
+            record.insert(
+                (*k).to_string(),
+                pillar_keyedstore::Value::Scalar(v.as_bytes().to_vec()),
+            );
+        }
+        self.keyed_store.with_mut(|s| {
+            s.doc_put_field(
+                collection,
+                id,
+                "event",
+                pillar_keyedstore::Value::Nested(record),
+                hlc,
+            )
+        });
+    }
+
     /// Index an already-appended [`Self::act_log`] event (`cid`, an
     /// `iam:users:write` admin act by `actor` on `handle`) under `handle`'s
     /// reserved per-user collection ([`user_audit_collection`]) in
@@ -4711,7 +4798,8 @@ impl WebAuthContext {
                     &format!("KV-PUT {collection} {key}"),
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
-                self.keyed_store.kv_put(collection, key, value, hlc);
+                self.keyed_store
+                    .with_mut(|s| s.kv_put(collection, key, value, hlc));
                 Ok(format!("KV-PUT {collection} {key} EVENT-CID {cid}"))
             }
             pillar_ops::KvOp::Delete { collection, key } => {
@@ -4721,17 +4809,18 @@ impl WebAuthContext {
                     &format!("KV-DELETE {collection} {key}"),
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
-                self.keyed_store.kv_delete(collection, key, hlc);
+                self.keyed_store
+                    .with_mut(|s| s.kv_delete(collection, key, hlc));
                 Ok(format!("KV-DELETE {collection} {key} EVENT-CID {cid}"))
             }
             pillar_ops::KvOp::Get { collection, key } => {
-                match self.keyed_store.kv_get(collection, key) {
+                match self.keyed_store.with(|s| s.kv_get(collection, key)) {
                     Some(v) => Ok(hex_encode_bytes(&v)),
                     None => Err(format!("no live key {key} in collection {collection}")),
                 }
             }
             pillar_ops::KvOp::Keys { collection } => {
-                Ok(join_lines(self.keyed_store.kv_keys(collection)))
+                Ok(join_lines(self.keyed_store.with(|s| s.kv_keys(collection))))
             }
             pillar_ops::KvOp::Collections => Ok(join_lines(self.keyed_store.collections())),
         }
@@ -4751,13 +4840,15 @@ impl WebAuthContext {
                     &format!("DOC-PUT {collection} {id} {field}"),
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
-                self.keyed_store.doc_put_field(
-                    collection,
-                    id,
-                    field,
-                    pillar_keyedstore::Value::Scalar(value.clone().into_bytes()),
-                    hlc,
-                );
+                self.keyed_store.with_mut(|s| {
+                    s.doc_put_field(
+                        collection,
+                        id,
+                        field,
+                        pillar_keyedstore::Value::Scalar(value.clone().into_bytes()),
+                        hlc,
+                    )
+                });
                 Ok(format!("DOC-PUT {collection} {id} {field} EVENT-CID {cid}"))
             }
             pillar_ops::DocOp::DeleteField {
@@ -4772,7 +4863,7 @@ impl WebAuthContext {
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
                 self.keyed_store
-                    .doc_delete_field(collection, id, field, hlc);
+                    .with_mut(|s| s.doc_delete_field(collection, id, field, hlc));
                 Ok(format!(
                     "DOC-DELETE {collection} {id} {field} EVENT-CID {cid}"
                 ))
@@ -4781,17 +4872,20 @@ impl WebAuthContext {
                 collection,
                 id,
                 field,
-            } => match self.keyed_store.doc_query(collection, id, field) {
+            } => match self
+                .keyed_store
+                .with(|s| s.doc_query(collection, id, field))
+            {
                 Some(v) => Ok(render_value(&v)),
                 None => Err(format!(
                     "no live field {field} on document {id} in collection {collection}"
                 )),
             },
-            pillar_ops::DocOp::Fields { collection, id } => {
-                Ok(join_lines(self.keyed_store.doc_fields(collection, id)))
-            }
+            pillar_ops::DocOp::Fields { collection, id } => Ok(join_lines(
+                self.keyed_store.with(|s| s.doc_fields(collection, id)),
+            )),
             pillar_ops::DocOp::Ids { collection } => {
-                Ok(join_lines(self.keyed_store.doc_ids(collection)))
+                Ok(join_lines(self.keyed_store.with(|s| s.doc_ids(collection))))
             }
         }
     }
@@ -4818,34 +4912,42 @@ impl WebAuthContext {
                     &format!("SQL-CREATE-VIEW {name} {source}"),
                 )?;
                 let hlc = self.next_keyed_hlc(actor);
-                pillar_sqlviews::create_view(&mut self.keyed_store, name, def, hlc);
+                self.keyed_store
+                    .with_mut(|st| pillar_sqlviews::create_view(st, name, def, hlc));
                 Ok(format!("VIEW {name} OVER {source} EVENT-CID {cid}"))
             }
             pillar_ops::SqlOp::DropView { name } => {
                 let cid =
                     self.authorize_data_write(actor, name, &format!("SQL-DROP-VIEW {name}"))?;
                 let hlc = self.next_keyed_hlc(actor);
-                pillar_sqlviews::drop_view(&mut self.keyed_store, name, hlc);
+                self.keyed_store
+                    .with_mut(|st| pillar_sqlviews::drop_view(st, name, hlc));
                 Ok(format!("DROP-VIEW {name} EVENT-CID {cid}"))
             }
             pillar_ops::SqlOp::View { name } => {
-                match pillar_sqlviews::materialize_view(&self.keyed_store, name) {
+                match self
+                    .keyed_store
+                    .with(|st| pillar_sqlviews::materialize_view(st, name))
+                {
                     Some(rows) => Ok(render_rows(&rows)),
                     None => Err(format!("no such view {name}")),
                 }
             }
-            pillar_ops::SqlOp::Views => {
-                Ok(join_lines(pillar_sqlviews::list_views(&self.keyed_store)))
-            }
+            pillar_ops::SqlOp::Views => Ok(join_lines(
+                self.keyed_store.with(pillar_sqlviews::list_views),
+            )),
             // `SHOW TABLES` — SQL-native alias for listing catalog entries,
             // folded from the same live `__catalog` collection as `Views`.
-            pillar_ops::SqlOp::ShowTables => {
-                Ok(join_lines(pillar_sqlviews::list_views(&self.keyed_store)))
-            }
+            pillar_ops::SqlOp::ShowTables => Ok(join_lines(
+                self.keyed_store.with(pillar_sqlviews::list_views),
+            )),
             // `DESCRIBE <table>` — SQL-native catalog-entry definition, folded
             // from the `__catalog` collection (source / filter / projection).
             pillar_ops::SqlOp::DescribeTable { table } => {
-                match pillar_sqlviews::view_def(&self.keyed_store, table) {
+                match self
+                    .keyed_store
+                    .with(|st| pillar_sqlviews::view_def(st, table))
+                {
                     Some(def) => Ok(render_view_def(table, &def)),
                     None => Err(format!("no such table {table}")),
                 }
@@ -4855,8 +4957,11 @@ impl WebAuthContext {
             // defined view (`name\tdef=<source[/filter][/project]>`).
             pillar_ops::SqlOp::SelectCatalog => {
                 let mut lines = Vec::new();
-                for name in pillar_sqlviews::list_views(&self.keyed_store) {
-                    if let Some(def) = pillar_sqlviews::view_def(&self.keyed_store, &name) {
+                for name in self.keyed_store.with(pillar_sqlviews::list_views) {
+                    if let Some(def) = self
+                        .keyed_store
+                        .with(|st| pillar_sqlviews::view_def(st, &name))
+                    {
                         lines.push(format!("{name}\t{}", view_def_summary(&def)));
                     }
                 }
@@ -4921,9 +5026,9 @@ impl WebAuthContext {
         match op {
             pillar_ops::CatalogOp::Databases => Ok(join_lines(self.catalog_databases())),
             pillar_ops::CatalogOp::Collections => Ok(join_lines(self.catalog_collections())),
-            pillar_ops::CatalogOp::Views => {
-                Ok(join_lines(pillar_sqlviews::list_views(&self.keyed_store)))
-            }
+            pillar_ops::CatalogOp::Views => Ok(join_lines(
+                self.keyed_store.with(pillar_sqlviews::list_views),
+            )),
             pillar_ops::CatalogOp::Describe { collection } => self.catalog_describe(collection),
         }
     }
@@ -4950,7 +5055,7 @@ impl WebAuthContext {
                 cols.insert(c);
             }
         }
-        for v in pillar_sqlviews::list_views(&self.keyed_store) {
+        for v in self.keyed_store.with(pillar_sqlviews::list_views) {
             cols.insert(v);
         }
         cols.into_iter().collect()
@@ -4965,7 +5070,9 @@ impl WebAuthContext {
     fn catalog_describe(&self, collection: &str) -> Result<String, String> {
         // A view (a `__catalog` entry) is an `sql` surface; a live keyed-store
         // collection is `kv` and/or `doc`; anything else is unknown.
-        let view = pillar_sqlviews::view_def(&self.keyed_store, collection);
+        let view = self
+            .keyed_store
+            .with(|st| pillar_sqlviews::view_def(st, collection));
         let live_collections = self.keyed_store.collections();
         let is_live = live_collections.iter().any(|c| c == collection);
         if view.is_none() && !is_live {
@@ -4979,8 +5086,14 @@ impl WebAuthContext {
         let (surface, sub) = if let Some(def) = &view {
             ("keyed", format!("sql source={}", def.source))
         } else {
-            let has_kv = !self.keyed_store.kv_keys(collection).is_empty();
-            let has_doc = !self.keyed_store.doc_ids(collection).is_empty();
+            let has_kv = !self
+                .keyed_store
+                .with(|st| st.kv_keys(collection))
+                .is_empty();
+            let has_doc = !self
+                .keyed_store
+                .with(|st| st.doc_ids(collection))
+                .is_empty();
             let sub = match (has_kv, has_doc) {
                 (true, true) => "kv,doc".to_owned(),
                 (true, false) => "kv".to_owned(),
@@ -4999,8 +5112,12 @@ impl WebAuthContext {
                 Some(p) => p.clone(),
                 None => self.collection_doc_schema(&def.source),
             }
-        } else if !self.keyed_store.kv_keys(collection).is_empty() {
-            self.keyed_store.kv_keys(collection)
+        } else if !self
+            .keyed_store
+            .with(|st| st.kv_keys(collection))
+            .is_empty()
+        {
+            self.keyed_store.with(|st| st.kv_keys(collection))
         } else {
             self.collection_doc_schema(collection)
         };
@@ -5039,8 +5156,8 @@ impl WebAuthContext {
     /// `collection`, in canonical sorted order — a collection's folded schema.
     fn collection_doc_schema(&self, collection: &str) -> Vec<String> {
         let mut fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for id in self.keyed_store.doc_ids(collection) {
-            for f in self.keyed_store.doc_fields(collection, &id) {
+        for id in self.keyed_store.with(|st| st.doc_ids(collection)) {
+            for f in self.keyed_store.with(|st| st.doc_fields(collection, &id)) {
                 fields.insert(f);
             }
         }
@@ -8041,7 +8158,11 @@ fn dispatch_data_kv_keys(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRes
     let Some(collection) = query_value(&request.path, "collection") else {
         return text_response(400, "Bad Request", "MISSING collection".to_owned());
     };
-    text_response(200, "OK", join_lines(ctx.keyed_store.kv_keys(collection)))
+    text_response(
+        200,
+        "OK",
+        join_lines(ctx.keyed_store.with(|st| st.kv_keys(collection))),
+    )
 }
 
 /// `GET /portal/data/kv/get?token=<s>&collection=<c>&key=<k>` — the live
@@ -8057,7 +8178,7 @@ fn dispatch_data_kv_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResp
     let Some(key) = query_value(&request.path, "key") else {
         return text_response(400, "Bad Request", "MISSING key".to_owned());
     };
-    match ctx.keyed_store.kv_get(collection, key) {
+    match ctx.keyed_store.with(|st| st.kv_get(collection, key)) {
         Some(v) => text_response(200, "OK", hex_encode_bytes(&v)),
         None => text_response(404, "Not Found", "DENIED no-live-key".to_owned()),
     }
@@ -8072,7 +8193,11 @@ fn dispatch_data_doc_ids(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRes
     let Some(collection) = query_value(&request.path, "collection") else {
         return text_response(400, "Bad Request", "MISSING collection".to_owned());
     };
-    text_response(200, "OK", join_lines(ctx.keyed_store.doc_ids(collection)))
+    text_response(
+        200,
+        "OK",
+        join_lines(ctx.keyed_store.with(|st| st.doc_ids(collection))),
+    )
 }
 
 /// `GET /portal/data/doc/fields?token=<s>&collection=<c>&id=<i>` — the live
@@ -8090,7 +8215,7 @@ fn dispatch_data_doc_fields(ctx: &WebAuthContext, request: &HttpRequest) -> Http
     text_response(
         200,
         "OK",
-        join_lines(ctx.keyed_store.doc_fields(collection, id)),
+        join_lines(ctx.keyed_store.with(|st| st.doc_fields(collection, id))),
     )
 }
 
@@ -8109,7 +8234,10 @@ fn dispatch_data_doc_get(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRes
     let Some(field) = query_value(&request.path, "field") else {
         return text_response(400, "Bad Request", "MISSING field".to_owned());
     };
-    match ctx.keyed_store.doc_query(collection, id, field) {
+    match ctx
+        .keyed_store
+        .with(|st| st.doc_query(collection, id, field))
+    {
         Some(v) => text_response(200, "OK", render_value(&v)),
         None => text_response(404, "Not Found", "DENIED no-live-field".to_owned()),
     }
@@ -8124,7 +8252,7 @@ fn dispatch_data_sql_views(ctx: &WebAuthContext, request: &HttpRequest) -> HttpR
     text_response(
         200,
         "OK",
-        join_lines(pillar_sqlviews::list_views(&ctx.keyed_store)),
+        join_lines(ctx.keyed_store.with(pillar_sqlviews::list_views)),
     )
 }
 
@@ -8139,7 +8267,10 @@ fn dispatch_data_sql_view(ctx: &WebAuthContext, request: &HttpRequest) -> HttpRe
     let Some(name) = query_value(&request.path, "name") else {
         return text_response(400, "Bad Request", "MISSING name".to_owned());
     };
-    match pillar_sqlviews::materialize_view(&ctx.keyed_store, name) {
+    match ctx
+        .keyed_store
+        .with(|st| pillar_sqlviews::materialize_view(st, name))
+    {
         Some(rows) => text_response(200, "OK", render_rows(&rows)),
         None => text_response(404, "Not Found", "DENIED no-such-view".to_owned()),
     }
@@ -16432,6 +16563,60 @@ mod tests {
     // `data_query_tier_remote_surface`). Seeds the store DIRECTLY (bypassing
     // the query tier's own signing gate, which is proven elsewhere) so these
     // tests isolate the portal browse routes' own behavior.
+    /// data-layer-single-substrate-dogfood: a session minted by the REAL login
+    /// path lands in the SAME keyed-store substrate the portal's kv browse
+    /// reads — the `sessions` collection surfaces in `/portal/data/kv/*` on a
+    /// live context, with NO second store seeded. This FAILS before the
+    /// consolidation (the session registry owned a private `KeyedStore`, so
+    /// `sessions` never appeared in the portal browse) and PASSES after it
+    /// (registry + browse share one `SharedStore`).
+    #[test]
+    fn real_login_session_surfaces_in_portal_kv_browse_same_substrate() {
+        let (mut ctx, _subkey) = provisioned_ctx();
+        // A real login mints a server-side session through `store_session` →
+        // `SessionRegistry::mint`, which now writes to the shared substrate.
+        let token = login_alice(&mut ctx);
+
+        // The `sessions` collection is live in the browse surface — proof the
+        // registry write and the portal read hit ONE store.
+        let cols = get(
+            &mut ctx,
+            &format!("/portal/data/kv/collections?token={token}"),
+        );
+        assert_eq!(cols.status, 200, "got: {}", cols.body);
+        assert!(
+            cols.body.lines().any(|c| c == "sessions"),
+            "the live session must surface in the portal kv browse (single substrate); got: {}",
+            cols.body
+        );
+
+        // And the session's key is enumerable under it.
+        let keys = get(
+            &mut ctx,
+            &format!("/portal/data/kv/keys?token={token}&collection=sessions"),
+        );
+        assert_eq!(keys.status, 200, "got: {}", keys.body);
+        assert!(
+            !keys.body.trim().is_empty(),
+            "the live session key must be browsable in the shared substrate; got empty"
+        );
+
+        // Single-substrate oracle: the registry's own view and the portal
+        // browse enumerate the SAME session keys — not two disconnected stores.
+        let registry_keys = ctx.session_registry.kv_keys();
+        assert!(
+            !registry_keys.is_empty(),
+            "the registry must hold the minted session"
+        );
+        for k in &registry_keys {
+            assert!(
+                keys.body.lines().any(|line| line == k),
+                "registry key {k} absent from the portal browse — two stores diverged: {}",
+                keys.body
+            );
+        }
+    }
+
     #[test]
     fn data_explore_kv_panel_lists_live_collections_keys_and_values() {
         let (mut ctx, _subkey) = provisioned_ctx();
@@ -16439,10 +16624,10 @@ mod tests {
         let actor = NodeId::from("owner");
         let hlc = ctx.next_keyed_hlc(&actor);
         ctx.keyed_store
-            .kv_put("config", "greeting", b"hello".to_vec(), hlc);
+            .with_mut(|st| st.kv_put("config", "greeting", b"hello".to_vec(), hlc));
         let hlc2 = ctx.next_keyed_hlc(&actor);
         ctx.keyed_store
-            .kv_put("config", "farewell", b"bye".to_vec(), hlc2);
+            .with_mut(|st| st.kv_put("config", "farewell", b"bye".to_vec(), hlc2));
 
         // Unauthenticated is refused.
         assert_eq!(get(&mut ctx, "/portal/data/kv/collections").status, 401);
@@ -16499,13 +16684,15 @@ mod tests {
         let actor = NodeId::from("owner");
         for (id, name) in [("u1", "alice"), ("u2", "bob")] {
             let hlc = ctx.next_keyed_hlc(&actor);
-            ctx.keyed_store.doc_put_field(
-                "users",
-                id,
-                "name",
-                pillar_keyedstore::Value::Scalar(name.as_bytes().to_vec()),
-                hlc,
-            );
+            ctx.keyed_store.with_mut(|st| {
+                st.doc_put_field(
+                    "users",
+                    id,
+                    "name",
+                    pillar_keyedstore::Value::Scalar(name.as_bytes().to_vec()),
+                    hlc,
+                )
+            });
         }
 
         assert_eq!(
@@ -16549,27 +16736,32 @@ mod tests {
         let actor = NodeId::from("owner");
         for (id, name, status) in [("u1", "alice", "on"), ("u2", "bob", "off")] {
             let hlc = ctx.next_keyed_hlc(&actor);
-            ctx.keyed_store.doc_put_field(
-                "users",
-                id,
-                "name",
-                pillar_keyedstore::Value::Scalar(name.as_bytes().to_vec()),
-                hlc,
-            );
+            ctx.keyed_store.with_mut(|st| {
+                st.doc_put_field(
+                    "users",
+                    id,
+                    "name",
+                    pillar_keyedstore::Value::Scalar(name.as_bytes().to_vec()),
+                    hlc,
+                )
+            });
             let hlc2 = ctx.next_keyed_hlc(&actor);
-            ctx.keyed_store.doc_put_field(
-                "users",
-                id,
-                "status",
-                pillar_keyedstore::Value::Scalar(status.as_bytes().to_vec()),
-                hlc2,
-            );
+            ctx.keyed_store.with_mut(|st| {
+                st.doc_put_field(
+                    "users",
+                    id,
+                    "status",
+                    pillar_keyedstore::Value::Scalar(status.as_bytes().to_vec()),
+                    hlc2,
+                )
+            });
         }
         let mut def = pillar_sqlviews::ViewDef::over("users".to_owned());
         def = def.filtered_eq("status".to_owned(), b"on".to_vec());
         def = def.projecting(vec!["name".to_owned()]);
         let hlc = ctx.next_keyed_hlc(&actor);
-        pillar_sqlviews::create_view(&mut ctx.keyed_store, "active_users", def, hlc);
+        ctx.keyed_store
+            .with_mut(|st| pillar_sqlviews::create_view(st, "active_users", def, hlc));
 
         assert_eq!(
             get(&mut ctx, "/portal/data/sql/views?token=nope").status,
@@ -16877,5 +17069,117 @@ mod tests {
             }
         }
         assert_eq!(out, with_backslash);
+    }
+
+    // data-layer-single-substrate-dogfood: a grant, a quota mutation, and a WoT
+    // trust edge issued through the REAL live web control-op path each SURFACE
+    // as a resource-event in the ONE shared keyed-store substrate the portal
+    // browses — no second store, no private per-plane copy. RED before the
+    // plane-projection wiring (the planes wrote only their private authority
+    // folds, invisible to the portal browse); GREEN after.
+    #[test]
+    fn rbac_quota_wot_planes_surface_in_the_one_substrate() {
+        use pillar_ops::{ControlOp, TrustOp};
+
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        let actor = ctx.identity_actor_for_test();
+
+        // Before any plane writes, each plane's browse collection is empty
+        // (empty-iff-empty, "before").
+        for c in ["rbac_grants", "quota_ledger", "wot_edges"] {
+            assert!(
+                ctx.keyed_store.with(|s| s.doc_ids(c)).is_empty(),
+                "plane collection {c} was non-empty before any write"
+            );
+        }
+
+        // (1) A grant issued through the real RBAC control-op path.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::GrantAdd {
+                subject: "alice".into(),
+                capability: "stream:append".into(),
+                allow: true,
+            }),
+        )
+        .expect("grant-add signed act succeeds for the owner");
+
+        // (2) A quota mutation: an attest carrying a quota budget.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::AttestBuild {
+                issuer: "owner".into(),
+                capacity: "self".into(),
+                authority: String::new(),
+                subject: "alice".into(),
+                action: "compute:schedule".into(),
+                resource: "cell/*".into(),
+                quota: Some(100),
+                scope: "cell".into(),
+            }),
+        )
+        .expect("attest-build (quota) signed act succeeds for the owner");
+
+        // (3) A WoT trust edge issued through the real authority.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::Edge {
+                subject: "alice".into(),
+                depth: 1,
+            }),
+        )
+        .expect("trust-edge signed act succeeds for the owner");
+
+        // Every plane now SURFACES in the ONE substrate the portal browses.
+        let grant_ids = ctx.keyed_store.with(|s| s.doc_ids("rbac_grants"));
+        assert!(
+            grant_ids.contains(&"alice:stream:append".to_string()),
+            "the issued grant did not surface in the single substrate: {grant_ids:?}"
+        );
+        assert_eq!(
+            ctx.keyed_store.with(|s| s.doc_ids("quota_ledger")).len(),
+            1,
+            "the quota mutation did not surface in the single substrate"
+        );
+        assert!(
+            ctx.keyed_store
+                .with(|s| s.doc_ids("wot_edges"))
+                .contains(&"owner->alice".to_string()),
+            "the trust edge did not surface in the single substrate"
+        );
+
+        // Each surfaced row carries the signed act's event CID (a verifiable
+        // resource-event, not a bare label).
+        let grant_event = ctx
+            .keyed_store
+            .with(|s| s.doc_get_field("rbac_grants", "alice:stream:append", "event"))
+            .expect("grant event field present");
+        match grant_event {
+            pillar_keyedstore::Value::Nested(m) => {
+                assert!(
+                    matches!(m.get("event_cid"), Some(pillar_keyedstore::Value::Scalar(v)) if !v.is_empty()),
+                    "surfaced grant carries no signed event CID"
+                );
+                assert!(matches!(
+                    m.get("effect"),
+                    Some(pillar_keyedstore::Value::Scalar(v)) if v == b"allow"
+                ));
+            }
+            other => panic!("grant event is not a nested record: {other:?}"),
+        }
+
+        // empty-iff-empty, "after": a never-written plane stays empty.
+        assert!(
+            ctx.keyed_store
+                .with(|s| s.doc_ids("never_written_plane"))
+                .is_empty(),
+            "a never-written plane surfaced a non-empty browse"
+        );
     }
 }

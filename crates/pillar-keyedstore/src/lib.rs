@@ -470,6 +470,67 @@ impl pillar_streamdb::ReclaimPolicy for KeyedFieldReclaimPolicy {
     }
 }
 
+/// A cheaply-cloneable shared handle to ONE [`KeyedStore`] substrate — the
+/// data-layer-single-substrate-dogfood consolidation primitive. Every cell
+/// plane (session registry, RBAC grants, quota, web-of-trust) and the portal's
+/// browse surface hold a CLONE of the SAME `SharedStore`, so a write on any
+/// live plane path is immediately visible to the portal's kv/doc/sql browse —
+/// there is exactly ONE keyed op-log, never a private per-plane copy.
+///
+/// The handle is an `Arc<Mutex<KeyedStore>>`; [`SharedStore::with`] /
+/// [`SharedStore::with_mut`] borrow the inner store for a read/write under the
+/// lock. It is NOT a second storage engine: the inner value is the same
+/// [`KeyedStore`] fold engine documented above, merely shared by reference so
+/// no plane constructs its own.
+#[derive(Clone, Debug, Default)]
+pub struct SharedStore {
+    inner: std::sync::Arc<std::sync::Mutex<KeyedStore>>,
+}
+
+impl SharedStore {
+    /// A fresh shared substrate wrapping an empty [`KeyedStore`].
+    #[must_use]
+    pub fn new() -> Self {
+        SharedStore {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(KeyedStore::new())),
+        }
+    }
+
+    /// Wrap an existing [`KeyedStore`] as the shared substrate.
+    #[must_use]
+    pub fn from_store(store: KeyedStore) -> Self {
+        SharedStore {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(store)),
+        }
+    }
+
+    /// Borrow the inner store immutably for the duration of `f` (a read/query).
+    pub fn with<R>(&self, f: impl FnOnce(&KeyedStore) -> R) -> R {
+        let guard = self.inner.lock().expect("SharedStore lock poisoned");
+        f(&guard)
+    }
+
+    /// Borrow the inner store mutably for the duration of `f` (a write).
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut KeyedStore) -> R) -> R {
+        let mut guard = self.inner.lock().expect("SharedStore lock poisoned");
+        f(&mut guard)
+    }
+
+    /// A folded snapshot copy of the inner store (for a read-only view whose
+    /// borrow must outlive the lock).
+    #[must_use]
+    pub fn snapshot(&self) -> KeyedStore {
+        self.with(Clone::clone)
+    }
+
+    /// The number of distinct collections currently live in the shared
+    /// substrate — the single-substrate oracle reads this to prove one store.
+    #[must_use]
+    pub fn collections(&self) -> Vec<String> {
+        self.with(KeyedStore::collections)
+    }
+}
+
 /// The keyed store persisted over the existing streamdb IPFS-backed op-log
 /// durability ([`PersistentStream`]) — NO second storage engine. Every keyed
 /// op is durably written under its content address before the write returns;
@@ -571,6 +632,32 @@ mod keyed_store {
         s.kv_put("c", "k", b"v1".to_vec(), hlc(1, 0, "n1"));
         assert_eq!(s.kv_get("c", "k"), Some(b"v1".to_vec()));
         assert_eq!(s.kv_get("c", "missing"), None);
+    }
+
+    // data-layer-single-substrate-dogfood: two clones of a `SharedStore` are
+    // ONE substrate — a write through one handle is observed through the other,
+    // proving planes that share it never diverge into private copies.
+    #[test]
+    fn shared_store_clones_observe_one_substrate() {
+        let plane = SharedStore::new();
+        let browse = plane.clone();
+        plane.with_mut(|s| {
+            s.kv_put(
+                "sessions",
+                "alice\u{0}s1",
+                b"live".to_vec(),
+                hlc(1, 0, "plane"),
+            );
+        });
+        // The browse clone sees the plane's write — one op-log, no second store.
+        assert_eq!(
+            browse.with(|s| s.kv_get("sessions", "alice\u{0}s1")),
+            Some(b"live".to_vec())
+        );
+        assert!(browse.collections().iter().any(|c| c == "sessions"));
+        // Empty-iff-empty: an untouched collection is empty in both handles.
+        assert!(browse.with(|s| s.kv_keys("unused").is_empty()));
+        assert!(plane.with(|s| s.kv_keys("unused").is_empty()));
     }
 
     #[test]
