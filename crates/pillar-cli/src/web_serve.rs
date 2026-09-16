@@ -389,11 +389,15 @@ pub struct WebAuthContext {
     /// (the `owner` `WebAuthContext::new` was constructed with), which
     /// unconditionally holds every capacity.
     trust: TrustStore,
-    /// The explicit ALLOW/DENY grant set backing `pillar grant add|rm|check|
-    /// who-can` and `pillar caps` — the SAME `Vec<ExplicitGrant>` the shared
-    /// [`RbacDecider`] every signed act routes through consults, so a
-    /// wire-issued grant and a web-issued one land in one authority source.
-    grants: Vec<pillar_rbac::ExplicitGrant>,
+    // NOTE: the explicit ALLOW/DENY grant set backing `pillar grant
+    // add|rm|check|who-can` and `pillar caps` is NO LONGER a private field
+    // here — it is derived, on every read, from the `rbac_grants` Document
+    // collection in `self.keyed_store` (see `Self::grants_from_store`). That
+    // collection is the SAME shared substrate `GrantAdd`/`GrantRm` write and
+    // the portal Explore panels browse, so a wire-issued grant and a
+    // web-issued one — and the decisions every signed act consults — all
+    // read the ONE authority source with no private per-plane copy left
+    // alongside it.
     /// Named, admin-defined capability sets (`pillar role …`) over
     /// [`pillar_iam::rbac_bridge::Role`], keyed by role name — the live
     /// substrate the IAM roles panel drives; a signed act per mutation gated on
@@ -1273,7 +1277,6 @@ impl WebAuthContext {
             session_registry: SessionRegistry::with_shared_store(shared_substrate.clone()),
             session_clock: 0,
             trust: TrustStore::new(owner_for_trust),
-            grants: Vec::new(),
             iam_roles: BTreeMap::new(),
             iam_groups: BTreeMap::new(),
             oauth: pillar_oidc::client_registry::ClientRegistry::default(),
@@ -4371,7 +4374,8 @@ impl WebAuthContext {
                 subject,
                 capability,
             } => {
-                let decider = RbacDecider::new(&self.authority, &[], &self.grants);
+                let grants = self.grants_from_store();
+                let decider = RbacDecider::new(&self.authority, &[], &grants);
                 let decision = decider.decide(&RbacRequest::new(
                     NodeId::from(subject.as_str()),
                     RbacCapability::from(capability.as_str()),
@@ -4384,7 +4388,7 @@ impl WebAuthContext {
             pillar_ops::TrustOp::WhoCan { capability } => {
                 let cap = RbacCapability::from(capability.as_str());
                 let mut body = String::new();
-                for g in &self.grants {
+                for g in &self.grants_from_store() {
                     if g.capability == cap && g.effect == pillar_rbac::GrantEffect::Allow {
                         body.push_str(&format!("{}\n", g.subject.0));
                     }
@@ -4395,7 +4399,8 @@ impl WebAuthContext {
                 subject,
                 candidates,
             } => {
-                let decider = RbacDecider::new(&self.authority, &[], &self.grants);
+                let grants = self.grants_from_store();
+                let decider = RbacDecider::new(&self.authority, &[], &grants);
                 let node = NodeId::from(subject.as_str());
                 let mut body = String::new();
                 for cand in candidates {
@@ -4513,19 +4518,11 @@ impl WebAuthContext {
                         &format!("GRANT-ADD {subject} {capability} allow={allow}"),
                     )
                     .map_err(|a| format!("unauthorized actor {a} for rbac:grants:write"))?;
-                let sub = NodeId::from(subject.as_str());
-                let cap = RbacCapability::from(capability.as_str());
-                self.grants
-                    .retain(|g| !(g.subject == sub && g.capability == cap));
-                self.grants.push(pillar_rbac::ExplicitGrant {
-                    subject: sub,
-                    capability: cap,
-                    effect: if *allow {
-                        pillar_rbac::GrantEffect::Allow
-                    } else {
-                        pillar_rbac::GrantEffect::Deny
-                    },
-                });
+                // The shared keyed-store substrate IS the grant's decision
+                // state now (see `Self::grants_from_store`) — `doc_put_field`
+                // (inside `project_plane_event`, keyed by `subject:capability`)
+                // both records and overwrites any prior grant for this pair,
+                // so there is no separate in-memory vec to retain/push into.
                 let eff = if *allow { "allow" } else { "deny" };
                 self.project_plane_event(
                     actor,
@@ -4554,10 +4551,11 @@ impl WebAuthContext {
                         &format!("GRANT-RM {subject} {capability}"),
                     )
                     .map_err(|a| format!("unauthorized actor {a} for rbac:grants:write"))?;
-                let sub = NodeId::from(subject.as_str());
-                let cap = RbacCapability::from(capability.as_str());
-                self.grants
-                    .retain(|g| !(g.subject == sub && g.capability == cap));
+                // Tombstone the shared substrate's record for this pair — the
+                // SAME row `GrantAdd` writes and `Self::grants_from_store`
+                // reads, so the removal is reflected in the ONE decision
+                // source (no private in-memory vec to retain out of).
+                self.tombstone_plane_event(actor, "rbac_grants", &format!("{subject}:{capability}"));
                 Ok(format!(
                     "REMOVED {subject} {capability} EVENT-CID {}",
                     cid.0
@@ -4738,6 +4736,67 @@ impl WebAuthContext {
                 hlc,
             )
         });
+    }
+
+    /// Tombstone a prior [`Self::project_plane_event`] row: deletes the
+    /// `event` field of `id` in `collection` so it drops out of `doc_ids`/
+    /// `doc_get_field` (and, for `rbac_grants`, out of
+    /// [`Self::grants_from_store`]'s reconstructed grant set) — the SAME
+    /// live substrate the portal browses, so a removal made through the real
+    /// front-end (e.g. `GrantRm`) is reflected there too, not just in a
+    /// private in-memory structure.
+    fn tombstone_plane_event(&mut self, actor: &NodeId, collection: &str, id: &str) {
+        let hlc = self.next_keyed_hlc(actor);
+        self.keyed_store
+            .with_mut(|s| s.doc_delete_field(collection, id, "event", hlc));
+    }
+
+    /// The explicit ALLOW/DENY grant set backing `pillar grant add|rm|check|
+    /// who-can` and `pillar caps`, reconstructed by reading the `rbac_grants`
+    /// Document collection in `self.keyed_store` — the SAME shared substrate
+    /// [`Self::project_plane_event`] writes and the portal Explore panels
+    /// browse. This makes the shared keyed-store substrate the actual
+    /// decision-making source RBAC reads from: there is no separate
+    /// in-memory grant vec kept alongside it (per the dogfood invariant, no
+    /// plane keeps a private copy of state the shared substrate already
+    /// holds).
+    fn grants_from_store(&self) -> Vec<pillar_rbac::ExplicitGrant> {
+        self.keyed_store.with(|s| {
+            let mut grants = Vec::new();
+            for id in s.doc_ids("rbac_grants") {
+                let Some(pillar_keyedstore::Value::Nested(fields)) =
+                    s.doc_get_field("rbac_grants", &id, "event")
+                else {
+                    continue;
+                };
+                let scalar_str = |v: Option<&pillar_keyedstore::Value>| -> Option<String> {
+                    match v {
+                        Some(pillar_keyedstore::Value::Scalar(b)) => {
+                            Some(String::from_utf8_lossy(b).into_owned())
+                        }
+                        _ => None,
+                    }
+                };
+                let (Some(subject), Some(capability), Some(effect)) = (
+                    scalar_str(fields.get("subject")),
+                    scalar_str(fields.get("capability")),
+                    scalar_str(fields.get("effect")),
+                ) else {
+                    continue;
+                };
+                let effect = if effect == "allow" {
+                    pillar_rbac::GrantEffect::Allow
+                } else {
+                    pillar_rbac::GrantEffect::Deny
+                };
+                grants.push(pillar_rbac::ExplicitGrant {
+                    subject: NodeId::from(subject.as_str()),
+                    capability: RbacCapability::from(capability.as_str()),
+                    effect,
+                });
+            }
+            grants
+        })
     }
 
     /// Index an already-appended [`Self::act_log`] event (`cid`, an
@@ -17181,5 +17240,126 @@ mod tests {
                 .is_empty(),
             "a never-written plane surfaced a non-empty browse"
         );
+    }
+
+    // data-layer-single-substrate-dogfood (rework): the RBAC decision path
+    // (`WhoCan`/`Caps`/`GrantCheck`) must read the shared `rbac_grants`
+    // Document collection ITSELF as the source of truth — not a private
+    // `self.grants` vec mirrored alongside it. RED before
+    // `Self::grants_from_store` replaced the private vec (a grant issued
+    // through the real front-end would not have been decidable purely from
+    // the shared substrate, and a removal would have left the private vec's
+    // copy stale); GREEN after.
+    #[test]
+    fn rbac_decisions_are_derived_from_the_shared_substrate_not_a_private_vec() {
+        use pillar_ops::{ControlOp, TrustOp};
+
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        let actor = ctx.identity_actor_for_test();
+
+        // Grant alice `stream:append` through the real control-op path.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::GrantAdd {
+                subject: "alice".into(),
+                capability: "stream:append".into(),
+                allow: true,
+            }),
+        )
+        .expect("grant-add succeeds for the owner");
+
+        // The decision reads directly off the shared substrate: alice is
+        // now ALLOWed, and she is listed by `WhoCan`.
+        let check = ctx
+            .control_op(
+                &actor,
+                &ControlOp::Trust(TrustOp::GrantCheck {
+                    subject: "alice".into(),
+                    capability: "stream:append".into(),
+                }),
+            )
+            .expect("grant-check succeeds");
+        assert_eq!(check, "ALLOW");
+        let who = ctx
+            .control_op(
+                &actor,
+                &ControlOp::Trust(TrustOp::WhoCan {
+                    capability: "stream:append".into(),
+                }),
+            )
+            .expect("who-can succeeds");
+        assert!(who.contains("alice"), "who-can did not list alice: {who:?}");
+
+        // Mutating the shared substrate's row directly (bypassing the
+        // control-op front-end entirely, exactly as the portal's kv/doc
+        // browse or a peer replaying the SAME substrate would) changes the
+        // decision — proving the decider has no private copy left to go
+        // stale against the substrate.
+        ctx.keyed_store.with_mut(|s| {
+            s.doc_delete_field(
+                "rbac_grants",
+                "alice:stream:append",
+                "event",
+                pillar_keyedstore::Hlc::new(999, 0, "owner".to_string()),
+            )
+        });
+        let check_after_external_delete = ctx
+            .control_op(
+                &actor,
+                &ControlOp::Trust(TrustOp::GrantCheck {
+                    subject: "alice".into(),
+                    capability: "stream:append".into(),
+                }),
+            )
+            .expect("grant-check succeeds");
+        assert_eq!(
+            check_after_external_delete, "DENY",
+            "decision did not follow a direct mutation of the shared substrate row \
+             — a private grants copy must still exist"
+        );
+
+        // Re-grant, then remove through the real `GrantRm` front-end: the
+        // removal must ALSO be visible in the shared substrate (tombstoned),
+        // not merely in a private vec.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::GrantAdd {
+                subject: "alice".into(),
+                capability: "stream:append".into(),
+                allow: true,
+            }),
+        )
+        .expect("re-grant succeeds");
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::GrantRm {
+                subject: "alice".into(),
+                capability: "stream:append".into(),
+            }),
+        )
+        .expect("grant-rm succeeds");
+        assert!(
+            ctx.keyed_store
+                .with(|s| s.doc_get_field("rbac_grants", "alice:stream:append", "event"))
+                .is_none(),
+            "GrantRm left the shared substrate's row live — the removal only reached a \
+             private grants copy"
+        );
+        let check_after_rm = ctx
+            .control_op(
+                &actor,
+                &ControlOp::Trust(TrustOp::GrantCheck {
+                    subject: "alice".into(),
+                    capability: "stream:append".into(),
+                }),
+            )
+            .expect("grant-check succeeds");
+        assert_eq!(check_after_rm, "DENY");
     }
 }
