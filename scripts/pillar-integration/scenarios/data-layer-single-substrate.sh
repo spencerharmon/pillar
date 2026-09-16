@@ -186,6 +186,32 @@ oracle_empty_iff_empty() {
     info "oracle-observed: empty-iff-empty node-web=$web_addr unwritten-collection-empty (no phantom store; panel empty IFF plane empty)"
 }
 
+# oracle_plane_collections_share_substrate <web-addr> <token> : the multi-plane
+# single-substrate oracle. The RBAC-grant, quota, and web-of-trust planes each
+# project their live web write as a resource-event into the SAME keyed-store
+# substrate the portal browses (see WebAuthContext::project_plane_event). This
+# oracle asserts each plane's Document collection (`rbac_grants`, `quota_ledger`,
+# `wot_edges`) is BROWSABLE through the portal doc-browse route on this live node
+# — the same substrate handle, one keyed op-log. With no grant/quota/edge issued
+# yet on this fresh node the collections read empty (empty-iff-empty over the doc
+# surface); the code-level surfacing of a real issued grant/quota/edge is proven
+# by the `rbac_quota_wot_planes_surface_in_the_one_substrate` regression test
+# over the real WebAuthContext control-op path.
+oracle_plane_collections_share_substrate() {
+    local web_addr="$1" token="$2" plane out code body
+    for plane in rbac_grants quota_ledger wot_edges; do
+        out=$(_dlss_browse "$web_addr" "$token" "/portal/data/doc/ids?collection=${plane}") \
+            || fail "plane-substrate oracle: doc/ids(${plane}) on $web_addr unreachable"
+        code=$(printf '%s\n' "$out" | sed -n '1p')
+        body=$(printf '%s\n' "$out" | tail -n +2)
+        [ "$code" = "200" ] \
+            || fail "plane-substrate oracle: doc/ids(${plane}) on $web_addr returned $code ($body) — the ${plane} plane is NOT browsable on the portal's single substrate"
+        [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ] \
+            || fail "plane-substrate oracle: the unwritten ${plane} plane is NON-empty on $web_addr ($body) — a phantom second store"
+        info "oracle-observed: plane-substrate node-web=$web_addr plane=${plane} browsable-on-single-substrate (one keyed op-log; empty IFF plane empty)"
+    done
+}
+
 scenario_data-layer-single-substrate() {
     local n="${PILLAR_IT_NODES:-3}"
     [ "$n" -ge 3 ] || fail "data-layer-single-substrate: the ROI requires >=3 real nodes (got $n)"
@@ -235,7 +261,8 @@ scenario_data-layer-single-substrate() {
 
         oracle_single_substrate_session_surfaces "$web" "$token"
         oracle_empty_iff_empty "$web" "$token"
+        oracle_plane_collections_share_substrate "$web" "$token"
     done
 
-    info "data-layer-single-substrate: on ${#DLSS_NAMES[@]} real nodes, every live-login session surfaced in ITS portal browse over ONE keyed-store substrate; no second store, panel empty IFF plane empty"
+    info "data-layer-single-substrate: on ${#DLSS_NAMES[@]} real nodes, every live-login session surfaced in ITS portal browse over ONE keyed-store substrate; the RBAC/quota/WoT plane collections are browsable on that SAME substrate; no second store, panel empty IFF plane empty"
 }

@@ -4415,6 +4415,17 @@ impl WebAuthContext {
                     .map_err(|a| format!("unauthorized actor {a} for wot:edges:write"))?;
                 self.authority
                     .issue_edge(actor.clone(), NodeId::from(subject.as_str()), *depth);
+                self.project_plane_event(
+                    actor,
+                    "wot_edges",
+                    &format!("{actor}->{subject}"),
+                    &cid.0.to_string(),
+                    &[
+                        ("signer", actor.0.as_str()),
+                        ("subject", subject.as_str()),
+                        ("depth", &depth.to_string()),
+                    ],
+                );
                 Ok(format!("EDGE {subject} depth {depth} EVENT-CID {}", cid.0))
             }
             pillar_ops::TrustOp::AttestBuild {
@@ -4466,6 +4477,23 @@ impl WebAuthContext {
                             body.push_str(&format!("CHAIN {}\n", c.0));
                         }
                         body.push_str(&format!("EVENT-CID {}", cid.0));
+                        // A quota mutation (an attest carrying a quota budget)
+                        // surfaces in the ONE substrate the portal inspects.
+                        if let Some(q) = quota {
+                            self.project_plane_event(
+                                actor,
+                                "quota_ledger",
+                                &attest_cid.0.to_string(),
+                                &cid.0.to_string(),
+                                &[
+                                    ("subject", subject.as_str()),
+                                    ("action", action.as_str()),
+                                    ("resource", resource.as_str()),
+                                    ("quota", &q.to_string()),
+                                    ("scope", scope.as_str()),
+                                ],
+                            );
+                        }
                         Ok(body)
                     }
                     Err(e) => Err(format!("DENIED {}", trust_error_reason(&e))),
@@ -4497,6 +4525,17 @@ impl WebAuthContext {
                     },
                 });
                 let eff = if *allow { "allow" } else { "deny" };
+                self.project_plane_event(
+                    actor,
+                    "rbac_grants",
+                    &format!("{subject}:{capability}"),
+                    &cid.0.to_string(),
+                    &[
+                        ("subject", subject.as_str()),
+                        ("capability", capability.as_str()),
+                        ("effect", eff),
+                    ],
+                );
                 Ok(format!(
                     "GRANTED {subject} {capability} {eff} EVENT-CID {}",
                     cid.0
@@ -4655,6 +4694,48 @@ impl WebAuthContext {
     fn next_keyed_hlc(&mut self, actor: &NodeId) -> pillar_keyedstore::Hlc {
         self.keyed_clock += 1;
         pillar_keyedstore::Hlc::new(self.keyed_clock, 0, actor.to_string())
+    }
+
+    /// Project a plane's live write into the ONE shared keyed-store substrate
+    /// (`self.keyed_store`) as a Document row the portal Explore panels browse —
+    /// the SAME substrate the session registry and the `pillar kv`/`doc` query
+    /// tier already read. This is the dogfood-invariant wiring: the RBAC-grant,
+    /// quota, and web-of-trust planes each record their live web write here
+    /// (keyed by `id`, one `event` field carrying the already-signed act's CID
+    /// plus the event fields), so a grant / quota mutation / trust edge issued
+    /// through the real front-end SURFACES in the portal browse of a live cell,
+    /// with no second store and no private per-plane copy. `event_cid` is the
+    /// signed act's content address (from `perform_signed_act`), so the surfaced
+    /// row is verifiably tied to the signed resource-event.
+    fn project_plane_event(
+        &mut self,
+        actor: &NodeId,
+        collection: &str,
+        id: &str,
+        event_cid: &str,
+        fields: &[(&str, &str)],
+    ) {
+        let hlc = self.next_keyed_hlc(actor);
+        let mut record = std::collections::BTreeMap::new();
+        record.insert(
+            "event_cid".to_string(),
+            pillar_keyedstore::Value::Scalar(event_cid.as_bytes().to_vec()),
+        );
+        for (k, v) in fields {
+            record.insert(
+                (*k).to_string(),
+                pillar_keyedstore::Value::Scalar(v.as_bytes().to_vec()),
+            );
+        }
+        self.keyed_store.with_mut(|s| {
+            s.doc_put_field(
+                collection,
+                id,
+                "event",
+                pillar_keyedstore::Value::Nested(record),
+                hlc,
+            )
+        });
     }
 
     /// Index an already-appended [`Self::act_log`] event (`cid`, an
@@ -16985,5 +17066,117 @@ mod tests {
             }
         }
         assert_eq!(out, with_backslash);
+    }
+
+    // data-layer-single-substrate-dogfood: a grant, a quota mutation, and a WoT
+    // trust edge issued through the REAL live web control-op path each SURFACE
+    // as a resource-event in the ONE shared keyed-store substrate the portal
+    // browses — no second store, no private per-plane copy. RED before the
+    // plane-projection wiring (the planes wrote only their private authority
+    // folds, invisible to the portal browse); GREEN after.
+    #[test]
+    fn rbac_quota_wot_planes_surface_in_the_one_substrate() {
+        use pillar_ops::{ControlOp, TrustOp};
+
+        let mut ctx = WebAuthContext::new(
+            ORIGIN,
+            NodeId::from("this-node"),
+            "this-node-secret",
+            NodeId::from("owner"),
+            4,
+        );
+        let actor = ctx.identity_actor_for_test();
+
+        // Before any plane writes, each plane's browse collection is empty
+        // (empty-iff-empty, "before").
+        for c in ["rbac_grants", "quota_ledger", "wot_edges"] {
+            assert!(
+                ctx.keyed_store.with(|s| s.doc_ids(c)).is_empty(),
+                "plane collection {c} was non-empty before any write"
+            );
+        }
+
+        // (1) A grant issued through the real RBAC control-op path.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::GrantAdd {
+                subject: "alice".into(),
+                capability: "stream:append".into(),
+                allow: true,
+            }),
+        )
+        .expect("grant-add signed act succeeds for the owner");
+
+        // (2) A quota mutation: an attest carrying a quota budget.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::AttestBuild {
+                issuer: "owner".into(),
+                capacity: "self".into(),
+                authority: String::new(),
+                subject: "alice".into(),
+                action: "compute:schedule".into(),
+                resource: "cell/*".into(),
+                quota: Some(100),
+                scope: "cell".into(),
+            }),
+        )
+        .expect("attest-build (quota) signed act succeeds for the owner");
+
+        // (3) A WoT trust edge issued through the real authority.
+        ctx.control_op(
+            &actor,
+            &ControlOp::Trust(TrustOp::Edge {
+                subject: "alice".into(),
+                depth: 1,
+            }),
+        )
+        .expect("trust-edge signed act succeeds for the owner");
+
+        // Every plane now SURFACES in the ONE substrate the portal browses.
+        let grant_ids = ctx.keyed_store.with(|s| s.doc_ids("rbac_grants"));
+        assert!(
+            grant_ids.contains(&"alice:stream:append".to_string()),
+            "the issued grant did not surface in the single substrate: {grant_ids:?}"
+        );
+        assert_eq!(
+            ctx.keyed_store.with(|s| s.doc_ids("quota_ledger")).len(),
+            1,
+            "the quota mutation did not surface in the single substrate"
+        );
+        assert!(
+            ctx.keyed_store
+                .with(|s| s.doc_ids("wot_edges"))
+                .contains(&"owner->alice".to_string()),
+            "the trust edge did not surface in the single substrate"
+        );
+
+        // Each surfaced row carries the signed act's event CID (a verifiable
+        // resource-event, not a bare label).
+        let grant_event = ctx
+            .keyed_store
+            .with(|s| s.doc_get_field("rbac_grants", "alice:stream:append", "event"))
+            .expect("grant event field present");
+        match grant_event {
+            pillar_keyedstore::Value::Nested(m) => {
+                assert!(
+                    matches!(m.get("event_cid"), Some(pillar_keyedstore::Value::Scalar(v)) if !v.is_empty()),
+                    "surfaced grant carries no signed event CID"
+                );
+                assert!(matches!(
+                    m.get("effect"),
+                    Some(pillar_keyedstore::Value::Scalar(v)) if v == b"allow"
+                ));
+            }
+            other => panic!("grant event is not a nested record: {other:?}"),
+        }
+
+        // empty-iff-empty, "after": a never-written plane stays empty.
+        assert!(
+            ctx.keyed_store
+                .with(|s| s.doc_ids("never_written_plane"))
+                .is_empty(),
+            "a never-written plane surfaced a non-empty browse"
+        );
     }
 }
