@@ -45,11 +45,33 @@
     #     docs/pillar-oci-image-frontend-wasm-stack-fix-... in the beehive layer.
     # nixos-25.11 (rustc 1.91.1) compiles `proc-macro2` cleanly (verified:
     # rustc 1.91.1 builds the exact 1.0.107 lib.rs to exit 0 where 1.89.0
-    # SIGSEGVs 15/15) AND its LLVM predates the 21.x SIGILL, so the whole
-    # workspace and the reproducible OCI image build succeed again on AVX2. A
-    # fixed rev (not a floating channel) keeps the toolchain stable across
+    # SIGSEGVs 15/15) AND its LLVM predates the 21.x SIGILL — BUT its rustc
+    # BINARY deterministically SIGSEGVs at process startup (a crash in the
+    # dynamic linker's `_dl_relocate_object`, before rustc's own `main`) on
+    # ANY info-query invocation `rustc -vV` / `rustc --version` (20/20 on this
+    # AVX2 host). A plain `cargo build` never hits that path, so `.#pillar`'s
+    # cargoBuildHook survives — but the `pillar-frontend` wasm stage drives
+    # `trunk`, whose `cargo metadata` MUST run `rustc -vV` to detect the host,
+    # and it crashes there, failing `.#pillar-oci-image` (and every
+    # image-under-test the pillar-integration harness builds). See
+    # docs/bee-flake-image-build-cargo-auditable-fix-flake-image-build-cargo-auditable-fix.md
+    # in the beehive layer.
+    #   rustc 1.86.0 (nixos-25.05) clears the `rustc -vV` crash and the SIGILL
+    # but is TOO OLD for the flake's from-source `wasm-bindgen-cli` 0.2.121
+    # (its `time` 0.3.47 dep requires rustc >= 1.88.0).
+    #   nixos-unstable @ 140145fe (rustc 1.90.0 + LLVM 20) is the release that
+    # clears ALL FOUR traps on this host, each re-verified here:
+    #   * `rustc -vV` runs clean 8/8 (no startup SIGSEGV);
+    #   * it compiles `proc-macro2` 1.0.107 at `-C opt-level=3` with no crash
+    #     (only ordinary unresolved-dep errors, exit 1 — never signal 11);
+    #   * LLVM 20 predates the 21.x ScalarEvolution SIGILL;
+    #   * >= 1.88.0, so the from-source `wasm-bindgen-cli` builds.
+    # cargo-auditable in this rev is still 0.6.5 (the version whose rustc
+    # wrapper panics on this toolchain), so the `buildRustPackage` derivations
+    # below disable it with `auditable = false;`.
+    # A fixed rev (not a floating channel) keeps the toolchain stable across
     # rebuilds.
-    nixpkgs.url = "github:NixOS/nixpkgs/b6018f87da91d19d0ab4cf979885689b469cdd41";
+    nixpkgs.url = "github:NixOS/nixpkgs/140145fe45eedd76f30ad311a2623ca996ed706b";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -133,6 +155,13 @@
         pillar-frontend = pkgs.rustPlatform.buildRustPackage {
           pname = "pillar-frontend";
           version = cargoVersion;
+          # Disable the cargo-auditable rustc wrapper: nixpkgs' pinned
+          # cargo-auditable 0.6.5 panics (Option::unwrap on None at
+          # cargo-auditable/src/rustc_wrapper.rs:109) against the pinned rustc
+          # 1.98 — a known <0.6.6 incompatibility. The audit SBOM metadata it
+          # embeds is not required for the reproducible image; turning it off
+          # keeps the image contents otherwise identical.
+          auditable = false;
           # pillar-frontend is a workspace member (so its host-native DoD is
           # `-p`-addressable from the repo root) and PATH-depends on sibling
           # members (`pillar-web-frontend`, and through it `pillar-web-api`,
@@ -212,6 +241,10 @@
           pname = "pillar";
           version = cargoVersion;
           src = self;
+
+          # Same cargo-auditable 0.6.5 rustc-wrapper panic as pillar-frontend
+          # above; disable the auditable SBOM wrapper on the pinned toolchain.
+          auditable = false;
 
           cargoLock = {
             lockFile = ./Cargo.lock;
