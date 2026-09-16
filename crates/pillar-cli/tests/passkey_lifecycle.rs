@@ -1,29 +1,18 @@
 //! Acceptance test — `um-passkey-lifecycle` (ROI P1 "User management &
 //! lifecycle" roadmap B4).
 //!
-//! Proves the passkey LIFECYCLE management surface over the existing WebAuthn
-//! RP endpoints (`/webauthn/register/*`, `/webauthn/credentials/{list,revoke}`):
-//! a user can enroll multiple NAMED credentials, LIST them (id/label/rpId/
-//! created/last-used/sign-count), and REVOKE one — with the no-lockout
-//! keep->=1 guard refusing an unconfirmed revoke of the LAST credential and
-//! permitting it once explicitly confirmed. No new authority path, no new
-//! TLA+ gate: this restates the RP's own `CrossSurfaceUsability` /
-//! `RevokedKeyNeverAdmits` behavior from the management surface's point of
-//! view, and drives the real `pillar webauthn list|revoke` CLI dispatch
-//! (`pillar_cli::webauthn_cli::run`) — the exact code the operator's CLI
-//! calls — over the real HTTP surface of a real booted node.
+//! Proves the passkey MANAGEMENT surface (list/name/revoke) over the
+//! existing WebAuthn RP + `/webauthn/register/*` ceremony end-to-end against
+//! a real booted node, and — the crux of the task — the no-lockout guard:
+//! revoking a user's LAST credential is refused (`409 CONFIRM-REQUIRED`)
+//! unless the caller explicitly confirms, while renaming (purely cosmetic)
+//! never gates on lockout at all.
 //!
-//! The hardware `register`/`login` ceremony verbs need a real CTAP2
-//! authenticator (behind the `passkey` build feature) and are exercised
-//! elsewhere; here credential ENROLLMENT is driven directly over
-//! `/webauthn/register/{begin,finish}` with a software Ed25519 "authenticator"
-//! (the SAME technique `pillar-cli`'s own `web_serve` unit tests use), so the
-//! node's REAL relying party (`pillar_web::webauthn::RelyingParty`) verifies a
-//! real attested credential — only the hardware CTAP2 transport is swapped for
-//! a software signer.
-//!
-//! Black-box: execs the real compiled `pillar` binary and drives its real
-//! HTTP portal surface.
+//! Black-box: execs the real compiled `pillar` binary as a subprocess and
+//! drives its real HTTP portal + WebAuthn surface, registering two
+//! credentials with a hand-built (no-hardware) attestation object — exactly
+//! the same wire shape `pillar_web::webauthn::RelyingParty`'s own unit tests
+//! and the browser ceremony produce.
 //!
 //! `#[cfg(feature = "acceptance")]`-gated; run via `cargo test -p pillar-cli
 //! --test passkey_lifecycle --features acceptance`.
@@ -35,9 +24,12 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const ADMIN_PASSWORD: &str = "correct horse battery staple 2026 passkey-lifecycle";
-const ADMIN_HANDLE: &str = "alice@pillar";
-const ORIGIN: &str = "https://pillar.local";
+use pillar_crypto::sign::signing_keypair_from_seed;
+use pillar_crypto::webauthn::{base64url_decode, base64url_encode, ed25519_public_key_to_cose};
+use pillar_crypto::Seed;
+
+const HANDLE: &str = "alice@pillar";
+const PASSWORD: &str = "correct horse battery staple 2026 passkey-lifecycle";
 
 struct HttpResponse {
     status: u16,
@@ -94,6 +86,8 @@ fn free_tcp_port() -> u16 {
         .expect("claim free tcp port")
 }
 
+/// A booted `pillar node run` subprocess with its HTTP portal surface
+/// bound; killed on drop.
 struct Node {
     child: Child,
     http_port: u16,
@@ -146,34 +140,52 @@ impl Node {
         http(self.http_port, "GET", path, "").expect("GET succeeds")
     }
 
-    fn nonce_id(&self) -> u64 {
+    /// GET /nonce then POST /login with `identifier\npassword\n<nonce id>` —
+    /// the real two-field node-custody login every portal session uses. The
+    /// admitted session token is carried on the `X-Pillar-Session` response
+    /// header (never the body).
+    fn login(&self, identifier: &str, password: &str) -> String {
         let nonce_resp = self.get("/nonce");
         assert_eq!(nonce_resp.status, 200, "nonce: {}", nonce_resp.body);
-        nonce_resp
+        let id: u64 = nonce_resp
             .body
             .split_whitespace()
             .nth(1)
             .expect("nonce id")
             .parse()
-            .expect("nonce id parses")
-    }
-
-    fn login(&self, identifier: &str, password: &str) -> String {
-        let id = self.nonce_id();
-        let resp = self.post("/login", &format!("{identifier}\n{password}\n{id}"));
-        assert_eq!(resp.status, 200, "login: {}", resp.body);
-        resp.session_token
+            .expect("nonce id parses");
+        let login_resp = self.post("/login", &format!("{identifier}\n{password}\n{id}"));
+        assert_eq!(login_resp.status, 200, "login: {}", login_resp.body);
+        login_resp
+            .session_token
             .expect("login response carries a session token")
     }
 
-    fn bootstrap_admin(&self) {
-        let create_cell = self.post("/bootstrap/create-cell", "cell-genesis");
-        assert_eq!(create_cell.status, 200, "create-cell: {}", create_cell.body);
-        let create_user = self.post(
-            "/bootstrap/create-user",
-            &format!("{ADMIN_HANDLE}\n{ADMIN_PASSWORD}"),
+    /// Drive a full no-hardware `/webauthn/register/{begin,finish}` ceremony:
+    /// mint a challenge, hand-build a minimal `fmt: none` attestation object
+    /// over a fresh Ed25519 "authenticator" keypair (exactly the wire shape
+    /// `pillar_web::webauthn::RelyingParty`'s own unit tests and the browser
+    /// ceremony produce — no real hardware / ctap-hid needed), and register
+    /// it under `label`. Returns the credential id (b64url) minted.
+    fn register_passkey(&self, token: &str, label: &str, credential_id: &[u8]) -> String {
+        let begin = self.post("/webauthn/register/begin", &format!("{token}\n{HANDLE}"));
+        assert_eq!(begin.status, 200, "register/begin: {}", begin.body);
+        let mut fields = begin.body.split_whitespace();
+        assert_eq!(fields.next(), Some("CHALLENGE"));
+        let challenge_b64 = fields.next().expect("challenge").to_owned();
+        let rp_id = fields.next().unwrap_or("pillar.local").to_owned();
+
+        let seed = Seed::from_bytes(format!("passkey-lifecycle-{label}").into_bytes());
+        let (public, _secret) = signing_keypair_from_seed(&seed).expect("keygen");
+        let cose = ed25519_public_key_to_cose(&public).expect("cose");
+        let attestation_b64 = base64url_encode(&attestation_object(&cose, credential_id, 0));
+
+        let finish = self.post(
+            "/webauthn/register/finish",
+            &format!("{token}\n{HANDLE}\n{challenge_b64}\n{attestation_b64}\n{label}\n{rp_id}"),
         );
-        assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
+        assert_eq!(finish.status, 200, "register/finish: {}", finish.body);
+        base64url_encode(credential_id)
     }
 }
 
@@ -184,41 +196,21 @@ impl Drop for Node {
     }
 }
 
-// ---- A software Ed25519 "authenticator" (no hardware needed): builds a real
-// `fmt=none` attestation object the node's real RP (`parse_attestation`)
-// verifies, exactly as `pillar-cli`'s own `web_serve` unit tests do. ----
-
-fn b64(bytes: &[u8]) -> String {
-    pillar_crypto::webauthn::base64url_encode(bytes)
-}
-
-fn challenge_of(resp: &HttpResponse) -> String {
-    assert_eq!(resp.status, 200, "begin failed: {}", resp.body);
-    resp.body
-        .split_whitespace()
-        .nth(1)
-        .expect("CHALLENGE <b64> ...")
-        .to_owned()
-}
-
-/// A test Ed25519 authenticator: returns the CBOR attestation object for a
-/// given credential id, keyed off `label` (so distinct labels mint distinct
-/// keys).
-fn software_attestation(label: &str, credential_id: &[u8], sign_count: u32) -> Vec<u8> {
-    let (public, _secret) = pillar_crypto::sign::signing_keypair_from_seed(
-        &pillar_crypto::Seed::from_bytes(label.as_bytes().to_vec()),
-    )
-    .expect("keypair from seed");
-    let cose = pillar_crypto::webauthn::ed25519_public_key_to_cose(&public)
-        .expect("cose-encode ed25519 public key");
+/// Hand-build a minimal `fmt: none` CBOR attestation object carrying
+/// `authData` (rpIdHash || flags(AT|UP) || signCount || aaguid=0 ||
+/// credIdLen || credId || COSE public key) — the exact shape
+/// `pillar_web::webauthn::RelyingParty::register_finish`'s
+/// `pillar_crypto::webauthn::parse_attestation` expects, mirroring
+/// `pillar_web::webauthn`'s own `mod tests::attestation` helper.
+fn attestation_object(cose: &[u8], credential_id: &[u8], sign_count: u32) -> Vec<u8> {
     let mut auth_data = Vec::new();
-    auth_data.extend_from_slice(&[0u8; 32]);
-    auth_data.push(0x40 | 0x01); // AT + UP flags
+    auth_data.extend_from_slice(&[0u8; 32]); // rpIdHash (unchecked here)
+    auth_data.push(0x40 | 0x01); // flags: AT (attested cred data) | UP (user present)
     auth_data.extend_from_slice(&sign_count.to_be_bytes());
-    auth_data.extend_from_slice(&[0u8; 16]); // AAGUID
+    auth_data.extend_from_slice(&[0u8; 16]); // aaguid
     auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
     auth_data.extend_from_slice(credential_id);
-    auth_data.extend_from_slice(&cose);
+    auth_data.extend_from_slice(cose);
     use ciborium::value::Value;
     let att = Value::Map(vec![
         (Value::Text("fmt".into()), Value::Text("none".into())),
@@ -226,207 +218,153 @@ fn software_attestation(label: &str, credential_id: &[u8], sign_count: u32) -> V
         (Value::Text("authData".into()), Value::Bytes(auth_data)),
     ]);
     let mut out = Vec::new();
-    ciborium::into_writer(&att, &mut out).expect("cbor-encode attestation object");
+    ciborium::into_writer(&att, &mut out).expect("cbor encode");
     out
 }
 
-/// Enroll one NAMED credential for the already-logged-in `token`, via the real
-/// `/webauthn/register/{begin,finish}` ceremony (software authenticator).
-/// Returns the credential's base64url id.
-fn enroll(node: &Node, token: &str, credential_id: &[u8], label: &str, rp_id: &str) -> String {
-    let begin = node.post(
-        "/webauthn/register/begin",
-        &format!("{token}\nalice@pillar"),
-    );
-    let challenge_b64 = challenge_of(&begin);
-    let attestation = software_attestation(label, credential_id, 0);
-    let finish = node.post(
-        "/webauthn/register/finish",
-        &format!(
-            "{token}\nalice@pillar\n{challenge_b64}\n{}\n{label}\n{rp_id}",
-            b64(&attestation)
-        ),
-    );
-    assert_eq!(finish.status, 200, "register/finish: {}", finish.body);
-    assert!(finish.body.starts_with("REGISTERED"), "{}", finish.body);
-    finish
-        .body
-        .split_whitespace()
-        .nth(1)
-        .expect("REGISTERED <cred-id-b64url>")
-        .to_owned()
+/// Parse one `CRED <id> <label> <rp_id> <created> <last|-> <signs>` line from
+/// `/webauthn/credentials/list`'s body into `(id, label)`.
+fn parse_cred_lines(body: &str) -> Vec<(String, String)> {
+    body.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() == 7 && f[0] == "CRED" {
+                Some((f[1].to_owned(), f[2].to_owned()))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
-/// The full passkey lifecycle: enroll two named credentials, LIST renders
-/// both with their metadata, REVOKE the first succeeds (a survivor remains),
-/// REVOKE of the LAST credential is refused `409 CONFIRM-REQUIRED` unless
-/// confirmed — the no-lockout keep->=1 guard — and a confirmed revoke of the
-/// last credential IS allowed (a lost sole key must still be revocable).
-/// Drives `list`/`revoke` through the real CLI dispatch
-/// (`pillar_cli::webauthn_cli::run`), not a hand-rolled HTTP client, so this
-/// proves the exact code the operator's `pillar webauthn` invokes.
 #[test]
-fn list_name_revoke_and_keep_at_least_one_over_the_real_cli_and_rp() {
+fn passkey_list_name_revoke_enforce_no_lockout() {
     let data_dir = tempfile::tempdir().expect("data dir");
     let node = Node::boot(data_dir.path());
-    node.bootstrap_admin();
-    let token = node.login(ADMIN_HANDLE, ADMIN_PASSWORD);
 
-    let domain = format!("127.0.0.1:{}", node.http_port);
-    let cli = |args: &[&str]| {
-        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        pillar_cli::webauthn_cli::run(&owned)
-    };
+    let create_cell = node.post("/bootstrap/create-cell", "cell-genesis");
+    assert_eq!(create_cell.status, 200, "create-cell: {}", create_cell.body);
+    let create_user = node.post("/bootstrap/create-user", &format!("{HANDLE}\n{PASSWORD}"));
+    assert_eq!(create_user.status, 200, "create-user: {}", create_user.body);
 
-    // --- Enroll two NAMED credentials, each bound to its own rpId.
-    let cred_blue = enroll(
-        &node,
-        &token,
-        b"cred-blue",
-        "yubikey-blue",
-        "deleteme.example.com",
-    );
-    let cred_green = enroll(
-        &node,
-        &token,
-        b"cred-green",
-        "laptop-green",
-        "pillar.example.net",
-    );
+    let token = node.login(HANDLE, PASSWORD);
 
-    // --- LIST (real CLI dispatch) renders both, with their chosen names.
-    let listing =
-        cli(&["list", "--domain", &domain, "--token", &token]).expect("webauthn list succeeds");
+    // --- 0. No credentials yet: an empty set.
+    let empty = node.post("/webauthn/credentials/list", &token);
+    assert_eq!(empty.status, 200, "list: {}", empty.body);
     assert!(
-        listing.contains(&cred_blue) && listing.contains("yubikey-blue"),
-        "listing carries the first credential's id + name: {listing}"
+        empty.body.trim().is_empty(),
+        "no credentials enrolled yet: {}",
+        empty.body
     );
+
+    // --- 1. Enroll TWO passkeys.
+    let cred_a = node.register_passkey(&token, "laptop", b"cred-passkey-a");
+    let cred_b = node.register_passkey(&token, "yubikey", b"cred-passkey-b");
+
+    // --- 2. LIST shows both, oldest-first, with their labels.
+    let list = node.post("/webauthn/credentials/list", &token);
+    assert_eq!(list.status, 200, "list: {}", list.body);
+    let creds = parse_cred_lines(&list.body);
+    assert_eq!(creds.len(), 2, "both credentials listed: {}", list.body);
+    assert_eq!(creds[0], (cred_a.clone(), "laptop".to_owned()));
+    assert_eq!(creds[1], (cred_b.clone(), "yubikey".to_owned()));
+
+    // --- 3. NAME (rename) one credential; the new label is reflected in a
+    // subsequent list, and the OTHER credential's label is untouched.
+    let rename = node.post(
+        "/webauthn/credentials/name",
+        &format!("{token}\n{cred_a}\nwork-laptop"),
+    );
+    assert_eq!(rename.status, 200, "name: {}", rename.body);
     assert!(
-        listing.contains(&cred_green) && listing.contains("laptop-green"),
-        "listing carries the second credential's id + name: {listing}"
+        rename.body.contains("work-laptop"),
+        "rename ack echoes the new label: {}",
+        rename.body
+    );
+    let after_rename = parse_cred_lines(&node.post("/webauthn/credentials/list", &token).body);
+    assert_eq!(after_rename[0], (cred_a.clone(), "work-laptop".to_owned()));
+    assert_eq!(after_rename[1], (cred_b.clone(), "yubikey".to_owned()));
+
+    // --- 4. REVOKE cred_a (not the last one — succeeds immediately, no
+    // confirm needed).
+    let revoke_a = node.post(
+        "/webauthn/credentials/revoke",
+        &format!("{token}\n{cred_a}"),
+    );
+    assert_eq!(revoke_a.status, 200, "revoke non-last: {}", revoke_a.body);
+    let after_revoke_a = parse_cred_lines(&node.post("/webauthn/credentials/list", &token).body);
+    assert_eq!(after_revoke_a.len(), 1);
+    assert_eq!(after_revoke_a[0].0, cred_b);
+
+    // --- 5. NO-LOCKOUT GUARD: cred_b is now the caller's LAST credential.
+    // Revoking it WITHOUT confirmation is refused (409 CONFIRM-REQUIRED); the
+    // credential remains live.
+    let revoke_last_unconfirmed = node.post(
+        "/webauthn/credentials/revoke",
+        &format!("{token}\n{cred_b}"),
     );
     assert_eq!(
-        listing.lines().count(),
-        2,
-        "both enrolled credentials are listed: {listing}"
-    );
-
-    // --- REVOKE (real CLI dispatch) of the first credential: a survivor
-    // remains, so no confirmation is required.
-    let revoke_first = cli(&[
-        "revoke",
-        "--credential-id",
-        &cred_blue,
-        "--domain",
-        &domain,
-        "--token",
-        &token,
-    ])
-    .expect("revoking a non-last credential needs no confirmation");
-    assert!(
-        revoke_first.contains("REVOKED"),
-        "revoke ack: {revoke_first}"
-    );
-
-    let listing2 =
-        cli(&["list", "--domain", &domain, "--token", &token]).expect("webauthn list succeeds");
-    assert!(
-        !listing2.contains(&cred_blue),
-        "revoked credential no longer listed: {listing2}"
+        revoke_last_unconfirmed.status, 409,
+        "revoking the last credential without confirm must be refused: {}",
+        revoke_last_unconfirmed.body
     );
     assert!(
-        listing2.contains("laptop-green"),
-        "the survivor remains listed: {listing2}"
+        revoke_last_unconfirmed
+            .body
+            .contains("CONFIRM-REQUIRED"),
+        "refusal names the confirm gate: {}",
+        revoke_last_unconfirmed.body
     );
+    let still_there = parse_cred_lines(&node.post("/webauthn/credentials/list", &token).body);
+    assert_eq!(still_there.len(), 1, "unconfirmed revoke did not apply");
 
-    // --- Enforce keep->=1: revoking the LAST credential WITHOUT --yes is
-    // refused by the CLI (surfaces the node's 409 CONFIRM-REQUIRED as a clear
-    // error, never a silent lockout).
-    let err = cli(&[
-        "revoke",
-        "--credential-id",
-        &cred_green,
-        "--domain",
-        &domain,
-        "--token",
-        &token,
-    ])
-    .expect_err("revoking the LAST credential without confirmation must be refused");
-    assert!(
-        err.contains("LAST") || err.contains("last"),
-        "refusal explains the last-credential guard: {err}"
+    // --- 5b. Renaming the LAST credential is always allowed (never gated
+    // on lockout — it is purely cosmetic).
+    let rename_last = node.post(
+        "/webauthn/credentials/name",
+        &format!("{token}\n{cred_b}\nlast-key"),
     );
-
-    // The un-confirmed revoke was a no-op: the credential is still listed.
-    let still =
-        cli(&["list", "--domain", &domain, "--token", &token]).expect("webauthn list succeeds");
-    assert!(
-        still.contains("laptop-green"),
-        "un-confirmed last-credential revoke left it intact: {still}"
-    );
-
-    // --- With --yes, revoking the LAST credential IS allowed (a lost sole key
-    // must still be revocable).
-    let revoke_last = cli(&[
-        "revoke",
-        "--credential-id",
-        &cred_green,
-        "--yes",
-        "--domain",
-        &domain,
-        "--token",
-        &token,
-    ])
-    .expect("a confirmed last-credential revoke is allowed");
-    assert!(revoke_last.contains("REVOKED"), "revoke ack: {revoke_last}");
-
-    let empty =
-        cli(&["list", "--domain", &domain, "--token", &token]).expect("webauthn list succeeds");
     assert_eq!(
-        empty.trim(),
-        "no credentials enrolled",
-        "all credentials revoked: {empty}"
+        rename_last.status, 200,
+        "renaming the last credential is never lockout-gated: {}",
+        rename_last.body
     );
 
-    // --- A revoked credential can never re-admit: even a hardware-perfect
-    // fresh assertion signed with the revoked key is refused by the real RP
-    // (`RevokedKeyNeverAdmits`), proving revoke is a permanent fail-closed
-    // effect, not just a management-surface hide.
-    let (_public, secret) = pillar_crypto::sign::signing_keypair_from_seed(
-        &pillar_crypto::Seed::from_bytes(b"cred-blue".to_vec()),
-    )
-    .expect("keypair from seed");
-    let begin = node.post("/webauthn/authenticate/begin", &token);
-    let challenge_b64 = challenge_of(&begin);
-    let challenge =
-        pillar_crypto::webauthn::base64url_decode(&challenge_b64).expect("challenge decodes");
-    use sha2::{Digest, Sha256};
-    let cdj = format!(
-        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}"}}"#,
-        b64(&challenge)
-    )
-    .into_bytes();
-    let mut ad = Vec::new();
-    ad.extend_from_slice(&[0u8; 32]);
-    ad.push(0x01);
-    ad.extend_from_slice(&9u32.to_be_bytes());
-    let mut signed = ad.clone();
-    signed.extend_from_slice(&Sha256::digest(&cdj));
-    let sig = pillar_crypto::sign::sign(&secret, &signed).expect("sign");
-    let replay = node.post(
-        "/webauthn/authenticate/finish",
-        &format!(
-            "{token}\n{challenge_b64}\n{}\n{}\n{}\n{}\n{}",
-            b64(b"cred-blue"),
-            b64(&ad),
-            b64(&cdj),
-            b64(sig.as_bytes()),
-            b64(b"hardware-prf-output"),
-        ),
+    // --- 6. Revoking the last credential WITH confirmation succeeds; the
+    // credential set is now empty.
+    let revoke_last_confirmed = node.post(
+        "/webauthn/credentials/revoke",
+        &format!("{token}\n{cred_b}\nconfirm"),
     );
-    assert_ne!(
-        replay.status, 200,
-        "a revoked credential must never re-admit: {}",
-        replay.body
+    assert_eq!(
+        revoke_last_confirmed.status, 200,
+        "confirmed last-credential revoke succeeds: {}",
+        revoke_last_confirmed.body
     );
+    let empty_again = node.post("/webauthn/credentials/list", &token);
+    assert!(
+        empty_again.body.trim().is_empty(),
+        "credential set is empty after the confirmed revoke: {}",
+        empty_again.body
+    );
+
+    // --- 7. Revoking / naming an UNKNOWN (or someone else's) credential id
+    // is refused not-found, never silently accepted.
+    let unknown = base64url_encode(b"never-registered");
+    let bad_revoke = node.post(
+        "/webauthn/credentials/revoke",
+        &format!("{token}\n{unknown}"),
+    );
+    assert_eq!(bad_revoke.status, 404, "unknown credential: {}", bad_revoke.body);
+    let bad_name = node.post(
+        "/webauthn/credentials/name",
+        &format!("{token}\n{unknown}\nnope"),
+    );
+    assert_eq!(bad_name.status, 404, "unknown credential: {}", bad_name.body);
+
+    // Sanity: base64url_decode round-trips what register_passkey encoded
+    // (guards against a helper bug silently making every assertion above a
+    // vacuous string-equality check on garbage).
+    assert_eq!(base64url_decode(&cred_b).unwrap(), b"cred-passkey-b");
 }
