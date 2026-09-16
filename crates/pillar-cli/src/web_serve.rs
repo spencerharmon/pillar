@@ -576,6 +576,16 @@ pub struct WebAuthContext {
     /// A sub-quorum approval set never fires. In-process, exactly like every
     /// other portal substrate here.
     recoveries: BTreeMap<String, RecoveryQuorum>,
+    /// Per-handle LOGIN HISTORY (`um-anomaly-signals`, ROI P1 "User
+    /// management & lifecycle" roadmap D3): the last-observed origin/geo/time
+    /// of every [`pillar_ops::UserOp::LoginObserve`] call, folded to detect
+    /// impossible-travel and new-origin anomalies. Advisory bookkeeping only
+    /// — no authority, no gate; `handle -> most-recent observation`.
+    login_history: BTreeMap<String, LoginObservation>,
+    /// Every origin ever observed for a handle (new-origin detection needs
+    /// the FULL set, not just the last one — a returning device must not
+    /// re-trip the alert every time).
+    login_origins: BTreeMap<String, std::collections::HashSet<String>>,
 }
 
 /// One open M-of-N break-glass recovery: the declared quorum threshold and the
@@ -589,6 +599,17 @@ struct RecoveryQuorum {
     m: u32,
     /// The distinct admin handles that have co-signed this recovery so far.
     approvers: std::collections::BTreeSet<String>,
+}
+
+/// One recorded [`pillar_ops::UserOp::LoginObserve`] observation — this
+/// handle's most recent login's origin/geo/time, kept to detect the NEXT
+/// login's anomalies against.
+#[derive(Clone, Debug)]
+struct LoginObservation {
+    origin: String,
+    lat: f64,
+    lon: f64,
+    at: u64,
 }
 
 /// Whole seconds since the Unix epoch — the real monotone-enough wall clock
@@ -1267,6 +1288,8 @@ impl WebAuthContext {
             lockout: pillar_web::account_lockout::LockoutGate::new(lockout_policy_from_env()),
             rate_limiter: rate_limiter_from_env(),
             recoveries: BTreeMap::new(),
+            login_history: BTreeMap::new(),
+            login_origins: BTreeMap::new(),
         }
     }
 
@@ -5331,6 +5354,13 @@ impl WebAuthContext {
             pillar_ops::UserOp::SecurityEventsFeed { kind } => {
                 self.security_events_feed(kind.as_deref())
             }
+            pillar_ops::UserOp::LoginObserve {
+                handle,
+                origin,
+                lat,
+                lon,
+                at,
+            } => self.login_observe(actor, handle, origin, lat, lon, *at),
             pillar_ops::UserOp::Invite {
                 handle,
                 email,
@@ -5494,6 +5524,7 @@ impl WebAuthContext {
             "MEMBER-ADD" | "MEMBER-ROLE" => Some("elevation"),
             "IDENTITY-ROTATE" => Some("rotation"),
             "SESSION-REVOKE" | "SESSION-REVOKE-ALL" => Some("revocation"),
+            "USER-ANOMALY-IMPOSSIBLE-TRAVEL" | "USER-ANOMALY-NEW-ORIGIN" => Some("anomaly"),
             _ => None,
         }
     }
@@ -5544,6 +5575,121 @@ impl WebAuthContext {
             count += 1;
         }
         body.push_str(&format!("events: {count}\n"));
+        Ok(body)
+    }
+
+    /// Beyond this speed no honest traveler moves between two logins — well
+    /// past commercial-flight cruise speed — so any pair of logins implying a
+    /// greater great-circle speed is an IMPOSSIBLE-TRAVEL anomaly.
+    const IMPOSSIBLE_TRAVEL_KMH: f64 = 900.0;
+
+    /// Great-circle distance between two lat/lon points, in kilometers
+    /// (haversine formula; mean Earth radius).
+    fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        const EARTH_RADIUS_KM: f64 = 6371.0;
+        let (rlat1, rlat2) = (lat1.to_radians(), lat2.to_radians());
+        let dlat = (lat2 - lat1).to_radians();
+        let dlon = (lon2 - lon1).to_radians();
+        let a = (dlat / 2.0).sin().powi(2)
+            + rlat1.cos() * rlat2.cos() * (dlon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().asin();
+        EARTH_RADIUS_KM * c
+    }
+
+    /// Observe one LOGIN for `handle` (`pillar user login-observe`,
+    /// `um-anomaly-signals`): ADVISORY impossible-travel / new-origin
+    /// anomaly detection over the node's per-handle login history — see the
+    /// [`pillar_ops::UserOp::LoginObserve`] doc for the full contract.
+    /// Member-gated (the SAME `perform_signed_act` decider every other
+    /// `iam:users:write` mutation uses); always records the observation,
+    /// and signs exactly one event PER detected anomaly kind (zero, one, or
+    /// both may fire for a single login). Never denies the login itself —
+    /// purely advisory.
+    fn login_observe(
+        &mut self,
+        actor: &NodeId,
+        handle: &str,
+        origin: &str,
+        lat: &str,
+        lon: &str,
+        at: u64,
+    ) -> Result<String, String> {
+        if self.authority.reachable_depth(actor).is_none() {
+            return Err("unauthorized: signer is not a recognized cell member".to_owned());
+        }
+        let lat: f64 = lat
+            .parse()
+            .map_err(|_| format!("malformed latitude {lat}"))?;
+        let lon: f64 = lon
+            .parse()
+            .map_err(|_| format!("malformed longitude {lon}"))?;
+
+        let mut anomalies: Vec<(String, String)> = Vec::new();
+
+        if let Some(prev) = self.login_history.get(handle) {
+            let distance_km = Self::haversine_km(prev.lat, prev.lon, lat, lon);
+            let dt_hours = if at > prev.at {
+                (at - prev.at) as f64 / 3600.0
+            } else {
+                0.0
+            };
+            let is_impossible = if dt_hours > 0.0 {
+                (distance_km / dt_hours) > Self::IMPOSSIBLE_TRAVEL_KMH
+            } else {
+                distance_km > 0.0
+            };
+            if is_impossible {
+                anomalies.push((
+                    "USER-ANOMALY-IMPOSSIBLE-TRAVEL".to_owned(),
+                    format!(
+                        "{handle} distance_km={:.0} dt_s={} prev_origin={} origin={origin}",
+                        distance_km,
+                        at.saturating_sub(prev.at),
+                        prev.origin,
+                    ),
+                ));
+            }
+        }
+        let seen_before = self
+            .login_origins
+            .get(handle)
+            .is_some_and(|set| !set.is_empty());
+        let origin_known = self
+            .login_origins
+            .get(handle)
+            .is_some_and(|set| set.contains(origin));
+        if seen_before && !origin_known {
+            anomalies.push((
+                "USER-ANOMALY-NEW-ORIGIN".to_owned(),
+                format!("{handle} origin={origin}"),
+            ));
+        }
+
+        let mut body = format!("OBSERVED handle={handle} origin={origin} at={at}\n");
+        for (verb, detail) in &anomalies {
+            let cid = self
+                .perform_signed_act(actor, "iam:users:write", &format!("{verb} {detail}"))
+                .map_err(|a| format!("unauthorized actor {a} for iam:users:write"))?;
+            body.push_str(&format!("ANOMALY {verb} EVENT-CID {}\n", cid.0));
+        }
+        body.push_str(&format!("anomalies: {}\n", anomalies.len()));
+
+        // Record the observation (always, anomaly or not) AFTER classifying,
+        // so this login's own origin/geo never suppresses ITS OWN anomaly.
+        self.login_history.insert(
+            handle.to_owned(),
+            LoginObservation {
+                origin: origin.to_owned(),
+                lat,
+                lon,
+                at,
+            },
+        );
+        self.login_origins
+            .entry(handle.to_owned())
+            .or_default()
+            .insert(origin.to_owned());
+
         Ok(body)
     }
 

@@ -629,6 +629,37 @@ pub enum UserOp {
         /// `revocation`); `None` renders every security-relevant category.
         kind: Option<String>,
     },
+    /// Observe one LOGIN for `handle` (`um-anomaly-signals`, ROI P1 "User
+    /// management & lifecycle" roadmap D3): an ADVISORY anomaly-detection
+    /// hook over the node's per-handle login history. `origin` is an
+    /// opaque device/IP tag (the SAME shape `pillar_identity::
+    /// session_registry` origins use, e.g. `chrome/macos/198.51.100.9`);
+    /// `lat`/`lon` are the login's geo coordinates and `at` its logical
+    /// timestamp (whole seconds) — ALL infra-supplied at runtime (geo/IP
+    /// enrichment is never performed here). Compares against this handle's
+    /// prior observations and, when either an IMPOSSIBLE-TRAVEL (too far,
+    /// too fast since the last login) or a NEW-ORIGIN (an origin string
+    /// never seen before for this handle, when at least one prior
+    /// observation exists) anomaly is detected, emits exactly ONE signed
+    /// `act_log` event per anomaly kind — folded into
+    /// [`Self::SecurityEventsFeed`]'s `anomaly` category — alongside always
+    /// recording the observation. Advisory only: detecting an anomaly signs
+    /// a signal, never denies or gates the login itself (no new authority,
+    /// no enforcement decision).
+    LoginObserve {
+        /// The logging-in user's handle.
+        handle: String,
+        /// Opaque device/IP origin tag.
+        origin: String,
+        /// Login latitude, in degrees (decimal string, e.g. `"37.7749"`) —
+        /// a `String` (not `f64`) so the op stays `Eq`, like every other
+        /// wire-carried numeric field in this crate.
+        lat: String,
+        /// Login longitude, in degrees (decimal string).
+        lon: String,
+        /// Logical login timestamp, in whole seconds.
+        at: u64,
+    },
     /// One IAM user's row.
     Show {
         /// The user handle.
