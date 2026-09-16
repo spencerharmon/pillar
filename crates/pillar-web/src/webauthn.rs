@@ -385,6 +385,25 @@ impl RelyingParty {
             .is_some_and(|r| r.user_handle == user_handle)
     }
 
+    /// Rename (relabel) a credential owned by `user_handle`. Refuses
+    /// (returns `false`, no mutation) unless the credential is a live record
+    /// actually owned by `user_handle` — the same ownership predicate revoke
+    /// uses ([`user_owns_credential`](Self::user_owns_credential)), so a user
+    /// can never relabel another user's credential. Purely cosmetic: does not
+    /// touch `sign_count`, `last_used_at`, or the no-lockout guard.
+    pub fn rename_credential(&mut self, user_handle: &str, credential_id: &[u8], label: &str) -> bool {
+        if !self.user_owns_credential(user_handle, credential_id) {
+            return false;
+        }
+        let key = hex(credential_id);
+        if let Some(record) = self.records.get_mut(&key) {
+            record.label = label.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Whether `credential_id` is the user's LAST live credential — i.e.
     /// revoking it removes their second factor entirely. Returns `false` if the
     /// user does not own the credential (that case is a plain not-found at the
@@ -651,6 +670,40 @@ mod tests {
             Err(RpError::Revoked),
             "a revoked credential must fail closed"
         );
+    }
+
+    #[test]
+    fn rename_credential_relabels_only_the_owners_own_record() {
+        let (_sk_a, cose_a) = authenticator("auth-a");
+        let mut rp = RelyingParty::new();
+        register(&mut rp, &cose_a, b"cred-1", 0);
+        // A second user's credential must never be touched by another user's
+        // rename (same ownership predicate revoke uses).
+        let ch2 = rp.begin("sess-2", "cell-A", 1000, TTL);
+        rp.register_finish(
+            "sess-2",
+            "cell-A",
+            1000,
+            0,
+            &ch2,
+            &attestation(&cose_a, b"cred-2", 0),
+            [9u8; 32],
+            "bob",
+            "",
+            "pillar.local",
+        )
+        .expect("register bob's credential");
+
+        // alice may rename her own credential.
+        assert!(rp.rename_credential("alice", b"cred-1", "my-key"));
+        assert_eq!(rp.record(b"cred-1").unwrap().label, "my-key");
+
+        // alice may NOT rename bob's credential.
+        assert!(!rp.rename_credential("alice", b"cred-2", "stolen-label"));
+        assert_eq!(rp.record(b"cred-2").unwrap().label, "");
+
+        // an unknown credential id is refused too.
+        assert!(!rp.rename_credential("alice", b"never-registered", "x"));
     }
 
     #[test]
