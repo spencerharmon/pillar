@@ -325,11 +325,116 @@ pub fn delete_resource(addr: &str) -> Result<(String, TransportKind), String> {
     .map_err(|e| e.to_string())
 }
 
-/// `pillar apply -f <manifest.yaml>`: parse a YAML or JSON manifest bundle
-/// (multi-document `---` stream, single document, or a `kind: List`) into one
-/// CRD per resource and send each as a `ResourceOp::Apply` over pillar-message.
+/// One resource's `--dry-run` preview outcome within a (possibly
+/// multi-document) manifest: whether the decider WOULD accept it, or the
+/// refusal reason it would give — with NO event emitted and NO state
+/// mutated (see [`dry_run_apply_manifest_text`]).
+pub struct DryRunReport {
+    /// The resource's `kind/name`, for a per-document report line.
+    pub label: String,
+    /// `Ok(())` if the object decodes, round-trips, and the decider would
+    /// ACCEPT it; `Err(reason)` for a schema/decode failure or a decider
+    /// refusal.
+    pub outcome: Result<(), String>,
+}
+
+/// The capability every standalone dry-run preview is evaluated under. This
+/// is an offline validation actor's capability, not a real cell's RBAC
+/// capability namespace — see [`dry_run_apply_manifest_text`]'s doc for why a
+/// fixed permissive local seed is required for this path to ever ACCEPT.
+const DRY_RUN_CAPABILITY: &str = "cli/dry-run-apply";
+
+/// The offline validation actor's identity: seeded as its own standalone
+/// [`pillar_wot_authority::WotAuthority`] trust ROOT (depth 0), so it always
+/// clears [`pillar_rbac::default_resource_class_policies`]'s depth
+/// thresholds for [`DRY_RUN_CAPABILITY`] regardless of resource class. This
+/// identity dials no cell and is never sent anywhere — it exists purely to
+/// give the in-process decider a subject to authorize.
+const DRY_RUN_ACTOR: &str = "cli-dry-run-offline-validator";
+
+/// Parse `text` as a (possibly multi-document) manifest and, for EACH
+/// resource, run the SAME schema-decode + envelope-round-trip + single-decider
+/// preview [`pillar_cli::resource::ResourcePlane::dry_run_apply`] runs against
+/// a live cell's `Platform` — but against a freshly constructed, **standalone,
+/// in-process** `Platform`: no live node, no cell dial, no network. This is
+/// the pure core `pillar apply -f <file> --dry-run` wraps with argv parsing +
+/// `ExitCode` translation.
+///
+/// Because the decider needs a policy/trust context to ever ACCEPT, this
+/// standalone path seeds one permissive-enough local `WotAuthority` +
+/// `default_resource_class_policies` context for a single offline validation
+/// actor ([`DRY_RUN_ACTOR`]) under a single offline capability
+/// ([`DRY_RUN_CAPABILITY`]) — this actor is the WoT trust ROOT (depth 0), so
+/// it clears every `ResourceClass` threshold `default_resource_class_policies`
+/// ships. This mirrors the identical seeding pattern
+/// `pillar_cli::resource`'s own unit tests use to get a real (non-mocked)
+/// ACCEPT out of the decider. It grants no wider authority than "this object,
+/// against its registered built-in schema, would be structurally accepted
+/// offline" — it says nothing about what a real cell's own WoT/RBAC state
+/// would decide for a live apply.
+///
+/// Schema coverage is every built-in kind
+/// ([`pillar_manifest::register_builtin_schemas`]) — the identical registry a
+/// live cell's `Platform` starts from — so an unknown/unregistered kind is
+/// refused exactly as it would be against a live cell, and a well-formed
+/// built-in-kind object is structurally validated identically offline.
+///
+/// # Errors
+/// A parse error string if `text` is not a well-formed (possibly
+/// multi-document) manifest — this is atomic, same as the live-apply path.
+/// Each resource's own accept/refuse outcome is reported per-item in the
+/// returned [`DryRunReport`], never as a top-level `Err`.
+pub fn dry_run_apply_manifest_text(text: &str) -> Result<Vec<DryRunReport>, String> {
+    use pillar_core::NodeId;
+    use pillar_rbac::{default_resource_class_policies, Capability as RbacCapability};
+    use pillar_wot_authority::WotAuthority;
+
+    let crds = pillar_manifest::Crd::from_documents(text).map_err(|e| e.to_string())?;
+
+    let mut registry = pillar_manifest::SchemaRegistry::new();
+    pillar_manifest::builtin::register_builtin_schemas(&mut registry);
+
+    let actor = NodeId::from(DRY_RUN_ACTOR);
+    let authority = WotAuthority::new(actor.clone(), 5);
+    let policies = default_resource_class_policies(&RbacCapability(DRY_RUN_CAPABILITY.to_owned()));
+    let mut platform = crate::Platform::new(registry, authority, policies, Vec::new());
+    let events_before = platform.event_count();
+
+    let mut reports = Vec::with_capacity(crds.len());
+    for crd in crds {
+        let label = format!("{}/{}", crd.kind, crd.metadata.name);
+        let plane = crate::resource::ResourcePlane::new(&mut platform, crd.api_version.clone());
+        let outcome = plane
+            .dry_run_apply(&actor, DRY_RUN_CAPABILITY, &crd)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        reports.push(DryRunReport { label, outcome });
+    }
+    debug_assert_eq!(
+        platform.event_count(),
+        events_before,
+        "dry-run must never append an event"
+    );
+    Ok(reports)
+}
+
+/// `pillar apply -f <manifest.yaml> [--dry-run]`: parse a YAML or JSON
+/// manifest bundle (multi-document `---` stream, single document, or a `kind:
+/// List`) into one CRD per resource.
+///
+/// Without `--dry-run`, sends each as a `ResourceOp::Apply` over pillar-message
+/// to a live node (see [`apply_manifest_text`]).
+///
+/// With `--dry-run`, runs a standalone, cell-INDEPENDENT preview (see
+/// [`dry_run_apply_manifest_text`]) — schema decode + envelope round-trip +
+/// single-decider preview against an in-process `Platform` — emitting NO
+/// event, dialing NO cell, mutating NOTHING. Prints each object's predicted
+/// ACCEPT/refusal and exits 0 iff EVERY object decodes, round-trips, and the
+/// decider would ACCEPT it; non-zero otherwise (a decode failure, an unknown
+/// kind, or a decider refusal for any object).
 pub fn apply(args: &[String]) -> ExitCode {
     let mut file = None;
+    let mut dry_run = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -337,11 +442,15 @@ pub fn apply(args: &[String]) -> ExitCode {
                 file = args.get(i + 1).cloned();
                 i += 2;
             }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
     let Some(file) = file else {
-        eprintln!("usage: pillar apply -f <manifest.yaml>");
+        eprintln!("usage: pillar apply -f <manifest.yaml> [--dry-run]");
         return ExitCode::from(2);
     };
     let text = match std::fs::read_to_string(&file) {
@@ -351,6 +460,31 @@ pub fn apply(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if dry_run {
+        return match dry_run_apply_manifest_text(&text) {
+            Ok(reports) => {
+                let mut all_ok = true;
+                for r in &reports {
+                    match &r.outcome {
+                        Ok(()) => println!("{}: ACCEPT (dry-run)", r.label),
+                        Err(reason) => {
+                            println!("{}: REFUSE (dry-run): {reason}", r.label);
+                            all_ok = false;
+                        }
+                    }
+                }
+                if all_ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(e) => {
+                eprintln!("pillar apply --dry-run: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match apply_manifest_text(&text) {
         Ok(acks) => {
             let mut all_ok = true;
@@ -2095,5 +2229,72 @@ mod resolve_tests {
     #[test]
     fn resolve_addr_rejects_an_unparseable_endpoint() {
         assert!(resolve_addr("not a socket addr", "test").is_err());
+    }
+}
+
+#[cfg(test)]
+mod apply_dry_run_argv_tests {
+    use super::dry_run_apply_manifest_text;
+
+    /// A well-formed built-in `RetentionPolicy` object (the SAME fixture
+    /// shape `pillar_manifest`'s own `from_documents` tests use).
+    const VALID_YAML: &str = concat!(
+        "apiVersion: pillar.dev/v1\n",
+        "kind: RetentionPolicy\n",
+        "metadata:\n",
+        "  name: solo\n",
+        "spec:\n",
+        "  signalKind: Metric\n",
+        "  window: 2592000\n",
+    );
+
+    /// An unregistered/unknown kind — no built-in schema exists for
+    /// `NotARealKind`, so this must be refused, not silently accepted.
+    const UNKNOWN_KIND_YAML: &str = concat!(
+        "apiVersion: pillar.dev/v1\n",
+        "kind: NotARealKind\n",
+        "metadata:\n",
+        "  name: bogus\n",
+        "spec:\n",
+        "  whatever: true\n",
+    );
+
+    #[test]
+    fn apply_dry_run_argv_accepts_a_valid_built_in_manifest() {
+        let reports =
+            dry_run_apply_manifest_text(VALID_YAML).expect("well-formed manifest parses");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].label, "RetentionPolicy/solo");
+        assert!(
+            reports[0].outcome.is_ok(),
+            "a well-formed, schema-valid built-in object must be predicted ACCEPT, got {:?}",
+            reports[0].outcome
+        );
+    }
+
+    #[test]
+    fn apply_dry_run_argv_refuses_an_unknown_kind() {
+        let reports =
+            dry_run_apply_manifest_text(UNKNOWN_KIND_YAML).expect("well-formed YAML parses");
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].outcome.is_err(),
+            "an unregistered kind must be refused, not accepted"
+        );
+    }
+
+    #[test]
+    fn apply_dry_run_argv_emits_no_event_for_either_outcome() {
+        // dry_run_apply_manifest_text asserts internally (debug_assert_eq!)
+        // that platform.event_count() is unchanged; calling it here for both
+        // a valid and an invalid manifest exercises that invariant on both
+        // paths within one test binary.
+        let _ = dry_run_apply_manifest_text(VALID_YAML).expect("parses");
+        let _ = dry_run_apply_manifest_text(UNKNOWN_KIND_YAML).expect("parses");
+    }
+
+    #[test]
+    fn apply_dry_run_argv_rejects_unparseable_yaml() {
+        assert!(dry_run_apply_manifest_text("not: [valid yaml").is_err());
     }
 }
