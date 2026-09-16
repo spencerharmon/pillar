@@ -1,156 +1,345 @@
-//! Acceptance test — `um-expiring-role-grants` (ROI Priority 1 "User
-//! management & lifecycle" roadmap C1).
+//! Acceptance test — `um-expiring-role-grants` (ROI P1 "User management &
+//! lifecycle" roadmap C1: expiring role grants).
 //!
-//! Proves role/group bindings with an expiry AUTO-LAPSE fail-closed: once
-//! wall-clock passes a binding's expiry it contributes NOTHING to the
-//! subject's effective role/group set — no revoke, no sweeper, no further
-//! action required. This is the executable image of the
-//! `ExpiredGrantNeverAdmits` invariant proven exhaustively by
-//! `specs/GrantAuthority.tla`, driven through the real
-//! `pillar_cli::expiring_role_grants::ExpiringRoleGrantLedger` API.
+//! Proves that a role/group binding carrying an ABSOLUTE expiry AUTO-LAPSES
+//! fail-closed: once wall-clock passes the expiry the grant contributes
+//! nothing to the subject's effective capabilities, and the SAME shared
+//! `pillar_rbac::RbacDecider` path every other capability check rides refuses
+//! the capability — never a bespoke bypass. This is the Rust refinement of
+//! `specs/GrantAuthority.tla`'s `ExpiredGrantNeverAdmits` invariant the C1
+//! story is gated on, driven directly over the real
+//! `pillar_iam::expiring_grants` engine (`GrantSet`/`GrantOp`,
+//! `effective_capabilities_at`, `authorize_capability_at`) the portal/CLI
+//! embed — not a mock.
 //!
-//! The REGRESSION this proves: a role/group binding that outlived its
-//! expiry (or that an explicit revoke failed to immediately drop) would be
-//! a STANDING grant — precisely the "never fail-open" defect this roadmap
-//! item exists to prevent. `expired_grant_never_admits()` over the whole
-//! ledger must hold at every wall-clock tick, and an expired binding's role/
-//! group name must be absent from `effective_roles`/`effective_groups`.
+//! The REGRESSION this proves: before this task a role/group binding was a
+//! bare, permanent membership (`rbac_bridge`), so a time-limited grant either
+//! did not exist or would have had to be manually revoked on a timer; after
+//! it, an expired grant is DERIVED-dead at every read (`now > expiry`), so it
+//! admits nothing with no per-grant write — and a plain permanent (`None`
+//! expiry) binding still behaves exactly as before.
 //!
 //! `#[cfg(feature = "acceptance")]`-gated; run via `cargo test -p pillar-cli
 //! --test expiring_role_grants --features acceptance`.
 
 #![cfg(feature = "acceptance")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pillar_cli::expiring_role_grants::{ExpiringRoleGrantLedger, RoleGrantError};
+use pillar_iam::expiring_grants::{
+    authorize_capability_at, effective_capabilities_at, GrantOp, GrantSet,
+};
+use pillar_iam::rbac_bridge::{ManagedGroup, Role};
+use pillar_iam::{apply_op, replay, UserOp};
+use pillar_rbac::{Capability, Decision, ExplicitGrant, GrantEffect, StepUpPolicy};
+use pillar_wot_authority::WotAuthority;
 
-#[test]
-fn expiring_role_grant_auto_lapses_at_expiry_fail_closed() {
-    let mut ledger = ExpiringRoleGrantLedger::new();
-    assert!(
-        ledger.effective_roles("alice").is_empty(),
-        "no ambient role without a live binding"
-    );
+const CRED_MANAGE: &str = "iam:credentials:manage";
+const USERS_WRITE: &str = "iam:users:write";
 
-    // An admin binds alice to billing-admin through tick 100.
-    let grant = ledger
-        .assign_role("owner", "alice", "billing-admin", 100)
-        .unwrap();
-    assert!(ledger.admits(grant));
-    assert_eq!(
-        ledger.effective_roles("alice"),
-        BTreeSet::from(["billing-admin".to_owned()]),
-        "the binding is live and contributes its role"
+fn roles() -> BTreeMap<String, Role> {
+    let mut roles = BTreeMap::new();
+    roles.insert(
+        "billing-admin".to_owned(),
+        Role::new("billing-admin", [CRED_MANAGE]),
     );
-    assert!(ledger.expired_grant_never_admits());
-
-    // Through the inclusive expiry the binding is still live.
-    ledger.tick_to(100);
-    assert!(ledger.admits(grant));
-    assert_eq!(
-        ledger.effective_roles("alice"),
-        BTreeSet::from(["billing-admin".to_owned()])
+    roles.insert(
+        "support-role".to_owned(),
+        Role::new("support-role", [USERS_WRITE]),
     );
-
-    // --- AUTO-LAPSE: one tick past expiry the binding silently stops
-    // admitting — no revoke was issued, no daemon swept it.
-    ledger.tick_to(101);
-    assert!(
-        !ledger.admits(grant),
-        "the binding auto-lapses past its window"
-    );
-    assert!(
-        ledger.effective_roles("alice").is_empty(),
-        "an expired role grant contributes nothing, fail-closed"
-    );
-    assert!(
-        ledger.expired_grant_never_admits(),
-        "invariant still holds after auto-lapse"
-    );
-
-    // The clock never rewinds: winding it back cannot revive the lapsed
-    // binding.
-    ledger.tick_to(10);
-    assert!(
-        !ledger.admits(grant),
-        "monotone clock: expired binding is never revived"
-    );
+    roles
 }
 
-#[test]
-fn expiring_group_membership_lapse_drops_inherited_membership() {
-    let mut ledger = ExpiringRoleGrantLedger::new();
-    let membership = ledger
-        .assign_group("owner", "bob", "support-team", 5)
-        .unwrap();
-    assert_eq!(
-        ledger.effective_groups("bob"),
-        BTreeSet::from(["support-team".to_owned()])
+fn groups() -> BTreeMap<String, ManagedGroup> {
+    let mut groups = BTreeMap::new();
+    groups.insert(
+        "support-team".to_owned(),
+        ManagedGroup::new("support-team", ["support-role"]),
     );
-
-    ledger.tick_to(6);
-    assert!(!ledger.admits(membership));
-    assert!(
-        ledger.effective_groups("bob").is_empty(),
-        "an expired group membership contributes nothing, fail-closed"
-    );
-    assert!(ledger.expired_grant_never_admits());
+    groups
 }
 
-#[test]
-fn explicit_revoke_fail_closes_immediately_without_waiting_for_expiry() {
-    let mut ledger = ExpiringRoleGrantLedger::new();
-    let grant = ledger
-        .assign_role("owner", "carol", "support-role", 1_000)
-        .unwrap();
-    assert!(ledger.admits(grant));
-
-    ledger.revoke(grant);
-    assert!(!ledger.admits(grant), "revocation fail-closes immediately");
-    assert!(ledger.effective_roles("carol").is_empty());
-    assert!(ledger.expired_grant_never_admits());
+fn one_user(handle: &str) -> BTreeMap<String, UserRecordAlias> {
+    // Re-exported UserRecord via replay; keep the alias local for readability.
+    replay([UserOp::Invite {
+        handle: handle.to_owned(),
+        display_name: handle.to_owned(),
+        email: format!("{handle}@example.com"),
+        force_password_change: true,
+        require_passkey_enrollment: false,
+        at: 1,
+    }])
 }
 
-#[test]
-fn expiry_in_the_past_is_refused() {
-    let mut ledger = ExpiringRoleGrantLedger::new();
-    ledger.tick_to(20);
-    match ledger.assign_role("owner", "dave", "role-x", 19) {
-        Err(RoleGrantError::ExpiryInPast {
-            expiry: 19,
-            now: 20,
-        }) => {}
-        other => panic!("an already-dead binding must be refused, got {other:?}"),
-    }
-}
+// `replay` returns `BTreeMap<String, pillar_iam::UserRecord>`; alias so the
+// helper signature reads cleanly without importing the concrete type name.
+type UserRecordAlias = pillar_iam::UserRecord;
 
+/// A role grant with an absolute expiry auto-lapses: live before the expiry,
+/// dead one tick after — and the transition needs no revoke write, only a
+/// clock advance (the `ExpiredGrantNeverAdmits` refinement).
 #[test]
-fn expired_grant_never_admits_holds_at_every_tick_across_a_mixed_ledger() {
-    // A mix of role and group bindings with staggered expiries; the whole-
-    // ledger invariant must hold at EVERY wall-clock tick, mirroring the
-    // TLA+ `ExpiredGrantNeverAdmits` state predicate across the reachable
-    // state space.
-    let mut ledger = ExpiringRoleGrantLedger::new();
-    let short_role = ledger.assign_role("owner", "a", "role-a", 3).unwrap();
-    let short_group = ledger.assign_group("owner", "b", "group-b", 6).unwrap();
-    let long_role = ledger.assign_role("owner", "c", "role-c", 1_000).unwrap();
+fn an_expiring_role_grant_auto_lapses_fail_closed() {
+    let records = one_user("alice");
+    let roles = roles();
+    let groups = groups();
 
-    for t in 0..=12 {
-        ledger.tick_to(t);
-        assert!(
-            ledger.expired_grant_never_admits(),
-            "ExpiredGrantNeverAdmits must hold at now={t}"
+    // Admin grants alice `billing-admin` until tick 100.
+    let grants = GrantSet::replay([GrantOp::GrantRole {
+        handle: "alice".to_owned(),
+        name: "billing-admin".to_owned(),
+        expires_at: Some(100),
+    }]);
+
+    // Before + at the expiry: the capability is present (inclusive-open).
+    for now in [1_u64, 50, 100] {
+        assert_eq!(
+            effective_capabilities_at(&records, &grants, &roles, &groups, "alice", now),
+            BTreeSet::from([CRED_MANAGE.to_owned()]),
+            "grant must be LIVE at tick {now} (<= expiry)"
         );
     }
 
-    assert!(!ledger.admits(short_role));
-    assert!(!ledger.admits(short_group));
-    assert!(ledger.admits(long_role));
-    assert!(ledger.effective_roles("a").is_empty());
-    assert!(ledger.effective_groups("b").is_empty());
+    // One tick past the expiry: the grant has auto-lapsed — nothing admitted,
+    // no revoke was ever issued.
+    assert!(
+        effective_capabilities_at(&records, &grants, &roles, &groups, "alice", 101).is_empty(),
+        "an expired grant must contribute NOTHING — ExpiredGrantNeverAdmits"
+    );
+}
+
+/// The auto-lapse is enforced through the SAME shared `RbacDecider` every
+/// other Pillar capability check uses: a live grant authorises the capability,
+/// an expired one is denied fail-closed — never a bespoke, decider-bypassing
+/// check.
+#[test]
+fn expiry_is_enforced_through_the_shared_decider() {
+    let authority = WotAuthority::new(pillar_core::NodeId::from("root"), 5);
+    let policies: [pillar_rbac::PolicyEvent; 0] = [];
+    let step_up = StepUpPolicy::default();
+    let records = one_user("alice");
+    let roles = roles();
+    let groups = groups();
+    let grants = GrantSet::replay([GrantOp::GrantRole {
+        handle: "alice".to_owned(),
+        name: "billing-admin".to_owned(),
+        expires_at: Some(100),
+    }]);
+
+    let decide = |now: u64| {
+        authorize_capability_at(
+            &authority,
+            &policies,
+            &[],
+            &records,
+            &grants,
+            &roles,
+            &groups,
+            &step_up,
+            "alice",
+            CRED_MANAGE,
+            now,
+            None,
+        )
+    };
+
+    assert_eq!(decide(50), Decision::Allow, "live grant → Allow");
     assert_eq!(
-        ledger.effective_roles("c"),
-        BTreeSet::from(["role-c".to_owned()])
+        decide(101),
+        Decision::Deny,
+        "expired grant → Deny (fail-closed) via the shared decider"
+    );
+
+    // A capability nobody's live grant covers denies at every tick — the
+    // fail-closed floor is never weakened by the expiry machinery.
+    assert_eq!(
+        authorize_capability_at(
+            &authority,
+            &policies,
+            &[],
+            &records,
+            &grants,
+            &roles,
+            &groups,
+            &step_up,
+            "alice",
+            "iam:groups:write",
+            50,
+            None,
+        ),
+        Decision::Deny,
+        "an ungranted capability stays denied"
+    );
+}
+
+/// An expiring GROUP binding lapses exactly like a role binding, and a
+/// permanent (`None` expiry) binding never lapses — the pre-C1 bare-membership
+/// semantics preserved as a strict subset.
+#[test]
+fn group_grants_lapse_and_permanent_grants_persist() {
+    let records = one_user("bob");
+    let roles = roles();
+    let groups = groups();
+
+    let grants = GrantSet::replay([
+        // A time-limited group membership (inherits support-role's capability).
+        GrantOp::GrantGroup {
+            handle: "bob".to_owned(),
+            name: "support-team".to_owned(),
+            expires_at: Some(10),
+        },
+    ]);
+    assert_eq!(
+        effective_capabilities_at(&records, &grants, &roles, &groups, "bob", 10),
+        BTreeSet::from([USERS_WRITE.to_owned()]),
+        "live group grant inherits its attached role's capability"
+    );
+    assert!(
+        effective_capabilities_at(&records, &grants, &roles, &groups, "bob", 11).is_empty(),
+        "an expired group binding lapses fail-closed"
+    );
+
+    // A permanent grant never lapses.
+    let permanent = GrantSet::replay([GrantOp::GrantRole {
+        handle: "bob".to_owned(),
+        name: "billing-admin".to_owned(),
+        expires_at: None,
+    }]);
+    assert_eq!(
+        effective_capabilities_at(&records, &permanent, &roles, &groups, "bob", u64::MAX),
+        BTreeSet::from([CRED_MANAGE.to_owned()]),
+        "a None-expiry grant is permanent (pre-C1 semantics)"
+    );
+}
+
+/// An explicit deny still wins over a LIVE expiring grant (fail-closed
+/// precedence is preserved), and an early revoke lapses a grant before its
+/// expiry.
+#[test]
+fn explicit_deny_and_early_revoke_both_win() {
+    let authority = WotAuthority::new(pillar_core::NodeId::from("root"), 5);
+    let policies: [pillar_rbac::PolicyEvent; 0] = [];
+    let step_up = StepUpPolicy::default();
+    let records = one_user("alice");
+    let roles = roles();
+    let groups = groups();
+
+    // Live long-lived grant, but an explicit deny present.
+    let grants = GrantSet::replay([GrantOp::GrantRole {
+        handle: "alice".to_owned(),
+        name: "billing-admin".to_owned(),
+        expires_at: Some(1_000),
+    }]);
+    let deny = [ExplicitGrant {
+        subject: pillar_core::NodeId::from("alice"),
+        capability: Capability::from(CRED_MANAGE),
+        effect: GrantEffect::Deny,
+    }];
+    assert_eq!(
+        authorize_capability_at(
+            &authority,
+            &policies,
+            &deny,
+            &records,
+            &grants,
+            &roles,
+            &groups,
+            &step_up,
+            "alice",
+            CRED_MANAGE,
+            50,
+            None,
+        ),
+        Decision::Deny,
+        "an explicit deny wins over a live expiring grant"
+    );
+
+    // Early revoke lapses the grant before its expiry.
+    let revoked = GrantSet::replay([
+        GrantOp::GrantRole {
+            handle: "alice".to_owned(),
+            name: "billing-admin".to_owned(),
+            expires_at: Some(1_000),
+        },
+        GrantOp::RevokeRole {
+            handle: "alice".to_owned(),
+            name: "billing-admin".to_owned(),
+        },
+    ]);
+    assert!(
+        effective_capabilities_at(&records, &revoked, &roles, &groups, "alice", 10).is_empty(),
+        "an explicitly revoked grant admits nothing even before its expiry"
+    );
+}
+
+/// A grant may be RENEWED (re-issued with a longer expiry): the renewed expiry
+/// governs, so the binding stays live past the original deadline — the C1
+/// extension leg — while an un-renewed grant lapses on schedule.
+#[test]
+fn renewal_extends_the_expiry() {
+    let records = one_user("alice");
+    let roles = roles();
+    let groups = groups();
+
+    let grants = GrantSet::replay([
+        GrantOp::GrantRole {
+            handle: "alice".to_owned(),
+            name: "billing-admin".to_owned(),
+            expires_at: Some(100),
+        },
+        GrantOp::GrantRole {
+            handle: "alice".to_owned(),
+            name: "billing-admin".to_owned(),
+            expires_at: Some(500),
+        },
+    ]);
+    assert_eq!(
+        effective_capabilities_at(&records, &grants, &roles, &groups, "alice", 300),
+        BTreeSet::from([CRED_MANAGE.to_owned()]),
+        "the renewed (longer) expiry governs — grant is live at tick 300"
+    );
+    assert!(
+        effective_capabilities_at(&records, &grants, &roles, &groups, "alice", 501).is_empty(),
+        "past the renewed expiry the grant still auto-lapses fail-closed"
+    );
+}
+
+/// The expiring-grant projection composes with the record's existing
+/// permanent bindings: a directly-assigned (permanent) role via `UserOp` and a
+/// separately expiring grant union while live, and only the expiring one
+/// lapses.
+#[test]
+fn expiring_grant_composes_with_permanent_record_roles() {
+    let mut records = one_user("alice");
+    // A permanent, directly-assigned role on the record itself.
+    apply_op(
+        &mut records,
+        UserOp::RoleAssign {
+            handle: "alice".to_owned(),
+            role: "support-role".to_owned(),
+            at: 2,
+        },
+    );
+    let roles = roles();
+    let groups = groups();
+
+    // Plus an expiring billing-admin grant.
+    let grants = GrantSet::replay([GrantOp::GrantRole {
+        handle: "alice".to_owned(),
+        name: "billing-admin".to_owned(),
+        expires_at: Some(100),
+    }]);
+
+    // While live: union of both.
+    assert_eq!(
+        effective_capabilities_at(&records, &grants, &roles, &groups, "alice", 50),
+        BTreeSet::from([CRED_MANAGE.to_owned(), USERS_WRITE.to_owned()]),
+        "the permanent record role and the live expiring grant union"
+    );
+    // After lapse: only the permanent role survives.
+    assert_eq!(
+        effective_capabilities_at(&records, &grants, &roles, &groups, "alice", 101),
+        BTreeSet::from([USERS_WRITE.to_owned()]),
+        "only the expiring grant lapses; the permanent record role persists"
     );
 }
