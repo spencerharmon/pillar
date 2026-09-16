@@ -62,7 +62,19 @@ jobs:
         run: nix develop -c bash -c 'cargo clippy --workspace --all-targets -- -D warnings'
 
       - name: test
-        run: nix develop -c bash -c 'cargo test --all'
+        # Split the target-tests from the doctests into two cargo invocations.
+        # A single `cargo test --all` interleaves the per-crate doctest rustdoc
+        # builds with the test-harness build; on the CI runner that races the
+        # doc-profile dependency rlibs and rustdoc fails at the FIRST doctest
+        # (pillar-bootstrap) with `error[E0463]: can't find crate for
+        # pillar_crypto` (and pillar_identity / pillar_rbac / sha2 / ...), even
+        # though those crates' unit tests just linked them. Two separate
+        # invocations each resolve+build their own dependency closure cleanly:
+        # `--all-targets` runs lib/bins/tests/examples (it deliberately EXCLUDES
+        # doctests), and `--doc` then runs the doctests against a doc-profile
+        # build it fully materializes. Together they cover exactly what the old
+        # single `cargo test --all` covered.
+        run: nix develop -c bash -c 'cargo test --all --all-targets && cargo test --all --doc'
 
   # Dedicated guard that the OPT-IN hardware custody backends still compile and
   # lint cleanly, so the main distribution (which ships them via
