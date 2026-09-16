@@ -83,7 +83,27 @@ pub static PARITY_MAP: &[ParityRule] = &[
     ParityRule::Paired { verb: "login", route_prefix: "/login" },
     ParityRule::Paired { verb: "session", route_prefix: "/portal/sessions" },
     ParityRule::Paired { verb: "identity", route_prefix: "/portal/identity" },
-    ParityRule::Paired { verb: "user", route_prefix: "/portal/members" },
+    // The `user` verb is IAM user LIFECYCLE (ls / show / audit /
+    // security-events / invite / disable / enable / require-change /
+    // set-password) — the counterpart of the `/portal/users/*` admin family
+    // (invite / bulk-invite / reset-password / unlock / forgot-password /
+    // disable / enable / require-password-change, incl. their /dry-run
+    // variants). Cell MEMBERSHIP add/set-role is the SEPARATE `member` verb,
+    // paired with `/portal/members` right below.
+    ParityRule::Paired { verb: "user", route_prefix: "/portal/users" },
+    // Cell MEMBERSHIP add / set-role: the `member` verb drives the same action
+    // the portal serves under `/portal/members/*`. The CLI reaches it over the
+    // sealed resource-op tier and the portal over HTTP — one act, two surfaces.
+    ParityRule::Paired { verb: "member", route_prefix: "/portal/members" },
+    // The Collection Explorer DATA plane (keyed KV / structured Document / live
+    // SQL views): the `kv` / `doc` / `sql` CLI verbs read+write the same sealed
+    // query tier the portal serves under `/portal/data/{kv,doc,sql}/*`.
+    ParityRule::Paired { verb: "kv", route_prefix: "/portal/data/kv" },
+    ParityRule::Paired { verb: "doc", route_prefix: "/portal/data/doc" },
+    ParityRule::Paired { verb: "sql", route_prefix: "/portal/data/sql" },
+    // The `config` verb fetches this node's CLI config bundle; the portal serves
+    // the same bundle for download at `/portal/profile/cli-config`.
+    ParityRule::Paired { verb: "config", route_prefix: "/portal/profile/cli-config" },
     ParityRule::Paired { verb: "domain", route_prefix: "/portal/domains" },
     ParityRule::Paired { verb: "attest", route_prefix: "/portal/attestations" },
     ParityRule::Paired { verb: "trust", route_prefix: "/portal/trust-graph" },
@@ -199,6 +219,38 @@ pub static PARITY_MAP: &[ParityRule] = &[
         verb: "versioning-rollout",
         reason: "in-process compat-negotiation/migration/readiness/rollback self-test rig exercised by the pillar-integration versioning-rollout scenario; a local diagnostic, not a served portal action",
     },
+    ParityRule::CliOnly {
+        verb: "delete",
+        reason: "kubectl-parity resource delete (ResourceOp::Delete); served in the portal under the shared /portal/resource/* family (paired via `apply`)",
+    },
+    ParityRule::CliOnly {
+        verb: "role",
+        reason: "IAM named-capability-set (role) registry management over the sealed resource-op tier; the portal exposes IAM as user-lifecycle under /portal/users, with no dedicated role-admin route",
+    },
+    ParityRule::CliOnly {
+        verb: "group",
+        reason: "IAM managed-group membership management over the sealed resource-op tier; no dedicated portal group-admin route (portal IAM is user-lifecycle under /portal/users)",
+    },
+    ParityRule::CliOnly {
+        verb: "oauth",
+        reason: "OAuth/OIDC client-registry management over the sealed resource-op tier; no dedicated portal oauth-admin route",
+    },
+    ParityRule::CliOnly {
+        verb: "catalog",
+        reason: "collection/catalog discovery over the sealed query tier; the portal Collection Explorer discovers via the /portal/data/{kv,doc,sql} views, with no dedicated catalog endpoint",
+    },
+    ParityRule::CliOnly {
+        verb: "topology",
+        reason: "topology / domain / membership VIEWS over pillar-message; the portal serves the topology plane under /portal/topology (paired via `space`)",
+    },
+    ParityRule::CliOnly {
+        verb: "portal",
+        reason: "a CLI client shell (PortalClient login-then-act) that drives the node THROUGH the portal HTTP surface; it exercises the portal routes rather than being a distinct portal action",
+    },
+    ParityRule::CliOnly {
+        verb: "public-visibility",
+        reason: "an in-process streamdb-op + RBAC-decider self-test rig proving the `public` visibility class; a local diagnostic, not a served portal action",
+    },
 
     // --- portal route families deliberately without a CLI verb -------------
     ParityRule::PortalOnly {
@@ -212,6 +264,14 @@ pub static PARITY_MAP: &[ParityRule] = &[
     ParityRule::PortalOnly {
         route_prefix: "/portal/layout",
         reason: "per-user portal dashboard layout persistence; a browser-only UI-state endpoint",
+    },
+    ParityRule::PortalOnly {
+        route_prefix: "/portal/recovery",
+        reason: "the M-of-N break-glass account-recovery quorum flow (start/approve) is a browser-coordinated multi-approver admin surface with no single-operator CLI verb",
+    },
+    ParityRule::PortalOnly {
+        route_prefix: "/portal/profile",
+        reason: "the self-service profile page is a browser-only account dashboard; its one operator-actionable sub-route /portal/profile/cli-config is separately paired with the `config` verb",
     },
     ParityRule::PortalOnly {
         route_prefix: "/",
