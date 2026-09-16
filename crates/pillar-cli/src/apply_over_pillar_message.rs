@@ -2261,8 +2261,7 @@ mod apply_dry_run_argv_tests {
 
     #[test]
     fn apply_dry_run_argv_accepts_a_valid_built_in_manifest() {
-        let reports =
-            dry_run_apply_manifest_text(VALID_YAML).expect("well-formed manifest parses");
+        let reports = dry_run_apply_manifest_text(VALID_YAML).expect("well-formed manifest parses");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].label, "RetentionPolicy/solo");
         assert!(

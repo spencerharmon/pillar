@@ -535,7 +535,7 @@ impl EventLog {
             .filter(|(_, n)| **n == 0)
             .map(|(id, _)| id.clone())
             .collect();
-        ready.sort_by_key(|id| sort_key(id));
+        ready.sort_by_key(&sort_key);
         let mut order: Vec<&Event> = Vec::with_capacity(self.events.len());
         while let Some(next) = ready.first().cloned() {
             ready.remove(0);
