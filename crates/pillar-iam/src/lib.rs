@@ -55,6 +55,9 @@ pub use expiring_grants::{
     GrantOp, GrantSet,
 };
 
+pub mod access_review;
+pub use access_review::{AttestationCampaign, CampaignOp, GrantKey, GrantKind};
+
 pub mod password_lifecycle;
 pub use password_lifecycle::{
     admit_gated_action, complete_self_password_change, evaluate_login_password_age,
