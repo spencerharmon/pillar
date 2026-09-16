@@ -26,11 +26,59 @@
 //!
 //! Run: `cargo run -p pillar-streamdb --example perf_bench --release -- [N]`
 //! where `N` is the op count (default 5000). Output is a single JSON object.
+//!
+//! Rig/noise robustness: the swarm's sandbox runs on shared, often-throttled
+//! CPUs where raw ns/op can swing by an order of magnitude run-to-run — not a
+//! real regression, just contention. Two mitigations, both load-bearing for the
+//! discipline to mean anything in this environment:
+//!   1. Every metric is measured as the MIN of several independent trials (a
+//!      contention/scheduler blip only ever makes a trial slower, never
+//!      faster, so the min is the closest single number gets to "the real
+//!      cost on quiet hardware").
+//!   2. A `calib_ns_per_op` figure (a fixed, allocation-free integer workload
+//!      with no streamdb code in it) is measured the same way in the same
+//!      process and emitted alongside the streamdb metrics. The shell harness
+//!      compares BASELINE-RELATIVE-TO-ITS-OWN-CALIBRATION ratios
+//!      (metric/calib) rather than raw ns/op, which cancels out the rig's
+//!      absolute clock speed / throttling state at measurement time.
 
 use std::time::Instant;
 
 use pillar_core::SideEffect;
 use pillar_streamdb::{OpLog, Stream};
+
+/// Run `f` `trials` times and return the MINIMUM elapsed-ns/op observed (the
+/// least-contended sample), not the mean — a scheduler/contention blip can
+/// only ever slow a trial down, never speed it up, so the min best isolates
+/// steady-state cost from sandbox noise.
+fn min_of_trials<F: FnMut() -> f64>(trials: usize, mut f: F) -> f64 {
+    let mut best = f64::INFINITY;
+    for _ in 0..trials {
+        let v = f();
+        if v < best {
+            best = v;
+        }
+    }
+    best
+}
+
+/// A fixed, streamdb-free integer workload used purely to gauge this run's CPU
+/// throughput, so the streamdb metrics can be reported relative to it instead
+/// of as raw wall-clock ns (which swings with rig speed / throttling).
+fn calibration_ns_per_op(reps: usize) -> f64 {
+    min_of_trials(3, || {
+        let t = Instant::now();
+        let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..reps {
+            acc = acc
+                .wrapping_mul(0xA24B_AED4_963E_E407)
+                .wrapping_add(i as u64);
+            acc ^= acc.rotate_left(17);
+        }
+        std::hint::black_box(acc);
+        t.elapsed().as_nanos() as f64 / reps as f64
+    })
+}
 
 /// Deterministic, distinct payloads so every op has a distinct content address
 /// (a realistic op set with no accidental dedup collapsing the work).
@@ -97,19 +145,27 @@ fn main() {
     // Guarantee gate: refuse to report numbers if the real crypto has regressed.
     assert_real_crypto_root();
 
+    // A fixed, streamdb-free workload measured the same way (min-of-trials) in
+    // this same process, so the metrics below can be reported relative to this
+    // run's actual CPU throughput instead of raw wall-clock ns.
+    let calib_ns_per_op = calibration_ns_per_op(2_000_000.max(n));
+
     // --- append hot path (via the policy-checked Stream::try_append, the real
     //     write surface a caller uses). ---
-    let mut stream = Stream::new();
-    let t = Instant::now();
-    for i in 0..n {
-        // try_append runs the same content-address + insert as OpLog::append,
-        // plus the view-policy admission check — the real caller path.
-        stream
-            .try_append(payload(i), SideEffect::Convergent)
-            .expect("default view policy admits a convergent append");
-    }
-    let append_ns_per_op = t.elapsed().as_nanos() as f64 / n as f64;
-    assert_eq!(stream.log().len(), n, "every distinct op must be retained");
+    let append_ns_per_op = min_of_trials(3, || {
+        let mut stream = Stream::new();
+        let t = Instant::now();
+        for i in 0..n {
+            // try_append runs the same content-address + insert as OpLog::append,
+            // plus the view-policy admission check — the real caller path.
+            stream
+                .try_append(payload(i), SideEffect::Convergent)
+                .expect("default view policy admits a convergent append");
+        }
+        let elapsed = t.elapsed().as_nanos() as f64 / n as f64;
+        assert_eq!(stream.log().len(), n, "every distinct op must be retained");
+        elapsed
+    });
 
     // Build a plain OpLog with the same set for the fold/merge/compact paths.
     let mut log = OpLog::new();
@@ -120,16 +176,19 @@ fn main() {
     // --- view-fold hot path: materialized order + cryptographic root. ---
     // Repeat so a small N still yields a stable per-op number.
     let fold_reps = (1_000_000 / n).max(1);
-    let t = Instant::now();
-    let mut acc = 0u8;
-    for _ in 0..fold_reps {
-        let view = log.order();
-        let root = log.root();
-        // touch the results so the optimizer cannot elide the fold.
-        acc ^= root.as_bytes()[0] ^ (view.len() as u8);
-    }
-    let view_fold_ns_per_op = t.elapsed().as_nanos() as f64 / (fold_reps as f64 * n as f64);
-    std::hint::black_box(acc);
+    let view_fold_ns_per_op = min_of_trials(3, || {
+        let t = Instant::now();
+        let mut acc = 0u8;
+        for _ in 0..fold_reps {
+            let view = log.order();
+            let root = log.root();
+            // touch the results so the optimizer cannot elide the fold.
+            acc ^= root.as_bytes()[0] ^ (view.len() as u8);
+        }
+        let elapsed = t.elapsed().as_nanos() as f64 / (fold_reps as f64 * n as f64);
+        std::hint::black_box(acc);
+        elapsed
+    });
 
     // --- merge hot path: CvRDT gossip join of two half-overlapping logs. ---
     let mut left = OpLog::new();
@@ -141,27 +200,31 @@ fn main() {
         right.append(payload(i)); // right holds the full set; ~half is new to left
     }
     let merge_reps = (200_000 / n).max(1);
-    let t = Instant::now();
-    for _ in 0..merge_reps {
-        let mut dst = left.clone();
-        dst.merge(&right);
-        std::hint::black_box(dst.len());
-    }
-    // amortized over the ops examined per merge (the full right set).
-    let merge_ns_per_op = t.elapsed().as_nanos() as f64 / (merge_reps as f64 * n as f64);
+    let merge_ns_per_op = min_of_trials(3, || {
+        let t = Instant::now();
+        for _ in 0..merge_reps {
+            let mut dst = left.clone();
+            dst.merge(&right);
+            std::hint::black_box(dst.len());
+        }
+        // amortized over the ops examined per merge (the full right set).
+        t.elapsed().as_nanos() as f64 / (merge_reps as f64 * n as f64)
+    });
 
     // --- compact hot path: snapshot the full set + fold its root. ---
     let compact_reps = (200_000 / n).max(1);
-    let t = Instant::now();
-    for _ in 0..compact_reps {
-        let snap = log.compact();
-        std::hint::black_box(snap.len());
-    }
-    let compact_ns_per_op = t.elapsed().as_nanos() as f64 / (compact_reps as f64 * n as f64);
+    let compact_ns_per_op = min_of_trials(3, || {
+        let t = Instant::now();
+        for _ in 0..compact_reps {
+            let snap = log.compact();
+            std::hint::black_box(snap.len());
+        }
+        t.elapsed().as_nanos() as f64 / (compact_reps as f64 * n as f64)
+    });
 
     // Single-line JSON object (stable key order) for the shell harness to parse.
     println!(
-        "{{\"schema\":1,\"n\":{},\"append_ns_per_op\":{:.3},\"view_fold_ns_per_op\":{:.3},\"merge_ns_per_op\":{:.3},\"compact_ns_per_op\":{:.3}}}",
-        n, append_ns_per_op, view_fold_ns_per_op, merge_ns_per_op, compact_ns_per_op
+        "{{\"schema\":1,\"n\":{},\"calib_ns_per_op\":{:.6},\"append_ns_per_op\":{:.3},\"view_fold_ns_per_op\":{:.3},\"merge_ns_per_op\":{:.3},\"compact_ns_per_op\":{:.3}}}",
+        n, calib_ns_per_op, append_ns_per_op, view_fold_ns_per_op, merge_ns_per_op, compact_ns_per_op
     );
 }

@@ -46,12 +46,36 @@ need jq
 [[ -f "$baseline" ]] || fail "baseline not found: $baseline"
 
 # --- 1. run the harness -----------------------------------------------------
-echo "streamdb-perf: building + running harness (n=$n) ..." >&2
-measured="$(cd "$repo_root" && cargo run -q -p pillar-streamdb --example perf_bench --release -- "$n" 2>/dev/null)" \
-  || fail "perf harness failed to build/run (crypto-realness guard may have tripped — see stderr)"
-
-echo "$measured" | jq -e . >/dev/null 2>&1 || fail "harness did not emit valid JSON: $measured"
-echo "streamdb-perf: measured $measured" >&2
+# This sandbox runs on shared, occasionally-throttled CPUs: a single process
+# invocation can land in a multi-second contention/throttling window that no
+# amount of in-process trial-taking can see past (the whole process stalls).
+# So run several INDEPENDENT process invocations and take the per-metric MIN
+# across all of them — the closest a wall-clock harness can get to "cost on
+# quiet hardware" in a noisy sandbox. A contention window can only ever make a
+# run slower, never faster, so the min isolates the real steady-state cost.
+invocations="${STREAMDB_PERF_INVOCATIONS:-3}"
+metrics_all=(calib_ns_per_op append_ns_per_op view_fold_ns_per_op merge_ns_per_op compact_ns_per_op)
+measured=""
+echo "streamdb-perf: building + running harness (n=$n, invocations=$invocations) ..." >&2
+for run in $(seq 1 "$invocations"); do
+  out="$(cd "$repo_root" && cargo run -q -p pillar-streamdb --example perf_bench --release -- "$n" 2>/dev/null)" \
+    || fail "perf harness failed to build/run (crypto-realness guard may have tripped — see stderr)"
+  echo "$out" | jq -e . >/dev/null 2>&1 || fail "harness did not emit valid JSON: $out"
+  echo "streamdb-perf: run $run/$invocations measured $out" >&2
+  if [[ -z "$measured" ]]; then
+    measured="$out"
+  else
+    merged="$measured"
+    for m in "${metrics_all[@]}"; do
+      a="$(echo "$merged" | jq -r --arg m "$m" '.[$m]')"
+      b="$(echo "$out" | jq -r --arg m "$m" '.[$m]')"
+      min="$(jq -n --argjson a "$a" --argjson b "$b" 'if $a < $b then $a else $b end')"
+      merged="$(echo "$merged" | jq --arg m "$m" --argjson v "$min" '.[$m] = $v')"
+    done
+    measured="$merged"
+  fi
+done
+echo "streamdb-perf: measured (min across $invocations runs) $measured" >&2
 if [[ -n "${STREAMDB_PERF_JSON:-}" ]]; then
   printf '%s\n' "$measured" > "$STREAMDB_PERF_JSON"
 fi
@@ -63,23 +87,40 @@ if [[ "$measured_n" != "$baseline_n" ]]; then
 fi
 
 # --- 2/3. compare each metric ----------------------------------------------
+# Every metric is compared as (metric_ns_per_op / calib_ns_per_op) against the
+# SAME ratio recorded in the baseline, not as raw ns/op. calib_ns_per_op is a
+# fixed, streamdb-free integer workload measured in the exact same process/run
+# (see perf_bench.rs); dividing by it cancels out this run's absolute CPU
+# throughput (rig identity, thermal/frequency state, container CPU quota) so
+# the comparison isolates the streamdb-specific cost the discipline actually
+# cares about, instead of flagging "this sandbox's CPU was slower today" as a
+# regression.
 metrics=(append_ns_per_op view_fold_ns_per_op merge_ns_per_op compact_ns_per_op)
 regressions=0
 uncovered=0
 
+calib_got="$(echo "$measured" | jq -r '.calib_ns_per_op')"
+calib_base="$(jq -r '.metrics.calib_ns_per_op // 1' "$baseline")"
+if [[ -z "$calib_got" || "$calib_got" == "null" ]]; then
+  fail "measurement missing calib_ns_per_op (rebuild harness — old binary?)"
+fi
+
 for m in "${metrics[@]}"; do
-  base="$(jq -r --arg m "$m" '.metrics[$m]' "$baseline")"
-  got="$(echo "$measured" | jq -r --arg m "$m" '.[$m]')"
-  if [[ -z "$base" || "$base" == "null" ]]; then
+  base_raw="$(jq -r --arg m "$m" '.metrics[$m]' "$baseline")"
+  got_raw="$(echo "$measured" | jq -r --arg m "$m" '.[$m]')"
+  if [[ -z "$base_raw" || "$base_raw" == "null" ]]; then
     fail "baseline missing metric '$m'"
   fi
-  if [[ -z "$got" || "$got" == "null" ]]; then
+  if [[ -z "$got_raw" || "$got_raw" == "null" ]]; then
     fail "measurement missing metric '$m'"
   fi
+  # normalize both sides to "cost per calibration unit" before comparing.
+  base="$(jq -n --argjson v "$base_raw" --argjson c "$calib_base" '$v / $c')"
+  got="$(jq -n --argjson v "$got_raw" --argjson c "$calib_got" '$v / $c')"
   # limit = base * tolerance ; regressed = got > limit
   regressed="$(jq -n --argjson g "$got" --argjson b "$base" --argjson t "$tolerance" \
     '($g > ($b * $t))')"
-  # ratio for reporting
+  # ratio for reporting (also calib-normalized, so it is rig-independent)
   ratio="$(jq -n --argjson g "$got" --argjson b "$base" '(($g / $b) * 1000 | round) / 1000')"
   if [[ "$regressed" == "true" ]]; then
     marker="$followups_dir/$m.md"

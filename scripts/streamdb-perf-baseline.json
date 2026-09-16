@@ -1,13 +1,14 @@
 {
   "schema": 1,
-  "note": "Tracked streamdb performance baseline. Metrics are ns/op (lower is better). Recorded by the recurring streamdb-perf-benchmark discipline (ROI P1). The harness (scripts/streamdb-perf-benchmark.sh -> cargo run -p pillar-streamdb --example perf_bench --release) compares a fresh measurement against these values with a regression tolerance (STREAMDB_PERF_TOLERANCE, default 1.40 = allow 40% noise). A measurement worse than baseline*tolerance is a REGRESSION and fails the check unless a follow-up tuning task is filed. A measurement meaningfully BELOW baseline is headroom to record a new baseline. Update this file (and note it in the change doc) when a real, verified improvement lands.",
+  "note": "Tracked streamdb performance baseline. Metrics are CALIB-NORMALIZED (metric_ns_per_op / calib_ns_per_op measured in the SAME process/run), not raw ns/op — calib_ns_per_op is a fixed, streamdb-free integer workload the harness measures alongside the streamdb metrics (see crates/pillar-streamdb/examples/perf_bench.rs). Dividing by it cancels out this run's absolute CPU throughput (rig identity, thermal/frequency state, shared-sandbox contention/throttling), so a slower/faster sandbox does not itself register as a regression or as headroom. Recorded by the recurring streamdb-perf-benchmark discipline (ROI P1). The harness (scripts/streamdb-perf-benchmark.sh -> cargo run -p pillar-streamdb --example perf_bench --release, min-of-3 independent process invocations, each itself a min-of-3 in-process trials) compares a fresh measurement's ratios against these values with a regression tolerance (STREAMDB_PERF_TOLERANCE, default 1.40 = allow 40% noise on top of the calib normalization). A measurement worse than baseline*tolerance is a REGRESSION and fails the check unless a follow-up tuning task is filed. A measurement meaningfully BELOW baseline is headroom to record a new baseline. Update this file (and note it in the change doc) when a real, verified improvement lands. `calib_ns_per_op` here is fixed at 1.0 by convention (the baseline's own calibration unit); every other metric is stored already-divided-by-that-run's-calib, i.e. as a ratio.",
   "n": 5000,
-  "recorded_at": "2026-09-14",
-  "recorded_commit_note": "initial baseline from bee-streamdb-perf-benchmark-recurring on the runner rig",
+  "recorded_at": "2026-09-16",
+  "recorded_commit_note": "re-recorded calib-normalized baseline (bee-streamdb-perf-benchmark-recurring) after observing 5-10x raw ns/op swings between independent process invocations on the shared honeybee sandbox; see change doc for the min-of-3-invocations + calib-ratio methodology this baseline assumes.",
   "metrics": {
-    "append_ns_per_op": 520.0,
-    "view_fold_ns_per_op": 125.0,
-    "merge_ns_per_op": 470.0,
-    "compact_ns_per_op": 300.0
+    "calib_ns_per_op": 1.0,
+    "append_ns_per_op": 230.0,
+    "view_fold_ns_per_op": 90.0,
+    "merge_ns_per_op": 260.0,
+    "compact_ns_per_op": 230.0
   }
 }
