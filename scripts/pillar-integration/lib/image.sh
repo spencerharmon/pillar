@@ -57,9 +57,25 @@ image_build_local() {
     # collected between the print and the `[ -x ]`/run — the recurring
     # 'expected an executable streamer' failure. The GC root pins it until we
     # remove the link at function end (via the RETURN trap below).
-    gcroot="$(mktemp -d "${TMPDIR:-/tmp}/pillar-it-gcroot.XXXXXX")/streamer"
+    #
+    # CRITICAL — the out-link MUST live on a path the HOST nix-daemon can see.
+    # `nix build --out-link L` registers an *indirect* GC root: a symlink in
+    # `/nix/var/nix/gcroots/auto/<hash>` pointing at the ABSOLUTE path of L,
+    # which the daemon dereferences (host-side) to find the rooted store path.
+    # Under the beehive DoD check-sandbox (bwrap, LOCALS.md 'DoD Check: sandbox')
+    # `$TMPDIR`/`/tmp` is the jail's PRIVATE tmpfs, so an out-link under $TMPDIR
+    # yields an auto-gcroot symlink pointing at `/tmp/...` that does NOT EXIST on
+    # the host — the daemon sees a dangling root, treats the path as unrooted,
+    # and a GC pass during the ~11-13min from-scratch build collects the streamer
+    # before `[ -x ]` runs (the deterministic 'expected an executable streamer'
+    # failure). The submodule checkout `$root`, by contrast, is bind-mounted into
+    # the jail at its TRUE host absolute path, so an out-link under $root produces
+    # an auto-gcroot the host daemon CAN resolve. Anchor there, never $TMPDIR.
+    local gcdir
+    gcdir="$(mktemp -d "$root/.pillar-it-gcroot.XXXXXX")"
+    gcroot="$gcdir/streamer"
     # shellcheck disable=SC2064
-    trap "rm -rf -- '$(dirname "$gcroot")'" RETURN
+    trap "rm -rf -- '$gcdir'" RETURN
     # Capture stdout (the store path) and stderr SEPARATELY so a diagnostic
     # stderr line can never be mistaken for the printed store path. stdout is the
     # out-path; stderr is captured to a temp file for the failure message.
@@ -76,6 +92,25 @@ image_build_local() {
     # `--print-out-paths` may emit multiple paths (one per output); take the last
     # non-empty stdout line as the streamer store path.
     streamer="$(printf '%s\n' "$streamer" | sed '/^$/d' | tail -1)"
+    # Diagnostics: prove the GC root is anchored where the HOST daemon can see it.
+    # Logs the resolved out-link absolute path, whether the symlink now resolves,
+    # and the auto-gcroot the daemon registered for it (host-visible target). If a
+    # future run regresses, this pinpoints whether the anchor survived the jail.
+    info "image: gcroot out-link=$gcroot resolves-to=$(readlink -f "$gcroot" 2>/dev/null || echo '<none>')"
+    if [ -d /nix/var/nix/gcroots/auto ]; then
+        local _autoroot
+        _autoroot="$(grep -rl -- "$gcdir" /nix/var/nix/gcroots/auto 2>/dev/null | head -1 || true)"
+        info "image: gcroot auto-registration=${_autoroot:-<none-found>}"
+    fi
+    # Belt-and-suspenders: even with the root anchored, re-REALISE the store path
+    # immediately before the executable check so a path collected in a race window
+    # is rebuilt/substituted (cheap when already present) rather than failing the
+    # guard. This makes the streamer's presence a computed fact, not an assumption.
+    if [ -n "$streamer" ] && [ ! -x "$streamer" ]; then
+        warn "image: streamer '$streamer' not executable after build — re-realising the store path"
+        nix --extra-experimental-features "nix-command flakes" \
+            build --out-link "$gcroot" "$root#pillar-oci-image" >/dev/null 2>&1 || true
+    fi
     [ -x "$streamer" ] \
         || fail "image_build_local: expected an executable streamer at '$streamer'"
 

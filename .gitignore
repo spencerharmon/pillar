@@ -16,3 +16,8 @@ specs/*.old
 
 # nix build output
 /result
+
+# pillar-integration image-under-test GC-root out-links (host-visible anchor
+# under the checkout so the nix-daemon can resolve the indirect root even inside
+# the bwrap DoD check-sandbox; see scripts/pillar-integration/lib/image.sh)
+/.pillar-it-gcroot.*
