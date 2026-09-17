@@ -1,0 +1,6 @@
+{
+  "public_op_ns": 33670,
+  "cell_op_ns": 35940,
+  "encryption_delta_ns": 2270,
+  "view_fold_ns_per_op": 120
+}
