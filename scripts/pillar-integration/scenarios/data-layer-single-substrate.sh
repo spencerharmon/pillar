@@ -36,11 +36,26 @@
 #       oracle on every node confirms a real pid + bound socket, so the single-
 #       substrate property holds on real running image nodes, not one stub host.
 #
+#   plane surfacing (RBAC grant / quota / WoT trust edge) — a REAL grant is
+#       issued via `pillar grant add`, a REAL quota mutation via `pillar attest
+#       build --quota`, and a REAL WoT trust edge via `pillar trust`, each
+#       through the genuinely external `pillar` CLI binary `docker exec`'d
+#       INTO the running node container (never linked in-process) using a
+#       real signing credential minted over `POST /portal/profile/cli-config`
+#       (the same turnkey path an operator's browser session uses) — then each
+#       mutation is asserted to surface as a signed resource-event in the
+#       portal's `/portal/data/doc/ids`/`doc/get` browse of the SAME live
+#       node, and its surfaced event is verified real (hash-matches-id +
+#       signature-valid) via `/portal/data/log/verify`.
+#
 # RED if a live session never surfaces in the portal browse (two stores), if an
-# untouched collection is non-empty (phantom store), or if a node is not a real
-# process; GREEN when every node's live session surfaces in ITS portal browse
-# over one substrate and the empty plane reads empty. Sourced by run-scenario.sh,
-# which has already sourced the lib layer and run fixtures_init.
+# untouched collection is non-empty (phantom store), if a node is not a real
+# process, or if an externally-issued grant/quota/trust-edge does not surface
+# with a verifying signature/CID in the same substrate; GREEN when every
+# node's live session surfaces in ITS portal browse over one substrate, the
+# empty plane reads empty, and every externally-issued plane mutation
+# surfaces + verifies. Sourced by run-scenario.sh, which has already sourced
+# the lib layer and run fixtures_init.
 
 # Per-node published web (bootstrap/portal) addresses, index-aligned with
 # TOPO_NODES. `topology_boot` publishes only the health probe port; this
@@ -187,16 +202,17 @@ oracle_empty_iff_empty() {
 }
 
 # oracle_plane_collections_share_substrate <web-addr> <token> : the multi-plane
-# single-substrate oracle. The RBAC-grant, quota, and web-of-trust planes each
-# project their live web write as a resource-event into the SAME keyed-store
-# substrate the portal browses (see WebAuthContext::project_plane_event). This
-# oracle asserts each plane's Document collection (`rbac_grants`, `quota_ledger`,
-# `wot_edges`) is BROWSABLE through the portal doc-browse route on this live node
-# — the same substrate handle, one keyed op-log. With no grant/quota/edge issued
-# yet on this fresh node the collections read empty (empty-iff-empty over the doc
-# surface); the code-level surfacing of a real issued grant/quota/edge is proven
-# by the `rbac_quota_wot_planes_surface_in_the_one_substrate` regression test
-# over the real WebAuthContext control-op path.
+# single-substrate oracle (PRE-mutation half). The RBAC-grant, quota, and
+# web-of-trust planes each project their live web write as a resource-event
+# into the SAME keyed-store substrate the portal browses (see
+# WebAuthContext::project_plane_event). This oracle asserts each plane's
+# Document collection (`rbac_grants`, `quota_ledger`, `wot_edges`) is BROWSABLE
+# through the portal doc-browse route on this live node — the same substrate
+# handle, one keyed op-log. With no grant/quota/edge issued yet on this fresh
+# node the collections read empty (empty-iff-empty over the doc surface). The
+# REAL, externally-issued mutation half (a real grant/quota/edge actually
+# surfacing, non-empty, signature/CID-verified) is
+# `oracle_plane_mutations_surface_externally`, below.
 oracle_plane_collections_share_substrate() {
     local web_addr="$1" token="$2" plane out code body
     for plane in rbac_grants quota_ledger wot_edges; do
@@ -210,6 +226,157 @@ oracle_plane_collections_share_substrate() {
             || fail "plane-substrate oracle: the unwritten ${plane} plane is NON-empty on $web_addr ($body) — a phantom second store"
         info "oracle-observed: plane-substrate node-web=$web_addr plane=${plane} browsable-on-single-substrate (one keyed op-log; empty IFF plane empty)"
     done
+}
+
+# _dlss_cli_config <web-addr> <token> : mint a real, turnkey `pillar` CLI
+# credential over the SAME `POST /portal/profile/cli-config` route a real
+# operator's browser session uses (never a fabricated key) and print the
+# resulting `config.yaml` text (banner + yaml) to stdout. Fails only on an
+# unreachable HTTP layer or a non-200 response.
+_dlss_cli_config() {
+    local web_addr="$1" token="$2" reply code
+    reply=$(driver_http_post "$web_addr" /portal/profile/cli-config "$token") \
+        || fail "cli-config export: POST /portal/profile/cli-config on $web_addr unreachable"
+    code=$(printf '%s\n' "$reply" | sed -n '1p')
+    [ "$code" = "200" ] \
+        || fail "cli-config export: POST /portal/profile/cli-config on $web_addr returned $code"
+    printf '%s\n' "$reply" | tail -n +3
+}
+
+# _dlss_cli_exec <node-name> <config-path-in-container> <pillar-args...> :
+# run the REAL `pillar` binary already baked into the running node's own
+# image, `docker exec`'d INTO that running container (a genuinely external
+# surface — never a linked crate, never an in-process call) with
+# `PILLAR_CONFIG` pointed at the credential file `_dlss_cli_config` produced,
+# so the CLI dials the node's real resource-op tier over its real loopback
+# listener using a real minted signing key. Prints the CLI's combined output;
+# returns its real exit code.
+_dlss_cli_exec() {
+    local name="$1" cfg="$2"
+    shift 2
+    "$CONTAINER_RUNTIME" exec -e "PILLAR_CONFIG=${cfg}" "$name" /bin/pillar "$@" 2>&1
+}
+
+# oracle_plane_mutations_surface_externally <node-name> <web-addr> <token> :
+# THE externally-issued plane-mutation oracle the DoD requires. Issues a REAL
+# grant (`pillar grant add`), a REAL quota mutation (`pillar attest build
+# --quota`), and a REAL WoT trust edge (`pillar trust`) against this live
+# node, each via the real `pillar` CLI binary `docker exec`'d into the node's
+# OWN running container using a credential minted over the real
+# `/portal/profile/cli-config` HTTP surface — never an in-process call, never
+# a linked crate. Each mutation's resulting event is then asserted to SURFACE
+# in the portal's `/portal/data/doc/ids`/`doc/get` browse of the SAME live
+# node (not merely an empty check), and the surfaced event's CID is verified
+# REAL — `hash-matches-id: true` and `signature-valid: true` — via
+# `/portal/data/log/verify`. RED if any CLI act is refused, if the
+# resulting event never surfaces in the doc browse, or if its CID fails
+# hash/signature verification; GREEN when every plane's externally-issued
+# mutation surfaces and verifies on the SAME substrate the session already
+# proved.
+oracle_plane_mutations_surface_externally() {
+    local name="$1" web_addr="$2" token="$3"
+    local cfg_text cfg_file cfg_in_container
+    cfg_text=$(_dlss_cli_config "$web_addr" "$token")
+    cfg_file="$(mktemp "${TMPDIR:-/tmp}/pillar-it-cli-config.XXXXXX.yaml")"
+    printf '%s\n' "$cfg_text" >"$cfg_file"
+    # The node image is distroless (no /tmp) — its only guaranteed-writable
+    # directory is the WorkingDir the flake creates (`var/lib/pillar/data`).
+    cfg_in_container="/var/lib/pillar/data/pillar-it-cli-config-$$.yaml"
+    "$CONTAINER_RUNTIME" cp "$cfg_file" "${name}:${cfg_in_container}" \
+        || fail "plane-mutation oracle: docker cp of the minted CLI credential into $name failed"
+    rm -f "$cfg_file"
+    info "oracle-observed: cli-config minted for node=$name (real POST /portal/profile/cli-config turnkey credential, docker-cp'd into the running node)"
+
+    local subject="dlss-grantee-$$" out
+
+    # (1) REAL grant, issued via the real `pillar grant add` CLI verb docker-
+    # exec'd into the live node.
+    out=$(_dlss_cli_exec "$name" "$cfg_in_container" grant add "data:write" --to "$subject") \
+        || fail "plane-mutation oracle: real 'pillar grant add' on $name refused:\n$out"
+    info "oracle-observed: grant-add node=$name subject=$subject cap=data:write (real docker-exec'd pillar CLI act): $out"
+    out=$(_dlss_browse "$web_addr" "$token" "/portal/data/doc/get?collection=rbac_grants&id=${subject}:data:write&field=event.subject") \
+        || fail "plane-mutation oracle: doc/get(rbac_grants) on $web_addr unreachable"
+    local code body
+    code=$(printf '%s\n' "$out" | sed -n '1p')
+    body=$(printf '%s\n' "$out" | tail -n +2)
+    [ "$code" = "200" ] && [ "$(printf '%s' "$body" | tr -d '[:space:]')" = "$subject" ] \
+        || fail "plane-mutation oracle: the real grant-add did NOT surface in the portal doc browse on $web_addr (code=$code body=$body) — the RBAC plane and the portal are TWO stores, not one"
+    _dlss_verify_surfaced_event "$web_addr" "$token" rbac_grants "${subject}:data:write" "grant-add"
+
+    # (2) REAL quota mutation, issued via `pillar attest build --quota` (a
+    # signed act carrying a quota budget, per web_serve.rs's
+    # TrustOp::AttestBuild handling).
+    out=$(_dlss_cli_exec "$name" "$cfg_in_container" attest build --as self --subject "$subject" \
+        --allow read "dlss-resource-$$" --quota "dlss=5" --in "dlss-scope-$$") \
+        || fail "plane-mutation oracle: real 'pillar attest build --quota' on $name refused:\n$out"
+    info "oracle-observed: attest-build node=$name subject=$subject quota=dlss=5 (real docker-exec'd pillar CLI act): $out"
+    local attest_cid
+    attest_cid=$(printf '%s\n' "$out" | grep '^CID ' | head -1 | awk '{print $2}')
+    [ -n "$attest_cid" ] \
+        || fail "plane-mutation oracle: 'pillar attest build --quota' on $name printed no CID:\n$out"
+    out=$(_dlss_browse "$web_addr" "$token" "/portal/data/doc/get?collection=quota_ledger&id=${attest_cid}&field=event.subject") \
+        || fail "plane-mutation oracle: doc/get(quota_ledger) on $web_addr unreachable"
+    code=$(printf '%s\n' "$out" | sed -n '1p')
+    body=$(printf '%s\n' "$out" | tail -n +2)
+    [ "$code" = "200" ] && [ "$(printf '%s' "$body" | tr -d '[:space:]')" = "$subject" ] \
+        || fail "plane-mutation oracle: the real quota mutation did NOT surface in the portal doc browse on $web_addr (code=$code body=$body) — the quota plane and the portal are TWO stores, not one"
+    _dlss_verify_surfaced_event "$web_addr" "$token" quota_ledger "$attest_cid" "attest-build"
+
+    # (3) REAL WoT trust edge, issued via `pillar trust <subject>`.
+    out=$(_dlss_cli_exec "$name" "$cfg_in_container" trust "$subject" --depth 1) \
+        || fail "plane-mutation oracle: real 'pillar trust' on $name refused:\n$out"
+    info "oracle-observed: trust-edge node=$name subject=$subject (real docker-exec'd pillar CLI act): $out"
+    # The edge's doc id is `<actor>->{subject}` where <actor> is the minted
+    # CLI signer's own subject (its ed25519 public key hex) — read it back
+    # off the cfg's `identity.signer_public_hex:` line rather than
+    # re-deriving the hex ourselves.
+    local signer_hex edge_id
+    signer_hex=$(printf '%s\n' "$cfg_text" | grep 'signer-public-hex:' | head -1 | awk '{print $2}' | tr -d '"')
+    [ -n "$signer_hex" ] \
+        || fail "plane-mutation oracle: could not read signer_public_hex back out of the minted cli-config"
+    edge_id="${signer_hex}->${subject}"
+    out=$(_dlss_browse "$web_addr" "$token" "/portal/data/doc/get?collection=wot_edges&id=${edge_id}&field=event.subject") \
+        || fail "plane-mutation oracle: doc/get(wot_edges) on $web_addr unreachable"
+    code=$(printf '%s\n' "$out" | sed -n '1p')
+    body=$(printf '%s\n' "$out" | tail -n +2)
+    [ "$code" = "200" ] && [ "$(printf '%s' "$body" | tr -d '[:space:]')" = "$subject" ] \
+        || fail "plane-mutation oracle: the real trust edge did NOT surface in the portal doc browse on $web_addr (code=$code body=$body id=$edge_id) — the WoT plane and the portal are TWO stores, not one"
+    _dlss_verify_surfaced_event "$web_addr" "$token" wot_edges "$edge_id" "trust-edge"
+
+    "$CONTAINER_RUNTIME" exec "$name" rm -f "$cfg_in_container" >/dev/null 2>&1 || true
+    info "oracle-observed: plane-mutation node=$name every externally-issued grant/quota/trust-edge surfaced in the portal's doc browse on the SAME substrate as the live session, and every surfaced event verified (hash-matches-id + signature-valid)"
+}
+
+# _dlss_verify_surfaced_event <web-addr> <token> <collection> <id> <label> :
+# read the surfaced document's `event.event_cid` field back through the
+# portal doc-browse surface, then verify that event for real via
+# `/portal/data/log/verify?collection=<c>&event_id=<hex>` — asserting BOTH
+# `hash-matches-id: true` and `signature-valid: true` are present in the
+# response, i.e. the surfaced row is tied to a genuinely signed,
+# content-addressed act in the SAME log-inspection tier every other
+# collection uses (`project_plane_event` indexes the plane's signed act into
+# `log_index` under `collection` — see web_serve.rs), not a placeholder
+# string.
+_dlss_verify_surfaced_event() {
+    local web_addr="$1" token="$2" collection="$3" id="$4" label="$5" out code body cid
+    out=$(_dlss_browse "$web_addr" "$token" "/portal/data/doc/get?collection=${collection}&id=${id}&field=event.event_cid") \
+        || fail "$label verify: doc/get(${collection}) event_cid on $web_addr unreachable"
+    code=$(printf '%s\n' "$out" | sed -n '1p')
+    body=$(printf '%s\n' "$out" | tail -n +2)
+    cid=$(printf '%s' "$body" | tr -d '[:space:]')
+    [ "$code" = "200" ] && [ -n "$cid" ] \
+        || fail "$label verify: no event_cid surfaced for ${collection}/${id} on $web_addr (code=$code body=$body)"
+    out=$(_dlss_browse "$web_addr" "$token" "/portal/data/log/verify?collection=${collection}&event_id=${cid}") \
+        || fail "$label verify: log/verify on $web_addr unreachable"
+    code=$(printf '%s\n' "$out" | sed -n '1p')
+    body=$(printf '%s\n' "$out" | tail -n +2)
+    [ "$code" = "200" ] \
+        || fail "$label verify: log/verify(${collection},${cid}) on $web_addr returned $code ($body)"
+    printf '%s\n' "$body" | grep -q '^hash-matches-id: true$' \
+        || fail "$label verify: log/verify(${collection},${cid}) did not report hash-matches-id: true:\n$body"
+    printf '%s\n' "$body" | grep -q '^signature-valid: true$' \
+        || fail "$label verify: log/verify(${collection},${cid}) did not report signature-valid: true:\n$body"
+    info "oracle-observed: ${label}-verified event_id=$cid hash-matches-id=true signature-valid=true (real content-addressed, signed event, log-inspection tier)"
 }
 
 scenario_data-layer-single-substrate() {
@@ -262,7 +429,14 @@ scenario_data-layer-single-substrate() {
         oracle_single_substrate_session_surfaces "$web" "$token"
         oracle_empty_iff_empty "$web" "$token"
         oracle_plane_collections_share_substrate "$web" "$token"
+
+        # (4) THE externally-issued plane-mutation acceptance: a REAL grant,
+        # quota mutation, and WoT trust edge, each issued via the real
+        # `pillar` CLI docker-exec'd into THIS live node (never in-process),
+        # each asserted to surface in the portal doc browse of the SAME node
+        # with a verifying signature/CID.
+        oracle_plane_mutations_surface_externally "${DLSS_NAMES[$i]}" "$web" "$token"
     done
 
-    info "data-layer-single-substrate: on ${#DLSS_NAMES[@]} real nodes, every live-login session surfaced in ITS portal browse over ONE keyed-store substrate; the RBAC/quota/WoT plane collections are browsable on that SAME substrate; no second store, panel empty IFF plane empty"
+    info "data-layer-single-substrate: on ${#DLSS_NAMES[@]} real nodes, every live-login session surfaced in ITS portal browse over ONE keyed-store substrate; the RBAC/quota/WoT plane collections are browsable on that SAME substrate, an externally-issued grant/quota/trust-edge on each node surfaced with a verified signature/CID, and no second store; panel empty IFF plane empty"
 }

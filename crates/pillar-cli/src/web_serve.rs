@@ -4421,7 +4421,7 @@ impl WebAuthContext {
                     actor,
                     "wot_edges",
                     &format!("{actor}->{subject}"),
-                    &cid.0.to_string(),
+                    &cid,
                     &[
                         ("signer", actor.0.as_str()),
                         ("subject", subject.as_str()),
@@ -4486,7 +4486,7 @@ impl WebAuthContext {
                                 actor,
                                 "quota_ledger",
                                 &attest_cid.0.to_string(),
-                                &cid.0.to_string(),
+                                &cid,
                                 &[
                                     ("subject", subject.as_str()),
                                     ("action", action.as_str()),
@@ -4531,7 +4531,7 @@ impl WebAuthContext {
                     actor,
                     "rbac_grants",
                     &format!("{subject}:{capability}"),
-                    &cid.0.to_string(),
+                    &cid,
                     &[
                         ("subject", subject.as_str()),
                         ("capability", capability.as_str()),
@@ -4706,18 +4706,29 @@ impl WebAuthContext {
     /// (keyed by `id`, one `event` field carrying the already-signed act's CID
     /// plus the event fields), so a grant / quota mutation / trust edge issued
     /// through the real front-end SURFACES in the portal browse of a live cell,
-    /// with no second store and no private per-plane copy. `event_cid` is the
-    /// signed act's content address (from `perform_signed_act`), so the surfaced
-    /// row is verifiably tied to the signed resource-event.
+    /// with no second store and no private per-plane copy. `event_id` is the
+    /// signed act's [`EventId`] (from `perform_signed_act`), so the surfaced
+    /// row is verifiably tied to the signed resource-event — this ALSO indexes
+    /// the event into [`Self::log_index`] under `collection` (the same index
+    /// [`Self::authorize_data_write`] builds for kv/doc/sql writes), so `pillar
+    /// log info|blocks|list|show|dag|verify <collection>` inspects and
+    /// signature/CID-verifies a plane's real grant/quota/trust-edge acts
+    /// exactly like every other collection on the ONE substrate — no plane
+    /// gets a write path the log-inspection tier cannot see.
     fn project_plane_event(
         &mut self,
         actor: &NodeId,
         collection: &str,
         id: &str,
-        event_cid: &str,
+        event_id: &EventId,
         fields: &[(&str, &str)],
     ) {
         let hlc = self.next_keyed_hlc(actor);
+        let event_cid = event_id.0.to_string();
+        self.log_index
+            .entry(collection.to_owned())
+            .or_default()
+            .push((event_id.clone(), hlc.clone()));
         let mut record = std::collections::BTreeMap::new();
         record.insert(
             "event_cid".to_string(),
