@@ -30,6 +30,7 @@ trusted. Each document below links to the specification that proves its claims.
 | [papers/pillar-data-layer.md](papers/pillar-data-layer.md) | The Pillar Data Layer — the multi-model streaming database turned inside-out: the primitive suite (keyed store / SQL views / TSDB), SQL-over-document mechanics, catalog-as-data, AP/CP split, collection-scoped placement, and the internal-component migration map (design of record for the data-layer model) |
 | [readiness-probe.md](readiness-probe.md) | The node readiness/liveness health surface (`GET /readyz` + `/healthz`) — real readiness (identity + views + WoT root), not a bound port, and how the deployment manifest wires it |
 | [private-pillar.md](private-pillar.md) | Configuring a private network root + owned seeds to run an isolated, app-specific pillar deployment |
+| [peer-discovery-and-bootstrap.md](peer-discovery-and-bootstrap.md) | How a node finds peers: the identity/reachability model, multi-homed (v4+v6) multiaddrs, the bootstrap/reconnect ladder, cell-scoped discovery via `Visibility::Cell` IPNS heads, the `config.yaml` anchor set (1 DNS / ≤3 IP), reachability warnings + `pillar node anchors regen` |
 
 ## Design principles
 
