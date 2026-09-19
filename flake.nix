@@ -162,6 +162,18 @@
           # embeds is not required for the reproducible image; turning it off
           # keeps the image contents otherwise identical.
           auditable = false;
+          # Stamp the exact build commit into the UI footer. The frontend build
+          # `src` (below) strips `.git` and the nix sandbox has no `git`, so the
+          # commit cannot be read from the tree at build time — hand it in from
+          # the flake's own source rev. `crates/pillar-web-frontend/build.rs`
+          # reads this and re-emits it as the `PILLAR_GIT_SHA` compile env the
+          # footer renders. `self.rev` is the clean-checkout commit (the CI
+          # image + frontend-bundle builds both run from a fresh detached
+          # checkout, so it is always set); a dirty local `nix build` falls back
+          # to `self.dirtyRev` (`<sha>-dirty`) so the stamp stays honest and
+          # never blank. If somehow neither is available build.rs fails loudly
+          # rather than ship a placeholder sha.
+          PILLAR_GIT_SHA = self.rev or self.dirtyRev or "";
           # pillar-frontend is a workspace member (so its host-native DoD is
           # `-p`-addressable from the repo root) and PATH-depends on sibling
           # members (`pillar-web-frontend`, and through it `pillar-web-api`,

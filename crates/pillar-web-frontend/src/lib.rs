@@ -22,6 +22,7 @@ pub mod console;
 pub mod dashboard;
 pub mod data_explore;
 pub mod explore;
+pub mod footer;
 pub mod iam_console;
 pub mod obs_console;
 pub mod overview;
@@ -66,6 +67,8 @@ pub use explore::{
     ExploreBuilder, ExploreBuilderProps, ExploreLogsBuilder, ExploreMetadataBuilder,
     ExploreProfilesBuilder, ExploreTracesBuilder,
 };
+#[cfg(feature = "yew")]
+pub use footer::Footer;
 #[cfg(feature = "yew")]
 pub use portal::Portal;
 #[cfg(feature = "yew")]

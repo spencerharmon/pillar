@@ -276,6 +276,10 @@ pub fn shell() -> Html {
                     <ToastProvider>
                         <BrowserRouter>
                             <Switch<Route> render={switch} />
+                            // The build-stamp footer sits OUTSIDE the `Switch`,
+                            // so it renders once on every route — login,
+                            // console, and public entry alike.
+                            <crate::footer::Footer />
                         </BrowserRouter>
                     </ToastProvider>
                 </AuthProvider>

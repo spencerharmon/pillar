@@ -905,6 +905,30 @@ pub fn global(theme: &Theme, motion: Motion) -> String {
         }}
         .pillar-secret-reveal__copy.copied {{ border-color: {accent}; color: {accent}; }}
         .pillar-secret-reveal__warn {{ color: #f2cf8b; font-size: 0.78rem; }}
+
+        /* Build-stamp footer (crate::footer::Footer): a slim, muted line the
+           app shell renders on EVERY page, login included. Fixed to the bottom
+           corner so it is present regardless of a page's own layout/scroll, and
+           `pointer-events: none` so it never intercepts a click. */
+        .pillar-build-footer {{
+            position: fixed;
+            bottom: 0;
+            right: 0;
+            margin: 0;
+            padding: 0.22rem 0.6rem;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.72rem;
+            letter-spacing: 0.02em;
+            color: {muted};
+            background: {surface_base};
+            border-top: 1px solid {border};
+            border-left: 1px solid {border};
+            border-top-left-radius: 6px;
+            opacity: 0.85;
+            pointer-events: none;
+            user-select: none;
+            z-index: 40;
+        }}
         "#,
         surface_base = theme.surface_base,
         surface_raised = theme.surface_raised,
