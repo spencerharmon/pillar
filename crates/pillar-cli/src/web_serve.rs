@@ -4555,7 +4555,11 @@ impl WebAuthContext {
                 // SAME row `GrantAdd` writes and `Self::grants_from_store`
                 // reads, so the removal is reflected in the ONE decision
                 // source (no private in-memory vec to retain out of).
-                self.tombstone_plane_event(actor, "rbac_grants", &format!("{subject}:{capability}"));
+                self.tombstone_plane_event(
+                    actor,
+                    "rbac_grants",
+                    &format!("{subject}:{capability}"),
+                );
                 Ok(format!(
                     "REMOVED {subject} {capability} EVENT-CID {}",
                     cid.0
