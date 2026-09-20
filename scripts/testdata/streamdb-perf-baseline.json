@@ -1,0 +1,8 @@
+{
+  "_comment": "Tracked streamdb performance baseline (ns/op ceilings) for scripts/streamdb-perf-benchmark.sh / crates/pillar-streamdb/src/bin/streamdb-perf-bench.rs. Recorded 2026-09-19 on the swarm's build hardware over several runs of OP_COUNT=4000. `tolerance` is a multiplicative regression floor->ceiling factor applied to every *_ns_per_op value below (measured must be <= baseline * tolerance to pass) -- generous to absorb CI/dev hardware variance without masking a real regression. Update this file's numbers (never just the tolerance) when a landed, reviewed perf-tuning task genuinely shrinks a metric, so the baseline keeps tracking real improvement instead of drifting stale.",
+  "public_op_path_ns_per_op": 120000.0,
+  "public_fold_ns_per_op": 950.0,
+  "cell_op_path_ns_per_op": 130000.0,
+  "cell_fold_ns_per_op": 950.0,
+  "tolerance": 2.0
+}
