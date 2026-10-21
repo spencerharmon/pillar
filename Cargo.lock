@@ -3666,6 +3666,7 @@ dependencies = [
  "pillar-coordination",
  "pillar-core",
  "pillar-crypto",
+ "pillar-observability",
  "pillar-wire",
  "sha2",
  "tracing",

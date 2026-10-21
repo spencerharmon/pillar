@@ -1,0 +1,23 @@
+{
+  "measurement": {
+    "schema_version": 1,
+    "op_count": 2000,
+    "fold_count": 2000,
+    "payload_bytes": 1024,
+    "samples": 7,
+    "public_op_ns": 293276.58,
+    "encrypted_op_ns": 294497.109,
+    "public_fold_ns": 278441.9905,
+    "encrypted_fold_ns": 317845.6505,
+    "op_delta_pct": 0.4161699512453376,
+    "fold_delta_pct": 14.151479067234995
+  },
+  "limits": {
+    "public_op_ns": 366595.72500000003,
+    "encrypted_op_ns": 368121.38625,
+    "public_fold_ns": 348052.48812500003,
+    "encrypted_fold_ns": 397307.063125,
+    "op_delta_pct": 10.416169951245337,
+    "fold_delta_pct": 24.151479067234995
+  }
+}

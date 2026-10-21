@@ -32,5 +32,9 @@ pillar-wire = { path = "../pillar-wire", default-features = false }
 sha2 = "0.10"
 tracing = "0.1"
 
+[dev-dependencies]
+# The performance example folds stream ops through the production TSDB query engine.
+pillar-observability = { path = "../pillar-observability" }
+
 [lints]
 workspace = true
