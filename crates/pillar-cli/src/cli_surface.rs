@@ -541,6 +541,16 @@ fn identity_trust(verb: &str, _args: &[String]) -> ExitCode {
 fn node(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("run") => node_run(&args[1..]),
+        Some("migrate-legacy-cell") => match crate::legacy_migration::run(&args[1..]) {
+            Ok(out) => {
+                println!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("pillar node migrate-legacy-cell: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some(_) => cluster_stream("node", args),
         None => {
             eprintln!(

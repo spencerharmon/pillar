@@ -238,6 +238,15 @@ pub(crate) fn load_installed(
     Ok(Some(bundle))
 }
 
+/// Load existing issuer credentials without ever generating new ones.
+pub(crate) fn load_credentials_existing(data_dir: &Path) -> Result<CellCredentials, String> {
+    let path = data_dir.join("cell-credentials.json");
+    let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let credentials = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    validate_credentials(&credentials)?;
+    Ok(credentials)
+}
+
 /// Issuer initialization only; joining nodes get credentials from their bundle.
 pub(crate) fn load_credentials(data_dir: &Path) -> Result<CellCredentials, String> {
     let path = data_dir.join("cell-credentials.json");

@@ -12179,6 +12179,22 @@ fn dispatch_request_decide(
         }
         let mut updated = entry.clone();
         if approve {
+            // Refuse BEFORE admitting: a cell whose credentials cannot be
+            // distributed (e.g. an unconverted legacy cell) must not record
+            // an admission for an enrollment it cannot complete.
+            let distributable = ctx.cli_export.as_ref().map(|m| {
+                crate::enrollment::validate_credentials(&crate::enrollment::CellCredentials {
+                    cell_id: m.cell_id.as_bytes().to_vec(),
+                    seed: m.cell_seed.as_bytes().to_vec(),
+                })
+            });
+            if let Some(Err(e)) = distributable {
+                return text_response(
+                    503,
+                    "Service Unavailable",
+                    format!("DENIED legacy-cell-credentials ({e}); run `pillar node migrate-legacy-cell`"),
+                );
+            }
             match crate::enrollment::verify_request(&updated.request) {
                 Ok((peer, sealing)) => {
                     if let Err(e) = ctx.admit_cell_node(&peer, sealing.into_bytes()) {

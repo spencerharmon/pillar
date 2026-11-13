@@ -43,6 +43,7 @@ pub mod iam_cli;
 pub mod identity_trust_cli;
 pub mod ingress_lb_udp;
 pub mod jit_elevation;
+pub mod legacy_migration;
 pub mod mailer;
 pub mod object_inspection;
 pub mod observability_ui;

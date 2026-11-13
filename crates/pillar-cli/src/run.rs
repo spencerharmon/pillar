@@ -861,22 +861,18 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // head pointer is kept on the PVC under `<data>/streamdb/heads`.
     // Enrollment starts a distinct stream under the joining node's own signer.
     // Never open a previous solo stream with the newly installed cell key.
-    let streamdb_root = config.data_dir.join(if installed.is_some() {
-        "streamdb-enrolled"
-    } else {
-        "streamdb"
+    let layout = crate::legacy_migration::boot_layout(&config.data_dir, installed.is_some())
+        .map_err(&enrollment_error)?;
+    let streamdb_root = config.data_dir.join(match layout {
+        _ if installed.is_some() => "streamdb-enrolled",
+        crate::legacy_migration::BootLayout::Converted => crate::legacy_migration::CONVERTED,
+        _ => "streamdb",
     });
-    let identity_seed_material = {
-        let id_bytes = keypair
-            .to_protobuf_encoding()
-            .map_err(|e| BootError::Identity {
-                path: config.identity_key.clone(),
-                reason: format!("encode for streamdb-signer derivation: {e}"),
-            })?;
-        let mut m = b"pillar-streamdb/segment-signer/v1:".to_vec();
-        m.extend_from_slice(&id_bytes);
-        pillar_crypto::Seed::from_bytes(m)
-    };
+    let identity_seed_material =
+        crate::legacy_migration::device_signer_seed(&keypair).map_err(|e| BootError::Identity {
+            path: config.identity_key.clone(),
+            reason: format!("encode for streamdb-signer derivation: {e}"),
+        })?;
     let (signer_public, signer_secret) =
         pillar_crypto::principal::principal_from_seed(&identity_seed_material).map_err(|e| {
             BootError::StreamDb {
@@ -885,22 +881,13 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             }
         })?;
     // Cell encryption is independent of the device's segment-signing identity.
-    // Preserve legacy streams, but only independently generated credentials may
-    // be distributed to joining devices.
-    let legacy_cell = installed.is_none()
-        && streamdb_root.exists()
-        && !config.data_dir.join("cell-credentials.json").exists();
-    let (cell_id, cell_seed) = if legacy_cell {
-        // Preserve already persisted solo-node streams. Legacy credentials
-        // contain device material and must never be distributed by enrollment.
-        (
-            pillar_crypto::CellId::from_bytes({
-                let mut m = b"pillar-streamdb/cell-id/v1:".to_vec();
-                m.extend_from_slice(identity_seed_material.as_bytes());
-                m
-            }),
-            identity_seed_material.clone(),
-        )
+    // An unconverted legacy stream keeps its device-derived credentials (never
+    // distributed by enrollment); `pillar node migrate-legacy-cell` converts it.
+    let (cell_id, cell_seed) = if layout == crate::legacy_migration::BootLayout::Legacy {
+        tracing::warn!(
+            "legacy cell credentials are device-derived; enrollment is unavailable until `pillar node migrate-legacy-cell` converts this cell"
+        );
+        crate::legacy_migration::legacy_cell_material(&identity_seed_material)
     } else {
         let credentials = match &installed {
             Some(bundle) => bundle.credentials.clone(),
