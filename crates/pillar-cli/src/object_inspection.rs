@@ -206,11 +206,14 @@ impl ObjectRecord {
         pos += 4;
         let link_count = u32::from_be_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?);
         pos += 4;
-        let mut links = Vec::with_capacity(link_count as usize);
+        let mut links = Vec::new();
         for _ in 0..link_count {
             links.push(ContentId::from_bytes(take_bytes(bytes, &mut pos)?));
         }
         let body = take_bytes(bytes, &mut pos)?;
+        if pos != bytes.len() {
+            return None;
+        }
         Some(ObjectRecord {
             signer,
             signature,
@@ -284,6 +287,32 @@ impl ObjectStore {
             Some(bytes) => ObjectRecord::decode(&bytes)
                 .ok_or_else(|| "stored block is not a well-formed object record".to_owned()),
         }
+    }
+
+    /// Export the exact stored block, including its original signature and
+    /// ciphertext. Re-authoring a sealed put would change its CID.
+    pub(crate) fn export_record(&self, cid_hex: &str) -> Result<Vec<u8>, String> {
+        let cid = Self::parse_cid(cid_hex)?;
+        self.node
+            .get_block(&cid)
+            .map_err(|e| format!("blockstore read: {e}"))?
+            .ok_or_else(|| format!("no such object {cid_hex}"))
+    }
+
+    /// Import and pin an exact block without re-signing or re-sealing it.
+    /// Returns its authenticated author subject for rebuilding the audit log.
+    pub(crate) fn import_record(&self, cid_hex: &str, bytes: &[u8]) -> Result<String, String> {
+        let cid = Self::parse_cid(cid_hex)?;
+        let record = ObjectRecord::decode(bytes)
+            .ok_or_else(|| "imported block is not a well-formed object record".to_owned())?;
+        if !record.verify_signature() {
+            return Err("imported object signature is invalid".to_owned());
+        }
+        self.node
+            .put_block_checked(&cid, bytes)
+            .map_err(|e| format!("blockstore import: {e}"))?;
+        self.node.pin(&cid).map_err(|e| format!("pin: {e}"))?;
+        Ok(record.author_subject)
     }
 
     /// Author + store a new block (`pillar object put`), attributing it to
@@ -585,6 +614,46 @@ mod tests {
         let verify = store.verify(&cid_hex).expect("verify");
         assert!(verify.contains("hash-matches-cid: true"), "{verify}");
         assert!(verify.contains("signature-valid: true"), "{verify}");
+    }
+
+    #[test]
+    fn query_journal_import_validates_and_preserves_exact_records() {
+        let source = ObjectStore::new();
+        let replica = ObjectStore::new();
+        let cid = source
+            .put(
+                AUTHOR_SUBJECT,
+                &ObjectOp::Put {
+                    visibility: ObjectVisibility::Public,
+                    payload_hex: hex_encode(b"exact public record"),
+                    links_hex: vec![],
+                    recipients_hex: vec![],
+                },
+            )
+            .unwrap();
+        let bytes = source.export_record(&cid).unwrap();
+        assert!(replica.import_record("00", &bytes).is_err());
+        assert!(replica.export_record(&cid).is_err());
+        assert!(replica.import_record(&cid, b"invalid record").is_err());
+        let mut corrupt = bytes.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let corrupt_cid = hex_encode(pillar_ipfs::content_id(&corrupt).as_bytes());
+        assert!(replica.import_record(&corrupt_cid, &corrupt).is_err());
+        assert!(replica.export_record(&corrupt_cid).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let trailing_cid = hex_encode(pillar_ipfs::content_id(&trailing).as_bytes());
+        assert!(replica.import_record(&trailing_cid, &trailing).is_err());
+        for _ in 0..2 {
+            assert_eq!(replica.import_record(&cid, &bytes).unwrap(), AUTHOR_SUBJECT);
+            assert_eq!(replica.export_record(&cid).unwrap(), bytes);
+            assert_eq!(replica.cat(&cid, None).unwrap(), "exact public record");
+            assert_eq!(replica.verify(&cid), source.verify(&cid));
+            assert!(replica
+                .stat(&cid, "replica")
+                .unwrap()
+                .contains("pinned: replica"));
+        }
     }
 
     #[test]
