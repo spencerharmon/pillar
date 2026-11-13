@@ -4,7 +4,8 @@
 //! A fresh node or a new user joins an existing cell by submitting a
 //! [`BootstrapRequest`] carrying its identifying information. An existing,
 //! authorized cell member reviews the queue ([`BootstrapRequestQueue::pending`])
-//! and approves ([`BootstrapRequestQueue::approve`]) or rejects it. On a NODE
+//! and approves ([`BootstrapRequestQueue::approve_node`] or
+//! [`BootstrapRequestQueue::approve`]) or rejects it. On a NODE
 //! approval an existing node seals the cell key to the newly-approved node and
 //! returns the CID of the sealed blob ([`SealedCellKey`]); on a USER approval
 //! the new user's operational-key offer is escrowed. Key material is delivered
@@ -14,7 +15,9 @@
 //! The seal is REAL cryptography: `pillar_crypto::seal` (X25519 key-agreement
 //! wrapping a fresh ChaCha20-Poly1305 content key, the same seal contract
 //! `cells-confidentiality-impl`/`key-distribution-offer-impl` already use).
-//! Only a holder of the approved node's derived sealing secret key can
+//! The caller supplies the node's authenticated recipient public key and actual
+//! cell credentials; neither is derived from public identity labels.
+//! Only a holder of the approved node's sealing secret key can
 //! recover the cell key; a non-recipient (including the cell's own key) is
 //! refused cryptographically — `CryptoError::NotARecipient` — not by
 //! bookkeeping, and a tampered envelope fails AEAD authentication.
@@ -22,39 +25,11 @@
 use std::collections::{BTreeSet, HashMap};
 
 use pillar_core::NodeId;
-use pillar_crypto::seal::{seal_to_recipients, sealing_keypair_from_seed, unseal};
-use pillar_crypto::{CryptoError, SealedEnvelope, SealingSecretKey, Seed};
+use pillar_crypto::seal::{seal_to_recipients, unseal};
+use pillar_crypto::{CryptoError, SealedEnvelope, SealingPublicKey, SealingSecretKey};
 use sha2::{Digest, Sha256};
 
 use crate::custody::CustodyKind;
-
-/// Derive a node's real X25519 sealing keypair deterministically from its
-/// [`NodeId`] label (in production, the node's device-subkey secret would
-/// seed this instead). Deterministic in the id; distinct ids yield
-/// cryptographically independent keypairs. Public so a new node (or a test)
-/// can derive its own secret key to [`SealedCellKey::unseal`] the cell key
-/// sealed to it.
-///
-/// # Errors
-/// Propagates a `pillar_crypto` key-derivation failure.
-pub fn sealing_keypair_for(
-    node: &NodeId,
-) -> Result<(pillar_crypto::SealingPublicKey, SealingSecretKey), CryptoError> {
-    let seed =
-        Seed::from_bytes(format!("pillar-bootstrap/node-sealing-key-v1::{}", node.0).into_bytes());
-    sealing_keypair_from_seed(&seed)
-}
-
-/// Derive the plaintext cell-key material sealed to an approved node. A real
-/// deployment seals the actual cell secret key bytes; this derives a
-/// deterministic stand-in plaintext from the cell id so the same cell always
-/// seals the same key material (the PLAINTEXT is a stand-in — the seal is not).
-fn cell_key_plaintext(cell: &NodeId) -> Vec<u8> {
-    let mut h = Sha256::new();
-    h.update(b"pillar-bootstrap/cell-key-plaintext-v1");
-    h.update(cell.0.as_bytes());
-    h.finalize().to_vec()
-}
 
 /// Content id (hex SHA-256) of a sealed envelope's bytes, addressing the
 /// sealed blob a new node fetches.
@@ -134,7 +109,7 @@ impl NodeIdentity {
 /// REAL-sealed (X25519 + AEAD, `pillar_crypto::seal`) the cell key to the new
 /// node; this carries the content id of that sealed blob, the recipient-
 /// sealed envelope itself, the node it is sealed to, and the member that
-/// sealed it. Only a holder of `sealed_to`'s derived secret key can
+/// sealed it. Only a holder of the supplied recipient key's matching secret can
 /// [`SealedCellKey::unseal`] it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedCellKey {
@@ -149,7 +124,7 @@ pub struct SealedCellKey {
 }
 
 impl SealedCellKey {
-    /// Recover the sealed cell-key plaintext using `sealed_to`'s derived
+    /// Recover the sealed cell-key plaintext using the recipient's
     /// sealing secret key. Fails cryptographically
     /// ([`CryptoError::NotARecipient`]) for any other key, and on a tampered
     /// envelope ([`CryptoError::DecryptionFailed`]) — AEAD authentication.
@@ -246,6 +221,12 @@ pub enum RequestError {
     /// requires an authorized member (never a self-approval, never an
     /// outsider).
     NotAuthorizedMember,
+    /// Node approval requires an explicit recipient key and nonempty credentials.
+    MissingCredentials,
+    /// Node approval was attempted on a user request.
+    WrongRequestKind,
+    /// Sealing failed; the request remains pending and no key was delivered.
+    SealingFailed(CryptoError),
 }
 
 /// The queue of bootstrap requests for one cell, with the set of authorized
@@ -369,17 +350,17 @@ impl BootstrapRequestQueue {
             .ok_or(RequestError::UnknownRequest)
     }
 
-    /// Approve a pending request as authorized member `member`. On a NODE
-    /// approval the cell key is sealed to the requester and the resulting
-    /// [`SealedCellKey`] (CID) is returned; on a USER approval the offer is
-    /// escrowed and `Ok(None)` is returned.
+    /// Approve a pending USER request as authorized member `member`, escrowing
+    /// its offer and returning `Ok(None)`. NODE requests require
+    /// [`Self::approve_node`] and fail closed here without changing state.
     ///
     /// # Errors
     ///
     /// [`RequestError::UnknownRequest`] if `id` is unknown;
     /// [`RequestError::NotPending`] if it was already decided;
     /// [`RequestError::NotAuthorizedMember`] if `member` is not an authorized
-    /// existing cell member.
+    /// existing cell member;
+    /// [`RequestError::MissingCredentials`] for a NODE request.
     pub fn approve(
         &mut self,
         id: BootstrapRequestId,
@@ -392,35 +373,57 @@ impl BootstrapRequestQueue {
         if self.requests[idx].state != RequestState::Pending {
             return Err(RequestError::NotPending);
         }
+        if self.requests[idx].kind == BootstrapRequestKind::Node {
+            return Err(RequestError::MissingCredentials);
+        }
+        self.escrowed.insert(id);
         self.requests[idx].state = RequestState::Approved;
         self.requests[idx].approver = Some(member.clone());
+        Ok(None)
+    }
 
-        match self.requests[idx].kind {
-            BootstrapRequestKind::Node => {
-                let subject = self.requests[idx].subject.clone();
-                // An existing node REAL-seals the cell key to the approved
-                // node's derived X25519 sealing public key (recipient-sealed,
-                // AEAD-authenticated — only that node's secret key can unseal).
-                let (recipient_pub, _recipient_secret) = sealing_keypair_for(&subject)
-                    .expect("deterministic sealing keypair derivation cannot fail");
-                let plaintext = cell_key_plaintext(&self.cell);
-                let envelope = seal_to_recipients(&plaintext, &[recipient_pub])
-                    .expect("sealing to a valid recipient key cannot fail");
-                let cid = envelope_cid(&envelope);
-                let sealed = SealedCellKey {
-                    cid,
-                    envelope,
-                    sealed_to: subject,
-                    sealed_by: member.clone(),
-                };
-                self.sealed.insert(id, sealed.clone());
-                Ok(Some(sealed))
-            }
-            BootstrapRequestKind::User => {
-                self.escrowed.insert(id);
-                Ok(None)
-            }
+    /// Approve a pending NODE request, sealing actual cell credentials to its
+    /// recipient key. The caller must authenticate that `recipient` belongs to
+    /// the requester and supply the cell's credential plaintext.
+    /// No approval state changes until sealing succeeds.
+    ///
+    /// # Errors
+    /// As [`Self::approve`] for membership, request lookup and terminal state;
+    /// [`RequestError::WrongRequestKind`] for a USER request;
+    /// [`RequestError::MissingCredentials`] for empty plaintext;
+    /// [`RequestError::SealingFailed`] if encryption fails.
+    pub fn approve_node(
+        &mut self,
+        id: BootstrapRequestId,
+        member: &NodeId,
+        recipient: &SealingPublicKey,
+        plaintext: &[u8],
+    ) -> Result<SealedCellKey, RequestError> {
+        if !self.members.contains(member) {
+            return Err(RequestError::NotAuthorizedMember);
         }
+        let idx = self.index_of(id)?;
+        if self.requests[idx].state != RequestState::Pending {
+            return Err(RequestError::NotPending);
+        }
+        if self.requests[idx].kind != BootstrapRequestKind::Node {
+            return Err(RequestError::WrongRequestKind);
+        }
+        if plaintext.is_empty() {
+            return Err(RequestError::MissingCredentials);
+        }
+        let envelope = seal_to_recipients(plaintext, std::slice::from_ref(recipient))
+            .map_err(RequestError::SealingFailed)?;
+        let sealed = SealedCellKey {
+            cid: envelope_cid(&envelope),
+            envelope,
+            sealed_to: self.requests[idx].subject.clone(),
+            sealed_by: member.clone(),
+        };
+        self.sealed.insert(id, sealed.clone());
+        self.requests[idx].state = RequestState::Approved;
+        self.requests[idx].approver = Some(member.clone());
+        Ok(sealed)
     }
 
     /// Reject a pending request as authorized member `member`. No key material
@@ -458,6 +461,14 @@ impl BootstrapRequestQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pillar_crypto::seal::sealing_keypair_from_seed;
+    use pillar_crypto::Seed;
+
+    const CREDENTIALS: &[u8] = b"test-only cell credential secret";
+
+    fn recipient_keys() -> (SealingPublicKey, SealingSecretKey) {
+        sealing_keypair_from_seed(&Seed::from_bytes(vec![0x42; 32])).expect("test keygen")
+    }
 
     fn queue() -> BootstrapRequestQueue {
         BootstrapRequestQueue::new(
@@ -486,9 +497,8 @@ mod tests {
             vec!["edge".into()],
         );
         let sealed = q
-            .approve(id, &NodeId::from("m1"))
-            .expect("approved")
-            .expect("node approval returns a sealed cell key");
+            .approve_node(id, &NodeId::from("m1"), &recipient_keys().0, CREDENTIALS)
+            .expect("approved");
         assert_eq!(sealed.sealed_to, NodeId::from("new-node"));
         assert_eq!(sealed.sealed_by, NodeId::from("m1"));
         assert!(sealed.cid.starts_with("bafy-cellkey-"));
@@ -507,15 +517,13 @@ mod tests {
             CustodyKind::Tpm,
             vec![],
         );
+        let (recipient, secret) = recipient_keys();
         let sealed = q
-            .approve(id, &NodeId::from("m1"))
-            .expect("approved")
-            .expect("node approval returns a sealed cell key");
-        let (_pk, secret) = sealing_keypair_for(&NodeId::from("new-node")).expect("keygen");
-        let expected = cell_key_plaintext(&NodeId::from("spencer-cell"));
+            .approve_node(id, &NodeId::from("m1"), &recipient, CREDENTIALS)
+            .expect("approved");
         assert_eq!(
             sealed.unseal(&secret).as_deref(),
-            Ok(expected.as_slice()),
+            Ok(CREDENTIALS),
             "the approved node must recover the real plaintext cell key"
         );
     }
@@ -530,19 +538,19 @@ mod tests {
             vec![],
         );
         let sealed = q
-            .approve(id, &NodeId::from("m1"))
-            .expect("approved")
-            .expect("sealed");
+            .approve_node(id, &NodeId::from("m1"), &recipient_keys().0, CREDENTIALS)
+            .expect("approved");
         // A different node's derived secret is not a recipient.
         let (_pk, other_secret) =
-            sealing_keypair_for(&NodeId::from("some-other-node")).expect("keygen");
+            sealing_keypair_from_seed(&Seed::from_bytes(vec![0x43; 32])).expect("keygen");
         assert_eq!(
             sealed.unseal(&other_secret),
             Err(CryptoError::NotARecipient),
             "a non-recipient node must be refused cryptographically"
         );
         // Nor can the existing member/cell key itself unseal it.
-        let (_pk, member_secret) = sealing_keypair_for(&NodeId::from("m1")).expect("keygen");
+        let (_pk, member_secret) =
+            sealing_keypair_from_seed(&Seed::from_bytes(vec![0x44; 32])).expect("keygen");
         assert_eq!(
             sealed.unseal(&member_secret),
             Err(CryptoError::NotARecipient)
@@ -558,11 +566,10 @@ mod tests {
             CustodyKind::Tpm,
             vec![],
         );
+        let (recipient, secret) = recipient_keys();
         let sealed = q
-            .approve(id, &NodeId::from("m1"))
-            .expect("approved")
-            .expect("sealed");
-        let (_pk, secret) = sealing_keypair_for(&NodeId::from("new-node")).expect("keygen");
+            .approve_node(id, &NodeId::from("m1"), &recipient, CREDENTIALS)
+            .expect("approved");
         // Flip a byte deep in the ciphertext payload — AEAD must reject it.
         let mut bytes = sealed.envelope_bytes().to_vec();
         let last = bytes.len() - 1;
@@ -606,6 +613,12 @@ mod tests {
             q.approve(id, &NodeId::from("outsider")),
             Err(RequestError::NotAuthorizedMember)
         );
+        for member in ["new-node", "outsider"] {
+            assert_eq!(
+                q.approve_node(id, &NodeId::from(member), &recipient_keys().0, CREDENTIALS),
+                Err(RequestError::NotAuthorizedMember)
+            );
+        }
         // No key was sealed.
         assert!(q.sealed_cell_key(id).is_none());
     }
@@ -627,6 +640,10 @@ mod tests {
             q.approve(id, &NodeId::from("m1")),
             Err(RequestError::NotPending)
         );
+        assert_eq!(
+            q.approve_node(id, &NodeId::from("m1"), &recipient_keys().0, CREDENTIALS),
+            Err(RequestError::NotPending)
+        );
     }
 
     #[test]
@@ -638,11 +655,18 @@ mod tests {
             CustodyKind::Tpm,
             vec![],
         );
-        q.approve(id, &NodeId::from("m1")).expect("approved");
+        let sealed = q
+            .approve_node(id, &NodeId::from("m1"), &recipient_keys().0, CREDENTIALS)
+            .expect("approved");
         assert_eq!(
             q.approve(id, &NodeId::from("m2")),
             Err(RequestError::NotPending)
         );
+        assert_eq!(
+            q.approve_node(id, &NodeId::from("m2"), &recipient_keys().0, CREDENTIALS),
+            Err(RequestError::NotPending)
+        );
+        assert_eq!(q.sealed_cell_key(id), Some(&sealed));
     }
 
     #[test]
@@ -656,7 +680,8 @@ mod tests {
         );
         let _b = q.submit_user(NodeId::from("user-b"), CustodyKind::Password, vec![]);
         assert_eq!(q.pending().len(), 2);
-        q.approve(a, &NodeId::from("m1")).unwrap();
+        q.approve_node(a, &NodeId::from("m1"), &recipient_keys().0, CREDENTIALS)
+            .unwrap();
         let pending = q.pending();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].subject(), &NodeId::from("user-b"));
@@ -672,6 +697,68 @@ mod tests {
             q.approve(BootstrapRequestId(99), &NodeId::from("m1")),
             Err(RequestError::UnknownRequest)
         );
+        assert_eq!(
+            q.approve_node(
+                BootstrapRequestId(99),
+                &NodeId::from("m1"),
+                &recipient_keys().0,
+                CREDENTIALS,
+            ),
+            Err(RequestError::UnknownRequest)
+        );
+    }
+
+    #[test]
+    fn node_approval_requires_credentials_and_successful_sealing() {
+        let mut q = queue();
+        let id = q.submit_node(
+            NodeId::from("new-node"),
+            node_identity(),
+            CustodyKind::Tpm,
+            vec![],
+        );
+        let before = q.all()[0].clone();
+        assert_eq!(
+            q.approve(id, &NodeId::from("m1")),
+            Err(RequestError::MissingCredentials)
+        );
+        assert_eq!(q.all()[0], before);
+        assert_eq!(
+            q.approve_node(id, &NodeId::from("m1"), &recipient_keys().0, b""),
+            Err(RequestError::MissingCredentials)
+        );
+        assert_eq!(q.all()[0], before);
+        assert_eq!(
+            q.approve_node(
+                id,
+                &NodeId::from("m1"),
+                &SealingPublicKey::from_bytes(vec![1; 31]),
+                CREDENTIALS,
+            ),
+            Err(RequestError::SealingFailed(CryptoError::InvalidKey))
+        );
+        assert_eq!(q.all()[0], before);
+        assert!(q.sealed_cell_key(id).is_none());
+        assert!(!q.is_escrowed(id));
+        let sealed = q
+            .approve_node(id, &NodeId::from("m1"), &recipient_keys().0, CREDENTIALS)
+            .expect("retry after failed sealing");
+        assert_eq!(sealed.unseal(&recipient_keys().1).unwrap(), CREDENTIALS);
+    }
+
+    #[test]
+    fn node_approval_refuses_user_requests_without_escrowing() {
+        let mut q = queue();
+        let id = q.submit_user(NodeId::from("new-user"), CustodyKind::Password, vec![]);
+        let before = q.all()[0].clone();
+        assert_eq!(
+            q.approve_node(id, &NodeId::from("m1"), &recipient_keys().0, CREDENTIALS),
+            Err(RequestError::WrongRequestKind)
+        );
+        assert_eq!(q.all()[0], before);
+        assert!(q.sealed_cell_key(id).is_none());
+        assert!(!q.is_escrowed(id));
+        assert_eq!(q.approve(id, &NodeId::from("m1")), Ok(None));
     }
 
     #[test]

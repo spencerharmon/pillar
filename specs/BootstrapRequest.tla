@@ -54,9 +54,12 @@ VARIABLES
     kind,      \* [Requesters -> Kinds \cup {None}]: request kind once submitted
     approver,  \* [Requesters -> Members \cup {None}]: who decided it
     sealed,    \* SUBSET Requesters: node requesters given the sealed cell key CID
-    escrowed   \* SUBSET Requesters: user requesters whose op-key offer was escrowed
+    escrowed,  \* SUBSET Requesters: user requesters whose op-key offer was escrowed
+    proven,    \* node request signatures verified against their recipient binding
+    retrieved, \* verified subject retrieved its approved envelope
+    installed  \* durable recipient installation (unchanged by process restart)
 
-vars == <<state, kind, approver, sealed, escrowed>>
+vars == <<state, kind, approver, sealed, escrowed, proven, retrieved, installed>>
 
 TypeOK ==
     /\ state    \in [Requesters -> States]
@@ -64,6 +67,9 @@ TypeOK ==
     /\ approver \in [Requesters -> Members \cup {None}]
     /\ sealed   \subseteq Requesters
     /\ escrowed \subseteq Requesters
+    /\ proven \subseteq Requesters
+    /\ retrieved \subseteq Requesters
+    /\ installed \subseteq Requesters
 
 Init ==
     /\ state    = [r \in Requesters |-> "absent"]
@@ -71,6 +77,9 @@ Init ==
     /\ approver = [r \in Requesters |-> None]
     /\ sealed   = {}
     /\ escrowed = {}
+    /\ proven = {}
+    /\ retrieved = {}
+    /\ installed = {}
 
 -----------------------------------------------------------------------------
 (* Submit a bootstrap request carrying identifying info (modelled by its     *)
@@ -82,7 +91,8 @@ Submit(r, k) ==
     /\ state[r] = "absent"
     /\ state' = [state EXCEPT ![r] = "pending"]
     /\ kind'  = [kind  EXCEPT ![r] = k]
-    /\ UNCHANGED <<approver, sealed, escrowed>>
+    /\ proven' = IF k = "node" THEN proven \cup {r} ELSE proven
+    /\ UNCHANGED <<approver, sealed, escrowed, retrieved, installed>>
 
 -----------------------------------------------------------------------------
 (* Approve a pending request. The approver MUST be an authorized existing     *)
@@ -94,11 +104,12 @@ Approve(r, m) ==
     /\ r \in Requesters
     /\ m \in Members
     /\ state[r] = "pending"
+    /\ kind[r] = "node" => r \in proven
     /\ state'    = [state    EXCEPT ![r] = "approved"]
     /\ approver' = [approver EXCEPT ![r] = m]
     /\ sealed'   = IF kind[r] = "node" THEN sealed \cup {r} ELSE sealed
     /\ escrowed' = IF kind[r] = "user" THEN escrowed \cup {r} ELSE escrowed
-    /\ UNCHANGED kind
+    /\ UNCHANGED <<kind, proven, retrieved, installed>>
 
 -----------------------------------------------------------------------------
 (* Reject a pending request. Terminal, and NO key material is ever delivered. *)
@@ -108,12 +119,31 @@ Reject(r, m) ==
     /\ state[r] = "pending"
     /\ state'    = [state    EXCEPT ![r] = "rejected"]
     /\ approver' = [approver EXCEPT ![r] = m]
-    /\ UNCHANGED <<kind, sealed, escrowed>>
+    /\ UNCHANGED <<kind, sealed, escrowed, proven, retrieved, installed>>
+
+\* The authenticated transport binds the issuer; the verified request signature
+\* binds the device identity to its sealing public key. Forged attempts stutter.
+Retrieve(r, subject) ==
+    /\ r \in sealed
+    /\ subject = r
+    /\ r \in proven
+    /\ retrieved' = retrieved \cup {r}
+    /\ UNCHANGED <<state, kind, approver, sealed, escrowed, proven, installed>>
+
+Install(r) ==
+    /\ r \in retrieved
+    /\ installed' = installed \cup {r}
+    /\ UNCHANGED <<state, kind, approver, sealed, escrowed, proven, retrieved>>
+
+Restart == UNCHANGED vars
 
 Next ==
     \/ \E r \in Requesters, k \in Kinds  : Submit(r, k)
     \/ \E r \in Requesters, m \in Members : Approve(r, m)
     \/ \E r \in Requesters, m \in Members : Reject(r, m)
+    \/ \E r \in Requesters, s \in Requesters : Retrieve(r, s)
+    \/ \E r \in Requesters : Install(r)
+    \/ Restart
 
 Spec == Init /\ [][Next]_vars
 
@@ -142,5 +172,10 @@ NoKeyWithoutAuthorizedApprover ==
 RejectedNeverGetsKey ==
     \A r \in Requesters :
         state[r] = "rejected" => (r \notin sealed /\ r \notin escrowed)
+
+InstalledOnlyAfterAuthenticatedApproval ==
+    /\ installed \subseteq retrieved
+    /\ retrieved \subseteq sealed
+    /\ sealed \subseteq proven
 
 =============================================================================

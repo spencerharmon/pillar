@@ -156,13 +156,18 @@ impl Node {
             .unwrap()
     }
 
-    /// Read the raw on-disk identity key bytes — EXACTLY
-    /// `pillar_cli::run::load_or_create_identity`'s persisted form
-    /// (`Keypair::to_protobuf_encoding()`), so this test can reproduce the
-    /// node's `cell_id`/`cell_group_key` derivation independently, with no
-    /// RPC of any kind to obtain them.
-    fn identity_key_bytes(&self) -> Vec<u8> {
-        std::fs::read(self.data_dir.join("identity.key")).expect("read identity.key")
+    /// Load the real private runtime credentials, without an RPC.
+    fn cell_material(&self) -> (Vec<u8>, Vec<u8>) {
+        #[derive(serde::Deserialize)]
+        struct CellCredentials {
+            cell_id: Vec<u8>,
+            seed: Vec<u8>,
+        }
+        let bytes = std::fs::read(self.data_dir.join("cell-credentials.json"))
+            .expect("read cell-credentials.json");
+        let credentials: CellCredentials =
+            serde_json::from_slice(&bytes).expect("parse cell-credentials.json");
+        (credentials.cell_id, credentials.seed)
     }
 }
 
@@ -180,17 +185,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
-}
-
-/// Reproduce the node's `identity_seed_material`/`cell_id` derivation
-/// (`pillar_cli::run::run`) from the raw on-disk identity key bytes alone —
-/// a pure function of `<data_dir>/identity.key`, no network call involved.
-fn cell_material(identity_key_bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut seed_bytes = b"pillar-streamdb/segment-signer/v1:".to_vec();
-    seed_bytes.extend_from_slice(identity_key_bytes);
-    let mut cell_id_bytes = b"pillar-streamdb/cell-id/v1:".to_vec();
-    cell_id_bytes.extend_from_slice(&seed_bytes);
-    (cell_id_bytes, seed_bytes)
 }
 
 fn signer_subject_hex(public: &pillar_crypto::SigningPublicKey) -> String {
@@ -219,9 +213,7 @@ fn cell_bootstrap_seeds_the_default_resourceset_floor_and_refuses_its_deletion()
     let admit = node.post("/bootstrap/admit-resource-signer", &subject_hex);
     assert_eq!(admit.status, 200, "admit-resource-signer: {}", admit.body);
 
-    // --- The REAL cell material, derived purely from the node's on-disk
-    // identity key — no RPC of any kind reveals it.
-    let (cell_id_bytes, seed_bytes) = cell_material(&node.identity_key_bytes());
+    let (cell_id_bytes, seed_bytes) = node.cell_material();
 
     // --- Wire the pillar-client env the CLI's `get`/`delete` read from.
     std::env::set_var(

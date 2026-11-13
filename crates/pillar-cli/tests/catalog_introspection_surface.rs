@@ -165,8 +165,18 @@ impl Node {
             .unwrap()
     }
 
-    fn identity_key_bytes(&self) -> Vec<u8> {
-        std::fs::read(self.data_dir.join("identity.key")).expect("read identity.key")
+    /// Load the real private runtime credentials, without an RPC.
+    fn cell_material(&self) -> (Vec<u8>, Vec<u8>) {
+        #[derive(serde::Deserialize)]
+        struct CellCredentials {
+            cell_id: Vec<u8>,
+            seed: Vec<u8>,
+        }
+        let bytes = std::fs::read(self.data_dir.join("cell-credentials.json"))
+            .expect("read cell-credentials.json");
+        let credentials: CellCredentials =
+            serde_json::from_slice(&bytes).expect("parse cell-credentials.json");
+        (credentials.cell_id, credentials.seed)
     }
 }
 
@@ -184,16 +194,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
-}
-
-/// Reproduce the node's `cell_id`/seed derivation from the on-disk identity key
-/// bytes alone (mirrors `data_query_tier_remote_surface`'s `cell_material`).
-fn cell_material(identity_key_bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut seed_bytes = b"pillar-streamdb/segment-signer/v1:".to_vec();
-    seed_bytes.extend_from_slice(identity_key_bytes);
-    let mut cell_id_bytes = b"pillar-streamdb/cell-id/v1:".to_vec();
-    cell_id_bytes.extend_from_slice(&seed_bytes);
-    (cell_id_bytes, seed_bytes)
 }
 
 #[test]
@@ -215,8 +215,7 @@ fn catalog_introspection_surface_folds_the_live_catalog_over_pillar_udp() {
     let admit = node.post("/bootstrap/admit-resource-signer", &subject_hex);
     assert_eq!(admit.status, 200, "admit-resource-signer: {}", admit.body);
 
-    // --- The REAL cell material, derived purely from the node's on-disk key.
-    let (cell_id_bytes, seed_bytes) = cell_material(&node.identity_key_bytes());
+    let (cell_id_bytes, seed_bytes) = node.cell_material();
 
     // --- Wire the pillar-client env the query verbs read from.
     std::env::set_var(

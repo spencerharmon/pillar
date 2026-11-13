@@ -137,6 +137,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use pillar_bootstrap::custody::parse_custody_kind;
@@ -238,6 +239,30 @@ struct CliExportMaterial {
     endpoint: String,
 }
 
+const NODE_REQUEST_ID_START: u64 = 1_000_000;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeEnrollment {
+    request: crate::enrollment::NodeRequest,
+    envelope: Option<Vec<u8>>,
+    rejected: bool,
+}
+
+struct EnrollmentState {
+    data_dir: PathBuf,
+    requests: BTreeMap<u64, NodeEnrollment>,
+    // A failed sync may have replaced the file already. Require a restart to
+    // reload durable truth rather than serve ambiguous in-memory state.
+    failed: bool,
+}
+
+fn random_session_token() -> Result<String, String> {
+    let mut bytes = [0; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(pillar_crypto::webauthn::base64url_encode(&bytes))
+}
+
 /// The reserved collection name the object-inspection tier's writes are
 /// indexed under in [`WebAuthContext::log_index`] — `pillar-log-inspection-
 /// tier`'s TSDB storage-layout exemplar: every `pillar object put` is an
@@ -304,16 +329,14 @@ pub struct WebAuthContext {
     first_user_second_factor: HashMap<String, String>,
     /// Admitted-but-not-yet-second-factor-verified logins. When a password
     /// login succeeds for a user who has an ENROLLED WebAuthn credential, the
-    /// admitted [`NodeCustodySession`] is parked HERE under a `p<n>` pending
+    /// admitted [`NodeCustodySession`] is parked HERE under a random pending
     /// token instead of being turned into a live session — so a password ALONE
     /// yields no usable session. The token is usable ONLY to drive the WebAuthn
     /// assertion ceremony ([`webauthn_ceremony_scope`] resolves it); a
     /// successful `authenticate/finish` promotes it into a real session
     /// ([`store_session`]) and removes it here.
     pending_2fa: HashMap<String, PendingLogin>,
-    /// Monotone counter minting distinct `p<n>` pending-2FA tokens.
-    next_pending: u64,
-    next_session: u64,
+    enrollment: Option<EnrollmentState>,
     /// The node/user bootstrap-request queue for the cell this node serves.
     /// `None` until the cell is created (a request joins an EXISTING cell).
     requests: Option<BootstrapRequestQueue>,
@@ -838,6 +861,10 @@ enum PortalOp {
     /// counterpart of [`WebAuthContext::resource_apply`], so a restarted node
     /// rehydrates every workload manifest the portal ever applied, not just
     /// the login path.
+    ResourceMessage {
+        actor: String,
+        encoded: Vec<u8>,
+    },
     ResourceApply {
         actor: String,
         name: String,
@@ -1253,7 +1280,7 @@ impl WebAuthContext {
             key_export_role: std::collections::HashSet::new(),
             step_up_at: HashMap::new(),
             first_user_second_factor: HashMap::new(),
-            next_session: 0,
+            enrollment: None,
             requests: None,
             identity: NodeIdentitySnapshot {
                 peer_id: node_for_identity.to_string(),
@@ -1290,7 +1317,6 @@ impl WebAuthContext {
             observability: ObservabilityBuilders::new(),
             webauthn_rp: PillarRelyingParty::new(),
             pending_2fa: HashMap::new(),
-            next_pending: 0,
             live_obs: None,
             workload_reconciler: None,
             scheduler_runtime: None,
@@ -1347,6 +1373,61 @@ impl WebAuthContext {
     pub fn with_persistent_journal(mut self, journal: SharedPortalJournal) -> Self {
         self.journal = Some(journal);
         self
+    }
+
+    /// Load the private node enrollment inbox AFTER replaying the cell journal.
+    /// Corrupt state or a failed initialized-marker write prevents startup.
+    pub fn with_enrollment(mut self, data_dir: PathBuf) -> Result<Self, String> {
+        let path = data_dir.join("enrollment-requests.json");
+        let requests: BTreeMap<u64, NodeEnrollment> = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+        for (id, entry) in &requests {
+            if *id < NODE_REQUEST_ID_START || (entry.rejected && entry.envelope.is_some()) {
+                return Err("invalid persisted node enrollment state".into());
+            }
+            crate::enrollment::verify_request(&entry.request)?;
+        }
+        if self.bootstrap.cell().is_some() {
+            crate::enrollment::write_private(&data_dir.join("cell-initialized"), b"1\n")?;
+        }
+        // Also repairs permissions on a previously existing inbox.
+        crate::enrollment::write_private(
+            &path,
+            &serde_json::to_vec(&requests).map_err(|e| e.to_string())?,
+        )?;
+        self.enrollment = Some(EnrollmentState {
+            data_dir,
+            requests,
+            failed: false,
+        });
+        Ok(self)
+    }
+
+    fn persist_enrollment(
+        &mut self,
+        requests: BTreeMap<u64, NodeEnrollment>,
+    ) -> Result<(), String> {
+        let state = self
+            .enrollment
+            .as_mut()
+            .ok_or("enrollment-not-configured")?;
+        if state.failed {
+            return Err("enrollment-persistence-failed".into());
+        }
+        let bytes = serde_json::to_vec(&requests).map_err(|e| e.to_string())?;
+        if let Err(e) = crate::enrollment::write_private(
+            &state.data_dir.join("enrollment-requests.json"),
+            &bytes,
+        ) {
+            state.failed = true;
+            tracing::error!(error = %e, "enrollment persistence failed; enrollment disabled");
+            return Err("enrollment-persistence-failed".into());
+        }
+        state.requests = requests;
+        Ok(())
     }
 
     /// Wire the cell id + seed material the CLI-config export bakes into a
@@ -1604,6 +1685,11 @@ impl WebAuthContext {
                     let _ = self
                         .webauthn_rp
                         .rename_credential(handle, &credential_id, &label);
+                }
+            }
+            PortalOp::ResourceMessage { actor, encoded } => {
+                if let Ok(op) = pillar_ops::ResourceOp::decode(&encoded) {
+                    let _ = self.resource_op_apply(&NodeId::from(actor.as_str()), &op);
                 }
             }
             PortalOp::ResourceApply {
@@ -3977,7 +4063,7 @@ impl WebAuthContext {
         op: &pillar_ops::ResourceOp,
     ) -> Result<String, ResourceError> {
         let mut plane = ResourcePlane::new(&mut self.resource_platform, &self.resource_api);
-        match op {
+        let result = match op {
             pillar_ops::ResourceOp::Apply { crd } => plane
                 .apply(actor, RESOURCE_CAP, crd.clone())
                 .map(|applied| applied.event.0.to_string()),
@@ -3995,7 +4081,14 @@ impl WebAuthContext {
                 // arriving here is a caller bug, not a mutation to authorize.
                 Err(ResourceError::UnroutableRead)
             }
+        };
+        if result.is_ok() {
+            self.record(&PortalOp::ResourceMessage {
+                actor: actor.to_string(),
+                encoded: op.encode().expect("validated resource operation encodes"),
+            });
         }
+        result
     }
 
     /// Dispatch a typed [`pillar_ops::ControlOp`] arriving over the sealed
@@ -6600,6 +6693,14 @@ impl WebAuthContext {
     pub fn create_cell(&mut self, cell: NodeId) -> Result<(), BootstrapError> {
         self.bootstrap
             .create_cell_checked(cell.clone(), self.name_registry.as_ref())?;
+        if let Some(state) = self.enrollment.as_mut() {
+            if let Err(e) =
+                crate::enrollment::write_private(&state.data_dir.join("cell-initialized"), b"1\n")
+            {
+                state.failed = true;
+                tracing::error!(error = %e, "cell marker persistence failed; enrollment disabled");
+            }
+        }
         let cell_id = cell.to_string();
         // The cell now exists: open the bootstrap-request queue for it so fresh
         // nodes/users can request to join.
@@ -6687,9 +6788,8 @@ impl WebAuthContext {
         self.bootstrap_create_first_user(handle, password)
     }
 
-    fn store_session(&mut self, session: NodeCustodySession) -> String {
-        let token = format!("s{}", self.next_session);
-        self.next_session += 1;
+    fn store_session(&mut self, session: NodeCustodySession) -> Result<String, String> {
+        let token = random_session_token()?;
         // Mirror a `pillar_web` login-session view keyed by the same token so
         // the shared non-loopback signing gate can resolve it.
         self.login_sessions.insert(
@@ -6716,7 +6816,7 @@ impl WebAuthContext {
             issued_at + SESSION_TTL_TICKS,
         );
         self.sessions.insert(token.clone(), session);
-        token
+        Ok(token)
     }
 
     /// Look up an admitted session by its bearer token. `pub(crate)` (rather
@@ -7600,6 +7700,11 @@ pub static ROUTES: &[RouteSpec] = &[
         method: "POST",
         path: PathMatch::Exact("/bootstrap/request/node"),
         handler: |ctx, _peer, request| dispatch_request_submit(ctx, request, true),
+    },
+    RouteSpec {
+        method: "POST",
+        path: PathMatch::Exact("/bootstrap/request/retrieve"),
+        handler: |ctx, _peer, request| dispatch_request_retrieve(ctx, request),
     },
     RouteSpec {
         method: "POST",
@@ -11425,7 +11530,16 @@ fn dispatch_webauthn_authenticate_finish(
             // client can drop the pending token and use the live one.
             if pending_identifier.is_some() {
                 if let Some(pending) = ctx.pending_2fa.remove(token) {
-                    let real = ctx.store_session(pending.session);
+                    let real = match ctx.store_session(pending.session) {
+                        Ok(token) => token,
+                        Err(_) => {
+                            return text_response(
+                                503,
+                                "Service Unavailable",
+                                "DENIED session-entropy-unavailable".into(),
+                            )
+                        }
+                    };
                     return text_response(200, "OK", format!("UNLOCKED {b64} {real}"));
                 }
             }
@@ -11551,7 +11665,7 @@ fn dispatch_login(
     // 2FA ENFORCEMENT: if this user (keyed on the STABLE admitted
     // subject, robust to which identifier form was typed) has an
     // ENROLLED WebAuthn credential, a password alone is NOT enough. Park
-    // the admitted session under a pending `p<n>` token (no live session
+    // the admitted session under a random pending token (no live session
     // minted) and tell the client to complete a WebAuthn assertion; only
     // `authenticate/finish` promotes it into a real session. A user with
     // no enrolled credential logs in on the password alone (the
@@ -11565,8 +11679,16 @@ fn dispatch_login(
         .get(&handle)
         .is_some_and(|r| r.force_password_change);
     if ctx.webauthn_rp.user_has_credentials(&subject) {
-        let ptoken = format!("p{}", ctx.next_pending);
-        ctx.next_pending += 1;
+        let ptoken = match random_session_token() {
+            Ok(token) => token,
+            Err(_) => {
+                return text_response(
+                    503,
+                    "Service Unavailable",
+                    "DENIED session-entropy-unavailable".into(),
+                )
+            }
+        };
         ctx.pending_2fa.insert(
             ptoken.clone(),
             PendingLogin {
@@ -11583,7 +11705,16 @@ fn dispatch_login(
             bytes: None,
         };
     }
-    let token = ctx.store_session(session);
+    let token = match ctx.store_session(session) {
+        Ok(token) => token,
+        Err(_) => {
+            return text_response(
+                503,
+                "Service Unavailable",
+                "DENIED session-entropy-unavailable".into(),
+            )
+        }
+    };
     HttpResponse {
         status: 200,
         reason: "OK",
@@ -11602,15 +11733,71 @@ fn parse_custody_field(token: &str) -> CustodyKind {
     parse_custody_kind(token).unwrap_or(CustodyKind::Password)
 }
 
-/// Submit a node/user bootstrap request. `is_node` selects the kind; the body
-/// carries the requester's identifying info as newline-separated fields (see
-/// the CLI `pillar bootstrap node`/`user` clients for the exact framing).
+/// Nodes submit signed JSON; users retain the newline-separated queue protocol.
 /// Requires the cell to exist (a request joins an EXISTING cell).
 fn dispatch_request_submit(
     ctx: &mut WebAuthContext,
     request: &HttpRequest,
     is_node: bool,
 ) -> HttpResponse {
+    if ctx.bootstrap.cell().is_none() {
+        return text_response(409, "Conflict", "DENIED no-cell-yet".into());
+    }
+    if is_node {
+        let Ok(node_request) =
+            serde_json::from_str::<crate::enrollment::NodeRequest>(&request.body)
+        else {
+            return text_response(
+                400,
+                "Bad Request",
+                "DENIED signed-node-request-required".into(),
+            );
+        };
+        if crate::enrollment::verify_request(&node_request).is_err() {
+            return text_response(401, "Unauthorized", "DENIED invalid-node-proof".into());
+        }
+        let Some(state) = ctx.enrollment.as_ref().filter(|s| !s.failed) else {
+            return text_response(
+                503,
+                "Service Unavailable",
+                "DENIED enrollment-unavailable".into(),
+            );
+        };
+        // Retries of the identical signed request keep the same durable ID.
+        if let Some((id, _)) = state
+            .requests
+            .iter()
+            .find(|(_, e)| e.request == node_request)
+        {
+            return text_response(200, "OK", format!("REQUEST {id}"));
+        }
+        let id = match state.requests.last_key_value() {
+            Some((last, _)) => match last.checked_add(1) {
+                Some(id) => id,
+                None => {
+                    return text_response(
+                        503,
+                        "Service Unavailable",
+                        "DENIED request-ids-exhausted".into(),
+                    )
+                }
+            },
+            None => NODE_REQUEST_ID_START,
+        };
+        let mut requests = state.requests.clone();
+        requests.insert(
+            id,
+            NodeEnrollment {
+                request: node_request,
+                envelope: None,
+                rejected: false,
+            },
+        );
+        return match ctx.persist_enrollment(requests) {
+            Ok(()) => text_response(200, "OK", format!("REQUEST {id}")),
+            Err(e) => text_response(503, "Service Unavailable", format!("DENIED {e}")),
+        };
+    }
     let Some(queue) = ctx.requests.as_mut() else {
         return text_response(409, "Conflict", "DENIED no-cell-yet".to_owned());
     };
@@ -11620,38 +11807,19 @@ fn dispatch_request_submit(
         return text_response(400, "Bad Request", "MISSING subject".to_owned());
     }
     let subject = NodeId::from(subject);
-    let id = if is_node {
-        // Fields: <subject>\n<peer_id>\n<version>\n<os>\n<public_key_cid>\n<custody>
-        // then any number of `pub=<addr>` / `priv=<addr>` / `label=<l>` lines.
-        let peer_id = lines.next().unwrap_or("").trim().to_owned();
-        let version = lines.next().unwrap_or("").trim().to_owned();
-        let os = lines.next().unwrap_or("").trim().to_owned();
-        let public_key_cid = lines.next().unwrap_or("").trim().to_owned();
-        let custody = parse_custody_field(lines.next().unwrap_or("").trim());
-        let mut identity = NodeIdentity::new(peer_id);
-        identity.version = version;
-        identity.os = os;
-        identity.public_key_cid = public_key_cid;
-        let mut labels = Vec::new();
-        for line in lines {
-            let line = line.trim();
-            if let Some(a) = line.strip_prefix("pub=") {
-                identity.public_addrs.push(a.to_owned());
-            } else if let Some(a) = line.strip_prefix("priv=") {
-                identity.private_addrs.push(a.to_owned());
-            } else if let Some(l) = line.strip_prefix("label=") {
-                labels.push(l.to_owned());
-            }
-        }
-        queue.submit_node(subject, identity, custody, labels)
-    } else {
-        // Fields: <subject>\n<custody> then any number of `label=<l>` lines.
-        let custody = parse_custody_field(lines.next().unwrap_or("").trim());
-        let labels: Vec<String> = lines
-            .filter_map(|l| l.trim().strip_prefix("label=").map(str::to_owned))
-            .collect();
-        queue.submit_user(subject, custody, labels)
-    };
+    // Reserve the high range exclusively for durable node requests.
+    if queue.all().len() as u64 >= NODE_REQUEST_ID_START {
+        return text_response(
+            503,
+            "Service Unavailable",
+            "DENIED request-ids-exhausted".into(),
+        );
+    }
+    let custody = parse_custody_field(lines.next().unwrap_or("").trim());
+    let labels: Vec<String> = lines
+        .filter_map(|l| l.trim().strip_prefix("label=").map(str::to_owned))
+        .collect();
+    let id = queue.submit_user(subject, custody, labels);
     text_response(200, "OK", format!("REQUEST {}", id.0))
 }
 
@@ -11668,13 +11836,73 @@ fn dispatch_request_list(ctx: &WebAuthContext) -> HttpResponse {
         };
         body.push_str(&format!("{} {} {}\n", req.id().0, kind, req.subject().0));
     }
+    if let Some(state) = &ctx.enrollment {
+        if state.failed {
+            return text_response(
+                503,
+                "Service Unavailable",
+                "DENIED enrollment-unavailable".into(),
+            );
+        }
+        for (id, entry) in &state.requests {
+            if !entry.rejected && entry.envelope.is_none() {
+                let Ok((peer, _)) = crate::enrollment::verify_request(&entry.request) else {
+                    return text_response(
+                        503,
+                        "Service Unavailable",
+                        "DENIED invalid-stored-node-proof".into(),
+                    );
+                };
+                body.push_str(&format!("{id} node {peer}\n"));
+            }
+        }
+    }
     text_response(200, "OK", body)
+}
+
+fn dispatch_request_retrieve(ctx: &WebAuthContext, request: &HttpRequest) -> HttpResponse {
+    let Ok(proof) = serde_json::from_str::<crate::enrollment::RetrieveRequest>(&request.body)
+    else {
+        return text_response(401, "Unauthorized", "DENIED invalid-retrieval-proof".into());
+    };
+    let Some(state) = ctx.enrollment.as_ref().filter(|s| !s.failed) else {
+        return text_response(
+            503,
+            "Service Unavailable",
+            "DENIED enrollment-unavailable".into(),
+        );
+    };
+    let authenticated = state.requests.get(&proof.id).filter(|entry| {
+        crate::enrollment::verify_request(&entry.request)
+            .is_ok_and(|(peer, _)| crate::enrollment::verify_retrieval(&proof, &peer).is_ok())
+    });
+    let Some(entry) = authenticated else {
+        return text_response(401, "Unauthorized", "DENIED invalid-retrieval-proof".into());
+    };
+    if entry.rejected {
+        return text_response(409, "Conflict", "DENIED rejected".into());
+    }
+    let Some(envelope) = &entry.envelope else {
+        return text_response(409, "Conflict", "DENIED pending".into());
+    };
+    match serde_json::to_string(envelope) {
+        Ok(body) => {
+            let mut response = text_response(200, "OK", body);
+            response.content_type = "application/json";
+            response
+        }
+        Err(_) => text_response(
+            503,
+            "Service Unavailable",
+            "DENIED envelope-serialization-failed".into(),
+        ),
+    }
 }
 
 /// Approve or reject a pending request. The body is `<id>\n<session-token>`.
 /// The presented session token must resolve to an admitted login session; its
-/// subject is the authorized member that decides the request. A NODE approval
-/// seals the cell key and returns its CID; a USER approval escrows the offer.
+/// subject decides the request. Node decisions additionally require the first
+/// user and durable enrollment; credentials are returned only by signed retrieval.
 fn dispatch_request_decide(
     ctx: &mut WebAuthContext,
     request: &HttpRequest,
@@ -11691,6 +11919,83 @@ fn dispatch_request_decide(
         return text_response(401, "Unauthorized", "DENIED not-authenticated".to_owned());
     };
     let member = session.subject.clone();
+    if id >= NODE_REQUEST_ID_START {
+        // initial_user is a handle; custody sessions carry its operational subkey.
+        if !ctx
+            .bootstrap
+            .initial_user()
+            .is_some_and(|handle| bootstrap_subkey(handle).node_id() == member)
+            || ctx.authority.reachable_depth(&member).is_none()
+            || !ctx
+                .session_registry
+                .ls(&member.0, ctx.session_clock)
+                .iter()
+                .any(|s| s.id == token)
+        {
+            return text_response(403, "Forbidden", "DENIED enrollment-admin-required".into());
+        }
+        let Some(state) = ctx.enrollment.as_ref().filter(|s| !s.failed) else {
+            return text_response(
+                503,
+                "Service Unavailable",
+                "DENIED enrollment-unavailable".into(),
+            );
+        };
+        let Some(entry) = state.requests.get(&id) else {
+            return text_response(409, "Conflict", "DENIED unknown-request".into());
+        };
+        if entry.rejected || entry.envelope.is_some() {
+            return text_response(409, "Conflict", "DENIED already-decided".into());
+        }
+        let mut updated = entry.clone();
+        if approve {
+            let result = (|| -> Result<Vec<u8>, String> {
+                let material = ctx.cli_export.as_ref().ok_or("missing-cell-credentials")?;
+                let journal = ctx.journal.as_ref().ok_or("missing-portal-journal")?;
+                let stream = journal.lock().map_err(|_| "portal-journal-unavailable")?;
+                let portal_ops = stream
+                    .stream()
+                    .log()
+                    .order()
+                    .iter()
+                    .map(|op| op.payload().to_vec())
+                    .collect();
+                let (recipient, sealing_key) = crate::enrollment::verify_request(&updated.request)?;
+                let bundle = crate::enrollment::EnrollmentBundle {
+                    version: 1,
+                    request_id: id,
+                    recipient,
+                    credentials: crate::enrollment::CellCredentials {
+                        cell_id: material.cell_id.as_bytes().to_vec(),
+                        seed: material.cell_seed.as_bytes().to_vec(),
+                    },
+                    portal_ops,
+                };
+                let plaintext =
+                    serde_json::to_vec(&bundle).map_err(|_| "bundle-serialization-failed")?;
+                crate::enrollment::validate_credentials(&bundle.credentials)?;
+                pillar_crypto::seal::seal_to_recipients(&plaintext, &[sealing_key])
+                    .map(|envelope| envelope.into_bytes())
+                    .map_err(|_| "enrollment-sealing-failed".into())
+            })();
+            match result {
+                Ok(envelope) => updated.envelope = Some(envelope),
+                Err(e) => return text_response(503, "Service Unavailable", format!("DENIED {e}")),
+            }
+        } else {
+            updated.rejected = true;
+        }
+        let mut requests = state.requests.clone();
+        requests.insert(id, updated);
+        return match ctx.persist_enrollment(requests) {
+            Ok(()) => text_response(
+                200,
+                "OK",
+                format!("{} {id}", if approve { "APPROVED" } else { "REJECTED" }),
+            ),
+            Err(e) => text_response(503, "Service Unavailable", format!("DENIED {e}")),
+        };
+    }
     let Some(queue) = ctx.requests.as_mut() else {
         return text_response(409, "Conflict", "DENIED no-cell-yet".to_owned());
     };
@@ -11716,6 +12021,9 @@ fn request_reason(e: &RequestError) -> &'static str {
         RequestError::UnknownRequest => "unknown-request",
         RequestError::NotPending => "already-decided",
         RequestError::NotAuthorizedMember => "not-authorized-member",
+        RequestError::MissingCredentials => "missing-credentials",
+        RequestError::WrongRequestKind => "wrong-request-kind",
+        RequestError::SealingFailed(_) => "sealing-failed",
     }
 }
 
@@ -14526,7 +14834,7 @@ mod tests {
     }
 
     #[test]
-    fn node_bootstrap_request_can_be_submitted_listed_and_approved_returning_a_cid() {
+    fn node_bootstrap_request_refuses_unsigned_and_unconfigured_enrollment() {
         let (mut ctx, _subkey) = provisioned_ctx();
         // A request can only join an EXISTING cell.
         assert_eq!(
@@ -14538,50 +14846,260 @@ mod tests {
             200
         );
 
-        // Submit a node request carrying identifying info.
+        // The old unsigned text protocol must never enqueue a node.
         let body = "new-node\n12D3KooWpeer\npillar 0.0.0\nlinux\nbafy-nodekey\ntpm\npub=/ip4/203.0.113.7/tcp/4001\nlabel=edge";
         let submitted = post(&mut ctx, "/bootstrap/request/node", body);
+        assert_eq!(submitted.status, 400);
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let signed = serde_json::to_string(&crate::enrollment::request(&key).unwrap()).unwrap();
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/node", &signed).status,
+            503
+        );
+        assert!(get(&mut ctx, "/bootstrap/request/list")
+            .body
+            .trim()
+            .is_empty());
+    }
+
+    #[test]
+    fn node_enrollment_persistence_and_marker_errors_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = provisioned_ctx()
+            .0
+            .with_enrollment(dir.path().to_path_buf())
+            .unwrap();
+        // A directory at the marker path forces the atomic replacement to fail.
+        std::fs::create_dir(dir.path().join("cell-initialized")).unwrap();
+        ctx.create_cell(NodeId::from("cell")).unwrap();
+        assert!(ctx.enrollment.as_ref().unwrap().failed);
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let body = serde_json::to_string(&crate::enrollment::request(&key).unwrap()).unwrap();
+        assert_eq!(post(&mut ctx, "/bootstrap/request/node", &body).status, 503);
+        assert!(ctx.with_enrollment(dir.path().to_path_buf()).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = provisioned_ctx().0;
+        ctx.create_cell(NodeId::from("cell")).unwrap();
+        let mut ctx = ctx.with_enrollment(dir.path().to_path_buf()).unwrap();
+        assert!(dir.path().join("cell-initialized").exists());
+        std::fs::remove_file(dir.path().join("enrollment-requests.json")).unwrap();
+        std::fs::create_dir(dir.path().join("enrollment-requests.json")).unwrap();
+        assert_eq!(post(&mut ctx, "/bootstrap/request/node", &body).status, 503);
+        assert!(ctx.enrollment.as_ref().unwrap().requests.is_empty());
+        assert!(ctx.enrollment.as_ref().unwrap().failed);
+        assert_eq!(get(&mut ctx, "/bootstrap/request/list").status, 503);
+        assert!(ctx.with_enrollment(dir.path().to_path_buf()).is_err());
+    }
+
+    #[test]
+    fn node_enrollment_is_private_authenticated_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::enrollment::load_credentials(dir.path()).unwrap();
+        let journal = test_journal();
+        let fresh = || {
+            provisioned_ctx()
+                .0
+                .with_persistent_journal(journal.clone())
+                .with_cli_export_material(
+                    pillar_crypto::CellId::from_bytes(credentials.cell_id.clone()),
+                    pillar_crypto::Seed::from_bytes(credentials.seed.clone()),
+                    "localhost:7443".into(),
+                )
+        };
+        let mut ctx = fresh().with_enrollment(dir.path().to_path_buf()).unwrap();
+        assert!(!dir.path().join("cell-initialized").exists());
+        ctx.bootstrap_cell_and_first_user(NodeId::from("cell"), "alice@pillar", PASSWORD)
+            .unwrap();
+        assert!(dir.path().join("cell-initialized").exists());
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let other = libp2p::identity::Keypair::generate_ed25519();
+        let signed = crate::enrollment::request(&key).unwrap();
+        let body = serde_json::to_string(&signed).unwrap();
+        let mut forged = signed.clone();
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/bootstrap/request/node",
+                &serde_json::to_string(&forged).unwrap()
+            )
+            .status,
+            401
+        );
+        let submitted = post(&mut ctx, "/bootstrap/request/node", &body);
         assert_eq!(submitted.status, 200);
-        assert!(
-            submitted.body.starts_with("REQUEST "),
-            "got: {}",
+        let id: u64 = submitted
+            .body
+            .strip_prefix("REQUEST ")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(id, NODE_REQUEST_ID_START);
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/node", &body).body,
             submitted.body
         );
-        let id = submitted.body.trim_start_matches("REQUEST ").trim();
-
-        // It shows up in the pending list.
-        let list = get(&mut ctx, "/bootstrap/request/list");
-        assert!(list.body.contains("node new-node"), "got: {}", list.body);
-
-        // Approving without authentication is refused.
-        let unauth = post(
-            &mut ctx,
-            "/bootstrap/request/approve",
-            &format!("{id}\nnot-a-token"),
+        let proof =
+            serde_json::to_string(&crate::enrollment::retrieval(&key, id).unwrap()).unwrap();
+        let wrong_proof =
+            serde_json::to_string(&crate::enrollment::retrieval(&other, id).unwrap()).unwrap();
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/retrieve", &proof).status,
+            409
         );
-        assert_eq!(unauth.status, 401);
-
-        // Authenticated approval seals the cell key and returns its CID.
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/retrieve", &wrong_proof).status,
+            401
+        );
+        let ops: Vec<Vec<u8>> = journal
+            .lock()
+            .unwrap()
+            .stream()
+            .log()
+            .order()
+            .iter()
+            .map(|op| op.payload().to_vec())
+            .collect();
+        let mut restarted = fresh();
+        restarted.replay(&ops);
+        let mut ctx = restarted.with_enrollment(dir.path().to_path_buf()).unwrap();
+        assert!(get(&mut ctx, "/bootstrap/request/list")
+            .body
+            .contains(&key.public().to_peer_id().to_string()));
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/approve", &format!("{id}\ns0")).status,
+            401
+        );
         let token = login_alice(&mut ctx);
+        assert_eq!(token.len(), 43);
+        assert_ne!(token, login_alice(&mut ctx));
+        // A real session is insufficient without the first-user capability.
+        let subkey = bootstrap_subkey("nonadmin");
+        ctx.admit_subject(subkey.node_id(), 4);
+        ctx.provision_offer(
+            "nonadmin",
+            "nonadmin",
+            Cid::from("nonadmin"),
+            subkey,
+            PASSWORD,
+            SECRET,
+        );
+        let nonce = get(&mut ctx, "/nonce")
+            .body
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let nonadmin = post(
+            &mut ctx,
+            "/login",
+            &format!("nonadmin\n{PASSWORD}\n{nonce}"),
+        )
+        .session_token
+        .unwrap();
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/bootstrap/request/approve",
+                &format!("{id}\n{nonadmin}")
+            )
+            .status,
+            403
+        );
+        let saved_journal = ctx.journal.take();
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/bootstrap/request/approve",
+                &format!("{id}\n{token}")
+            )
+            .status,
+            503
+        );
+        ctx.journal = saved_journal;
         let approved = post(
             &mut ctx,
             "/bootstrap/request/approve",
             &format!("{id}\n{token}"),
         );
-        assert_eq!(approved.status, 200, "got: {}", approved.body);
-        assert!(
-            approved.body.contains("APPROVED bafy-cellkey-"),
-            "got: {}",
-            approved.body
+        assert_eq!(approved.status, 200, "{}", approved.body);
+        assert_eq!(approved.body.trim(), format!("APPROVED {id}"));
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/bootstrap/request/reject",
+                &format!("{id}\n{token}")
+            )
+            .status,
+            409
         );
-
-        // The request is terminal: a second decision is refused.
-        let again = post(
-            &mut ctx,
-            "/bootstrap/request/approve",
-            &format!("{id}\n{token}"),
+        let retrieved = post(&mut ctx, "/bootstrap/request/retrieve", &proof);
+        assert_eq!(retrieved.status, 200);
+        let envelope: Vec<u8> = serde_json::from_str(&retrieved.body).unwrap();
+        let bundle = crate::enrollment::unseal_bundle(&key, &envelope, id).unwrap();
+        assert!(bundle.credentials == credentials);
+        assert_eq!(bundle.portal_ops, ops);
+        assert!(crate::enrollment::unseal_bundle(&other, &envelope, id).is_err());
+        let mut restarted = fresh();
+        restarted.replay(&ops);
+        let mut ctx = restarted.with_enrollment(dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/retrieve", &proof).body,
+            retrieved.body
         );
-        assert_eq!(again.status, 409);
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/retrieve", &wrong_proof).status,
+            401
+        );
+        let body = serde_json::to_string(&crate::enrollment::request(&other).unwrap()).unwrap();
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/node", &body).body.trim(),
+            format!("REQUEST {}", id + 1)
+        );
+        let token = login_alice(&mut ctx);
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/bootstrap/request/reject",
+                &format!("{}\n{token}", id + 1)
+            )
+            .status,
+            200
+        );
+        let rejected_proof =
+            serde_json::to_string(&crate::enrollment::retrieval(&other, id + 1).unwrap()).unwrap();
+        let mut ctx = ctx.with_enrollment(dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            post(&mut ctx, "/bootstrap/request/retrieve", &rejected_proof)
+                .body
+                .trim(),
+            "DENIED rejected"
+        );
+        assert_eq!(
+            post(
+                &mut ctx,
+                "/bootstrap/request/approve",
+                &format!("{}\n{token}", id + 1)
+            )
+            .status,
+            409
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["cell-initialized", "enrollment-requests.json"] {
+                assert_eq!(
+                    std::fs::metadata(dir.path().join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
     }
 
     #[test]

@@ -158,8 +158,18 @@ impl Node {
             .unwrap()
     }
 
-    fn identity_key_bytes(&self) -> Vec<u8> {
-        std::fs::read(self.data_dir.join("identity.key")).expect("read identity.key")
+    /// Load the real private runtime credentials, without an RPC.
+    fn cell_material(&self) -> (Vec<u8>, Vec<u8>) {
+        #[derive(serde::Deserialize)]
+        struct CellCredentials {
+            cell_id: Vec<u8>,
+            seed: Vec<u8>,
+        }
+        let bytes = std::fs::read(self.data_dir.join("cell-credentials.json"))
+            .expect("read cell-credentials.json");
+        let credentials: CellCredentials =
+            serde_json::from_slice(&bytes).expect("parse cell-credentials.json");
+        (credentials.cell_id, credentials.seed)
     }
 }
 
@@ -177,14 +187,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
-}
-
-fn cell_material(identity_key_bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut seed_bytes = b"pillar-streamdb/segment-signer/v1:".to_vec();
-    seed_bytes.extend_from_slice(identity_key_bytes);
-    let mut cell_id_bytes = b"pillar-streamdb/cell-id/v1:".to_vec();
-    cell_id_bytes.extend_from_slice(&seed_bytes);
-    (cell_id_bytes, seed_bytes)
 }
 
 fn signer_subject_hex(public: &pillar_crypto::SigningPublicKey) -> String {
@@ -211,7 +213,7 @@ fn cell_bootstrap_seeds_the_editable_credential_policy_floor_read_by_the_ceremon
     let admit = node.post("/bootstrap/admit-resource-signer", &subject_hex);
     assert_eq!(admit.status, 200, "admit-resource-signer: {}", admit.body);
 
-    let (cell_id_bytes, seed_bytes) = cell_material(&node.identity_key_bytes());
+    let (cell_id_bytes, seed_bytes) = node.cell_material();
 
     std::env::set_var(
         "PILLAR_RESOURCE_OP_ADDR",

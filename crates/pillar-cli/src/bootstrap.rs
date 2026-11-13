@@ -7,9 +7,11 @@
 //!   run the combined single-step cell+user bootstrap (locally by default, or
 //!   drive a running node's `--domain` endpoints). Refuses a cell name already
 //!   claimed on the network.
-//! - `pillar bootstrap node --domain <d> [opts]` — a fresh node submits a join
-//!   request carrying its identifying info (peer id, addresses, version, OS,
-//!   public-key CID).
+//! - `pillar bootstrap node --domain <d> --data-dir <dir> [--identity-key <path>]`
+//!   submits a join request signed by the joining node's existing identity.
+//! - `pillar bootstrap node complete <id> --domain <d> --data-dir <dir>`
+//!   retrieves and installs the approved enrollment while the joining daemon is
+//!   stopped; accepts the same optional identity-key path as submission.
 //! - `pillar bootstrap user --domain <d> [opts]` — a new user submits a join
 //!   request.
 //! - `pillar bootstrap request list [--domain <d>]` — list pending requests.
@@ -216,7 +218,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
 fn usage() -> &'static str {
     "usage:\n\
      \x20 pillar bootstrap cell <name> --user <handle> [--domain D] [--cell-custody K] [--user-custody K] [--cell-label L]... [--user-label L]...\n\
-     \x20 pillar bootstrap node --domain <D> [--key K] [--peer-id P] [--pubkey-cid C] [--node-custody K] [--listen A]... [--label L]...\n\
+     \x20 pillar bootstrap node --domain <D> --data-dir DIR [--identity-key PATH]\n\
+     \x20 pillar bootstrap node complete <id> --domain <D> --data-dir DIR [--identity-key PATH]\n\
      \x20 pillar bootstrap user --domain <D> --user <id> [--user-custody K] [--label L]...\n\
      \x20 pillar bootstrap request list [--domain D]\n\
      \x20 pillar bootstrap request approve <id> [--domain D]\n\
@@ -316,55 +319,138 @@ fn require_valid_domain(parsed: &Args<'_>) -> Result<(String, String), String> {
     Ok((authority, host))
 }
 
-/// `pillar bootstrap node --domain <D>`: submit a node join request carrying
-/// this node's identifying information.
+/// Submit or complete enrollment using the joining daemon's existing identity.
 fn bootstrap_node(args: &[String]) -> Result<String, String> {
+    use crate::enrollment;
+    use std::fs::{self, OpenOptions};
+    use std::path::PathBuf;
+
     let parsed = Args::parse(args)?;
-    let (authority, _host) = require_valid_domain(&parsed)?;
-    let custody = custody_or_default(parsed.get("node-custody"), CustodyKind::Tpm)?;
-    let peer_id = parsed.get("peer-id").unwrap_or("").to_owned();
-    let subject = parsed
-        .get("key")
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("node-{peer_id}"));
-    let pubkey_cid = parsed.get("pubkey-cid").unwrap_or("").to_owned();
-    let version = env!("CARGO_PKG_VERSION").to_owned();
-    let os = std::env::consts::OS.to_owned();
+    for (index, (name, value)) in parsed.flags.iter().enumerate() {
+        if !matches!(*name, "domain" | "data-dir" | "identity-key") {
+            return Err(format!("bootstrap node does not accept --{name}"));
+        }
+        if value.is_empty() || value.starts_with("--") {
+            return Err(format!("flag --{name} requires a nonempty value"));
+        }
+        if parsed.flags[..index].iter().any(|(key, _)| key == name) {
+            return Err(format!("flag --{name} must be specified only once"));
+        }
+    }
+    let request_id = match parsed.positional.as_slice() {
+        [] => None,
+        ["complete", id] => Some(
+            id.parse::<u64>()
+                .map_err(|_| "bootstrap node complete requires a numeric request <id>")?,
+        ),
+        _ => return Err(usage().to_owned()),
+    };
+    let domain = parsed
+        .get("domain")
+        .ok_or("bootstrap node requires --domain <D>")?;
+    let data_dir = PathBuf::from(
+        parsed
+            .get("data-dir")
+            .ok_or("bootstrap node requires --data-dir DIR")?,
+    );
+    if domain
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
+        return Err("bootstrap node does not support HTTPS: its HTTP helper is plaintext; use an authenticated SSH forward or another trusted transport to the issuer's HTTP listener".into());
+    }
+    let endpoint = domain.strip_prefix("http://").unwrap_or(domain);
+    if endpoint.trim_end_matches('/').is_empty()
+        || endpoint.trim_end_matches('/').contains('/')
+        || endpoint.chars().any(char::is_whitespace)
+    {
+        return Err("bootstrap node --domain must be an HTTP host[:port], without a path".into());
+    }
+    let (authority, _) = authority_of(domain);
+    let identity_path = parsed
+        .get("identity-key")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("identity.key"));
 
-    let mut body = String::new();
-    body.push_str(&subject);
-    body.push('\n');
-    body.push_str(&peer_id);
-    body.push('\n');
-    body.push_str(&version);
-    body.push('\n');
-    body.push_str(&os);
-    body.push('\n');
-    body.push_str(&pubkey_cid);
-    body.push('\n');
-    body.push_str(custody_token(custody));
-    for addr in parsed.all("listen") {
-        body.push_str(&format!("\npub={addr}"));
-    }
-    for addr in parsed.all("private-listen") {
-        body.push_str(&format!("\npriv={addr}"));
-    }
-    for label in parsed.all("label") {
-        body.push_str(&format!("\nlabel={label}"));
-    }
+    // Keep the same lock as the daemon until installation finishes. Never unlink
+    // it: replacing its inode would allow a concurrent daemon to bypass the lock.
+    let _enrollment_lock = if request_id.is_some() {
+        let path = data_dir.join("enrollment.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("cannot open enrollment lock {}: {e}", path.display()))?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|e| {
+            format!(
+                "cannot lock {}: {e}; stop the joining daemon before running bootstrap node complete (enrollment cannot hot-replace a running cell)",
+                path.display()
+            )
+        })?;
+        Some(file)
+    } else {
+        None
+    };
+    let bytes = fs::read(&identity_path).map_err(|e| {
+        format!(
+            "cannot read existing joining identity {}: {e}; no identity was generated",
+            identity_path.display()
+        )
+    })?;
+    let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&bytes)
+        .map_err(|e| format!("invalid joining identity {}: {e}", identity_path.display()))?;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let local_options = format!(
+        "--data-dir {} --identity-key {}",
+        quote(&data_dir.to_string_lossy()),
+        quote(&identity_path.to_string_lossy())
+    );
 
-    let reply = http(&authority, "POST", "/bootstrap/request/node", &body)?;
-    if reply.status != 200 {
-        return Err(format!(
-            "node request refused: {} {}",
-            reply.status, reply.body
-        ));
+    if let Some(id) = request_id {
+        let body = serde_json::to_string(&enrollment::retrieval(&keypair, id)?)
+            .map_err(|e| format!("cannot encode enrollment retrieval: {e}"))?;
+        let reply = http(&authority, "POST", "/bootstrap/request/retrieve", &body)?;
+        if reply.status != 200 {
+            return Err(format!(
+                "node enrollment retrieval refused: {} {}",
+                reply.status, reply.body
+            ));
+        }
+        let envelope: Vec<u8> = serde_json::from_str(&reply.body)
+            .map_err(|e| format!("invalid enrollment envelope response: {e}"))?;
+        let bundle = enrollment::unseal_bundle(&keypair, &envelope, id)?;
+        enrollment::install(&data_dir, &keypair, &bundle)?;
+        Ok(format!(
+            "installed node enrollment for request {id}\n\
+             Restart the joining daemon with:\n\
+             pillar node run {local_options}\n\
+             Preserve its previous listener, dial, and other runtime options. The enrollment takes effect only on restart."
+        ))
+    } else {
+        let body = serde_json::to_string(&enrollment::request(&keypair)?)
+            .map_err(|e| format!("cannot encode node enrollment request: {e}"))?;
+        let reply = http(&authority, "POST", "/bootstrap/request/node", &body)?;
+        if reply.status != 200 {
+            return Err(format!(
+                "node request refused: {} {}",
+                reply.status, reply.body
+            ));
+        }
+        let id = reply
+            .body
+            .strip_prefix("REQUEST ")
+            .and_then(|id| id.parse::<u64>().ok())
+            .ok_or("malformed node request response: expected REQUEST <id>")?;
+        Ok(format!(
+            "REQUEST {id}\n\
+             An existing member must approve this request. Then stop the joining daemon and run:\n\
+             pillar bootstrap node complete {id} --domain {} {local_options}\n\
+             Use an authenticated SSH forward or another trusted transport; plaintext HTTP does not authenticate the issuer.",
+            quote(domain)
+        ))
     }
-    Ok(format!(
-        "submitted node bootstrap request ({}) to {} — an existing member must approve it",
-        reply.body,
-        parsed.get("domain").unwrap_or("")
-    ))
 }
 
 /// `pillar bootstrap user --domain <D> --user <id>`: submit a user join request.

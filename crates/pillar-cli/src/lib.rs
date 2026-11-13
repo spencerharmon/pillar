@@ -36,6 +36,7 @@ pub mod cluster;
 pub mod config_export;
 pub mod credential_policy;
 pub mod defaults;
+mod enrollment;
 pub mod foundational_guardrails;
 pub mod health;
 pub mod iam_cli;

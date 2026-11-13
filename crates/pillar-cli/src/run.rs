@@ -723,7 +723,7 @@ pub fn load_or_create_identity(path: &Path) -> Result<Keypair, BootError> {
                 })?;
             }
         }
-        std::fs::write(path, &bytes).map_err(|e| BootError::Identity {
+        crate::enrollment::write_private(path, &bytes).map_err(|e| BootError::Identity {
             path: path.to_path_buf(),
             reason: format!("write: {e}"),
         })?;
@@ -757,7 +757,22 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     run_startup_self_checks().map_err(BootError::CompatSelfCheck)?;
 
     prepare_data_dir(&config.data_dir)?;
+    let enrollment_error = |reason: String| BootError::StreamDb {
+        path: config.data_dir.clone(),
+        reason,
+    };
+    let enrollment_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(config.data_dir.join("enrollment.lock"))
+        .map_err(|e| enrollment_error(e.to_string()))?;
+    fs2::FileExt::try_lock_exclusive(&enrollment_lock)
+        .map_err(|e| enrollment_error(format!("data directory is in use: {e}")))?;
     let keypair = load_or_create_identity(&config.identity_key)?;
+    let installed =
+        crate::enrollment::load_installed(&config.data_dir, &keypair).map_err(&enrollment_error)?;
     let peer_id = pillar_net::peer_id_of(&keypair);
     tracing::info!(%peer_id, data_dir = %config.data_dir.display(), "pillar peer identity loaded");
 
@@ -790,7 +805,13 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // it every boot, so a restarting node recovers write capability from its
     // own identity alone. Pillar owns head signing itself and the owner-signed
     // head pointer is kept on the PVC under `<data>/streamdb/heads`.
-    let streamdb_root = config.data_dir.join("streamdb");
+    // Enrollment starts a distinct stream under the joining node's own signer.
+    // Never open a previous solo stream with the newly installed cell key.
+    let streamdb_root = config.data_dir.join(if installed.is_some() {
+        "streamdb-enrolled"
+    } else {
+        "streamdb"
+    });
     let identity_seed_material = {
         let id_bytes = keypair
             .to_protobuf_encoding()
@@ -809,18 +830,37 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 reason: format!("derive streamdb segment-signing key: {e}"),
             }
         })?;
-    // Method #1 step (d): every op is now sealed as a `PillarMessage::StreamOp`
-    // body to this node's cell. Solo-node interim: derive a single-member
-    // cell id + group key from the same identity seed material the segment-
-    // signing key comes from (mirrors that derivation) until real
-    // multi-member cell provisioning wires a shared group key in here.
-    let cell_id = pillar_crypto::CellId::from_bytes({
-        let mut m = b"pillar-streamdb/cell-id/v1:".to_vec();
-        m.extend_from_slice(identity_seed_material.as_bytes());
-        m
-    });
-    let cell_group_key = pillar_crypto::cell::group_key_from_seed(&identity_seed_material)
-        .map_err(|e| BootError::StreamDb {
+    // Cell encryption is independent of the device's segment-signing identity.
+    // Preserve legacy streams, but only independently generated credentials may
+    // be distributed to joining devices.
+    let legacy_cell = installed.is_none()
+        && streamdb_root.exists()
+        && !config.data_dir.join("cell-credentials.json").exists();
+    let (cell_id, cell_seed) = if legacy_cell {
+        // Preserve already persisted solo-node streams. Legacy credentials
+        // contain device material and must never be distributed by enrollment.
+        (
+            pillar_crypto::CellId::from_bytes({
+                let mut m = b"pillar-streamdb/cell-id/v1:".to_vec();
+                m.extend_from_slice(identity_seed_material.as_bytes());
+                m
+            }),
+            identity_seed_material.clone(),
+        )
+    } else {
+        let credentials = match &installed {
+            Some(bundle) => bundle.credentials.clone(),
+            None => {
+                crate::enrollment::load_credentials(&config.data_dir).map_err(&enrollment_error)?
+            }
+        };
+        (
+            pillar_crypto::CellId::from_bytes(credentials.cell_id),
+            pillar_crypto::Seed::from_bytes(credentials.seed),
+        )
+    };
+    let cell_group_key =
+        pillar_crypto::cell::group_key_from_seed(&cell_seed).map_err(|e| BootError::StreamDb {
             path: streamdb_root.clone(),
             reason: format!("derive streamdb cell group key: {e}"),
         })?;
@@ -851,6 +891,25 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
             reason: e.to_string(),
         })?,
     ));
+    if let Some(bundle) = &installed {
+        // Import idempotently into this node's own signed stream. This also
+        // lets a joined node include the original admissions in future offers.
+        let mut journal = stream.lock().expect("streaming DB lock");
+        let existing: std::collections::BTreeSet<Vec<u8>> = journal
+            .stream()
+            .log()
+            .order()
+            .iter()
+            .map(|op| op.payload().to_vec())
+            .collect();
+        for payload in &bundle.portal_ops {
+            if !existing.contains(payload) {
+                journal
+                    .append(payload.clone(), pillar_core::SideEffect::Convergent)
+                    .map_err(|e| enrollment_error(format!("import enrollment journal: {e}")))?;
+            }
+        }
+    }
     {
         let stream = stream.lock().expect("streaming DB lock");
         tracing::info!(
@@ -1275,7 +1334,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // CLI on the same host).
                 .with_cli_export_material(
                     resource_op_cell_id.clone(),
-                    identity_seed_material.clone(),
+                    cell_seed.clone(),
                     {
                         let default_port =
                             crate::resource_op_udp_server::DEFAULT_RESOURCE_OP_UDP_PORT;
@@ -1305,6 +1364,9 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         .collect()
                 };
                 ctx.replay(&persisted_ops);
+                ctx = ctx
+                    .with_enrollment(config.data_dir.clone())
+                    .map_err(&enrollment_error)?;
 
                 // Self-register this node as a live cell member in the topology
                 // registry, so the catalog-introspection surface's placement

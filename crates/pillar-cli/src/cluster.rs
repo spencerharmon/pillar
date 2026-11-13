@@ -28,6 +28,7 @@ use pillar_bootstrap::CustodyKind;
 use pillar_cells::Cell;
 use pillar_coordination::LeaseRegister;
 use pillar_core::{Epoch, NodeId};
+use pillar_crypto::SealingPublicKey;
 
 // ---------------------------------------------------------------------------
 // `pillar domain` — naming-only, no authority, no event log.
@@ -738,10 +739,9 @@ impl RequestCli {
         self.queue.all().iter().find(|r| r.id() == id)
     }
 
-    /// `pillar request approve <id>` (the `node-approve` case, when the
-    /// request is a NODE request, returns the sealed-cell-key CID; for a USER
-    /// request it returns `None` — the offer was escrowed instead). Exactly
-    /// [`BootstrapRequestQueue::approve`].
+    /// `pillar request approve <id>` escrows a USER offer and returns `None`.
+    /// NODE requests fail closed with [`RequestError::MissingCredentials`];
+    /// callers with actual credentials must use [`Self::approve_node`].
     ///
     /// # Errors
     /// As [`BootstrapRequestQueue::approve`].
@@ -751,6 +751,21 @@ impl RequestCli {
         member: &NodeId,
     ) -> Result<Option<SealedCellKey>, RequestError> {
         self.queue.approve(id, member)
+    }
+
+    /// Approve a NODE request with its authenticated recipient public key and
+    /// actual cell credential plaintext, returning the sealed-cell-key CID.
+    ///
+    /// # Errors
+    /// As [`BootstrapRequestQueue::approve_node`].
+    pub fn approve_node(
+        &mut self,
+        id: BootstrapRequestId,
+        member: &NodeId,
+        recipient: &SealingPublicKey,
+        plaintext: &[u8],
+    ) -> Result<SealedCellKey, RequestError> {
+        self.queue.approve_node(id, member, recipient, plaintext)
     }
 
     /// `pillar request reject <id>` — refuses; delivers no key material.
@@ -989,8 +1004,22 @@ mod tests {
         let id = requests.submit_node(n("newnode"), node_identity(), CustodyKind::Password, vec![]);
         assert_eq!(requests.ls().len(), 1);
 
-        let sealed = requests.approve(id, &n("m1")).unwrap();
-        let sealed = sealed.expect("a node approval seals the cell key");
+        assert_eq!(
+            requests.approve(id, &n("m1")),
+            Err(RequestError::MissingCredentials)
+        );
+        assert_eq!(requests.ls().len(), 1);
+        assert!(requests.describe(id).unwrap().approver().is_none());
+        assert!(requests.queue().sealed_cell_key(id).is_none());
+        let (recipient, secret) = pillar_crypto::seal::sealing_keypair_from_seed(
+            &pillar_crypto::Seed::from_bytes(vec![0x42; 32]),
+        )
+        .unwrap();
+        let credentials = b"test-only cell credential secret";
+        let sealed = requests
+            .approve_node(id, &n("m1"), &recipient, credentials)
+            .unwrap();
+        assert_eq!(sealed.unseal(&secret).unwrap(), credentials);
         assert_eq!(sealed.sealed_to, n("newnode"));
         assert_eq!(sealed.sealed_by, n("m1"));
         assert!(
