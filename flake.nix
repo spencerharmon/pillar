@@ -262,6 +262,18 @@
             lockFile = ./Cargo.lock;
           };
 
+          # Apply to the entire native Cargo dependency graph, not just pillar.
+          # Keep crypto crates' runtime dispatch + software fallbacks; globally
+          # enabling AES/AVX would let them elide detection on older machines.
+          # The pinned nixpkgs stdenv/runtime libraries also use generic x86-64.
+          RUSTFLAGS = pkgs.lib.optionalString (system == "x86_64-linux")
+            "-C target-cpu=x86-64";
+          NIX_CFLAGS_COMPILE = pkgs.lib.optionalString (system == "x86_64-linux")
+            "-march=x86-64 -mtune=generic";
+          # rustc 1.90's netlink-packet-route compilation exhausts its default
+          # worker stack in the release build; this changes the compiler only.
+          RUST_MIN_STACK = "16777216";
+
           # The shipped `pillar` binary (pillar-cli) enables the `hsm` feature so
           # a deployed node carries EVERY popular hardware custody backend
           # (TPM / passkey / PKCS#11). The feature is off in the everyday build
@@ -344,6 +356,56 @@
             imports = [ ./nix/tests/module.nix ];
             _module.args = { inherit self; };
           };
+          cpu-baseline = (pkgs.testers.runNixOSTest {
+            name = "pillar-cpu-baseline";
+            nodes.machine = { ... }: {
+              # TCG really traps unsupported instructions. CPUID masking under
+              # KVM alone can still execute instructions supported by the host.
+              virtualisation.qemu.options = [
+                "-machine accel=tcg"
+                "-cpu Westmere,-aes,-pclmulqdq"
+              ];
+              virtualisation.memorySize = 2048;
+              # libp2p reads resolv.conf while constructing its DNS transport.
+              # The isolated guest must not depend on DHCP creating it later.
+              networking.resolvconf.enable = false;
+              environment.etc."resolv.conf".text = "nameserver 127.0.0.1\n";
+              environment.systemPackages = [ pillar pkgs.curl ];
+              systemd.services.pillar = {
+                wantedBy = [ "multi-user.target" ];
+                serviceConfig = {
+                  ExecStart = "${pillar}/bin/pillar node run --data-dir /var/lib/pillar --listen /ip4/127.0.0.1/tcp/0 --health-bind 127.0.0.1 --health-port 8643";
+                  StateDirectory = "pillar";
+                  Restart = "no";
+                };
+              };
+            };
+            testScript = ''
+              start_all()
+              machine.wait_for_unit("pillar.service")
+              cpuinfo = machine.succeed("cat /proc/cpuinfo")
+              flags = set(next(line.split(":", 1)[1] for line in cpuinfo.splitlines()
+                               if line.startswith("flags")).split())
+              forbidden = {"avx", "avx2", "fma", "bmi1", "bmi2", "aes", "pclmulqdq"}
+              assert not flags & forbidden, flags & forbidden
+              assert {"ssse3", "sse4_1", "sse4_2", "popcnt"} <= flags, flags
+              machine.wait_for_unit("pillar.service")
+              machine.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8643/readyz")
+              assert machine.succeed("curl --fail --silent http://127.0.0.1:8643/readyz").strip() == "ready"
+              output = machine.succeed("pillar secrets-audit-rotation-mfa", timeout=300)
+              print(output)
+              for step in ["seal-and-read-secret", "audit-log-signed-forged-rejected",
+                           "key-rotation-revokes-old-access", "stepup-mfa-required-for-privileged-action"]:
+                  assert f"ok: {step}" in output, output
+              machine.succeed("systemctl is-active pillar.service")
+              assert machine.succeed("systemctl show pillar.service -p NRestarts --value").strip() == "0"
+              assert machine.succeed("curl --fail --silent http://127.0.0.1:8643/readyz").strip() == "ready"
+            '';
+          }).overrideTestDerivation (old: {
+            # This check intentionally uses software emulation, including on
+            # builders without /dev/kvm; keep the other test scheduling tags.
+            requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
+          });
         };
 
         # Dev shell for CI's fmt/clippy/test (and local dev): the SAME native
