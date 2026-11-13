@@ -21,7 +21,7 @@ fn usage() -> &'static str {
      USAGE:\n\
      \x20 pillar apply -f <manifest.yaml>           validate, authorize, sign, emit a signed event (YAML/JSON; multi-doc & `kind: List` bundles)\n\
      \x20 pillar get      <kind> [name]              read the live cell's materialized view over pillar-message (CRD YAML)\n\
-     \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
+     \x20 pillar node run [--identity-key P] [--data-dir D] [--listen A ...] [--external-address A ...] [--dial A ...] [--web-bind ADDR] [--web-port N]  boot a full peer and block\n\
      \x20 pillar ingress-lb-udp serve <manifest-file>   bind a real UDP LB dataplane (Frontend/Route/LoadBalancerPolicy) on a VIP and forward datagrams; prints `vip=<ip:port>`\n\
      \x20 pillar bootstrap cell <name> --user <handle> [opts]  combined single-step cell+user bootstrap\n\
      \x20 pillar bootstrap node|user --domain <D> [opts]       submit a node/user join request\n\
