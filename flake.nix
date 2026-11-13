@@ -270,6 +270,9 @@
             "-C target-cpu=x86-64";
           NIX_CFLAGS_COMPILE = pkgs.lib.optionalString (system == "x86_64-linux")
             "-march=x86-64 -mtune=generic";
+          # rustc 1.90's netlink-packet-route compilation exhausts its default
+          # worker stack in the release build; this changes the compiler only.
+          RUST_MIN_STACK = "16777216";
 
           # The shipped `pillar` binary (pillar-cli) enables the `hsm` feature so
           # a deployed node carries EVERY popular hardware custody backend
