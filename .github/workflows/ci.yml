@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Nested frontend builds may run with an isolated HOME and no git safe.directory.
+  PILLAR_GIT_SHA: ${{ github.sha }}
 
 jobs:
   # fmt + clippy + test all run through the flake devShell (`nix develop`), so
