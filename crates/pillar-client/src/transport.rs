@@ -577,8 +577,20 @@ mod tests {
                     break;
                 }
                 total.extend_from_slice(&buf[..n]);
-                if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+                if let Some(end) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                    // Consume the body before closing; unread request bytes can
+                    // make TCP reset the connection and discard the response.
+                    let headers = std::str::from_utf8(&total[..end]).expect("headers");
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .expect("content length")
+                        .parse()
+                        .expect("numeric content length");
+                    if total.len() >= end + 4 + length {
+                        assert_eq!(&total[end + 4..], response_bytes.as_slice());
+                        break;
+                    }
                 }
             }
             let head = format!(
