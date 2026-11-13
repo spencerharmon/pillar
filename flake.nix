@@ -352,6 +352,7 @@
         };
 
         checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          nixos-module-eval = import ./nix/tests/module-eval.nix { inherit pkgs self; };
           nixos-module = pkgs.testers.runNixOSTest {
             imports = [ ./nix/tests/module.nix ];
             _module.args = { inherit self; };

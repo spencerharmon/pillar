@@ -10,6 +10,7 @@ flake input:
   services.pillar = {
     enable = true;
     listen = [ "/ip4/0.0.0.0/tcp/4001" ];
+    externalAddresses = [ "/dns4/node.example.com/tcp/4001" ];
     seeds = [ "/dns4/seed.example.com/tcp/4001" ];
     webBind = "127.0.0.1";
     publicResourceOpAddress = "node.example.com:8644";
@@ -28,7 +29,25 @@ when the web surface is enabled. It never opens outbound seed/dial or advertised
 ports. Port zero cannot be automatically opened. Keep HTTP behind an authenticated
 tunnel or TLS proxy; opening a firewall is not transport authentication.
 
-Options mirror node flags: `dataDir`, `identityKey`, `listen`, `dial`, `seeds`,
+`externalAddresses` is a list of strings (default `[]`) containing externally
+reachable libp2p multiaddrs to advertise. The module joins the list with commas
+into `PILLAR_EXTERNAL_ADDRESSES`; the default produces an empty string. These
+advertisements do not change `listen` or any other bind, and do not open firewall
+ports even with `openFirewall = true`. Arrange external routing/NAT separately.
+This is distinct from `publicResourceOpAddress`, which advertises the resource-op
+endpoint rather than libp2p addresses. Use the typed option, not an `extraEnv`
+override of `PILLAR_EXTERNAL_ADDRESSES` (which the module rejects).
+
+Outside NixOS, repeat `--external-address <multiaddr>` on `pillar node run`, or
+set `PILLAR_EXTERNAL_ADDRESSES` to a comma/whitespace-separated list. Explicit
+flags replace the entire environment list. Unset or empty environment means no
+explicit advertisements; malformed multiaddrs are rejected at startup. Addresses
+are registered before the first identify exchange, independently of UPnP (which
+can still advertise automatically mapped addresses). These are operator-confirmed
+routes, not reachability probes: configure forwarding to the actual listeners,
+and only advertise transports the node serves. Private swarms do not serve QUIC.
+
+Options mirror node flags: `dataDir`, `identityKey`, `listen`, `externalAddresses`, `dial`, `seeds`,
 `swarmKeyFile`, `upnp`, `webBind`, `webPort`, `healthBind`, `healthPort`.
 Environment-only controls are `resourceOpBind`, `publicResourceOpAddress`,
 `publicHost` (fallback), `pslUdpBind`, `pslQuicBind`, `ingressLbUdpManifest`, and
@@ -60,6 +79,18 @@ Use the configured data directory and identity path with both `bootstrap node`
 and `bootstrap node complete`. Approval does not install state into the joiner:
 stop the joining service, complete enrollment as `pillar`, then start it again.
 Keep its original identity, listener, and seed configuration.
+
+## Evaluation Regression
+
+```sh
+nix eval .#checks.x86_64-linux.nixos-module-eval.drvPath
+```
+
+This fast check evaluates the exported NixOS module without compiling Pillar or
+booting VMs. It checks external-address defaults, comma-separated environment
+mapping, list/string type enforcement, rejection of `extraEnv` overrides, and
+unchanged binds and firewall rules with advertisements configured (both with and
+without `openFirewall`). It is also included in `nix flake check`.
 
 ## VM Regression
 

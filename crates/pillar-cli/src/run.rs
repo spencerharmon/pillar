@@ -65,6 +65,8 @@ pub const DEFAULT_DATA_DIR: &str = "pillar-data";
 const ENV_IDENTITY_KEY: &str = "PILLAR_IDENTITY_KEY";
 const ENV_DATA_DIR: &str = "PILLAR_DATA_DIR";
 const ENV_LISTEN: &str = "PILLAR_LISTEN";
+/// Advertised libp2p addresses only; these never create listeners or mappings.
+const ENV_EXTERNAL_ADDRESSES: &str = "PILLAR_EXTERNAL_ADDRESSES";
 const ENV_DIAL: &str = "PILLAR_DIAL";
 /// `--seed-node` (also `--seed`) / `PILLAR_SEED_NODE` (also
 /// `PILLAR_SEED_MULTIADDR`): one or more federation seed multiaddrs (each
@@ -175,6 +177,9 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// libp2p multiaddrs the peer listens on. Never empty.
     pub listen: Vec<Multiaddr>,
+    /// Operator-confirmed external multiaddrs advertised through identify.
+    /// Independent of listeners, outbound seeds, and automatic UPnP mappings.
+    pub external_addresses: Vec<Multiaddr>,
     /// libp2p multiaddrs (of already-running peers) to dial at boot — the
     /// rig's mesh-formation mechanism. May be empty (a first/seed node).
     pub dial: Vec<Multiaddr>,
@@ -223,6 +228,13 @@ pub struct NodeConfig {
 pub enum ConfigError {
     /// A flag that requires a value was given none.
     MissingValue(&'static str),
+    /// An advertised external address is empty or not a valid multiaddr.
+    BadExternalAddress {
+        /// The offending value.
+        value: String,
+        /// The parser's reason.
+        reason: String,
+    },
     /// A `--listen` / `PILLAR_LISTEN` entry did not parse as a multiaddr.
     BadListen {
         /// The offending value.
@@ -270,6 +282,9 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::MissingValue(flag) => write!(f, "{flag} requires a value"),
+            ConfigError::BadExternalAddress { value, reason } => {
+                write!(f, "invalid external multiaddr `{value}`: {reason}")
+            }
             ConfigError::BadListen { value, reason } => {
                 write!(f, "invalid listen multiaddr `{value}`: {reason}")
             }
@@ -300,6 +315,8 @@ impl NodeConfig {
     /// `PILLAR_LISTEN` may carry a comma-or-whitespace-separated list. The
     /// identity-key default is derived from the resolved data dir so a lone
     /// `--data-dir` keeps the key beside the data.
+    /// `--external-address` is also repeatable and replaces the entire
+    /// comma-or-whitespace-separated `PILLAR_EXTERNAL_ADDRESSES` list.
     ///
     /// `env` is injected (rather than reading `std::env` directly) so the pure
     /// resolution is unit-testable without mutating process globals.
@@ -310,6 +327,7 @@ impl NodeConfig {
         let mut identity_key: Option<PathBuf> = None;
         let mut data_dir: Option<PathBuf> = None;
         let mut listen: Vec<Multiaddr> = Vec::new();
+        let mut external_addresses: Vec<Multiaddr> = Vec::new();
         let mut dial: Vec<Multiaddr> = Vec::new();
         let mut seed: Vec<Multiaddr> = Vec::new();
         let mut swarm_key: Option<PathBuf> = None;
@@ -341,6 +359,13 @@ impl NodeConfig {
                         .get(i + 1)
                         .ok_or(ConfigError::MissingValue("--listen"))?;
                     listen.push(parse_listen(v)?);
+                    i += 2;
+                }
+                "--external-address" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or(ConfigError::MissingValue("--external-address"))?;
+                    external_addresses.push(parse_external_address(v)?);
                     i += 2;
                 }
                 "--dial" => {
@@ -426,6 +451,17 @@ impl NodeConfig {
             listen.push(parse_listen(DEFAULT_LISTEN)?);
         }
 
+        if external_addresses.is_empty() {
+            if let Some(v) = env(ENV_EXTERNAL_ADDRESSES) {
+                for entry in v
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                {
+                    external_addresses.push(parse_external_address(entry)?);
+                }
+            }
+        }
+
         // Dial: explicit flags win; else a single env list; no default (a
         // seed/first node dials nothing).
         if dial.is_empty() {
@@ -495,6 +531,7 @@ impl NodeConfig {
             identity_key,
             data_dir,
             listen,
+            external_addresses,
             dial,
             seed,
             swarm_key,
@@ -510,6 +547,22 @@ impl NodeConfig {
     pub fn from_process_args(args: &[String]) -> Result<Self, ConfigError> {
         Self::from_args_env(args, |k| std::env::var(k).ok())
     }
+}
+
+fn parse_external_address(value: &str) -> Result<Multiaddr, ConfigError> {
+    let address = value
+        .parse::<Multiaddr>()
+        .map_err(|e| ConfigError::BadExternalAddress {
+            value: value.to_owned(),
+            reason: e.to_string(),
+        })?;
+    if address.is_empty() {
+        return Err(ConfigError::BadExternalAddress {
+            value: value.to_owned(),
+            reason: "address must not be empty".to_owned(),
+        });
+    }
+    Ok(address)
 }
 
 fn parse_listen(value: &str) -> Result<Multiaddr, ConfigError> {
@@ -999,6 +1052,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let mut swarm =
         pillar_net::build_event_swarm_with_root(keypair, root, config.upnp, quic_enabled)
             .map_err(|e| BootError::Transport(e.to_string()))?;
+    // Install confirmed advertisements before any connection/identify exchange.
+    // Unlike listen_on, this neither binds a socket nor requests a UPnP mapping.
+    for addr in &config.external_addresses {
+        swarm.add_external_address(addr.clone());
+    }
     let topic = pillar_net::event_log_topic();
     swarm
         .behaviour_mut()

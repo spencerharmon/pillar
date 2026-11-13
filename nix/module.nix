@@ -13,6 +13,7 @@ let
     PILLAR_DATA_DIR = cfg.dataDir;
     PILLAR_IDENTITY_KEY = cfg.identityKey;
     PILLAR_LISTEN = lib.concatStringsSep "," cfg.listen;
+    PILLAR_EXTERNAL_ADDRESSES = lib.concatStringsSep "," cfg.externalAddresses;
     PILLAR_DIAL = lib.concatStringsSep "," cfg.dial;
     PILLAR_SEED_NODE = lib.concatStringsSep "," cfg.seeds;
     PILLAR_UPNP = lib.boolToString cfg.upnp;
@@ -70,6 +71,12 @@ in {
       type = types.nonEmptyListOf types.str;
       default = [ "/ip4/0.0.0.0/tcp/4001" ];
       description = "Listen multiaddrs. Fixed ports are required with openFirewall.";
+    };
+    externalAddresses = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      example = [ "/dns4/node.example.com/tcp/4001" ];
+      description = "Externally reachable libp2p multiaddrs to advertise, passed comma-separated in PILLAR_EXTERNAL_ADDRESSES. Does not change listener binds or open firewall ports.";
     };
     dial = mkOption {
       type = types.listOf types.str;
