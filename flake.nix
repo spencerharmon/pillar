@@ -362,6 +362,10 @@
                 "-cpu Westmere,-aes,-pclmulqdq"
               ];
               virtualisation.memorySize = 2048;
+              # libp2p reads resolv.conf while constructing its DNS transport.
+              # The isolated guest must not depend on DHCP creating it later.
+              networking.resolvconf.enable = false;
+              environment.etc."resolv.conf".text = "nameserver 127.0.0.1\n";
               environment.systemPackages = [ pillar pkgs.curl ];
               systemd.services.pillar = {
                 wantedBy = [ "multi-user.target" ];
@@ -374,7 +378,7 @@
             };
             testScript = ''
               start_all()
-              machine.wait_for_unit("multi-user.target")
+              machine.wait_for_unit("pillar.service")
               cpuinfo = machine.succeed("cat /proc/cpuinfo")
               flags = set(next(line.split(":", 1)[1] for line in cpuinfo.splitlines()
                                if line.startswith("flags")).split())
