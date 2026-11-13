@@ -12151,10 +12151,10 @@ fn dispatch_request_decide(
     let member = session.subject.clone();
     if id >= NODE_REQUEST_ID_START {
         // initial_user is a handle; custody sessions carry its operational subkey.
-        if !ctx
+        if ctx
             .bootstrap
             .initial_user()
-            .is_some_and(|handle| bootstrap_subkey(handle).node_id() == member)
+            .is_none_or(|handle| bootstrap_subkey(handle).node_id() != member)
             || ctx.authority.reachable_depth(&member).is_none()
             || !ctx
                 .session_registry

@@ -322,9 +322,19 @@
           name = "pillar";
           tag = "latest";
 
+          # Besides pillar + CA certs, the image carries the minimal toolset the
+          # existing-cell migration procedure (docs/legacy-cell-enrollment-
+          # migration.md) runs in-image: bash, GNU tar (--one-file-system
+          # whole-tree backup), coreutils (sha256sum/du/df) and jq. The
+          # entrypoint/env defaults below are unchanged; checks.migration-image
+          # executes this exact image.
           contents = [
             pillar
             pkgs.cacert
+            pkgs.bashInteractive
+            pkgs.gnutar
+            pkgs.coreutils
+            pkgs.jq
           ];
 
           config = {
@@ -341,6 +351,8 @@
           # Ensure the runtime data dir exists in the image.
           extraCommands = ''
             mkdir -p var/lib/pillar/data
+            mkdir -p tmp
+            chmod 1777 tmp
           '';
         };
       in
@@ -352,6 +364,10 @@
         };
 
         checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          migration-image = pkgs.testers.runNixOSTest {
+            imports = [ ./nix/tests/migration-image.nix ];
+            _module.args = { inherit self; image = pillar-oci-image; };
+          };
           nixos-module-eval = import ./nix/tests/module-eval.nix { inherit pkgs self; };
           nixos-module = pkgs.testers.runNixOSTest {
             imports = [ ./nix/tests/module.nix ];

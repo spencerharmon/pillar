@@ -3241,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-blob-provider"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "libp2p",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-bootstrap"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-cells"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3276,7 +3276,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -3326,7 +3326,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3345,7 +3345,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-controller"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "libp2p",
@@ -3363,21 +3363,21 @@ dependencies = [
 
 [[package]]
 name = "pillar-coordination"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
 ]
 
 [[package]]
 name = "pillar-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-crypto",
 ]
 
 [[package]]
 name = "pillar-crypto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-e2e"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "libp2p",
@@ -3428,7 +3428,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-eventlog"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3453,7 +3453,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-iam"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ciborium",
  "pillar-core",
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-identity"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3483,14 +3483,14 @@ dependencies = [
 
 [[package]]
 name = "pillar-integration-coverage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-surface-inventory",
 ]
 
 [[package]]
 name = "pillar-ipam"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-coordination",
  "pillar-core",
@@ -3500,7 +3500,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-ipfs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "libp2p",
@@ -3513,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-key-distribution"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3524,7 +3524,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-keyedstore"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-streamdb",
@@ -3534,7 +3534,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-manifest"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3550,7 +3550,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "hkdf",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-observability"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3598,7 +3598,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-oidc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "pillar-core",
@@ -3614,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-ops"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-manifest",
  "serde",
@@ -3623,7 +3623,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-quota-ledger"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-coordination",
  "pillar-core",
@@ -3633,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-rbac"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-coordination",
  "pillar-core",
@@ -3646,11 +3646,11 @@ dependencies = [
 
 [[package]]
 name = "pillar-realness-gate"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "pillar-recovery"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3663,7 +3663,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-sqlviews"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-keyedstore",
  "serde",
@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-streamdb"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-coordination",
  "pillar-core",
@@ -3685,7 +3685,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-surface-inventory"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-cli",
  "pillar-manifest",
@@ -3696,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-swarm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rand_core 0.6.4",
  "sha3",
@@ -3704,7 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-topology"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-trust-artifacts",
@@ -3712,7 +3712,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-trust-artifacts"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",
@@ -3722,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-upgrade-gate"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-cells",
  "pillar-core",
@@ -3735,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ciborium",
  "pillar-bootstrap",
@@ -3751,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-web-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-crypto",
  "serde",
@@ -3760,7 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-web-frontend"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "gloo-net 0.4.0",
@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-wire"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ciborium",
  "getrandom 0.2.17",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "pillar-wot-authority"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pillar-core",
  "pillar-crypto",

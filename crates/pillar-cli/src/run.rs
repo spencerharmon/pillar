@@ -826,7 +826,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     let keypair = load_or_create_identity(&config.identity_key)?;
     let cell_keypair = keypair.clone();
     let installed =
-        crate::enrollment::load_installed(&config.data_dir, &keypair).map_err(&enrollment_error)?;
+        crate::enrollment::load_installed(&config.data_dir, &keypair).map_err(enrollment_error)?;
     let peer_id = pillar_net::peer_id_of(&keypair);
     tracing::info!(%peer_id, data_dir = %config.data_dir.display(), "pillar peer identity loaded");
 
@@ -862,7 +862,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // Enrollment starts a distinct stream under the joining node's own signer.
     // Never open a previous solo stream with the newly installed cell key.
     let layout = crate::legacy_migration::boot_layout(&config.data_dir, installed.is_some())
-        .map_err(&enrollment_error)?;
+        .map_err(enrollment_error)?;
     let streamdb_root = config.data_dir.join(match layout {
         _ if installed.is_some() => "streamdb-enrolled",
         crate::legacy_migration::BootLayout::Converted => crate::legacy_migration::CONVERTED,
@@ -892,7 +892,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
         let credentials = match &installed {
             Some(bundle) => bundle.credentials.clone(),
             None => {
-                crate::enrollment::load_credentials(&config.data_dir).map_err(&enrollment_error)?
+                crate::enrollment::load_credentials(&config.data_dir).map_err(enrollment_error)?
             }
         };
         (
@@ -1416,11 +1416,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 };
                 ctx = ctx
                     .with_cell_node_identity(&cell_keypair)
-                    .map_err(&enrollment_error)?;
+                    .map_err(enrollment_error)?;
                 ctx.replay(&persisted_ops);
                 ctx = ctx
                     .with_enrollment(config.data_dir.clone())
-                    .map_err(&enrollment_error)?;
+                    .map_err(enrollment_error)?;
 
                 // Self-register this node as a live cell member in the topology
                 // registry, so the catalog-introspection surface's placement
