@@ -62,6 +62,14 @@ fn sealing_keys(keypair: &Keypair) -> Result<(SealingPublicKey, SealingSecretKey
         .map_err(|e| e.to_string())
 }
 
+/// This node's X25519 sealing keypair, derived from its custody-held identity
+/// exactly as its enrollment request advertises it.
+pub(crate) fn node_sealing_keys(
+    keypair: &Keypair,
+) -> Result<(SealingPublicKey, SealingSecretKey), String> {
+    sealing_keys(keypair)
+}
+
 fn request_bytes(public_key: &[u8], sealing_key: &[u8]) -> Vec<u8> {
     let mut bytes = REQUEST_DOMAIN.to_vec();
     // Length prefixes make the two variable-length fields unambiguous.

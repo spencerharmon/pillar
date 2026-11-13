@@ -771,6 +771,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     fs2::FileExt::try_lock_exclusive(&enrollment_lock)
         .map_err(|e| enrollment_error(format!("data directory is in use: {e}")))?;
     let keypair = load_or_create_identity(&config.identity_key)?;
+    let cell_keypair = keypair.clone();
     let installed =
         crate::enrollment::load_installed(&config.data_dir, &keypair).map_err(&enrollment_error)?;
     let peer_id = pillar_net::peer_id_of(&keypair);
@@ -1282,6 +1283,11 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
     // `crate::web_serve` for the auth-gate contract) — only when
     // `--web-bind`/`PILLAR_WEB_BIND` was actually configured; unset, `node
     // run` opens no web listener at all.
+    // The live portal context, shared with the controller loop so replicated
+    // cell-journal ops materialize incrementally and op-sync disclosure is
+    // gated on approved cell membership.
+    let mut portal_ctx: Option<std::sync::Arc<std::sync::Mutex<crate::web_serve::WebAuthContext>>> =
+        None;
     if let Some(web_bind) = config.web_bind {
         match crate::web_serve::bind(web_bind, config.web_port) {
             Ok(listener) => {
@@ -1363,6 +1369,9 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         .map(|op| op.payload().to_vec())
                         .collect()
                 };
+                ctx = ctx
+                    .with_cell_node_identity(&cell_keypair)
+                    .map_err(&enrollment_error)?;
                 ctx.replay(&persisted_ops);
                 ctx = ctx
                     .with_enrollment(config.data_dir.clone())
@@ -1377,6 +1386,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 ctx.topology_register_node("pillar-node", "ok", 1);
 
                 let ctx = std::sync::Arc::new(std::sync::Mutex::new(ctx));
+                portal_ctx = Some(std::sync::Arc::clone(&ctx));
 
                 // The `psl-message-api` pillar-UDP and QUIC tiers
                 // (`psl-message-api`, 2026-09-09 ROI HEAD): opt-in,
@@ -1696,12 +1706,16 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // addresses we already hold. The peer answers with exactly the
                 // gap; its response is applied into our durable store when it
                 // arrives (below). Skipped when we have no peer to ask.
-                let target_peer = swarm.connected_peers().next().copied();
-                if let Some(peer) = target_peer {
+                // Ask EVERY connected peer: one unapproved same-swarm peer
+                // must never starve sync with the actual cell members.
+                let targets: Vec<libp2p::PeerId> = swarm.connected_peers().copied().collect();
+                if !targets.is_empty() {
                     let request = pillar_net::op_sync_request(stream.lock().expect("streaming DB lock").stream().log());
                     let have = request.have.len();
-                    swarm.behaviour_mut().op_sync.send_request(&peer, request);
-                    tracing::debug!(%peer, have, "pillar peer requested anti-entropy op sync");
+                    for peer in targets {
+                        swarm.behaviour_mut().op_sync.send_request(&peer, request.clone());
+                        tracing::debug!(%peer, have, "pillar peer requested anti-entropy op sync");
+                    }
                 }
             }
             event = swarm.select_next_some() => {
@@ -1802,16 +1816,27 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                     // Every gossiped event-log message is an append-only op the
                     // controller folds into the local stream view AND durably
                     // persists under the content-addressed data-dir store.
-                    if let Err(e) = stream.lock().expect("streaming DB lock").append(
+                    // Portal (cell-journal) ops NEVER travel gossip: any swarm
+                    // peer can publish there, so one arriving is an injection
+                    // attempt and is refused (they replicate only over
+                    // membership-gated op-sync).
+                    if crate::web_serve::is_portal_op(&message.data) {
+                        tracing::warn!(source = ?message.source, "refused portal op over transport gossip (not cell-authorized)");
+                    } else if let Err(e) = stream.lock().expect("streaming DB lock").append(
                         message.data,
                         pillar_core::SideEffect::Convergent,
                     ) {
                         tracing::warn!(error = %e, "pillar streaming DB append failed");
                     }
                 } else if let SwarmEvent::Behaviour(pillar_net::EventBehaviourEvent::OpSync(
-                    libp2p::request_response::Event::Message { message, .. },
+                    libp2p::request_response::Event::Message { peer, message, .. },
                 )) = event
                 {
+                    let peer_is_cell_node = portal_ctx.as_ref().is_some_and(|ctx| {
+                        ctx.lock()
+                            .expect("portal context lock")
+                            .is_cell_node(&peer.to_string())
+                    });
                     match message {
                         // A peer asked us for the ops it is missing: answer from
                         // our durable store with exactly the gap (never the whole
@@ -1819,8 +1844,17 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         libp2p::request_response::Message::Request {
                             request, channel, ..
                         } => {
-                            let response =
+                            let mut response =
                                 pillar_net::answer_op_sync(stream.lock().expect("streaming DB lock").stream().log(), &request);
+                            if !peer_is_cell_node {
+                                // Confidential cell journal is disclosed ONLY to
+                                // approved cell nodes (Noise-authenticated peer id).
+                                let before = response.ops.len();
+                                response.ops.retain(|op| !crate::web_serve::is_portal_op(op));
+                                if before != response.ops.len() {
+                                    tracing::info!(%peer, withheld = before - response.ops.len(), "withheld cell journal from non-member peer");
+                                }
+                            }
                             let sent = response.ops.len();
                             if swarm
                                 .behaviour_mut()
@@ -1839,8 +1873,39 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                         // identical content-addressed CID our peers hold — a
                         // partitioned/late node reconverges to one consistent
                         // state (no split-brain).
-                        libp2p::request_response::Message::Response { response, .. } => {
+                        libp2p::request_response::Message::Response { mut response, .. } => {
+                            if !peer_is_cell_node {
+                                let before = response.ops.len();
+                                response.ops.retain(|op| !crate::web_serve::is_portal_op(op));
+                                if before != response.ops.len() {
+                                    tracing::warn!(%peer, refused = before - response.ops.len(), "refused portal ops from non-member peer");
+                                }
+                            }
+                            // The portal ops this response newly admits (dedup
+                            // by content address against the durable log).
+                            let fresh_portal: Vec<Vec<u8>> = {
+                                let guard = stream.lock().expect("streaming DB lock");
+                                let mut seen = std::collections::BTreeSet::new();
+                                response
+                                    .ops
+                                    .iter()
+                                    .filter(|op| crate::web_serve::is_portal_op(op))
+                                    .filter(|op| {
+                                        let id = pillar_streamdb::OpId(pillar_streamdb::content_address(op));
+                                        !guard.stream().log().contains(&id) && seen.insert(id.to_hex())
+                                    })
+                                    .cloned()
+                                    .collect()
+                            };
                             let admitted = pillar_net::apply_op_sync(&mut *stream.lock().expect("streaming DB lock"), response);
+                            if !fresh_portal.is_empty() {
+                                if let Some(ctx) = portal_ctx.as_ref() {
+                                    // Incremental materialization: the SAME
+                                    // ordered, deterministic replay fold boot uses.
+                                    ctx.lock().expect("portal context lock").replay(&fresh_portal);
+                                    tracing::info!(ops = fresh_portal.len(), %peer, "materialized replicated cell journal ops into live portal");
+                                }
+                            }
                             if admitted > 0 {
                                 let ops = stream.lock().expect("streaming DB lock").stream().log().len();
                                 node_counters.record_streamdb_ops(ops as u64);

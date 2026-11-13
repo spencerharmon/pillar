@@ -867,6 +867,88 @@ impl NodeCustodyVerifier {
         Some((cid, handle, offer.node_sealed_bytes().to_vec()))
     }
 
+    /// Every identifier with a currently ADMITTED offer, sorted — the set a
+    /// `SealToNode` (`specs/NodeCustodyLogin.tla`) extension walks when
+    /// the cell seals its custodied offers to a newly approved cell node.
+    #[must_use]
+    pub fn admitted_identifiers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .cell_db
+            .identifier_to_cid
+            .keys()
+            .filter(|id| self.has_offer_for(id))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// `SealToNode` step 1 (`specs/NodeCustodyLogin.tla`): strip THIS node's
+    /// outer node-seal off `identifier`'s admitted offer, returning its CID and
+    /// the still PASSWORD-LOCKED inner ciphertext. The operational key itself is
+    /// never unlocked (no password is involved) and this node's private node
+    /// key never leaves it; the caller re-seals the inner layer to ONE
+    /// explicitly approved recipient node's own public sealing key. `None` when
+    /// the offer is not admitted or not sealed to this node.
+    #[must_use]
+    pub fn offer_inner_for(&self, identifier: &str) -> Option<(Cid, Vec<u8>)> {
+        if !self.has_offer_for(identifier) {
+            return None;
+        }
+        let cid = self.cell_db.resolve_cid(identifier)?.clone();
+        let offer = self.cell_db.offer_for(&cid)?;
+        let inner = self.node_key.unseal(offer)?;
+        Some((cid, inner.as_bytes().to_vec()))
+    }
+
+    /// The current node-sealed blob bytes of `identifier`'s offer (cheap; no
+    /// unseal) — lets a caller memoize [`Self::offer_inner_for`].
+    #[must_use]
+    pub fn offer_blob_for(&self, identifier: &str) -> Option<Vec<u8>> {
+        let cid = self.cell_db.resolve_cid(identifier)?;
+        Some(self.cell_db.offer_for(cid)?.node_sealed_bytes().to_vec())
+    }
+
+    /// `SealToNode` step 2, on the RECIPIENT node: install the password-locked
+    /// `inner` ciphertext it received (sealed to its own key) under ITS OWN
+    /// node key, replacing a blob it cannot open (one sealed to another node).
+    /// Only replaces the offer currently at `cid` for `identifier`, so a stale
+    /// recipient offer never clobbers a newer generation; the registered
+    /// public verifier and ledger admission are untouched, so a wrong `inner`
+    /// can only make the password unlock fail, never admit anyone. `false` if
+    /// there is no matching admitted offer.
+    pub fn install_offer_inner(&mut self, identifier: &str, cid: &Cid, inner: &[u8]) -> bool {
+        if self.cell_db.resolve_cid(identifier) != Some(cid) || !self.has_offer_for(identifier) {
+            return false;
+        }
+        let Some(record) = self.cell_db.record_for(identifier).cloned() else {
+            return false;
+        };
+        let Some(existing) = self.cell_db.offer_for(cid).cloned() else {
+            return false;
+        };
+        let handle = self
+            .cell_db
+            .handle_for(identifier)
+            .unwrap_or(identifier)
+            .to_owned();
+        let seal_key = node_seal_key(&self.node_key.node, &self.node_key.secret);
+        let Ok(outer) = aead::seal_symmetric(&seal_key, inner, b"pillar-node-custody/node-seal-v1")
+        else {
+            return false;
+        };
+        let mut sealed_to = existing.sealed_to.clone();
+        sealed_to.insert(self.node_key.node.clone());
+        let offer = SealedOffer::from_sealed_parts(
+            existing.subkey.clone(),
+            outer.as_bytes().to_vec(),
+            sealed_to,
+        );
+        self.cell_db
+            .put_offer(identifier.to_owned(), handle, cid.clone(), record, offer);
+        true
+    }
+
     /// Revoke a previously-provisioned offer through the REAL
     /// [`KeyDistributionLedger::revoke_offer`] — fail-closed, exactly as
     /// every other `pillar_key_distribution` consumer observes: after this,

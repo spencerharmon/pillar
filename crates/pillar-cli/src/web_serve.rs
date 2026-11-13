@@ -210,6 +210,7 @@ use pillar_web_api::{
     BootstrapStatus, LoginRequest, LoginResponse, NonceResponse,
 };
 pub use pillar_web_api::{NodeIdentitySnapshot, SessionSummary};
+use sha2::Digest as _;
 
 /// The server-side state the node-side-custody portal needs: the node-custody
 /// verifier (holding this node's node key + its cell-DB view of node-sealed
@@ -337,6 +338,18 @@ pub struct WebAuthContext {
     /// ([`store_session`]) and removes it here.
     pending_2fa: HashMap<String, PendingLogin>,
     enrollment: Option<EnrollmentState>,
+    /// This node's own cell-node identity (see [`CellNodeIdentity`]); `None`
+    /// in unit tests / a node without a libp2p identity wired.
+    cell_identity: Option<CellNodeIdentity>,
+    /// Peers admitted to this cell (journaled [`PortalOp::AdmitCellNode`]):
+    /// peer id -> X25519 sealing public key.
+    cell_nodes: BTreeMap<String, Vec<u8>>,
+    /// `(recipient, identifier, sha256(inner))` recipient offers already
+    /// journaled by ANY cell node, so an offer is sealed to a node once.
+    recipient_offers: std::collections::BTreeSet<(String, String, Vec<u8>)>,
+    /// In-memory memo: sha256(node-sealed blob) -> (cid, inner), so the
+    /// argon2id outer unseal runs once per blob per process.
+    inner_memo: HashMap<Vec<u8>, (Cid, Vec<u8>)>,
     /// The node/user bootstrap-request queue for the cell this node serves.
     /// `None` until the cell is created (a request joins an EXISTING cell).
     requests: Option<BootstrapRequestQueue>,
@@ -1018,6 +1031,47 @@ enum PortalOp {
         handle: String,
         at: u64,
     },
+    /// A node admitted to THIS cell through the approved node-enrollment
+    /// request flow (`specs/BootstrapRequest.tla` approval). `peer` is its
+    /// libp2p peer id (the Noise-authenticated transport identity) and
+    /// `sealing_key` the X25519 public key from its signed request. Only
+    /// these peers receive confidential journal data over op-sync or may
+    /// author replicated portal ops; sharing the transport swarm is NOT
+    /// cell authorization.
+    AdmitCellNode {
+        peer: String,
+        sealing_key: Vec<u8>,
+    },
+    /// `SealToNode` (`specs/NodeCustodyLogin.tla`) for ONE explicitly
+    /// approved cell node: `identifier`'s password-locked offer ciphertext
+    /// (the inner layer; the outer node-seal stripped by the sender's own node
+    /// key) sealed to `recipient`'s public sealing key. Only the recipient can
+    /// open it; it re-seals the inner layer under its OWN node key. No node
+    /// private key is ever copied and no other peer gains custody.
+    RecipientOffer {
+        recipient: String,
+        identifier: String,
+        cid: String,
+        digest: Vec<u8>,
+        envelope: Vec<u8>,
+    },
+}
+
+/// Whether a streaming-DB op payload is a confidential portal-journal op
+/// (vs. e.g. a public gossiped event-log message). The node's op-sync /
+/// gossip handlers use this to keep portal ops cell-scoped.
+#[must_use]
+pub fn is_portal_op(payload: &[u8]) -> bool {
+    payload.starts_with(PORTAL_OP_TAG)
+}
+
+/// This node's own cell-node identity: its peer id plus the X25519 sealing
+/// keypair derived from its custody-held `identity.key` (the SAME derivation
+/// the enrollment request advertises).
+struct CellNodeIdentity {
+    peer: String,
+    sealing_public: Vec<u8>,
+    sealing_secret: pillar_crypto::SealingSecretKey,
 }
 
 /// The first user's operational subkey id — deterministic from the handle, so a
@@ -1281,6 +1335,10 @@ impl WebAuthContext {
             step_up_at: HashMap::new(),
             first_user_second_factor: HashMap::new(),
             enrollment: None,
+            cell_identity: None,
+            cell_nodes: BTreeMap::new(),
+            recipient_offers: std::collections::BTreeSet::new(),
+            inner_memo: HashMap::new(),
             requests: None,
             identity: NodeIdentitySnapshot {
                 peer_id: node_for_identity.to_string(),
@@ -1554,7 +1612,7 @@ impl WebAuthContext {
         // New ops must stamp a sequence strictly above any v2 op already on
         // disk; v1 ops carry no stamp and never constrain it.
         if let Some(max_v2_seq) = max_v2_seq {
-            self.next_op_seq = max_v2_seq + 1;
+            self.next_op_seq = self.next_op_seq.max(max_v2_seq + 1);
         }
         if applied > 0 {
             tracing::info!(
@@ -1890,7 +1948,173 @@ impl WebAuthContext {
                     pillar_iam::UserOp::EmailVerified { handle, at },
                 );
             }
+            PortalOp::AdmitCellNode { peer, sealing_key } => {
+                self.cell_nodes.insert(peer, sealing_key);
+            }
+            PortalOp::RecipientOffer {
+                recipient,
+                identifier,
+                cid,
+                digest,
+                envelope,
+            } => {
+                self.recipient_offers.insert((
+                    recipient.clone(),
+                    identifier.clone(),
+                    digest.clone(),
+                ));
+                self.install_recipient_offer(&recipient, &identifier, &cid, &digest, &envelope);
+            }
         }
+    }
+
+    /// Open a [`PortalOp::RecipientOffer`] addressed to THIS node and install
+    /// its inner ciphertext under this node's own node key. Offers addressed
+    /// to any other node are inert here (this node cannot open them).
+    fn install_recipient_offer(
+        &mut self,
+        recipient: &str,
+        identifier: &str,
+        cid: &str,
+        digest: &[u8],
+        envelope: &[u8],
+    ) {
+        let Some(me) = self.cell_identity.as_ref() else {
+            return;
+        };
+        if me.peer != recipient {
+            return;
+        }
+        let inner = match pillar_crypto::seal::unseal(
+            &pillar_crypto::SealedEnvelope::from_bytes(envelope.to_vec()),
+            &me.sealing_secret,
+        ) {
+            Ok(inner) => inner,
+            Err(e) => {
+                tracing::warn!(error = %e, %identifier, "recipient offer: cannot open envelope");
+                return;
+            }
+        };
+        if sha2::Sha256::digest(&inner).as_slice() != digest {
+            tracing::warn!(%identifier, "recipient offer: digest mismatch; ignored");
+            return;
+        }
+        if !self
+            .verifier
+            .install_offer_inner(identifier, &Cid::from(cid), &inner)
+        {
+            tracing::debug!(%identifier, "recipient offer: no matching admitted offer generation");
+        }
+    }
+
+    /// Wire this node's own libp2p identity as its cell-node identity: its
+    /// peer id and the X25519 sealing keypair derived from `keypair` exactly
+    /// as its enrollment request advertised. Call BEFORE [`Self::replay`] so
+    /// recipient offers addressed to this node install on replay.
+    pub fn with_cell_node_identity(
+        mut self,
+        keypair: &libp2p::identity::Keypair,
+    ) -> Result<Self, String> {
+        let (public, secret) = crate::enrollment::node_sealing_keys(keypair)?;
+        self.cell_identity = Some(CellNodeIdentity {
+            peer: keypair.public().to_peer_id().to_string(),
+            sealing_public: public.into_bytes(),
+            sealing_secret: secret,
+        });
+        Ok(self)
+    }
+
+    /// Whether `peer` (a libp2p peer id) is an approved member node of this
+    /// cell. Membership comes ONLY from the journaled approval; a peer merely
+    /// sharing the transport swarm is never a member.
+    #[must_use]
+    pub fn is_cell_node(&self, peer: &str) -> bool {
+        self.cell_nodes.contains_key(peer)
+    }
+
+    /// Seal every admitted offer THIS node custodies to every other approved
+    /// cell node that has not yet been offered that exact ciphertext — the
+    /// `SealToNode` action, journaled as [`PortalOp::RecipientOffer`] so it
+    /// replicates (and persists) with the rest of the cell journal. A no-op
+    /// until a second cell node exists.
+    pub(crate) fn seal_offers_to_cell_nodes(&mut self) {
+        let Some(me) = self.cell_identity.as_ref().map(|m| m.peer.clone()) else {
+            return;
+        };
+        let recipients: Vec<(String, Vec<u8>)> = self
+            .cell_nodes
+            .iter()
+            .filter(|(peer, _)| **peer != me)
+            .map(|(p, k)| (p.clone(), k.clone()))
+            .collect();
+        if recipients.is_empty() {
+            return;
+        }
+        for identifier in self.verifier.admitted_identifiers() {
+            let Some(blob) = self.verifier.offer_blob_for(&identifier) else {
+                continue;
+            };
+            let blob_digest = sha2::Sha256::digest(&blob).to_vec();
+            let (cid, inner) = match self.inner_memo.get(&blob_digest) {
+                Some(hit) => hit.clone(),
+                None => {
+                    let Some(opened) = self.verifier.offer_inner_for(&identifier) else {
+                        continue;
+                    };
+                    self.inner_memo.insert(blob_digest, opened.clone());
+                    opened
+                }
+            };
+            let digest = sha2::Sha256::digest(&inner).to_vec();
+            for (recipient, sealing_key) in &recipients {
+                let key = (recipient.clone(), identifier.clone(), digest.clone());
+                if self.recipient_offers.contains(&key) {
+                    continue;
+                }
+                let envelope = match pillar_crypto::seal::seal_to_recipients(
+                    &inner,
+                    &[pillar_crypto::SealingPublicKey::from_bytes(
+                        sealing_key.clone(),
+                    )],
+                ) {
+                    Ok(envelope) => envelope.into_bytes(),
+                    Err(e) => {
+                        tracing::error!(error = %e, %recipient, "recipient offer sealing failed");
+                        continue;
+                    }
+                };
+                self.record(&PortalOp::RecipientOffer {
+                    recipient: recipient.clone(),
+                    identifier: identifier.clone(),
+                    cid: cid.0.clone(),
+                    digest: digest.clone(),
+                    envelope,
+                });
+                self.recipient_offers.insert(key);
+            }
+        }
+    }
+
+    /// Journal this node and an approved joining node as cell members, then
+    /// seal custodied offers to the new member. Runs BEFORE the enrollment
+    /// snapshot is taken so the bundle already carries both.
+    fn admit_cell_node(&mut self, peer: &str, sealing_key: Vec<u8>) -> Result<(), String> {
+        let me = self
+            .cell_identity
+            .as_ref()
+            .map(|m| (m.peer.clone(), m.sealing_public.clone()))
+            .ok_or("missing-node-identity")?;
+        for (peer, sealing_key) in [me, (peer.to_owned(), sealing_key)] {
+            if self.cell_nodes.get(&peer) != Some(&sealing_key) {
+                self.record(&PortalOp::AdmitCellNode {
+                    peer: peer.clone(),
+                    sealing_key: sealing_key.clone(),
+                });
+                self.cell_nodes.insert(peer, sealing_key);
+            }
+        }
+        self.seal_offers_to_cell_nodes();
+        Ok(())
     }
 
     /// Restore the cell on replay: the raw [`CellBootstrap::create_cell`] (NO
@@ -8712,7 +8936,13 @@ fn dispatch_http(
     }
     for route in ROUTES {
         if route.method == request.method && route.path.matches(path) {
-            return (route.handler)(ctx, peer, request);
+            let response = (route.handler)(ctx, peer, request);
+            if request.method == "POST" {
+                // A mutation may have minted/resealed an offer: keep every
+                // approved cell node able to log the user in.
+                ctx.seal_offers_to_cell_nodes();
+            }
+            return response;
         }
     }
     // The Yew + WebAssembly portal's embedded static assets (wasm/js/css),
@@ -11949,6 +12179,14 @@ fn dispatch_request_decide(
         }
         let mut updated = entry.clone();
         if approve {
+            match crate::enrollment::verify_request(&updated.request) {
+                Ok((peer, sealing)) => {
+                    if let Err(e) = ctx.admit_cell_node(&peer, sealing.into_bytes()) {
+                        return text_response(503, "Service Unavailable", format!("DENIED {e}"));
+                    }
+                }
+                Err(e) => return text_response(503, "Service Unavailable", format!("DENIED {e}")),
+            }
             let result = (|| -> Result<Vec<u8>, String> {
                 let material = ctx.cli_export.as_ref().ok_or("missing-cell-credentials")?;
                 let journal = ctx.journal.as_ref().ok_or("missing-portal-journal")?;
@@ -11985,7 +12223,13 @@ fn dispatch_request_decide(
         } else {
             updated.rejected = true;
         }
-        let mut requests = state.requests.clone();
+        let Some(mut requests) = ctx.enrollment.as_ref().map(|s| s.requests.clone()) else {
+            return text_response(
+                503,
+                "Service Unavailable",
+                "DENIED enrollment-unavailable".into(),
+            );
+        };
         requests.insert(id, updated);
         return match ctx.persist_enrollment(requests) {
             Ok(()) => text_response(
@@ -15019,6 +15263,9 @@ mod tests {
             503
         );
         ctx.journal = saved_journal;
+        ctx = ctx
+            .with_cell_node_identity(&libp2p::identity::Keypair::generate_ed25519())
+            .unwrap();
         let approved = post(
             &mut ctx,
             "/bootstrap/request/approve",
@@ -15040,7 +15287,11 @@ mod tests {
         let envelope: Vec<u8> = serde_json::from_str(&retrieved.body).unwrap();
         let bundle = crate::enrollment::unseal_bundle(&key, &envelope, id).unwrap();
         assert!(bundle.credentials == credentials);
-        assert_eq!(bundle.portal_ops, ops);
+        // Approval journals the cell membership + recipient offers BEFORE the
+        // snapshot, so the bundle is the prior journal plus those ops.
+        assert!(ops.iter().all(|op| bundle.portal_ops.contains(op)));
+        assert!(bundle.portal_ops.len() > ops.len());
+        let ops = bundle.portal_ops.clone();
         assert!(crate::enrollment::unseal_bundle(&other, &envelope, id).is_err());
         let mut restarted = fresh();
         restarted.replay(&ops);
