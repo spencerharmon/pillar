@@ -2,6 +2,7 @@
 """Black-box enrollment and failover: OCI lifecycle, shipped CLI, and HTTP only."""
 
 import hashlib
+import json
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 import re
@@ -81,6 +82,20 @@ def main():
         path, key, cid, expected = entry
         return ok(i, "GET", path, query={"token": tokens[i], key: cid}) == expected
 
+    def audit_write(i, collection, *args):
+        reply = cli(i, *args)
+        match = re.search(r"EVENT-CID (1220[0-9a-f]{64})", reply)
+        assert match, reply
+        cid = match.group(1)
+        for verb in ("show", "verify"):
+            query = ("log", verb, collection, cid)
+            expected = cli(i, *query)
+            assert cid in expected, expected
+            if verb == "verify":
+                assert "signature-valid: true" in expected and "hash-matches-id: true" in expected
+            queries.append((query, expected))
+        return reply
+
     def write(i, phase):
         # Multiple objects, including multiline and large values, preclude a
         # name-only or last-object-only replication oracle.
@@ -104,18 +119,18 @@ def main():
         dataset.append(("/portal/layout", "cid", cid, expected))
 
         value = secrets.token_hex(256)
-        cli(i, "kv", "put", "failover-kv", phase, value)
+        audit_write(i, "failover-kv", "kv", "put", "failover-kv", phase, value)
         queries.append((("kv", "get", "failover-kv", phase), value + "\n"))
-        cli(i, "doc", "put", "failover-doc", phase, "value", value)
+        audit_write(i, "failover-doc", "doc", "put", "failover-doc", phase, "value", value)
         queries.append((("doc", "get", "failover-doc", phase, "value"), value + "\n"))
-        cli(i, "sql", "create-view", phase, "failover-doc", "--eq", "value", value)
+        audit_write(i, phase, "sql", "create-view", phase, "failover-doc", "--eq", "value", value)
         query = ("sql", "view", phase)
         expected = cli(i, *query)
         assert value in expected
         queries.append((query, expected))
         for visibility in ("public", "sealed"):
             flags = ("--recipient", recipient) if visibility == "sealed" else ()
-            reply = cli(i, "object", "put", visibility, value, *flags)
+            reply = audit_write(i, "__objects", "object", "put", visibility, value, *flags)
             cid = reply.split()[1]
             query = ("object", "cat", cid, "--secret", secret) if flags else ("object", "cat", cid)
             assert cli(i, *query) == value + "\n"
@@ -212,6 +227,23 @@ def main():
         for i in (1, 2):
             write(i, f"survivor-{i}")
             verify((1, 2), f"survivor-{i}-write")
+        # Isolate one survivor so both accept causally concurrent writes from
+        # the same client. Each sees its own event before the other's event.
+        address = json.loads(run("inspect", nodes[2]).stdout)[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
+        run("network", "disconnect", network, nodes[2])
+        for i in (1, 2):
+            phase = f"partition-{i}"
+            value = secrets.token_hex(256)
+            audit_write(i, "failover-kv", "kv", "put", "failover-kv", phase, value)
+            queries.append((("kv", "get", "failover-kv", phase), value + "\n"))
+            audit_write(i, "failover-doc", "doc", "put", "failover-doc", phase, "value", value)
+            queries.append((("doc", "get", "failover-doc", phase, "value"), value + "\n"))
+            audit_write(i, phase, "sql", "create-view", phase, "failover-doc", "--eq", "value", value)
+            reply = audit_write(i, "__objects", "object", "put", "public", value)
+            queries.append((("object", "cat", reply.split()[1]), value + "\n"))
+        run("network", "connect", "--ip", address, "--alias", nodes[2], network, nodes[2])
+        web[2] = run("port", nodes[2], "8642").stdout.strip()
+        verify((1, 2), "concurrent-survivor-audit")
         # Durable recovery on both survivors with genesis still unavailable.
         for i in (1, 2):
             run("restart", "-t", "2", nodes[i])
