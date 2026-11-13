@@ -356,6 +356,13 @@
             imports = [ ./nix/tests/module.nix ];
             _module.args = { inherit self; };
           };
+          native-service = (pkgs.testers.runNixOSTest {
+            imports = [ ./nix/tests/native-service.nix ];
+            _module.args = { inherit self nixpkgs; };
+          }).overrideTestDerivation (old: {
+            # Software-emulated baseline CPU (TCG); no /dev/kvm needed.
+            requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
+          });
           cpu-baseline = (pkgs.testers.runNixOSTest {
             name = "pillar-cpu-baseline";
             nodes.machine = { ... }: {

@@ -1466,7 +1466,16 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 std::thread::spawn(move || crate::web_serve::serve_shared(listener, ctx));
             }
             Err(e) => {
-                tracing::warn!(error = %e, %web_bind, port = config.web_port, "pillar web UI failed to bind; continuing without it");
+                // An explicitly configured web listener that cannot bind is a
+                // boot failure: continuing would leave the operator's service
+                // "active" with its portal silently missing.
+                // Exit directly: returning would drop runtimes owned by this
+                // async context, which panics instead of reporting the cause.
+                eprintln!(
+                    "pillar node run: web UI bind {web_bind}:{}: {e}",
+                    config.web_port
+                );
+                std::process::exit(1);
             }
         }
     }
