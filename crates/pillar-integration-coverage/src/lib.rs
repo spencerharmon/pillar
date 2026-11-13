@@ -28,10 +28,10 @@
 //!    deadline it becomes an ERROR — a skipped proof cannot be silently
 //!    disabled indefinitely.
 //!
-//! The ledger itself (which scenarios exist and what they claim) is supplied
-//! by the caller — this crate is the enforcement machinery, not a hardcoded
-//! catalog of scenarios, exactly as `pillar-surface-inventory` reads the real
-//! served registries rather than hand-maintaining a list.
+//! [`registered_scenarios`] supplies the concrete scenario ledger. The gates
+//! also accept caller-supplied claims for targeted checks and mutation tests.
+//! Registration is intentionally partial: unexercised inventory entries remain
+//! orphaned, rather than being claimed merely because they exist.
 
 use pillar_surface_inventory::SurfaceEntry;
 
@@ -54,6 +54,46 @@ pub struct ScenarioClaim {
     /// If this scenario is currently skipped/xfail'd, the skip record naming
     /// why and by when it must be un-skipped.
     pub skip: Option<ScenarioSkip>,
+}
+
+/// Concrete scenarios under `scripts/pillar-integration/scenarios/<id>.sh`.
+/// Claims describe exercised surfaces, not whole-inventory coverage or a green
+/// execution result; the integration runner must still execute the scenario.
+#[must_use]
+pub fn registered_scenarios() -> Vec<ScenarioClaim> {
+    vec![ScenarioClaim {
+        scenario_id: "cell-join-genesis-failover".to_string(),
+        claims: [
+            "cli:bootstrap",
+            "cli:login",
+            "cli:config",
+            "cli:kv",
+            "cli:doc",
+            "cli:sql",
+            "cli:object",
+            "cli:apply",
+            "cli:get",
+            "http:GET /bootstrap/status",
+            "http:POST /bootstrap/create-cell",
+            "http:POST /bootstrap/create-user",
+            "http:POST /bootstrap/request/node",
+            "http:POST /bootstrap/request/approve",
+            "http:POST /bootstrap/request/retrieve",
+            "http:GET /nonce",
+            "http:POST /login",
+            "http:POST /portal/profile/cli-config",
+            "http:GET /portal/status",
+            "http:POST /portal/layout",
+            "http:GET /portal/layout",
+            "http:POST /portal/obs/dashboard",
+            "http:GET /portal/obs/dashboard/get",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        realness_oracle: Some("cid-identical-reads-after-genesis-termination".to_string()),
+        skip: None,
+    }]
 }
 
 /// A scenario's skip/xfail record: a deliberate, tracked, TIME-BOUNDED

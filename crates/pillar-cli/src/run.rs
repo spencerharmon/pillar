@@ -1349,44 +1349,35 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 // create-first-user flow) — every non-loopback signing action
                 // is refused until a login admits, matching the
                 // "exposed ⇒ authenticated" invariant exactly.
-                let mut ctx = crate::web_serve::WebAuthContext::new(
-                    format!("https://{peer_id}"),
-                    pillar_core::NodeId::from("pillar-node"),
-                    format!("pillar-node-key-{peer_id}"),
-                    pillar_core::NodeId::from("pillar-node"),
-                    16,
-                )
-                .with_live_observability(std::sync::Arc::clone(&live_obs))
-                .with_workload_reconciler(reconciler.clone())
-                .with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime))
-                // Tell the portal's Swarm panel which swarm this node is
-                // actually running on (read-only: kind + fingerprint + seeds).
-                // Pillar keeps no swarm state, so the panel only inspects and
-                // mints keys — it never repoints a running node.
-                .with_swarm_info(
-                    swarm_key.kind(),
-                    swarm_key.fingerprint(),
-                    effective_seeds.iter().map(|a| a.to_string()).collect(),
-                )
-                // Wire the DURABLE streaming DB as the portal's mutation
-                // journal: every cell/user/member/custody/identity act is
-                // thereafter persisted as a signed op on the SAME stream the
-                // controller loop rides, so a restart rehydrates a
-                // login-capable node instead of re-serving bootstrap.
-                .with_persistent_journal(std::sync::Arc::clone(&stream))
-                // Wire the cell id + seed the CLI-config export bakes into a
-                // downloadable `config.yaml` (so a `pillar` CLI can seal/open
-                // this cell's content and sign resource ops). The seed is the
-                // SAME material `cell_group_key` was derived from above. The
-                // node cannot infer its own externally-reachable address, so
-                // the deploy supplies it via `PILLAR_PUBLIC_RESOURCE_OP_ADDR`
-                // (a full `host:port`) or `PILLAR_PUBLIC_HOST` (host only, the
-                // default port is appended); absent both, loopback is used (a
-                // CLI on the same host).
-                .with_cli_export_material(
-                    resource_op_cell_id.clone(),
-                    cell_seed.clone(),
-                    {
+                let mut ctx = node_web_context(swarm.local_peer_id())
+                    .with_live_observability(std::sync::Arc::clone(&live_obs))
+                    .with_workload_reconciler(reconciler.clone())
+                    .with_scheduler_runtime(std::sync::Arc::clone(&scheduler_runtime))
+                    // Tell the portal's Swarm panel which swarm this node is
+                    // actually running on (read-only: kind + fingerprint + seeds).
+                    // Pillar keeps no swarm state, so the panel only inspects and
+                    // mints keys — it never repoints a running node.
+                    .with_swarm_info(
+                        swarm_key.kind(),
+                        swarm_key.fingerprint(),
+                        effective_seeds.iter().map(|a| a.to_string()).collect(),
+                    )
+                    // Wire the DURABLE streaming DB as the portal's mutation
+                    // journal: every cell/user/member/custody/identity act is
+                    // thereafter persisted as a signed op on the SAME stream the
+                    // controller loop rides, so a restart rehydrates a
+                    // login-capable node instead of re-serving bootstrap.
+                    .with_persistent_journal(std::sync::Arc::clone(&stream))
+                    // Wire the cell id + seed the CLI-config export bakes into a
+                    // downloadable `config.yaml` (so a `pillar` CLI can seal/open
+                    // this cell's content and sign resource ops). The seed is the
+                    // SAME material `cell_group_key` was derived from above. The
+                    // node cannot infer its own externally-reachable address, so
+                    // the deploy supplies it via `PILLAR_PUBLIC_RESOURCE_OP_ADDR`
+                    // (a full `host:port`) or `PILLAR_PUBLIC_HOST` (host only, the
+                    // default port is appended); absent both, loopback is used (a
+                    // CLI on the same host).
+                    .with_cli_export_material(resource_op_cell_id.clone(), cell_seed.clone(), {
                         let default_port =
                             crate::resource_op_udp_server::DEFAULT_RESOURCE_OP_UDP_PORT;
                         std::env::var("PILLAR_PUBLIC_RESOURCE_OP_ADDR")
@@ -1397,8 +1388,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                                     .map(|h| format!("{h}:{default_port}"))
                             })
                             .unwrap_or_else(|| format!("127.0.0.1:{default_port}"))
-                    },
-                );
+                    });
 
                 // Rehydrate the portal state from the ops already persisted in
                 // the streaming DB (rebuilt from IPFS-pinned segments by
@@ -2076,9 +2066,38 @@ async fn spawn_ingress_lb_udp_from_env() -> Option<pillar_net::UdpDataplane> {
     }
 }
 
+fn node_web_context(peer_id: &libp2p::PeerId) -> crate::web_serve::WebAuthContext {
+    crate::web_serve::WebAuthContext::new(
+        format!("https://{peer_id}"),
+        pillar_core::NodeId::from("pillar-node"),
+        format!("pillar-node-key-{peer_id}"),
+        pillar_core::NodeId::from("pillar-node"),
+        16,
+    )
+    // The logical authority name is not the node's libp2p transport identity.
+    .with_identity(crate::web_serve::NodeIdentitySnapshot {
+        peer_id: peer_id.to_string(),
+        listen_addrs: Vec::new(),
+        connected_peers: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn node_web_context_uses_each_live_swarms_peer_id() {
+        let mut reported = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let keypair = Keypair::generate_ed25519();
+            let expected = keypair.public().to_peer_id();
+            let swarm = pillar_net::build_event_swarm(keypair).unwrap();
+            let ctx = node_web_context(swarm.local_peer_id());
+            assert_eq!(ctx.identity().peer_id, expected.to_string());
+            assert!(reported.insert(ctx.identity().peer_id.clone()));
+        }
+    }
 
     fn no_env(_: &str) -> Option<String> {
         None
