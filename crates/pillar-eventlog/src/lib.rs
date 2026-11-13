@@ -578,6 +578,17 @@ impl EventLog {
     /// This is the local-authoring path, so its links are correct by
     /// construction and it never fails.
     pub fn append(&mut self, author: &Author, payload: impl Into<Vec<u8>>) -> EventId {
+        let event = self.prepare_append(author, payload);
+        // ingest cannot fail for a locally-authored, correctly-linked event.
+        self.ingest(event)
+            .expect("locally authored event is always valid")
+    }
+
+    /// Build and sign the next event from the current tips without publishing it
+    /// or advancing any chain. [`Self::ingest`] revalidates it when committed;
+    /// intervening appends by the same author can make its links stale.
+    #[must_use]
+    pub fn prepare_append(&self, author: &Author, payload: impl Into<Vec<u8>>) -> Event {
         let seq = self.height.get(author).copied().unwrap_or(0);
         let prev = self.tip.get(author).cloned();
         let parents: BTreeSet<EventId> = self
@@ -594,10 +605,7 @@ impl EventLog {
             payload: payload.into(),
         };
         let signature = Signature::sign(author, &content);
-        let event = Event::stamped(content, signature);
-        // ingest cannot fail for a locally-authored, correctly-linked event.
-        self.ingest(event)
-            .expect("locally authored event is always valid")
+        Event::stamped(content, signature)
     }
 
     /// Ingest a (possibly remotely gossiped) fully-formed event, enforcing
@@ -616,6 +624,27 @@ impl EventLog {
     /// Returns the event's [`EventId`] on success, or the specific
     /// [`EventError`] that refused it.
     pub fn ingest(&mut self, event: Event) -> Result<EventId, EventError> {
+        let id = self.validate_ingest(&event)?;
+        if self.events.contains_key(&id) {
+            return Ok(id);
+        }
+
+        let author = event.content.author.clone();
+        let seq = event.content.seq;
+        // Admit: store the content-addressed bytes in the shared store, then
+        // record the event and advance the author's chain.
+        self.store.append(event.content.canonical_bytes());
+        self.height.insert(author.clone(), seq + 1);
+        self.tip.insert(author.clone(), id.clone());
+        self.by_seq.insert((author, seq), id.clone());
+        self.events.insert(id.clone(), event);
+        Ok(id)
+    }
+
+    /// Check whether [`Self::ingest`] would accept an event without changing the
+    /// log. An already-held content id succeeds after the envelope-schema check,
+    /// preserving ingest's idempotent duplicate behavior.
+    pub fn validate_ingest(&self, event: &Event) -> Result<EventId, EventError> {
         // Envelope-schema gate: reject a stamped-but-unknown envelope version
         // (e.g. a newer peer's) distinctly from a corrupt/tampered event.
         event
@@ -682,13 +711,6 @@ impl EventLog {
             }
         }
 
-        // Admit: store the content-addressed bytes in the shared store, then
-        // record the event and advance the author's chain.
-        self.store.append(event.content.canonical_bytes());
-        self.height.insert(author.clone(), seq + 1);
-        self.tip.insert(author.clone(), id.clone());
-        self.by_seq.insert((author, seq), id.clone());
-        self.events.insert(id.clone(), event);
         Ok(id)
     }
 
@@ -770,6 +792,95 @@ mod tests {
 
     fn author(name: &str) -> Author {
         Author(name.to_string())
+    }
+
+    #[test]
+    fn preparing_and_validating_does_not_publish_or_advance_chains() {
+        let alice = author("alice");
+        let bob = author("bob");
+        let mut log = EventLog::new();
+        let genesis = log.prepare_append(&alice, b"genesis".to_vec());
+        assert_eq!(genesis.content.seq, 0);
+        assert_eq!(genesis.content.prev, None);
+        assert!(genesis.content.parents.is_empty());
+        assert!(genesis.is_authentic());
+        assert_eq!(log.validate_ingest(&genesis), Ok(genesis.id()));
+        assert!(log.is_empty());
+        assert!(log.store.is_empty());
+        assert!(log.height.is_empty());
+        assert!(log.tip.is_empty());
+        assert!(log.by_seq.is_empty());
+
+        let a0 = log.ingest(genesis).unwrap();
+        let b0 = log.append(&bob, b"bob genesis".to_vec());
+        let next = log.prepare_append(&alice, b"next".to_vec());
+        assert_eq!(next.content.seq, 1);
+        assert_eq!(next.content.prev, Some(a0.clone()));
+        assert_eq!(next.content.parents, BTreeSet::from([b0.clone()]));
+        assert!(next.is_authentic());
+        assert_eq!(log.validate_ingest(&next), Ok(next.id()));
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.store.len(), 2);
+        assert_eq!(log.by_seq.len(), 2);
+        assert_eq!(log.chain_height(&alice), 1);
+        assert_eq!(log.tip(&alice), Some(a0));
+        assert_eq!(log.tip(&bob), Some(b0));
+        assert!(!log.contains(&next.id()));
+        assert_eq!(log.append(&alice, b"next".to_vec()), next.id());
+        assert_eq!(log.chain_height(&alice), 2);
+    }
+
+    #[test]
+    fn invalid_validation_leaves_log_unchanged() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+        let genesis = log.append(&alice, b"genesis".to_vec());
+        let valid = log.prepare_append(&alice, b"next".to_vec());
+        let mut tampered = valid.clone();
+        tampered.content.payload.push(0);
+        let mut gapped = valid.clone();
+        gapped.content.seq += 1;
+        gapped.signature = Signature::sign(&alice, &gapped.content);
+        let mut dangling = valid.clone();
+        dangling.content.parents.insert(genesis.clone());
+        dangling.signature = Signature::sign(&alice, &dangling.content);
+        for (event, error) in [
+            (tampered, EventError::TamperedSignature),
+            (gapped, EventError::GapOrBrokenPrev),
+            (dangling, EventError::DanglingParent),
+        ] {
+            assert_eq!(log.validate_ingest(&event), Err(error.clone()));
+            assert_eq!(log.ingest(event), Err(error));
+            assert_eq!(log.len(), 1);
+            assert_eq!(log.store.len(), 1);
+            assert_eq!(log.by_seq.len(), 1);
+            assert_eq!(log.chain_height(&alice), 1);
+            assert_eq!(log.tip(&alice), Some(genesis.clone()));
+        }
+        assert_eq!(log.ingest(valid.clone()), Ok(valid.id()));
+    }
+
+    #[test]
+    fn validation_preserves_duplicate_ordering() {
+        let alice = author("alice");
+        let mut log = EventLog::new();
+        let id = log.append(&alice, b"genesis".to_vec());
+        let tip = log.append(&alice, b"next".to_vec());
+        let mut duplicate = log.get(&id).unwrap().clone();
+        duplicate.signature = Signature::sign(&author("mallory"), &duplicate.content);
+        assert!(!duplicate.is_authentic());
+        assert_eq!(log.validate_ingest(&duplicate), Ok(id.clone()));
+        assert_eq!(log.ingest(duplicate.clone()), Ok(id));
+
+        duplicate.schema_version = pillar_crypto::SurfaceVersion(Event::SCHEMA_VERSION.0 + 1);
+        let error = log.validate_ingest(&duplicate).unwrap_err();
+        assert!(matches!(error, EventError::UnsupportedSchemaVersion(_)));
+        assert_eq!(log.ingest(duplicate), Err(error));
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.store.len(), 2);
+        assert_eq!(log.by_seq.len(), 2);
+        assert_eq!(log.chain_height(&alice), 2);
+        assert_eq!(log.tip(&alice), Some(tip));
     }
 
     /// `UniquePerAuthorSeq` + content-address dedup: re-ingesting an event is a

@@ -1539,38 +1539,32 @@ impl WebAuthContext {
     /// Append one portal mutation to the durable streaming DB. A no-op while
     /// replaying (so folding the log back never re-appends), and a no-op when
     /// no journal is wired (unit tests). A serialize/append failure is logged
-    /// and does NOT roll back the already-applied in-memory mutation — the same
-    /// posture the controller loop takes for a failed gossip-op append; the
-    /// on-disk log simply lags by that op until the next successful append
-    /// (surfaced as an error, never silently swallowed as success).
+    /// and does NOT roll back the already-applied in-memory mutation. This
+    /// best-effort wrapper is for legacy portal acts only; query writes MUST
+    /// call `record_durable` before publishing their prepared event or data.
     fn record(&mut self, op: &PortalOp) {
+        if let Err(error) = self.record_durable(op) {
+            tracing::error!(%error, "portal journal: op NOT persisted");
+        }
+    }
+
+    fn record_durable(&mut self, op: &PortalOp) -> Result<(), String> {
         if self.replaying {
-            return;
+            return Ok(());
         }
         let Some(journal) = self.journal.clone() else {
-            return;
+            return Ok(());
         };
         let mut payload = PORTAL_OP_TAG.to_vec();
         let seq = self.next_op_seq;
-        self.next_op_seq += 1;
+        let next_seq = seq.checked_add(1).ok_or("portal journal: sequence exhausted")?;
         payload.extend_from_slice(&seq.to_be_bytes());
-        match serde_json::to_vec(op) {
-            Ok(json) => payload.extend_from_slice(&json),
-            Err(e) => {
-                tracing::error!(error = %e, "portal journal: failed to serialize op; NOT persisted");
-                return;
-            }
-        }
-        let mut stream = match journal.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::error!("portal journal: stream lock poisoned; op NOT persisted");
-                return;
-            }
-        };
-        if let Err(e) = stream.append(payload, pillar_core::SideEffect::Convergent) {
-            tracing::error!(error = %e, "portal journal: durable append failed; op NOT persisted");
-        }
+        payload.extend(serde_json::to_vec(op).map_err(|e| e.to_string())?);
+        let mut stream = journal.lock().map_err(|_| "portal journal: poisoned lock")?;
+        stream.append(payload, pillar_core::SideEffect::Convergent)
+            .map_err(|e| format!("portal journal: durable append failed: {e}"))?;
+        self.next_op_seq = next_seq;
+        Ok(())
     }
 
     /// Fold a persisted portal-op log back into this (freshly constructed)
@@ -1585,6 +1579,16 @@ impl WebAuthContext {
     /// deterministic mutator the live act used, with recording suppressed.
     /// Call BEFORE serving.
     pub fn replay(&mut self, ops: &[Vec<u8>]) {
+        self.replay_records(ops, false);
+    }
+
+    /// Upgrade locally persisted journals, including historical records whose
+    /// audit signed only an operation summary. Never use for peer deliveries.
+    pub(crate) fn replay_persisted(&mut self, ops: &[Vec<u8>]) {
+        self.replay_records(ops, true);
+    }
+
+    fn replay_records(&mut self, ops: &[Vec<u8>], trusted_legacy: bool) {
         self.replaying = true;
         // Two on-disk journal layouts coexist, and BOTH must replay:
         //   v1 (pre-sequence-stamp): PORTAL_OP_TAG ++ serde_json(op)
@@ -1635,14 +1639,19 @@ impl WebAuthContext {
         decoded.sort_by_key(|(key, _)| *key);
         let applied = decoded.len();
         for (_, op) in decoded {
+            if !trusted_legacy && matches!(&op,
+                PortalOp::QueryMessage { audit: None, .. } | PortalOp::ObjectStored { audit: None, .. }) {
+                tracing::warn!("portal journal: unsigned query requires trusted local replay");
+                continue;
+            }
             self.apply_replayed(op);
         }
-        self.replay_pending_queries();
+        self.replay_pending_queries(trusted_legacy);
         self.replaying = false;
         // New ops must stamp a sequence strictly above any v2 op already on
         // disk; v1 ops carry no stamp and never constrain it.
         if let Some(max_v2_seq) = max_v2_seq {
-            self.next_op_seq = self.next_op_seq.max(max_v2_seq + 1);
+            self.next_op_seq = self.next_op_seq.max(max_v2_seq.saturating_add(1));
         }
         if applied > 0 {
             tracing::info!(
@@ -1654,7 +1663,7 @@ impl WebAuthContext {
 
     /// Retry causally blocked records even across separate gossip deliveries.
     /// EventLog remains the authority for signatures, chains and parent links.
-    fn replay_pending_queries(&mut self) {
+    fn replay_pending_queries(&mut self, trusted_legacy: bool) {
         loop {
             let pending = std::mem::take(&mut self.pending_queries);
             let mut progressed = false;
@@ -1668,13 +1677,16 @@ impl WebAuthContext {
                     } => audit,
                     _ => unreachable!("only signed query records are queued"),
                 };
-                // Ingest deduplicates by content ID before signature checking;
-                // verify even duplicate envelopes received through the journal.
-                if !audit.event.is_authentic() {
-                    tracing::warn!("portal journal: invalid query audit signature");
+                let validation = if trusted_legacy {
+                    Self::validate_query_record_format(&op, audit, true)
+                } else {
+                    Self::validate_query_record(&op, audit)
+                };
+                if let Err(error) = validation {
+                    tracing::warn!(%error, "portal journal: invalid query record");
                     continue;
                 }
-                match self.query_log.ingest(audit.event.clone()) {
+                match self.query_log.validate_ingest(&audit.event) {
                     Err(
                         pillar_eventlog::EventError::GapOrBrokenPrev
                         | pillar_eventlog::EventError::DanglingParent,
@@ -1886,6 +1898,10 @@ impl WebAuthContext {
                 let result = pillar_ops::QueryOp::decode(&encoded)
                     .map_err(|e| e.to_string())
                     .and_then(|op| {
+                        Self::query_write_description(&op)?;
+                        if hlc.physical > u64::MAX - 2 {
+                            return Err("invalid legacy mutation clock".into());
+                        }
                         self.query_op_stamped(&NodeId::from(actor.as_str()), &op, Some(hlc), None)
                     });
                 if let Err(error) = result {
@@ -5165,6 +5181,111 @@ impl WebAuthContext {
         self.query_op_stamped(actor, op, None, None)
     }
 
+    fn query_write_description(op: &pillar_ops::QueryOp) -> Result<(String, String), String> {
+        use pillar_ops::{DocOp, KvOp, QueryOp, SqlOp};
+        let (collection, summary) = match op {
+            QueryOp::Kv(KvOp::Put { collection, key, value_hex }) => {
+                decode_hex_bytes(value_hex).ok_or("value_hex is not valid lowercase hex")?;
+                (collection, format!("KV-PUT {collection} {key}"))
+            }
+            QueryOp::Kv(KvOp::Delete { collection, key }) =>
+                (collection, format!("KV-DELETE {collection} {key}")),
+            QueryOp::Doc(DocOp::PutField { collection, id, field, .. }) =>
+                (collection, format!("DOC-PUT {collection} {id} {field}")),
+            QueryOp::Doc(DocOp::DeleteField { collection, id, field }) =>
+                (collection, format!("DOC-DELETE {collection} {id} {field}")),
+            QueryOp::Sql(SqlOp::CreateView { name, source, .. }) =>
+                (name, format!("SQL-CREATE-VIEW {name} {source}")),
+            QueryOp::Sql(SqlOp::DropView { name }) => (name, format!("SQL-DROP-VIEW {name}")),
+            _ => return Err("query journal requires a keyed mutation".into()),
+        };
+        Ok((collection.clone(), summary))
+    }
+
+    /// Canonical, domain-separated audit payload. The object CID binds the
+    /// exact signed/sealed block, not the plaintext that would be re-sealed.
+    fn query_record_payload(op: &PortalOp, audit: &QueryAudit) -> Result<Vec<u8>, String> {
+        match op {
+            PortalOp::QueryMessage { actor, encoded, hlc, .. } => {
+                let query = pillar_ops::QueryOp::decode(encoded).map_err(|e| e.to_string())?;
+                let (collection, summary) = Self::query_write_description(&query)?;
+                if collection != audit.collection || query.encode().map_err(|e| e.to_string())? != *encoded {
+                    return Err("noncanonical query or incorrect collection".into());
+                }
+                let binding = serde_json::to_string(&("QUERY-AUDIT-v1", actor, &collection, encoded, hlc, &audit.hlc))
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("{summary}\n{binding}").into_bytes())
+            }
+            PortalOp::ObjectStored { cid_hex, encoded, .. } => {
+                crate::object_inspection::ObjectStore::validate_record(cid_hex, encoded)?;
+                if audit.collection != TSDB_OBJECTS_COLLECTION {
+                    return Err("incorrect object audit collection".into());
+                }
+                let binding = serde_json::to_string(&("OBJECT-AUDIT-v1", cid_hex, &audit.collection, &audit.hlc))
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("OBJECT-PUT\n{binding}").into_bytes())
+            }
+            _ => Err("not a query record".into()),
+        }
+    }
+
+    fn validate_query_record(op: &PortalOp, audit: &QueryAudit) -> Result<(), String> {
+        Self::validate_query_record_format(op, audit, false)
+    }
+
+    fn validate_query_record_format(op: &PortalOp, audit: &QueryAudit, trusted_legacy: bool) -> Result<(), String> {
+        if !audit.event.is_authentic() {
+            return Err("invalid query audit signature".into());
+        }
+        let (subject, _node): (String, String) = serde_json::from_str(&audit.event.content().author().0)
+            .map_err(|e| format!("invalid query writer: {e}"))?;
+        let actor = match op {
+            PortalOp::QueryMessage { actor, hlc, .. } => {
+                if hlc.author != audit.event.content().author().0
+                    || hlc.physical.checked_add(1) != Some(audit.hlc.physical)
+                    || hlc.logical != 0
+                {
+                    return Err("invalid mutation clock association".into());
+                }
+                actor.clone()
+            }
+            PortalOp::ObjectStored { cid_hex, encoded, .. } =>
+                crate::object_inspection::ObjectStore::validate_record(cid_hex, encoded)?,
+            _ => return Err("not a query record".into()),
+        };
+        if audit.hlc.author != audit.event.content().author().0
+            || audit.hlc.logical != 0
+            || audit.hlc.physical > u64::MAX - 2
+        {
+            return Err("invalid audit clock association".into());
+        }
+        let payload = Self::query_record_payload(op, audit)?;
+        let legacy_summary = match op {
+            PortalOp::QueryMessage { encoded, .. } => Self::query_write_description(
+                &pillar_ops::QueryOp::decode(encoded).map_err(|e| e.to_string())?)?.1,
+            PortalOp::ObjectStored { .. } => "OBJECT-PUT".into(),
+            _ => unreachable!(),
+        };
+        if actor != subject || (audit.event.content().payload() != payload
+            && !(trusted_legacy && audit.event.content().payload() == legacy_summary.as_bytes())) {
+            return Err("query audit does not bind mutation".into());
+        }
+        Ok(())
+    }
+
+    fn prepare_query_audit(&self, actor: &NodeId, collection: String, hlc: pillar_keyedstore::Hlc, op: &PortalOp) -> Result<QueryAudit, String> {
+        self.authorize_act(actor, "data:write")
+            .map_err(|a| format!("unauthorized actor {a} for data:write"))?;
+        let author = Author(hlc.author.clone());
+        let mut audit = QueryAudit {
+            event: self.query_log.prepare_append(&author, Vec::new()),
+            collection,
+            hlc,
+        };
+        audit.event = self.query_log.prepare_append(&author, Self::query_record_payload(op, &audit)?);
+        Ok(audit)
+    }
+
     fn query_op_stamped(
         &mut self,
         actor: &NodeId,
@@ -5179,14 +5300,35 @@ impl WebAuthContext {
             return Err("unauthorized: signer is not a recognized cell member".to_owned());
         }
         let keyed_write = !op.is_read() && !matches!(op, pillar_ops::QueryOp::Object(_));
-        let hlc = keyed_write.then(|| {
+        let hlc = if keyed_write && !self.replaying {
+            let (collection, _) = Self::query_write_description(op)?;
+            let author = serde_json::to_string(&(actor.to_string(), &self.identity.peer_id))
+                .map_err(|e| e.to_string())?;
+            let tick = self.keyed_clock.checked_add(2).filter(|tick| *tick <= u64::MAX - 2)
+                .ok_or("query clock exhausted")?;
+            let hlc = pillar_keyedstore::Hlc::new(tick - 1, 0, author.clone());
+            let mut record = PortalOp::QueryMessage {
+                actor: actor.to_string(),
+                encoded: op.encode().map_err(|e| e.to_string())?,
+                hlc: hlc.clone(),
+                audit: None,
+            };
+            audit = Some(self.prepare_query_audit(actor, collection,
+                pillar_keyedstore::Hlc::new(tick, 0, author), &record)?);
+            if let PortalOp::QueryMessage { audit: saved, .. } = &mut record {
+                *saved = audit.clone();
+            }
+            // No mutation, clock tick or DAG predecessor is visible until durable.
+            self.record_durable(&record)?;
+            Some(hlc)
+        } else { keyed_write.then(|| {
             let hlc = hlc.unwrap_or_else(|| self.next_keyed_hlc(actor));
             // Observe remote stamps without re-stamping the mutation: a later
             // local write must win over everything this node has already seen.
             self.keyed_clock = self.keyed_clock.max(hlc.physical);
             hlc
-        });
-        let result = match op {
+        }) };
+        match op {
             pillar_ops::QueryOp::Kv(kv) => self.kv_query_op(actor, kv, hlc.as_ref(), &mut audit),
             pillar_ops::QueryOp::Doc(doc) => {
                 self.doc_query_op(actor, doc, hlc.as_ref(), &mut audit)
@@ -5197,16 +5339,7 @@ impl WebAuthContext {
             pillar_ops::QueryOp::Object(obj) => self.object_query_op(actor, obj),
             pillar_ops::QueryOp::Catalog(catalog) => self.catalog_query_op(actor, catalog),
             pillar_ops::QueryOp::Log(log) => self.log_query_op(actor, log),
-        };
-        if !self.replaying && result.is_ok() && keyed_write {
-            self.record(&PortalOp::QueryMessage {
-                actor: actor.to_string(),
-                encoded: op.encode().expect("validated query operation encodes"),
-                hlc: hlc.expect("keyed writes have an origin stamp"),
-                audit,
-            });
         }
-        result
     }
 
     /// The next HLC stamp, with an unambiguous actor/node tie-break so the
@@ -5351,14 +5484,9 @@ impl WebAuthContext {
             .push((cid.clone(), hlc));
     }
 
-    /// Authorize a keyed-store WRITE act on the `data:write` capability, then
-    /// return the signed event's CID for the ack. Refusal mirrors every other
-    /// signed-act path. Also indexes the newly-appended [`Self::act_log`]
-    /// event in [`Self::query_log`] under `collection` in [`Self::log_index`] — the same signed
-    /// event `pillar log info|blocks|list|show|dag|watch|verify` reads back
-    /// (`pillar-log-inspection-tier`), stamped with a fresh HLC tick so the
-    /// op-log inspection surface can render a real, monotonic clock per
-    /// event.
+    /// Publish an already durable (live) or fully validated (replay) audit and
+    /// index its original HLC. Authorization happens during live preparation.
+    /// Unsigned local legacy records reconstruct in the separate legacy log.
     fn authorize_data_write(
         &mut self,
         actor: &NodeId,
@@ -5386,24 +5514,11 @@ impl WebAuthContext {
                     .map_err(|e| format!("invalid query writer: {e}"))?;
             if subject != actor.to_string()
                 || saved.collection != collection
-                || saved.event.content().payload() != payload.as_bytes()
             {
                 return Err("query audit does not match mutation".into());
             }
         } else {
-            self.authorize_act(actor, "data:write")
-                .map_err(|a| format!("unauthorized actor {a} for data:write"))?;
-            let hlc = self.next_keyed_hlc(actor);
-            // A writer owns one linear chain. Two nodes serving the same actor
-            // must not fork a single author's sequence space.
-            let cid = self
-                .query_log
-                .append(&Author(hlc.author.clone()), payload.as_bytes());
-            *audit = Some(QueryAudit {
-                event: self.query_log.get(&cid).expect("just appended").clone(),
-                collection: collection.to_owned(),
-                hlc,
-            });
+            return Err("query write requires a prepared durable audit".into());
         }
         let saved = audit.as_ref().expect("audit captured above");
         let cid = self
@@ -5654,24 +5769,31 @@ impl WebAuthContext {
     ) -> Result<String, String> {
         match op {
             pillar_ops::ObjectOp::Put { .. } => {
+                if self.replaying {
+                    return Err("object replay requires an exact ObjectStored record".into());
+                }
                 self.authorize_act(actor, "data:write")
                     .map_err(|a| format!("unauthorized actor {a} for data:write"))?;
-                // Validate/store first: a refused Put must not leave an audit
-                // predecessor that will never be journaled.
-                let cid_hex = self.objects.put(&actor.to_string(), op)?;
-                let encoded = self.objects.export_record(&cid_hex)?;
-                let mut audit = None;
+                let (cid_hex, encoded) = self.objects.prepare_record(&actor.to_string(), op)?;
+                let mut record = PortalOp::ObjectStored {
+                    cid_hex: cid_hex.clone(), encoded: encoded.clone(), audit: None,
+                };
+                let tick = self.keyed_clock.checked_add(1).filter(|tick| *tick <= u64::MAX - 2)
+                    .ok_or("query clock exhausted")?;
+                let hlc = pillar_keyedstore::Hlc::new(tick, 0,
+                    serde_json::to_string(&(actor.to_string(), &self.identity.peer_id)).map_err(|e| e.to_string())?);
+                let mut audit = Some(self.prepare_query_audit(actor, TSDB_OBJECTS_COLLECTION.into(), hlc, &record)?);
+                if let PortalOp::ObjectStored { audit: saved, .. } = &mut record {
+                    *saved = audit.clone();
+                }
+                self.record_durable(&record)?;
+                self.objects.import_record(&cid_hex, &encoded)?;
                 let event_cid = self.authorize_data_write(
                     actor,
                     TSDB_OBJECTS_COLLECTION,
                     "OBJECT-PUT",
                     &mut audit,
                 )?;
-                self.record(&PortalOp::ObjectStored {
-                    cid_hex: cid_hex.clone(),
-                    encoded,
-                    audit,
-                });
                 Ok(format!("OBJECT-PUT {cid_hex} EVENT-CID {event_cid}"))
             }
             pillar_ops::ObjectOp::Stat { cid_hex } => {
@@ -14009,6 +14131,796 @@ mod tests {
             group,
         );
         Arc::new(Mutex::new(stream))
+    }
+
+    fn query_journal_context(node: &str) -> WebAuthContext {
+        WebAuthContext::new(ORIGIN, NodeId::from(node), "secret", NodeId::from("owner"), 4)
+    }
+
+    fn query_journal_payloads(journal: &SharedPortalJournal) -> Vec<Vec<u8>> {
+        journal.lock().unwrap().stream().log().order().iter()
+            .map(|op| op.payload().to_vec()).collect()
+    }
+
+    fn query_journal_decode(raw: &[u8]) -> PortalOp {
+        let rest = raw.strip_prefix(PORTAL_OP_TAG).unwrap();
+        serde_json::from_slice(&rest[8..]).unwrap()
+    }
+
+    fn query_journal_encode(op: &PortalOp) -> Vec<u8> {
+        let mut raw = PORTAL_OP_TAG.to_vec();
+        raw.extend_from_slice(&0u64.to_be_bytes());
+        raw.extend(serde_json::to_vec(op).unwrap());
+        raw
+    }
+
+    fn query_journal_audit(op: &mut PortalOp) -> &mut QueryAudit {
+        match op {
+            PortalOp::QueryMessage { audit: Some(audit), .. }
+            | PortalOp::ObjectStored { audit: Some(audit), .. } => audit,
+            _ => panic!("expected signed query record"),
+        }
+    }
+
+    fn query_journal_state(ctx: &WebAuthContext) -> String {
+        ctx.keyed_store.with(|store| format!("{:?}", (
+            ctx.query_log.events_in_causal_order(),
+            store.log().root(),
+            store.log().order().iter().map(|op| op.payload()).collect::<Vec<_>>(),
+            &ctx.log_index,
+            ctx.keyed_clock,
+        )))
+    }
+
+    fn query_journal_resign(op: &mut PortalOp, payload: Vec<u8>) {
+        let audit = query_journal_audit(op);
+        let old = audit.event.content();
+        let content = pillar_eventlog::EventContent::for_fixture(
+            old.author().clone(), old.seq(), old.prev(), old.parents().clone(), payload,
+        );
+        audit.event = pillar_eventlog::Event::stamped(
+            content.clone(), pillar_eventlog::Signature::sign(content.author(), &content),
+        );
+        assert!(audit.event.is_authentic());
+    }
+
+    #[test]
+    fn query_journal_legacy_signed_restore_preserves_history_and_new_dependencies() {
+        use pillar_ops::{DocOp, KvOp, ObjectOp, ObjectVisibility, QueryOp, SqlOp};
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let seed = pillar_crypto::Seed::from_bytes(b"query-journal-legacy".to_vec());
+            let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(&seed).unwrap();
+            Arc::new(Mutex::new(pillar_streamdb::IpfsPersistentStream::open(
+                dir.path(), public, secret, pillar_streamdb::Visibility::Cell,
+                pillar_crypto::CellId::from_bytes(b"test-cell".to_vec()),
+                pillar_crypto::cell::group_key_from_seed(&seed).unwrap(),
+            ).unwrap()))
+        };
+        let journal = open();
+        let owner = NodeId::from("owner");
+        let mut historical = query_journal_context("source").with_persistent_journal(journal.clone());
+        let writes = [
+            QueryOp::Kv(KvOp::Put {
+                collection: "data".into(), key: "key".into(), value_hex: "00ff".into(),
+            }),
+            QueryOp::Doc(DocOp::PutField {
+                collection: "people".into(), id: "alice".into(), field: "name".into(), value: "Alice".into(),
+            }),
+            QueryOp::Sql(SqlOp::CreateView {
+                name: "names".into(), source: "people".into(), filter_field: None,
+                filter_value: None, project: Some(vec!["name".into()]),
+            }),
+            QueryOp::Object(ObjectOp::Put {
+                visibility: ObjectVisibility::Public, payload_hex: "00ff".into(),
+                links_hex: vec![], recipients_hex: vec![],
+            }),
+        ];
+        let mut objects = Vec::new();
+        // Reproduce the historical writer: sign summaries before constructing
+        // the journal, so every prev/parent and CID belongs to the legacy DAG.
+        for (i, write) in writes.iter().enumerate() {
+            let actor = NodeId::from(if i == 1 { "other" } else { "owner" });
+            let author = serde_json::to_string(&(actor.to_string(), &historical.identity.peer_id)).unwrap();
+            let mutation_hlc = pillar_keyedstore::Hlc::new(historical.keyed_clock + 1, 0, author.clone());
+            let (collection, summary) = if matches!(write, QueryOp::Object(_)) {
+                (TSDB_OBJECTS_COLLECTION.to_owned(), "OBJECT-PUT".to_owned())
+            } else {
+                WebAuthContext::query_write_description(write).unwrap()
+            };
+            let mut audit = Some(QueryAudit {
+                event: historical.query_log.prepare_append(&Author(author.clone()), summary.as_bytes()),
+                collection: collection.clone(),
+                hlc: pillar_keyedstore::Hlc::new(mutation_hlc.physical + 1, 0, author),
+            });
+            let record = if let QueryOp::Object(op) = write {
+                let (cid_hex, encoded) = historical.objects.prepare_record(&actor.to_string(), op).unwrap();
+                objects.push((cid_hex.clone(), encoded.clone()));
+                PortalOp::ObjectStored { cid_hex, encoded, audit: audit.clone() }
+            } else {
+                PortalOp::QueryMessage {
+                    actor: actor.to_string(), encoded: write.encode().unwrap(),
+                    hlc: mutation_hlc.clone(), audit: audit.clone(),
+                }
+            };
+            historical.record_durable(&record).unwrap();
+            historical.replaying = true;
+            if let PortalOp::ObjectStored { cid_hex, encoded, .. } = &record {
+                historical.objects.import_record(cid_hex, encoded).unwrap();
+                historical.authorize_data_write(&actor, &collection, &summary, &mut audit).unwrap();
+            } else {
+                historical.query_op_stamped(&actor, write, Some(mutation_hlc), audit).unwrap();
+            }
+            historical.replaying = false;
+        }
+        let legacy = query_journal_payloads(&journal);
+        let expected = query_journal_state(&historical);
+        let collections = ["data", "people", "names", TSDB_OBJECTS_COLLECTION];
+        let dags = collections.map(|collection| historical.log_dag(collection).unwrap());
+        let events = historical.query_log.events_in_causal_order();
+        assert!(events.iter().any(|event| event.content().prev().is_some()));
+        assert!(events.iter().any(|event| !event.content().parents().is_empty()));
+        for raw in &legacy {
+            let mut record = query_journal_decode(raw);
+            let audit = query_journal_audit(&mut record).clone();
+            assert!(audit.event.is_authentic());
+            assert!(!audit.event.content().payload().contains(&b'\n'));
+            assert!(WebAuthContext::validate_query_record(&record, &audit).is_err());
+        }
+        drop(historical);
+        drop(journal);
+
+        let reopened = open();
+        assert_eq!(query_journal_payloads(&reopened), legacy);
+        let mut restored = query_journal_context("source").with_persistent_journal(reopened.clone());
+        let mut reversed = legacy.clone();
+        reversed.reverse();
+        restored.replay_persisted(&reversed);
+        restored.replay_persisted(&reversed);
+        assert_eq!(query_journal_state(&restored), expected);
+        assert!(restored.pending_queries.is_empty());
+        for (collection, dag) in collections.iter().zip(&dags) {
+            assert_eq!(&restored.log_dag(collection).unwrap(), dag);
+        }
+        assert_eq!(restored.query_op(&owner, &QueryOp::Kv(KvOp::Get {
+            collection: "data".into(), key: "key".into(),
+        })).unwrap(), "00ff");
+        assert_eq!(restored.query_op(&owner, &QueryOp::Doc(DocOp::GetField {
+            collection: "people".into(), id: "alice".into(), field: "name".into(),
+        })).unwrap(), "Alice");
+        assert!(restored.query_op(&owner, &QueryOp::Sql(SqlOp::View { name: "names".into() })).unwrap().contains("Alice"));
+        assert_eq!(query_journal_payloads(&reopened), legacy, "restore must not rewrite history");
+
+        let mut peer = query_journal_context("peer");
+        let before = query_journal_state(&peer);
+        peer.replay(&reversed);
+        assert_eq!(query_journal_state(&peer), before);
+        assert!(peer.pending_queries.is_empty());
+        for (cid, encoded) in &objects {
+            assert_eq!(restored.objects.export_record(cid).unwrap(), *encoded);
+            assert_eq!(restored.objects.get(cid, None).unwrap(), "00ff");
+            assert!(peer.objects.export_record(cid).is_err());
+        }
+
+        let legacy_ids = restored.query_log.events_in_causal_order().iter()
+            .map(|event| event.id()).collect::<Vec<_>>();
+        restored.query_op(&owner, &QueryOp::Kv(KvOp::Put {
+            collection: "data".into(), key: "key".into(), value_hex: "abcd".into(),
+        })).unwrap();
+        let ack = restored.query_op(&owner, &QueryOp::Object(ObjectOp::Put {
+            visibility: ObjectVisibility::Public, payload_hex: "abcd".into(),
+            links_hex: vec![objects[0].0.clone()], recipients_hex: vec![],
+        })).unwrap();
+        let cid = ack.split_whitespace().nth(1).unwrap().to_owned();
+        objects.push((cid.clone(), restored.objects.export_record(&cid).unwrap()));
+        let all = query_journal_payloads(&reopened);
+        let new = all.iter().filter(|raw| !legacy.contains(raw)).collect::<Vec<_>>();
+        assert_eq!(new.len(), 2);
+        for raw in &new {
+            let mut record = query_journal_decode(raw);
+            let audit = query_journal_audit(&mut record).clone();
+            assert!(WebAuthContext::validate_query_record(&record, &audit).is_ok());
+            assert!(audit.event.content().prev().is_some());
+        }
+        assert!(new.iter().any(|raw| {
+            let mut record = query_journal_decode(raw);
+            query_journal_audit(&mut record).event.content().prev()
+                .is_some_and(|prev| legacy_ids.contains(&prev))
+        }));
+        let expected = query_journal_state(&restored);
+        drop(restored);
+        drop(reopened);
+
+        let reopened = open();
+        let mut restarted = query_journal_context("source").with_persistent_journal(reopened.clone());
+        restarted.replay_persisted(&query_journal_payloads(&reopened));
+        assert_eq!(query_journal_state(&restarted), expected);
+        assert!(restarted.pending_queries.is_empty());
+        assert_eq!(restarted.query_op(&owner, &QueryOp::Kv(KvOp::Get {
+            collection: "data".into(), key: "key".into(),
+        })).unwrap(), "abcd");
+        for (cid, encoded) in objects {
+            assert_eq!(restarted.objects.export_record(&cid).unwrap(), encoded);
+            assert!(restarted.objects.verify(&cid).unwrap().contains("true"));
+        }
+        assert_eq!(query_journal_payloads(&reopened), all);
+    }
+
+    #[test]
+    fn query_journal_unsigned_records_require_local_trust_and_object_put_cannot_bypass_it() {
+        use pillar_ops::{KvOp, ObjectOp, ObjectVisibility, QueryOp};
+
+        let owner = NodeId::from("owner");
+        let journal = test_journal();
+        let mut source = query_journal_context("source").with_persistent_journal(journal.clone());
+        let object = ObjectOp::Put {
+            visibility: ObjectVisibility::Public, payload_hex: "00ff".into(),
+            links_hex: vec![], recipients_hex: vec![],
+        };
+        source.query_op(&owner, &QueryOp::Kv(KvOp::Put {
+            collection: "data".into(), key: "key".into(), value_hex: "00ff".into(),
+        })).unwrap();
+        let ack = source.query_op(&owner, &QueryOp::Object(object.clone())).unwrap();
+        let cid = ack.split_whitespace().nth(1).unwrap();
+        let unsigned = query_journal_payloads(&journal).iter().map(|raw| {
+            let mut record = query_journal_decode(raw);
+            match &mut record {
+                PortalOp::QueryMessage { audit, .. } | PortalOp::ObjectStored { audit, .. } => *audit = None,
+                _ => unreachable!(),
+            }
+            query_journal_encode(&record)
+        }).collect::<Vec<_>>();
+        let mut peer = query_journal_context("peer");
+        let before = query_journal_state(&peer);
+        peer.replay(&unsigned);
+        assert_eq!(query_journal_state(&peer), before);
+        assert!(peer.act_log.is_empty());
+        assert!(peer.pending_queries.is_empty());
+        assert!(peer.objects.export_record(cid).is_err());
+
+        let mut local = query_journal_context("source");
+        local.replay_persisted(&unsigned);
+        assert_eq!(local.query_op(&owner, &QueryOp::Kv(KvOp::Get {
+            collection: "data".into(), key: "key".into(),
+        })).unwrap(), "00ff");
+        assert_eq!(local.objects.export_record(cid), source.objects.export_record(cid));
+        assert!(local.query_log.is_empty(), "unsigned history must not invent signed predecessors");
+        assert_eq!(local.act_log.len(), 2);
+
+        let malicious = query_journal_encode(&PortalOp::QueryMessage {
+            actor: "owner".into(), encoded: QueryOp::Object(object).encode().unwrap(),
+            hlc: pillar_keyedstore::Hlc::new(100, 0, "attacker"), audit: None,
+        });
+        for trusted in [false, true] {
+            let mut target = query_journal_context("target");
+            let before = query_journal_state(&target);
+            if trusted { target.replay_persisted(&[malicious.clone()]); }
+            else { target.replay(&[malicious.clone()]); }
+            assert_eq!(query_journal_state(&target), before, "trusted={trusted}");
+            assert!(target.act_log.is_empty());
+            assert!(target.objects.export_record(cid).is_err());
+            assert!(target.pending_queries.is_empty());
+        }
+    }
+
+    #[test]
+    fn query_journal_resigned_invalid_clocks_are_rejected_without_state_changes() {
+        use pillar_ops::{KvOp, ObjectOp, ObjectVisibility, QueryOp};
+
+        for object in [false, true] {
+            let journal = test_journal();
+            let mut source = query_journal_context("source").with_persistent_journal(journal.clone());
+            let write = if object {
+                QueryOp::Object(ObjectOp::Put {
+                    visibility: ObjectVisibility::Public, payload_hex: "00ff".into(),
+                    links_hex: vec![], recipients_hex: vec![],
+                })
+            } else {
+                QueryOp::Kv(KvOp::Put {
+                    collection: "data".into(), key: "key".into(), value_hex: "00ff".into(),
+                })
+            };
+            source.query_op(&NodeId::from("owner"), &write).unwrap();
+            let original = query_journal_decode(&query_journal_payloads(&journal)[0]);
+            for mutation in ["mutation-author", "mutation-logical", "mutation-physical", "mutation-max",
+                "audit-author", "audit-logical", "audit-physical", "audit-max-minus-one", "audit-max"] {
+                let mut altered = original.clone();
+                if mutation.starts_with("mutation-") && object { continue; }
+                if mutation == "audit-physical" && object { continue; }
+                match &mut altered {
+                    PortalOp::QueryMessage { hlc, audit: Some(audit), .. } => match mutation {
+                        "mutation-author" => hlc.author = "other".into(),
+                        "mutation-logical" => hlc.logical = 1,
+                        "mutation-physical" => hlc.physical += 1,
+                        "mutation-max" => hlc.physical = u64::MAX,
+                        "audit-physical" => audit.hlc.physical += 1,
+                        "audit-max-minus-one" | "audit-max" => {
+                            audit.hlc.physical = if mutation == "audit-max" { u64::MAX } else { u64::MAX - 1 };
+                            hlc.physical = audit.hlc.physical - 1;
+                        }
+                        _ => {}
+                    },
+                    PortalOp::ObjectStored { audit: Some(audit), .. } => match mutation {
+                        "audit-max-minus-one" => audit.hlc.physical = u64::MAX - 1,
+                        "audit-max" => audit.hlc.physical = u64::MAX,
+                        _ => {}
+                    },
+                    _ => unreachable!(),
+                }
+                let audit = query_journal_audit(&mut altered);
+                match mutation {
+                    "audit-author" => audit.hlc.author = "other".into(),
+                    "audit-logical" => audit.hlc.logical = 1,
+                    _ => {}
+                }
+                let audit = audit.clone();
+                let payload = WebAuthContext::query_record_payload(&altered, &audit).unwrap();
+                query_journal_resign(&mut altered, payload.clone());
+                let audit = query_journal_audit(&mut altered).clone();
+                assert_eq!(audit.event.content().payload(), payload);
+                assert!(audit.event.is_authentic());
+                assert!(WebAuthContext::validate_query_record(&altered, &audit).is_err(), "{mutation}");
+                for installed in [false, true] {
+                    let mut peer = query_journal_context("peer");
+                    if installed { peer.replay(&[query_journal_encode(&original)]); }
+                    let before = query_journal_state(&peer);
+                    let object_before = if let PortalOp::ObjectStored { cid_hex, .. } = &original {
+                        Some(peer.objects.export_record(cid_hex))
+                    } else { None };
+                    peer.replay(&[query_journal_encode(&altered)]);
+                    assert_eq!(query_journal_state(&peer), before, "{mutation}, object={object}, installed={installed}");
+                    assert!(peer.act_log.is_empty());
+                    assert!(peer.pending_queries.is_empty());
+                    if let PortalOp::ObjectStored { cid_hex, .. } = &original {
+                        assert_eq!(Some(peer.objects.export_record(cid_hex)), object_before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_journal_clock_boundary_replays_but_exhausted_live_writes_are_atomic() {
+        use pillar_ops::{KvOp, ObjectOp, ObjectVisibility, QueryOp};
+
+        for object in [false, true] {
+            let journal = test_journal();
+            let mut source = query_journal_context("source").with_persistent_journal(journal.clone());
+            let write = if object {
+                QueryOp::Object(ObjectOp::Put {
+                    visibility: ObjectVisibility::Public, payload_hex: "00ff".into(),
+                    links_hex: vec![], recipients_hex: vec![],
+                })
+            } else {
+                QueryOp::Kv(KvOp::Put {
+                    collection: "data".into(), key: "key".into(), value_hex: "00ff".into(),
+                })
+            };
+            source.keyed_clock = u64::MAX - if object { 3 } else { 4 };
+            source.query_op(&NodeId::from("owner"), &write).unwrap();
+            assert_eq!(source.keyed_clock, u64::MAX - 2);
+            let records = query_journal_payloads(&journal);
+            let mut peer = query_journal_context("peer");
+            peer.replay(&records);
+            assert_eq!(query_journal_state(&peer), query_journal_state(&source));
+            assert!(peer.pending_queries.is_empty());
+
+            for clock in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+                let journal = test_journal();
+                let mut target = query_journal_context("target").with_persistent_journal(journal.clone());
+                target.replay(&records);
+                target.keyed_clock = clock;
+                let before = query_journal_state(&target);
+                let seq = target.next_op_seq;
+                let failed_write = if object {
+                    QueryOp::Object(ObjectOp::Put {
+                        visibility: ObjectVisibility::Public, payload_hex: "abcd".into(),
+                        links_hex: vec![], recipients_hex: vec![],
+                    })
+                } else {
+                    QueryOp::Kv(KvOp::Put {
+                        collection: "data".into(), key: "key".into(), value_hex: "abcd".into(),
+                    })
+                };
+                let failed_cid = if let QueryOp::Object(op) = &failed_write {
+                    Some(target.objects.prepare_record("owner", op).unwrap().0)
+                } else { None };
+                assert_eq!(target.query_op(&NodeId::from("owner"), &failed_write).unwrap_err(), "query clock exhausted");
+                assert_eq!(query_journal_state(&target), before, "object={object}, clock={clock}");
+                assert_eq!(target.next_op_seq, seq);
+                assert!(query_journal_payloads(&journal).is_empty());
+                assert!(target.pending_queries.is_empty());
+                if let Some(cid) = failed_cid {
+                    assert!(target.objects.export_record(&cid).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_journal_disk_append_failure_is_atomic_and_later_writes_survive_restart() {
+        use pillar_ops::{KvOp, ObjectOp, ObjectVisibility, QueryOp};
+
+        for object in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let open = || {
+                let seed = pillar_crypto::Seed::from_bytes(b"query-journal-disk-fault".to_vec());
+                let (public, secret) = pillar_crypto::sign::signing_keypair_from_seed(&seed).unwrap();
+                Arc::new(Mutex::new(pillar_streamdb::IpfsPersistentStream::open(
+                    dir.path(), public, secret, pillar_streamdb::Visibility::Cell,
+                    pillar_crypto::CellId::from_bytes(b"test-cell".to_vec()),
+                    pillar_crypto::cell::group_key_from_seed(&seed).unwrap(),
+                ).unwrap()))
+            };
+            let write = |value: &str| if object {
+                QueryOp::Object(ObjectOp::Put {
+                    visibility: ObjectVisibility::Public, payload_hex: value.into(),
+                    links_hex: vec![], recipients_hex: vec![],
+                })
+            } else {
+                QueryOp::Kv(KvOp::Put {
+                    collection: "data".into(), key: "key".into(), value_hex: value.into(),
+                })
+            };
+            let journal = open();
+            assert!(journal.lock().unwrap().store().is_durable());
+            let mut source = query_journal_context("source").with_persistent_journal(journal.clone());
+            let owner = NodeId::from("owner");
+            let other = NodeId::from("other");
+            source.admit_resource_op_signer(other.clone());
+            let mut objects = Vec::new();
+            let first = source.query_op(&owner, &write("01")).unwrap();
+            if object {
+                objects.push(first.split_whitespace().nth(1).unwrap().to_owned());
+            }
+            let before = query_journal_state(&source);
+            let durable_before = query_journal_payloads(&journal);
+            let head_before = journal.lock().unwrap().head_cid().cloned();
+            let seq_before = source.next_op_seq;
+            let failed_object = match write("ff") {
+                QueryOp::Object(op) => Some(source.objects.prepare_record("owner", &op).unwrap().0),
+                _ => None,
+            };
+
+            // Unlike permissions, a non-directory parent fails even when run as root.
+            let blocks = dir.path().join("blocks");
+            let saved = dir.path().join("saved-blocks");
+            std::fs::rename(&blocks, &saved).unwrap();
+            std::fs::write(&blocks, b"not a directory").unwrap();
+            let result = source.query_op(&owner, &write("ff"));
+            std::fs::remove_file(&blocks).unwrap();
+            std::fs::rename(&saved, &blocks).unwrap();
+
+            let error = result.expect_err("a failed durable append must not acknowledge success");
+            assert!(error.contains("durable append failed"), "{error}");
+            assert_eq!(query_journal_state(&source), before);
+            assert_eq!(source.next_op_seq, seq_before);
+            assert_eq!(query_journal_payloads(&journal), durable_before);
+            assert_eq!(journal.lock().unwrap().head_cid().cloned(), head_before);
+            assert!(source.pending_queries.is_empty());
+            if let Some(cid) = &failed_object {
+                assert!(source.objects.export_record(cid).is_err());
+                assert_eq!(source.objects.get(&objects[0], None).unwrap(), "01");
+            } else {
+                assert_eq!(source.query_op(&owner, &QueryOp::Kv(KvOp::Get {
+                    collection: "data".into(), key: "key".into(),
+                })).unwrap(), "01");
+            }
+            for (actor, value) in [(&other, "02"), (&owner, "03")] {
+                let ack = source.query_op(actor, &write(value)).unwrap();
+                if object {
+                    objects.push(ack.split_whitespace().nth(1).unwrap().to_owned());
+                }
+            }
+            assert_eq!(source.query_log.len(), 3);
+            let expected = query_journal_state(&source);
+            let events = source.query_log.events_in_causal_order();
+            assert!(events.iter().any(|e| !e.content().parents().is_empty()));
+            assert!(events.iter().any(|e| e.content().prev().is_some()));
+            let collection = if object { TSDB_OBJECTS_COLLECTION } else { "data" };
+            let dag = source.log_dag(collection).unwrap();
+            let live = query_journal_payloads(&journal);
+            drop(source);
+            drop(journal);
+
+            // Reopen the real pin store, not the old handle's in-memory log.
+            let reopened = open();
+            let mut persisted = query_journal_payloads(&reopened);
+            assert_eq!(persisted, live);
+            assert_eq!(persisted.len(), 3);
+            persisted.reverse();
+            let mut restarted = query_journal_context("source").with_persistent_journal(reopened.clone());
+            let mut replica = query_journal_context("replica");
+            for raw in &persisted {
+                replica.replay(&[raw.clone()]);
+            }
+            for ctx in [&mut restarted, &mut replica] {
+                ctx.replay(&persisted);
+                ctx.replay(&persisted);
+                assert!(ctx.pending_queries.is_empty());
+                assert_eq!(query_journal_state(ctx), expected);
+                assert_eq!(ctx.log_dag(collection).unwrap(), dag);
+                if object {
+                    for (cid, value) in objects.iter().zip(["01", "02", "03"]) {
+                        assert_eq!(ctx.objects.get(cid, None).unwrap(), value);
+                        assert!(ctx.objects.verify(cid).unwrap().contains("true"));
+                    }
+                    assert!(ctx.objects.export_record(failed_object.as_ref().unwrap()).is_err());
+                } else {
+                    assert_eq!(ctx.query_op(&owner, &QueryOp::Kv(KvOp::Get {
+                        collection: "data".into(), key: "key".into(),
+                    })).unwrap(), "03");
+                }
+            }
+            assert_eq!(query_journal_payloads(&reopened), live, "replay must not append");
+        }
+    }
+
+    #[test]
+    fn query_journal_keyed_substitutions_rejected_before_and_after_original() {
+        use pillar_ops::{DocOp, KvOp, QueryOp, SqlOp};
+
+        let writes = [
+            QueryOp::Kv(KvOp::Put {
+                collection: "data".into(), key: "key".into(), value_hex: "00ff".into(),
+            }),
+            QueryOp::Doc(DocOp::PutField {
+                collection: "data".into(), id: "key".into(), field: "name".into(), value: "original".into(),
+            }),
+            QueryOp::Sql(SqlOp::CreateView {
+                name: "view".into(), source: "data".into(), filter_field: Some("status".into()),
+                filter_value: Some("active".into()), project: Some(vec!["name".into()]),
+            }),
+        ];
+        for write in writes {
+            let journal = test_journal();
+            let mut source = query_journal_context("source").with_persistent_journal(journal.clone());
+            source.query_op(&NodeId::from("owner"), &write).unwrap();
+            let original = query_journal_decode(&query_journal_payloads(&journal)[0]);
+            let mut cases = Vec::new();
+            for mutation in ["value", "physical", "logical", "author", "audit-physical", "audit-logical", "audit-author", "actor", "collection", "malformed", "noncanonical", "read", "filter-field", "projection"] {
+                let mut altered = original.clone();
+                let PortalOp::QueryMessage { actor, encoded, hlc, audit: Some(audit) } = &mut altered else { unreachable!() };
+                match mutation {
+                    "value" | "filter-field" | "projection" => {
+                        let mut query = write.clone();
+                        match (&mut query, mutation) {
+                            (QueryOp::Kv(KvOp::Put { value_hex, .. }), "value") => *value_hex = "ffff".into(),
+                            (QueryOp::Doc(DocOp::PutField { value, .. }), "value") => *value = "substituted".into(),
+                            (QueryOp::Sql(SqlOp::CreateView { filter_value, .. }), "value") => *filter_value = Some("inactive".into()),
+                            (QueryOp::Sql(SqlOp::CreateView { filter_field, .. }), "filter-field") => *filter_field = Some("other".into()),
+                            (QueryOp::Sql(SqlOp::CreateView { project, .. }), "projection") => *project = Some(vec!["status".into()]),
+                            _ => continue,
+                        }
+                        *encoded = query.encode().unwrap();
+                    }
+                    "physical" => hlc.physical += 100,
+                    "logical" => hlc.logical += 1,
+                    "author" => hlc.author = "other-writer".into(),
+                    "audit-physical" => audit.hlc.physical += 100,
+                    "audit-logical" => audit.hlc.logical += 1,
+                    "audit-author" => audit.hlc.author = "other-writer".into(),
+                    "actor" => *actor = "other".into(),
+                    "collection" => audit.collection = "other".into(),
+                    "malformed" => *encoded = vec![0xff],
+                    "noncanonical" => {
+                        encoded.push(b' ');
+                        assert_eq!(QueryOp::decode(encoded).unwrap(), write);
+                    }
+                    "read" => *encoded = match &write {
+                        QueryOp::Kv(_) => QueryOp::Kv(KvOp::Get { collection: "data".into(), key: "key".into() }),
+                        QueryOp::Doc(_) => QueryOp::Doc(DocOp::GetField { collection: "data".into(), id: "key".into(), field: "name".into() }),
+                        _ => QueryOp::Sql(SqlOp::View { name: "view".into() }),
+                    }.encode().unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(audit.event.is_authentic());
+                cases.push((mutation, altered));
+            }
+            for (label, mut altered) in cases {
+                assert_eq!(query_journal_audit(&mut altered).event, query_journal_audit(&mut original.clone()).event);
+                let audit = query_journal_audit(&mut altered).clone();
+                assert!(WebAuthContext::validate_query_record(&altered, &audit).is_err(), "{label}");
+                let mut replica = query_journal_context("replica");
+                for installed in [false, true] {
+                    if installed {
+                        replica.replay(&[query_journal_encode(&original)]);
+                        assert_eq!(query_journal_state(&replica), query_journal_state(&source));
+                    }
+                    let before = query_journal_state(&replica);
+                    replica.replay(&[query_journal_encode(&altered)]);
+                    assert_eq!(query_journal_state(&replica), before, "{write:?}: {label}, installed={installed}");
+                    assert!(replica.pending_queries.is_empty());
+                }
+            }
+
+            // Sign the invalid record's actual binding, so signature or
+            // payload mismatch alone cannot hide missing semantic validation.
+            let mut noncanonical = write.encode().unwrap();
+            noncanonical.push(b' ');
+            let invalid_records = [
+                vec![0xff],
+                noncanonical,
+                QueryOp::Kv(KvOp::Get {
+                    collection: "data".into(), key: "key".into(),
+                }).encode().unwrap(),
+                QueryOp::Kv(KvOp::Put {
+                    collection: "data".into(), key: "key".into(), value_hex: "not-hex".into(),
+                }).encode().unwrap(),
+            ];
+            for invalid in invalid_records {
+                let mut altered = original.clone();
+                let PortalOp::QueryMessage { actor, encoded, hlc, audit: Some(audit) } = &mut altered else { unreachable!() };
+                *encoded = invalid;
+                let summary = std::str::from_utf8(audit.event.content().payload()).unwrap().lines().next().unwrap();
+                let binding = serde_json::to_string(&("QUERY-AUDIT-v1", actor, &audit.collection, encoded, hlc, &audit.hlc)).unwrap();
+                let payload = format!("{summary}\n{binding}").into_bytes();
+                query_journal_resign(&mut altered, payload);
+                let audit = query_journal_audit(&mut altered).clone();
+                assert!(WebAuthContext::query_record_payload(&altered, &audit).is_err());
+                assert!(WebAuthContext::validate_query_record(&altered, &audit).is_err());
+                let mut replica = query_journal_context("replica");
+                for installed in [false, true] {
+                    if installed {
+                        replica.replay(&[query_journal_encode(&original)]);
+                        assert_eq!(query_journal_state(&replica), query_journal_state(&source));
+                    }
+                    let before = query_journal_state(&replica);
+                    replica.replay(&[query_journal_encode(&altered)]);
+                    assert_eq!(query_journal_state(&replica), before);
+                    assert!(replica.pending_queries.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_journal_object_substitutions_and_signed_invalid_records_are_atomic() {
+        use pillar_ops::{ObjectOp, ObjectVisibility, QueryOp};
+
+        let put = ObjectOp::Put {
+            visibility: ObjectVisibility::Public, payload_hex: "00ff".into(),
+            links_hex: vec![], recipients_hex: vec![],
+        };
+        let journal = test_journal();
+        let mut source = query_journal_context("source").with_persistent_journal(journal.clone());
+        source.query_op(&NodeId::from("owner"), &QueryOp::Object(put.clone())).unwrap();
+        let mut original = query_journal_decode(&query_journal_payloads(&journal)[0]);
+        let original_audit = query_journal_audit(&mut original).clone();
+        let (original_cid, original_bytes) = match &original {
+            PortalOp::ObjectStored { cid_hex, encoded, .. } => (cid_hex.clone(), encoded.clone()),
+            _ => unreachable!(),
+        };
+        let (other_cid, other_bytes) = source.objects.prepare_record("other", &put).unwrap();
+        let mut cases = Vec::new();
+        for mutation in ["cid", "bytes", "malformed", "author", "collection", "audit-physical", "audit-logical", "audit-author"] {
+            let mut altered = original.clone();
+            let PortalOp::ObjectStored { cid_hex, encoded, audit: Some(audit) } = &mut altered else { unreachable!() };
+            match mutation {
+                "cid" => *cid_hex = other_cid.clone(),
+                "bytes" => encoded[0] ^= 1,
+                "malformed" => {
+                    *encoded = vec![0xff];
+                    *cid_hex = hex_encode_bytes(pillar_ipfs::content_id(encoded).as_bytes());
+                }
+                "author" => { *cid_hex = other_cid.clone(); *encoded = other_bytes.clone(); }
+                "collection" => audit.collection = "other".into(),
+                "audit-physical" => audit.hlc.physical += 100,
+                "audit-logical" => audit.hlc.logical += 1,
+                "audit-author" => audit.hlc.author = "other-writer".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(audit.event, original_audit.event);
+            cases.push((mutation, altered.clone()));
+            if matches!(mutation, "cid" | "bytes" | "malformed" | "author") {
+                let audit = query_journal_audit(&mut altered).clone();
+                let PortalOp::ObjectStored { cid_hex, .. } = &altered else { unreachable!() };
+                let binding = serde_json::to_string(&("OBJECT-AUDIT-v1", cid_hex, &audit.collection, &audit.hlc)).unwrap();
+                let payload = format!("OBJECT-PUT\n{binding}").into_bytes();
+                if mutation == "author" {
+                    assert_eq!(WebAuthContext::query_record_payload(&altered, &audit).unwrap(), payload);
+                }
+                query_journal_resign(&mut altered, payload);
+                cases.push(("signed-invalid", altered));
+            }
+        }
+        for (label, mut altered) in cases {
+            let audit = query_journal_audit(&mut altered).clone();
+            assert!(audit.event.is_authentic());
+            assert!(WebAuthContext::validate_query_record(&altered, &audit).is_err(), "{label}");
+            let mut replica = query_journal_context("replica");
+            for installed in [false, true] {
+                if installed {
+                    replica.replay(&[query_journal_encode(&original)]);
+                    assert_eq!(query_journal_state(&replica), query_journal_state(&source));
+                }
+                let before = query_journal_state(&replica);
+                let object_before = replica.objects.export_record(&original_cid);
+                replica.replay(&[query_journal_encode(&altered)]);
+                assert_eq!(query_journal_state(&replica), before, "{label}, installed={installed}");
+                assert_eq!(replica.objects.export_record(&original_cid), object_before);
+                assert!(replica.objects.export_record(&other_cid).is_err());
+                if let PortalOp::ObjectStored { cid_hex, .. } = &altered {
+                    if cid_hex != &original_cid {
+                        assert!(replica.objects.export_record(cid_hex).is_err());
+                    }
+                }
+                assert!(replica.pending_queries.is_empty());
+            }
+            assert_eq!(replica.objects.export_record(&original_cid).unwrap(), original_bytes);
+        }
+    }
+
+    #[test]
+    fn query_journal_queued_substitution_cannot_crowd_out_authentic_record() {
+        use pillar_ops::{KvOp, ObjectOp, ObjectVisibility, QueryOp};
+
+        for (object, cross_actor) in [(false, false), (true, false), (false, true), (true, true)] {
+            let journal = test_journal();
+            let mut source = query_journal_context("source").with_persistent_journal(journal.clone());
+            source.admit_resource_op_signer(NodeId::from("other"));
+            let mut records = Vec::new();
+            for value in ["01", "02"] {
+                let write = if object {
+                    QueryOp::Object(ObjectOp::Put {
+                        visibility: ObjectVisibility::Public, payload_hex: value.into(),
+                        links_hex: vec![], recipients_hex: vec![],
+                    })
+                } else {
+                    QueryOp::Kv(KvOp::Put {
+                        collection: "data".into(), key: "key".into(), value_hex: value.into(),
+                    })
+                };
+                let actor = if cross_actor && value == "02" { "other" } else { "owner" };
+                let before = query_journal_payloads(&journal);
+                source.query_op(&NodeId::from(actor), &write).unwrap();
+                let delta = query_journal_payloads(&journal).into_iter()
+                    .filter(|raw| !before.contains(raw)).collect::<Vec<_>>();
+                assert_eq!(delta.len(), 1);
+                records.push(query_journal_decode(&delta[0]));
+            }
+            let child_event = &query_journal_audit(&mut records[1]).event;
+            if cross_actor {
+                assert!(!child_event.content().parents().is_empty());
+            } else {
+                assert!(child_event.content().prev().is_some());
+            }
+            let parent = query_journal_encode(&records[0]);
+            let child = query_journal_encode(&records[1]);
+            let mut forged = records[1].clone();
+            match &mut forged {
+                PortalOp::QueryMessage { encoded, .. } => *encoded = QueryOp::Kv(KvOp::Put {
+                    collection: "data".into(), key: "key".into(), value_hex: "ff".into(),
+                }).encode().unwrap(),
+                PortalOp::ObjectStored { encoded, .. } => encoded[0] ^= 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(query_journal_audit(&mut forged).event, query_journal_audit(&mut records[1]).event);
+            let forged = query_journal_encode(&forged);
+            for forged_first in [false, true] {
+                let mut replica = query_journal_context("replica");
+                let before = query_journal_state(&replica);
+                let batch = if forged_first { vec![forged.clone(), child.clone()] } else { vec![child.clone(), forged.clone()] };
+                replica.replay(&batch);
+                replica.replay(&[forged.clone(), child.clone()]);
+                assert_eq!(query_journal_state(&replica), before);
+                assert_eq!(replica.pending_queries.len(), 1);
+                assert_eq!(query_journal_encode(&replica.pending_queries[0]), child);
+                replica.replay(&[parent.clone()]);
+                assert!(replica.pending_queries.is_empty());
+                assert_eq!(query_journal_state(&replica), query_journal_state(&source));
+                replica.replay(&[forged.clone(), child.clone(), parent.clone()]);
+                assert_eq!(query_journal_state(&replica), query_journal_state(&source));
+                if let PortalOp::ObjectStored { cid_hex, encoded, .. } = &records[1] {
+                    assert_eq!(replica.objects.export_record(cid_hex).unwrap(), *encoded);
+                } else {
+                    assert_eq!(replica.query_op(&NodeId::from("owner"), &QueryOp::Kv(KvOp::Get {
+                        collection: "data".into(), key: "key".into(),
+                    })).unwrap(), "02");
+                }
+            }
+        }
     }
 
     #[test]

@@ -302,16 +302,30 @@ impl ObjectStore {
     /// Import and pin an exact block without re-signing or re-sealing it.
     /// Returns its authenticated author subject for rebuilding the audit log.
     pub(crate) fn import_record(&self, cid_hex: &str, bytes: &[u8]) -> Result<String, String> {
+        let author_subject = Self::validate_record(cid_hex, bytes)?;
         let cid = Self::parse_cid(cid_hex)?;
+        self.node
+            .put_block_checked(&cid, bytes)
+            .map_err(|e| format!("blockstore import: {e}"))?;
+        self.node.pin(&cid).map_err(|e| format!("pin: {e}"))?;
+        Ok(author_subject)
+    }
+
+    /// Validate an exact block's CID, format and signature without importing or
+    /// pinning it. Returns its authenticated author subject.
+    pub(crate) fn validate_record(cid_hex: &str, bytes: &[u8]) -> Result<String, String> {
+        let cid = Self::parse_cid(cid_hex)?;
+        if pillar_ipfs::content_id(bytes) != cid {
+            return Err(format!(
+                "blockstore import: {}",
+                pillar_ipfs::IpfsError::CidMismatch
+            ));
+        }
         let record = ObjectRecord::decode(bytes)
             .ok_or_else(|| "imported block is not a well-formed object record".to_owned())?;
         if !record.verify_signature() {
             return Err("imported object signature is invalid".to_owned());
         }
-        self.node
-            .put_block_checked(&cid, bytes)
-            .map_err(|e| format!("blockstore import: {e}"))?;
-        self.node.pin(&cid).map_err(|e| format!("pin: {e}"))?;
         Ok(record.author_subject)
     }
 
@@ -324,6 +338,18 @@ impl ObjectStore {
     /// A string reason: bad hex, a `Sealed` put naming no recipients, or a
     /// signing/sealing/storage fault.
     pub fn put(&self, author_subject: &str, op: &ObjectOp) -> Result<String, String> {
+        let (cid_hex, bytes) = self.prepare_record(author_subject, op)?;
+        self.import_record(&cid_hex, &bytes)?;
+        Ok(cid_hex)
+    }
+
+    /// Build, seal and sign a new block and compute its CID without importing or
+    /// pinning it. Import these exact bytes to preserve a sealed record's CID.
+    pub(crate) fn prepare_record(
+        &self,
+        author_subject: &str,
+        op: &ObjectOp,
+    ) -> Result<(String, Vec<u8>), String> {
         let ObjectOp::Put {
             visibility,
             payload_hex,
@@ -369,15 +395,8 @@ impl ObjectStore {
             links,
         )?;
         let encoded = record.encode();
-        let cid = self
-            .node
-            .put_block(&encoded)
-            .map_err(|e| format!("blockstore write: {e}"))?;
-        // Every authored object is pinned durable on write — matches the
-        // design doc's `pinned: n1, n3` expectation (a block a node authors
-        // it always holds durably).
-        self.node.pin(&cid).map_err(|e| format!("pin: {e}"))?;
-        Ok(hex_encode(cid.as_bytes()))
+        let cid = pillar_ipfs::content_id(&encoded);
+        Ok((hex_encode(cid.as_bytes()), encoded))
     }
 
     /// `pillar object stat <cid>`: codec, size, pin status, and which nodes
@@ -542,6 +561,96 @@ mod tests {
     use pillar_crypto::Seed;
 
     const AUTHOR_SUBJECT: &str = "actor-hex-subject";
+
+    #[test]
+    fn preparing_and_validating_records_does_not_import_or_pin() {
+        let (recipient, secret) =
+            sealing_keypair_from_seed(&Seed::from_bytes(b"recipient-a".to_vec())).unwrap();
+        for visibility in [ObjectVisibility::Public, ObjectVisibility::Sealed] {
+            let store = ObjectStore::new();
+            let (cid_hex, bytes) = store
+                .prepare_record(
+                    AUTHOR_SUBJECT,
+                    &ObjectOp::Put {
+                        visibility,
+                        payload_hex: hex_encode(b"prepared body"),
+                        links_hex: vec![],
+                        recipients_hex: vec![hex_encode(recipient.as_bytes())],
+                    },
+                )
+                .unwrap();
+            let cid = pillar_ipfs::content_id(&bytes);
+            assert_eq!(cid_hex, hex_encode(cid.as_bytes()));
+            assert_eq!(
+                ObjectStore::validate_record(&cid_hex, &bytes).unwrap(),
+                AUTHOR_SUBJECT
+            );
+            assert!(!store.node.has_block(&cid).unwrap());
+            assert!(store.export_record(&cid_hex).is_err());
+            assert!(store.node.pinned().unwrap().is_empty());
+
+            assert_eq!(
+                store.import_record(&cid_hex, &bytes).unwrap(),
+                AUTHOR_SUBJECT
+            );
+            assert_eq!(store.export_record(&cid_hex).unwrap(), bytes);
+            assert_eq!(store.node.pinned().unwrap(), vec![cid]);
+            assert_eq!(
+                store
+                    .cat(&cid_hex, Some(&hex_encode(secret.as_bytes())))
+                    .unwrap(),
+                "prepared body"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_record_validation_does_not_import_or_pin() {
+        let store = ObjectStore::new();
+        let (cid_hex, bytes) = store
+            .prepare_record(
+                AUTHOR_SUBJECT,
+                &ObjectOp::Put {
+                    visibility: ObjectVisibility::Public,
+                    payload_hex: hex_encode(b"prepared body"),
+                    links_hex: vec![],
+                    recipients_hex: vec![],
+                },
+            )
+            .unwrap();
+        let mut corrupt = bytes.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        for (claimed_cid, invalid_bytes, expected_error) in [
+            ("not hex".to_owned(), bytes.clone(), "cid_hex"),
+            ("00".to_owned(), bytes.clone(), "blockstore import"),
+            (
+                hex_encode(pillar_ipfs::content_id(&corrupt).as_bytes()),
+                corrupt,
+                "signature is invalid",
+            ),
+            (
+                hex_encode(pillar_ipfs::content_id(&trailing).as_bytes()),
+                trailing,
+                "not a well-formed object record",
+            ),
+        ] {
+            let error = ObjectStore::validate_record(&claimed_cid, &invalid_bytes).unwrap_err();
+            assert!(error.contains(expected_error), "{error}");
+            assert_eq!(store.import_record(&claimed_cid, &invalid_bytes), Err(error));
+            assert!(!store
+                .node
+                .has_block(&pillar_ipfs::content_id(&invalid_bytes))
+                .unwrap());
+            assert!(store.export_record(&claimed_cid).is_err());
+            assert!(store.node.pinned().unwrap().is_empty());
+        }
+        assert_eq!(
+            store.import_record(&cid_hex, &bytes).unwrap(),
+            AUTHOR_SUBJECT
+        );
+    }
 
     #[test]
     fn a_public_object_round_trips_with_no_access_barrier() {
