@@ -339,6 +339,13 @@
           default = pillar-oci-image;
         };
 
+        checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          nixos-module = pkgs.testers.runNixOSTest {
+            imports = [ ./nix/tests/module.nix ];
+            _module.args = { inherit self; };
+          };
+        };
+
         # Dev shell for CI's fmt/clippy/test (and local dev): the SAME native
         # inputs the reproducible `pillar` build uses, but exposed through
         # mkShell so their `.dev` outputs (headers + pkg-config `.pc` files)
@@ -371,5 +378,10 @@
           buildInputs = [ pkgs.tpm2-tss pkgs.hidapi pkgs.libusb1 ];
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         };
-      });
+      }) // {
+        nixosModules.default = { pkgs, ... }: {
+          imports = [ ./nix/module.nix ];
+          services.pillar.package = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.pillar;
+        };
+      };
 }
