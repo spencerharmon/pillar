@@ -40,6 +40,8 @@ jobs:
           git config --global --add safe.directory "$(pwd)"
           server="${GITHUB_SERVER_URL#https://}"
           git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          # PR merge commits are not included in the clone's branch refspec.
+          git fetch origin "${GITHUB_SHA}"
           git checkout --detach "${GITHUB_SHA}"
 
       - name: Enable nix flakes
@@ -100,6 +102,7 @@ jobs:
           git config --global --add safe.directory "$(pwd)"
           server="${GITHUB_SERVER_URL#https://}"
           git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git fetch origin "${GITHUB_SHA}"
           git checkout --detach "${GITHUB_SHA}"
 
       - name: Enable nix flakes
@@ -142,6 +145,7 @@ jobs:
           git config --global --add safe.directory "$(pwd)"
           server="${GITHUB_SERVER_URL#https://}"
           git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git fetch origin "${GITHUB_SHA}"
           git checkout --detach "${GITHUB_SHA}"
 
       - name: Enable nix flakes
@@ -181,6 +185,7 @@ jobs:
           git config --global --add safe.directory "$(pwd)"
           server="${GITHUB_SERVER_URL#https://}"
           git clone --no-checkout "https://x-access-token:${GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git" .
+          git fetch origin "${GITHUB_SHA}"
           git checkout --detach "${GITHUB_SHA}"
 
       - name: Enable nix flakes
