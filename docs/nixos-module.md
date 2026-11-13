@@ -106,3 +106,25 @@ credential, and durable reads/writes on the joiner after restart with the issuer
 stopped. This tests enrollment and persistence, not ongoing resource replication.
 The NixOS test needs a Linux builder with virtualization support (`kvm`); no
 external seed, deployment hostname, or production secret is used.
+
+## Fleet Acceptance
+
+```sh
+nix build .#checks.x86_64-linux.fleet-acceptance
+```
+
+Three VMs run the flake package through `services.pillar` under TCG with a
+Westmere CPU lacking AVX/AVX2/FMA/BMI and AES-NI/PCLMUL. This check needs no KVM;
+software emulation is intentional so unsupported instructions actually trap.
+Only genesis creates a cell. Both other nodes submit join requests, require
+approval, install identity-bound enrollment as the service user, and log in to
+their own portals. No daemon identity or cell-state directory is copied.
+
+The test compares full dashboard/layout contents, KV and document values, SQL
+views, public and recipient-sealed objects, signatures/hashes, audit events,
+and applied manifests written before and after enrollment. It then powers off
+genesis, requires fresh portal logins and bidirectional writes on the survivors,
+and repeats the complete read oracle after restarting both survivor services.
+The survivors have a direct seed connection, not a genesis-only star. The test
+uses only runtime-generated fixture credentials and isolated VM hostnames; it
+does not deploy to or retire any operator infrastructure.

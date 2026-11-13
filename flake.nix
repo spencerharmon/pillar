@@ -380,6 +380,12 @@
             # Software-emulated baseline CPU (TCG); no /dev/kvm needed.
             requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
           });
+          fleet-acceptance = (pkgs.testers.runNixOSTest {
+            imports = [ ./nix/tests/fleet-acceptance.nix ];
+            _module.args = { inherit self; };
+          }).overrideTestDerivation (old: {
+            requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
+          });
           cpu-baseline = (pkgs.testers.runNixOSTest {
             name = "pillar-cpu-baseline";
             nodes.machine = { ... }: {
