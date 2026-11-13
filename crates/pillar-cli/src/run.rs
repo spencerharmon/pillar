@@ -1407,7 +1407,7 @@ pub async fn run(config: NodeConfig) -> Result<(), BootError> {
                 ctx = ctx
                     .with_cell_node_identity(&cell_keypair)
                     .map_err(enrollment_error)?;
-                ctx.replay(&persisted_ops);
+                ctx.replay_persisted(&persisted_ops);
                 ctx = ctx
                     .with_enrollment(config.data_dir.clone())
                     .map_err(enrollment_error)?;
